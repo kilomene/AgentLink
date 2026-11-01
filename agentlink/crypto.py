@@ -24,6 +24,10 @@ import secrets
 from pathlib import Path
 
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
@@ -53,19 +57,37 @@ class Identity:
             data = json.loads(self.path.read_text())
             self._priv = X25519PrivateKey.from_private_bytes(
                 _unb64(data["private_key"]))
+            if data.get("signing_private_key"):
+                self._sign = Ed25519PrivateKey.from_private_bytes(
+                    _unb64(data["signing_private_key"]))
+            else:
+                # Older keys file: add a signing key and re-save.
+                self._sign = Ed25519PrivateKey.generate()
+                self._save(data)
         else:
             self._priv = X25519PrivateKey.generate()
-            raw = self._priv.private_bytes(
-                serialization.Encoding.Raw,
-                serialization.PrivateFormat.Raw,
-                serialization.NoEncryption())
-            self.path.write_text(json.dumps(
-                {"username": username, "private_key": _b64(raw),
-                 "public_key": self.public_key_b64}))
-            try:
-                os.chmod(self.path, 0o600)
-            except OSError:
-                pass
+            self._sign = Ed25519PrivateKey.generate()
+            self._save({})
+
+    def _save(self, data: dict) -> None:
+        raw = self._priv.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption())
+        sraw = self._sign.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption())
+        data.update({"username": self.username,
+                     "private_key": _b64(raw),
+                     "public_key": self.public_key_b64,
+                     "signing_private_key": _b64(sraw),
+                     "signing_public_key": self.signing_public_key_b64})
+        self.path.write_text(json.dumps(data))
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
 
     @classmethod
     def ephemeral(cls) -> "Identity":
@@ -74,7 +96,28 @@ class Identity:
         obj.username = "ephemeral"
         obj.path = None
         obj._priv = X25519PrivateKey.generate()
+        obj._sign = Ed25519PrivateKey.generate()
         return obj
+
+    @property
+    def signing_public_key_b64(self) -> str:
+        raw = self._sign.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        return _b64(raw)
+
+    def sign(self, payload: bytes) -> str:
+        """Ed25519 signature (base64) — used for signed delivery proof."""
+        return _b64(self._sign.sign(payload))
+
+    @staticmethod
+    def verify_signature(sign_pub_b64: str, payload: bytes,
+                         signature_b64: str) -> bool:
+        try:
+            pub = Ed25519PublicKey.from_public_bytes(_unb64(sign_pub_b64))
+            pub.verify(_unb64(signature_b64), payload)
+            return True
+        except Exception:
+            return False
 
     @property
     def public_key_b64(self) -> str:
@@ -116,8 +159,9 @@ class Identity:
         return self.decrypt_envelope(envelope)
 
 
-def encrypt_with_key(key: bytes, plaintext: bytes) -> dict:
-    nonce = secrets.token_bytes(12)
+def encrypt_with_key(key: bytes, plaintext: bytes,
+                     nonce: bytes | None = None) -> dict:
+    nonce = nonce or secrets.token_bytes(12)
     ct = ChaCha20Poly1305(key).encrypt(nonce, plaintext, None)
     return {"nonce": _b64(nonce), "ct": _b64(ct)}
 
