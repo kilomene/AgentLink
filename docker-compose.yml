@@ -1,0 +1,11 @@
+services:
+  relay:
+    build: .
+    ports:
+      - "8765:8765"
+    volumes:
+      - agentlink-data:/data
+    restart: unless-stopped
+
+volumes:
+  agentlink-data:
