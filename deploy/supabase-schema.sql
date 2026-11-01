@@ -97,3 +97,85 @@ create table if not exists audit_log (
   work_id text not null default '',
   status text not null default ''
 );
+
+-- v1 feature-wave additions (points 21-42): columns + new tables.
+alter table users add column if not exists sign_pub text not null default '';
+alter table users add column if not exists capabilities text not null default '[]';
+alter table users add column if not exists cap_desc text not null default '';
+alter table users add column if not exists last_seen double precision not null default 0;
+alter table queue add column if not exists priority integer not null default 0;
+alter table work add column if not exists content_group text;
+alter table work add column if not exists batch_id text;
+alter table work add column if not exists priority text not null default 'normal';
+alter table work add column if not exists auto_reassign integer not null default 1;
+alter table work add column if not exists assignee_role text not null default '';
+alter table work add column if not exists attempt integer not null default 1;
+alter table work add column if not exists progress_percent integer not null default 0;
+alter table work add column if not exists progress_at double precision not null default 0;
+alter table work add column if not exists proof_hash text not null default '';
+alter table work add column if not exists proof_ts double precision not null default 0;
+alter table work add column if not exists proof_sig text not null default '';
+alter table work add column if not exists proof_verified integer not null default 0;
+alter table work add column if not exists chain_id text not null default '';
+alter table work add column if not exists chain_step integer not null default 0;
+alter table work_deliveries add column if not exists content_group text;
+alter table work_deliveries add column if not exists content_next text;
+alter table blobs add column if not exists for_channel text not null default '';
+alter table blobs add column if not exists whole_sha text not null default '';
+alter table audit_log add column if not exists priority text not null default '';
+alter table audit_log add column if not exists size integer not null default 0;
+alter table audit_log add column if not exists mentions text not null default '[]';
+alter table audit_log add column if not exists ref_id text not null default '';
+
+create table if not exists channels (
+  id text primary key, name text not null, creator text not null,
+  created_at double precision not null);
+create table if not exists channel_members (
+  channel_id text not null, username text not null,
+  role text not null default 'member', added_by text not null default '',
+  joined_at double precision not null,
+  primary key (channel_id, username));
+create table if not exists channel_keys (
+  channel_id text not null, username text not null,
+  epoch integer not null, wrapped text not null,
+  primary key (channel_id, username, epoch));
+create table if not exists upload_sessions (
+  id text primary key, owner text not null, blob_id text not null,
+  whole_sha text not null, chunk_size integer not null,
+  total_chunks integer not null, for_user text not null default '',
+  for_group text not null default '', for_channel text not null default '',
+  got text not null default '[]', created_at double precision not null);
+create table if not exists work_checkpoints (
+  work_id text primary key, attempt integer not null, by_user text not null,
+  content_assigner text, content_group text,
+  ts double precision not null);
+create table if not exists alerts (
+  id text primary key, kind text not null, subject text not null,
+  created_at double precision not null,
+  last_reminder double precision not null default 0,
+  resolved integer not null default 0,
+  resolved_at double precision not null default 0);
+create table if not exists library (
+  id text primary key, filename text not null,
+  size integer not null default 0, sha256 text not null,
+  sender text not null, dest_kind text not null, dest_id text not null,
+  work_id text not null default '',
+  created_at double precision not null);
+create table if not exists vault (
+  id text primary key, group_id text not null, filename text not null,
+  size integer not null default 0, sha256 text not null,
+  added_by text not null, blob_id text not null,
+  pinned integer not null default 0,
+  created_at double precision not null);
+create table if not exists chains (
+  id text primary key, creator text not null,
+  group_id text not null default '', status text not null default 'running',
+  current_step integer not null default 0,
+  created_at double precision not null,
+  updated_at double precision not null);
+create table if not exists chain_steps (
+  chain_id text not null, step_index integer not null,
+  work_id text, target_kind text not null default 'user',
+  target text not null default '', status text not null default 'pending',
+  handoff text, released_at double precision,
+  primary key (chain_id, step_index));
