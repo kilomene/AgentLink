@@ -279,7 +279,11 @@ def test_group_permissions_enforced(relay_url, state_root):
         await one.group_settings(gid, {"send_messages": "admins_only"})
         with pytest.raises(RequestFailed) as ei:
             await two.group_send(gid, "should be blocked")
-        assert ei.value.reason == "permission_denied"
+        # Point 43e: the agent's local gate fires first once the live
+        # settings event lands; the server enforces the same rule
+        # (reason "permission_denied") for clients without the view.
+        assert ei.value.reason in ("permission_denied",
+                                   "permission_denied_local")
         await one.group_send(gid, "admin speaking")
 
         # Superadmin promotes two to admin; two can now send and can
