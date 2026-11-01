@@ -1,0 +1,50 @@
+"""THE TIMING MAP — the single source of truth for every timed
+behaviour in AgentLink (point 42B). "Every second and every minute
+has its own timing": runtime code reads THESE constants; the README
+Timing section mirrors this table; a consistency test fails if code
+drifts from it.
+
+All timestamps are stored as epoch SECONDS (the authoritative
+instant) with Pacific display strings where humans/agents read them
+(point 36); sub-second ordering uses monotonic sequence ids.
+"""
+
+# Presence / heartbeat (points 15, 39)
+HEARTBEAT_SECONDS = 5            # agent heartbeat cadence, never stops
+OFFLINE_GRACE_SECONDS = 15       # 3 missed beats -> shown offline
+REASSIGN_GRACE_SECONDS = 30      # no heartbeat anywhere for 30s -> dead
+RECONNECT_FIRST_RETRY = 0        # first retry is instant
+RECONNECT_BACKOFF_CAP_SECONDS = 5
+HOME_PROBE_SECONDS = 5           # failover home-probe cadence
+
+# Supervision (points 11, 17, 39)
+WATCHDOG_CRON_SECONDS = 60       # per-minute watchdog cron
+WATCHDOG_STALE_SECONDS = 20      # heartbeat stamp older than this = hung
+RESTART_SEC = 1                  # systemd RestartSec
+
+# Dashboard (point 10)
+DEVICE_TRUST_SECONDS = 7 * 24 * 3600   # trusted device life: 7 days
+LOGIN_RATE_LIMIT_ATTEMPTS = 5
+LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300
+
+# Auto-update (point 12)
+UPDATE_CHECK_SECONDS = 15 * 60   # 15 minutes
+
+# Fleet alerts (point 37)
+ALERT_OFFLINE_SECONDS = 300      # agent offline beyond 5 min -> alert
+ALERT_URGENT_SECONDS = 120       # urgent undelivered beyond 2 min
+ALERT_REMINDER_SECONDS = 3600    # throttled reminder cadence
+ALERT_CHAIN_PAUSE_SECONDS = 300  # chain paused beyond 5 min -> alert
+
+# Deadline pressure (point 36)
+DEADLINE_WARN_HALF = "50% of window elapsed"
+DEADLINE_WARN_LATE_SECONDS = 3600  # 1 hour remaining (scaled on short windows)
+
+# Backups (points 17, 19c)
+BACKUP_CRON = "daily"            # plus on-demand via operator CLI
+
+# Relay fleet scan (reassignment + pressure + alerts evaluation)
+FLEET_SCAN_SECONDS = 1
+SELF_CHECK_SECONDS = 60          # daemon self-heal cadence (point 43d)
+CONNECT_RACE_GRACE_SECONDS = 0.3  # prefer-home grace inside a race (44a)
+NETWORK_WATCH_SECONDS = 2         # network-change fingerprint watch (44b)
