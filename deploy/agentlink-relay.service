@@ -8,7 +8,7 @@ Type=simple
 User=agentlink
 ExecStart=/usr/local/bin/agentlink relay --host 0.0.0.0 --port 8765 --db /var/lib/agentlink/relay.db
 Restart=always
-RestartSec=3
+RestartSec=1
 
 [Install]
 WantedBy=multi-user.target
