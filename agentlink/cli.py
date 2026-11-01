@@ -69,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         print("commands: relay register agent whoami directory send send-file "
-              "dial group assign deliver work")
+              "dial group assign deliver work update doctor service backup")
         return 0
     cmd, rest = argv[0], argv[1:]
 
@@ -182,6 +182,16 @@ def main(argv: list[str] | None = None) -> int:
         print(reply)
         return 0
 
+    if cmd == "backup":
+        from .backup import main as _backup_main
+        return _backup_main(rest)
+    if cmd == "update":
+        from .updater import main as _update_main
+        return _update_main(rest)
+    if cmd == "doctor":
+        return _doctor(rest)
+    if cmd == "service":
+        return _service(rest)
     if cmd == "group":
         return _group(rest)
     if cmd == "assign":
@@ -194,10 +204,153 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+def _doctor(rest: list[str]) -> int:
+    """Verification report: DB integrity + permissions, identity files,
+    endpoint configuration. Read-only."""
+    import sqlite3
+    import stat as _stat
+    from .config import DEFAULT_ENDPOINT, resolve_endpoint
+
+    ap = argparse.ArgumentParser(prog="agentlink doctor")
+    ap.add_argument("--db", default="~/.agentlink/relay.db")
+    ap.add_argument("--state-dir", default=None)
+    args = ap.parse_args(rest)
+    state = Path(args.state_dir or DEFAULT_STATE_DIR).expanduser()
+    report: dict = {"endpoint_default": DEFAULT_ENDPOINT,
+                    "endpoint_resolved": resolve_endpoint(None),
+                    "state_dir": str(state), "checks": []}
+
+    def check(name, ok, detail=""):
+        report["checks"].append({"name": name, "ok": bool(ok),
+                                 "detail": detail})
+
+    db = Path(args.db).expanduser()
+    if db.exists():
+        mode = _stat.S_IMODE(db.stat().st_mode)
+        check("relay_db_permissions_0600", mode == 0o600, oct(mode))
+        try:
+            conn = sqlite3.connect(str(db))
+            result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            mode_j = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            audit_n = conn.execute(
+                "SELECT COUNT(*) FROM audit_log").fetchone()[0]
+            conn.close()
+            check("relay_db_integrity", result == "ok", result)
+            check("relay_db_wal", mode_j == "wal", mode_j)
+            report["audit_log_entries"] = audit_n
+        except Exception as exc:
+            check("relay_db_integrity", False, str(exc))
+    else:
+        check("relay_db_exists", False, f"not found at {db} (relay not run yet)")
+    if state.exists():
+        for f in sorted(state.iterdir()):
+            if f.name.startswith(("secret-", "keys-", "groupkeys-")):
+                mode = _stat.S_IMODE(f.stat().st_mode)
+                check(f"identity_file_{f.name}_0600", mode == 0o600, oct(mode))
+    report["healthy"] = all(c["ok"] for c in report["checks"])
+    _print(report)
+    return 0 if report["healthy"] else 1
+
+
+def _service(rest: list[str]) -> int:
+    """Life mode: install the agent as a system service.
+
+    Deliberately install/status ONLY — there is no uninstall path in the
+    agent-facing CLI. Removing the service is an operator action done
+    outside AgentLink (systemctl disable + unit removal by the operator).
+    """
+    sub = rest[0] if rest else ""
+    if sub == "install":
+        ap = argparse.ArgumentParser(prog="agentlink service install")
+        ap.add_argument("--username", required=True)
+        ap.add_argument("--user", action="store_true",
+                        help="install as a systemd --user unit")
+        args = ap.parse_args(rest[1:])
+        unit = (
+            "[Unit]\nDescription=AgentLink agent (life mode)\n"
+            "After=network-online.target\nWants=network-online.target\n\n"
+            "[Service]\nType=simple\n"
+            f"ExecStart={sys.executable} -m agentlink agent"
+            f" --username @{args.username.lstrip('@')}\n"
+            "Restart=always\nRestartSec=3\n\n"
+            "[Install]\nWantedBy="
+            + ("default.target" if args.user else "multi-user.target") + "\n")
+        if args.user:
+            dest = Path("~/.config/systemd/user").expanduser() / \
+                "agentlink-agent.service"
+        else:
+            dest = Path("/etc/systemd/system/agentlink-agent.service")
+        result: dict = {"unit": unit}
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(unit)
+            result["installed"] = str(dest)
+            result["next"] = ("systemctl " + ("--user " if args.user else "")
+                              + "enable --now agentlink-agent")
+        except OSError as exc:
+            result["installed"] = None
+            result["error"] = str(exc)
+            result["next"] = ("save the unit to your systemd directory"
+                              " (needs operator privileges) and enable it")
+        # Cron safety net, installed idempotently: per-minute watchdog
+        # + daily update check. Marker-delimited, safe to re-run.
+        try:
+            import shutil
+            import subprocess as _sp
+            home = Path("~/.agentlink").expanduser()
+            home.mkdir(parents=True, exist_ok=True)
+            (home / "watchdog.sh").write_text(
+                "#!/bin/sh\n"
+                "systemctl --user is-active --quiet agentlink-agent"
+                " 2>/dev/null || systemctl --user restart agentlink-agent"
+                " 2>/dev/null || systemctl restart agentlink-agent"
+                " 2>/dev/null || true\n")
+            try:
+                (home / "watchdog.sh").chmod(0o755)
+            except OSError:
+                pass
+            if shutil.which("crontab"):
+                cur = _sp.run(["crontab", "-l"], capture_output=True,
+                              text=True).stdout
+                if "# agentlink-watchdog-begin" not in cur:
+                    block = (
+                        "# agentlink-watchdog-begin\n"
+                        "* * * * * /bin/sh ~/.agentlink/watchdog.sh"
+                        " >/dev/null 2>&1\n"
+                        "# agentlink-watchdog-end\n"
+                        "# agentlink-update-begin\n"
+                        "17 4 * * * agentlink update >/dev/null 2>&1\n"
+                        "# agentlink-update-end\n")
+                    proc = _sp.run(["crontab", "-"], input=cur + block,
+                                   capture_output=True, text=True)
+                    result["cron"] = "installed" if proc.returncode == 0 \
+                        else "failed"
+                else:
+                    result["cron"] = "already installed"
+            else:
+                result["cron"] = "no crontab binary; copy deploy/" \
+                                 "agentlink.cron into your cron spool"
+        except Exception as exc:
+            result["cron"] = f"skipped: {exc}"
+        _print(result)
+        return 0
+    if sub == "status":
+        _print({"life_mode": "identity, keys and state live in ~/.agentlink"
+                             " (outside the code directory); the daemon"
+                             " re-registers, re-joins groups and drains"
+                             " queued work on every restart",
+                "uninstall": "no agent-facing uninstall exists by design;"
+                             " removal is an operator-only action"})
+        return 0
+    print("usage: agentlink service <install|status>", file=sys.stderr)
+    return 2
+
+
 def _group(rest: list[str]) -> int:
     if not rest:
         print("usage: agentlink group <create|add|remove|members|promote|"
-              "demote|settings|join-link|join>", file=sys.stderr)
+              "demote|settings|nickname|custom-role|join-link|join>",
+              file=sys.stderr)
         return 2
     sub, r = rest[0], rest[1:]
     ap = argparse.ArgumentParser(prog=f"agentlink group {sub}")
@@ -214,20 +367,35 @@ def _group(rest: list[str]) -> int:
         fn = lambda a: a.group_add(args.group_id, args.members)  # noqa: E731
     elif sub == "remove":
         ap.add_argument("group_id")
-        ap.add_argument("username")
+        ap.add_argument("target")
         args = ap.parse_args(r)
-        fn = lambda a: a.group_remove(args.group_id, args.username)  # noqa: E731
+        fn = lambda a: a.group_remove(args.group_id, args.target)  # noqa: E731
     elif sub == "members":
         ap.add_argument("group_id")
         args = ap.parse_args(r)
         fn = lambda a: a.group_members(args.group_id)  # noqa: E731
     elif sub in ("promote", "demote"):
         ap.add_argument("group_id")
-        ap.add_argument("username")
+        ap.add_argument("target")
         args = ap.parse_args(r)
-        fn = (lambda a: a.group_promote(args.group_id, args.username)) \
+        fn = (lambda a: a.group_promote(args.group_id, args.target)) \
             if sub == "promote" else \
-            (lambda a: a.group_demote(args.group_id, args.username))
+            (lambda a: a.group_demote(args.group_id, args.target))
+    elif sub == "nickname":
+        ap.add_argument("group_id")
+        ap.add_argument("nickname")
+        ap.add_argument("--for", default=None, dest="for_user",
+                        help="username (admins only for other members)")
+        args = ap.parse_args(r)
+        fn = lambda a: a.group_set_nickname(  # noqa: E731
+            args.group_id, args.nickname, username=args.for_user)
+    elif sub == "custom-role":
+        ap.add_argument("group_id")
+        ap.add_argument("target")
+        ap.add_argument("custom_role")
+        args = ap.parse_args(r)
+        fn = lambda a: a.group_set_custom_role(  # noqa: E731
+            args.group_id, args.target, args.custom_role)
     elif sub == "settings":
         ap.add_argument("group_id")
         ap.add_argument("settings_json",

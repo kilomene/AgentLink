@@ -11,17 +11,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import json
 import logging
 import os
 from dataclasses import dataclass, field
+from http import HTTPStatus
 
 import websockets
 import websockets.exceptions
 from websockets.server import serve
 
-from .protocol import MAX_FRAME, new_id, normalize_username, now_ts, verify_file
-from .store import NotFound, Store, UsernameTaken
+from .protocol import MAX_FRAME, new_id, normalize_username, now_ts
+from .store import GroupFull, NotFound, Store, UsernameTaken
 
 log = logging.getLogger("agentlink.relay")
 
@@ -33,7 +35,10 @@ class Peer:
     ws: object
     username: str
     display_name: str = ""
+    pubkey: str = ""
     ephemeral: bool = False
+    last_seen: int = 0
+    home_endpoint: str = ""
 
 
 @dataclass
@@ -41,16 +46,98 @@ class Relay:
     host: str = "127.0.0.1"
     port: int = 8765
     db_path: str = "~/.agentlink/relay.db"
+    backend_store: object = None
+    blob_store: object = None
+    server_name: str | None = None
+    dashboard_password: str | None = None
+    dashboard_port: int = 8766
+    dashboard_enabled: bool = True
+    dashboard: object = field(default=None, repr=False)
     peers: dict = field(default_factory=dict)  # username -> Peer
+    activity: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=300))
     _server: object = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        self.store = Store(os.path.expanduser(self.db_path))
+        self.store = self.backend_store or \
+            Store(os.path.expanduser(self.db_path))
+        if self.blob_store is None:
+            from .blobstore import create_blob_store
+            default_root = os.path.join(
+                os.path.dirname(os.path.expanduser(self.db_path)), "blobs")
+            self.blob_store = create_blob_store(local_root=default_root)
+
+    @property
+    def server_label(self) -> str:
+        return self.server_name or f"ws://{self.host}:{self.port}"
+
+    def _log_activity(self, kind: str, actor: str, target: str = "",
+                      group_id: str = "", work_id: str = "",
+                      status: str = "") -> None:
+        """Metadata only — never content. Feeds the live dashboard."""
+        self.activity.appendleft({
+            "ts": now_ts(), "kind": kind, "from": actor, "to": target,
+            "group_id": group_id, "work_id": work_id, "status": status})
+        try:
+            self.store.audit(kind, actor, target, group_id, work_id, status)
+        except Exception:
+            pass
+        if getattr(self, "dashboard", None) is not None:
+            self.dashboard.notify()
+
+    def _dashboard_data(self) -> dict:
+        users = self.store.list_users()
+        now = now_ts()
+        for u in users:
+            peer = self.peers.get(u["username"])
+            # Presence derives from the 5-second heartbeat: a peer is
+            # online only if its last sign of life is fresh.
+            u["online"] = bool(peer) and (now - peer.last_seen) <= 20
+            u["last_seen"] = peer.last_seen if peer else None
+            u["riding"] = self.server_label if peer else None
+            u["home"] = peer.home_endpoint if peer else None
+            u.pop("pubkey", None)
+        return {
+            "server": self.server_label,
+            "online": sorted(u["username"] for u in users if u["online"]),
+            "users": users,
+            "groups": self.store.all_groups(),
+            "work": self.store.list_work_meta(),
+            "activity": self.store.list_audit(),
+        }
+
+    def _resolve_dashboard_password(self) -> str:
+        if self.dashboard_password:
+            return self.dashboard_password
+        env = os.environ.get("AGENTLINK_DASHBOARD_PASSWORD")
+        if env:
+            return env
+        from pathlib import Path
+        pw_file = Path(os.path.expanduser("~/.agentlink/dashboard-password.txt"))
+        if pw_file.exists():
+            return pw_file.read_text().strip()
+        import secrets as _secrets
+        pw = _secrets.token_urlsafe(18)
+        pw_file.parent.mkdir(parents=True, exist_ok=True)
+        pw_file.write_text(pw)
+        try:
+            os.chmod(pw_file, 0o600)
+        except OSError:
+            pass
+        log.warning("dashboard password generated; stored at %s", pw_file)
+        return pw
 
     async def start(self) -> "Relay":
         self._server = await serve(
-            self._handle, self.host, self.port, max_size=MAX_FRAME
+            self._handle, self.host, self.port, max_size=MAX_FRAME,
         )
+        if self.dashboard_enabled:
+            from .dashboard import DashboardServer
+            password = self._resolve_dashboard_password()
+            dash_host = self.host
+            self.dashboard = DashboardServer(
+                self, dash_host, self.dashboard_port, password).start()
+            self.dashboard_port = self.dashboard.port
         sockets = self._server.sockets or ()
         if sockets:
             self.port = sockets[0].getsockname()[1]
@@ -58,6 +145,9 @@ class Relay:
         return self
 
     async def stop(self) -> None:
+        if getattr(self, "dashboard", None) is not None:
+            self.dashboard.stop()
+            self.dashboard = None
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -104,12 +194,22 @@ class Relay:
                     continue
                 ftype = frame.get("type")
                 req_id = frame.get("req_id")
+                if peer is not None:
+                    peer.last_seen = now_ts()
                 if ftype == "hello":
                     peer = await self._on_hello(ws, frame, peer)
                 elif ftype == "ping":
+                    if peer is not None:
+                        peer.last_seen = now_ts()
                     await self._send(ws, {"type": "pong", "req_id": req_id})
                 elif peer is None:
                     await self._error(ws, "not_registered", req_id)
+                elif ftype == "blob_put":
+                    await self._on_blob_put(ws, frame, peer)
+                elif ftype == "blob_get":
+                    await self._on_blob_get(ws, frame, peer)
+                elif ftype == "blob_delete":
+                    await self._on_blob_delete(ws, frame, peer)
                 elif ftype == "send":
                     await self._on_send(ws, frame, peer)
                 elif ftype == "group_create":
@@ -118,8 +218,21 @@ class Relay:
                     await self._on_group_add(ws, frame, peer)
                 elif ftype == "group_remove":
                     await self._on_group_remove(ws, frame, peer)
+                elif ftype == "get_key":
+                    target = normalize_username(frame.get("username"))
+                    await self._result(ws, req_id, True, {
+                        "username": target,
+                        "pubkey": self.store.pubkey_of(target) if target else ""})
                 elif ftype == "group_members":
                     await self._on_group_members(ws, frame, peer)
+                elif ftype == "group_nickname":
+                    await self._on_group_nickname(ws, frame, peer)
+                elif ftype == "group_custom_role":
+                    await self._on_group_custom_role(ws, frame, peer)
+                elif ftype == "set_group_keys":
+                    await self._on_set_group_keys(ws, frame, peer)
+                elif ftype == "get_group_key":
+                    await self._on_get_group_key(ws, frame, peer)
                 elif ftype in ("group_promote", "group_demote"):
                     await self._on_group_role(ws, frame, peer,
                                               promote=(ftype == "group_promote"))
@@ -159,6 +272,8 @@ class Relay:
         finally:
             if peer is not None and self.peers.get(peer.username) is peer:
                 del self.peers[peer.username]
+                if not peer.ephemeral:
+                    self._log_activity("offline", peer.username)
                 log.info("peer @%s disconnected", peer.username)
 
     async def _on_hello(self, ws, frame, old):
@@ -167,10 +282,11 @@ class Relay:
         req_id = frame.get("req_id")
         display = str(frame.get("display_name") or frame.get("name") or "")[:64]
         secret = frame.get("secret")
+        pubkey = str(frame.get("pubkey") or "")
         if frame.get("ephemeral"):
             username = "dial-" + new_id()[:8]
             peer = Peer(ws=ws, username=username, display_name=display or "dial",
-                        ephemeral=True)
+                        pubkey=pubkey, ephemeral=True, last_seen=now_ts())
             self.peers[username] = peer
             await self._send(ws, {"type": "welcome", "req_id": req_id,
                                   "username": username, "secret": None,
@@ -184,13 +300,15 @@ class Relay:
         if self.store.exists(username):
             if self.store.verify(username, secret):
                 self.store.set_display_name(username, display or username)
+                self.store.set_pubkey(username, pubkey)
             else:
                 await self._error(ws, "username_taken", req_id)
                 return None
             owner_secret = secret
         else:
             try:
-                owner_secret = self.store.claim(username, display or username)
+                owner_secret = self.store.claim(
+                    username, display or username, pubkey)
             except UsernameTaken:
                 await self._error(ws, "username_taken", req_id)
                 return None
@@ -201,8 +319,11 @@ class Relay:
             except Exception:
                 pass
         peer = Peer(ws=ws, username=username,
-                    display_name=display or username)
+                    display_name=display or username, pubkey=pubkey,
+                    last_seen=now_ts(),
+                    home_endpoint=str(frame.get("home_endpoint") or ""))
         self.peers[username] = peer
+        self._log_activity("online", username)
         queued = self.store.dequeue_all(username)
         await self._send(ws, {"type": "welcome", "req_id": req_id,
                               "username": username, "secret": owner_secret,
@@ -212,28 +333,117 @@ class Relay:
         log.info("peer @%s registered, flushed %d queued", username, len(queued))
         return peer
 
-    # -- 1:1 messages ---------------------------------------------------------
+    # -- sealed file blobs (R2 in production; relay proxies ciphertext) -----
+    async def _on_blob_put(self, ws, frame, peer: Peer) -> None:
+        import base64 as _b64
+        import hashlib as _hl
+        req_id = frame.get("req_id")
+        try:
+            data = _b64.b64decode(frame.get("data_b64") or "")
+        except Exception:
+            await self._error(ws, "bad_blob", req_id)
+            return
+        if not data:
+            await self._error(ws, "bad_blob", req_id, "empty blob")
+            return
+        for_user = normalize_username(frame.get("for_user"))
+        for_group = frame.get("for_group")
+        if for_group:
+            if self.store.role_of(for_group, peer.username) is None:
+                await self._error(ws, "not_a_member", req_id)
+                return
+        elif for_user:
+            if not self.store.exists(for_user):
+                await self._error(ws, "unknown_username", req_id, for_user)
+                return
+        else:
+            await self._error(ws, "bad_blob", req_id,
+                              "blob needs for_user or for_group")
+            return
+        blob_id = "b-" + _hl.sha256(data).hexdigest()
+        self.blob_store.put(blob_id, data)
+        self.store.put_blob_meta(blob_id, owner=peer.username,
+                                 for_user=for_user or "",
+                                 for_group=for_group or "",
+                                 size=len(data))
+        await self._result(ws, req_id, True,
+                           {"blob_id": blob_id, "size": len(data)})
+
+    def _blob_authorized(self, meta, username) -> bool:
+        if meta is None:
+            return False
+        if username in (meta["owner"], meta.get("for_user")):
+            return True
+        gid = meta.get("for_group")
+        return bool(gid) and self.store.role_of(gid, username) is not None
+
+    async def _on_blob_get(self, ws, frame, peer: Peer) -> None:
+        import base64 as _b64
+        req_id = frame.get("req_id")
+        meta = self.store.get_blob_meta(str(frame.get("blob_id") or ""))
+        if not self._blob_authorized(meta, peer.username):
+            await self._error(ws, "permission_denied", req_id,
+                              "not a recipient of this blob")
+            return
+        from .blobstore import BlobNotFound
+        try:
+            data = self.blob_store.get(meta["id"])
+        except BlobNotFound:
+            await self._error(ws, "unknown_blob", req_id)
+            return
+        await self._result(ws, req_id, True,
+                           {"blob_id": meta["id"],
+                            "data_b64": _b64.b64encode(data).decode()})
+
+    async def _on_blob_delete(self, ws, frame, peer: Peer) -> None:
+        req_id = frame.get("req_id")
+        meta = self.store.get_blob_meta(str(frame.get("blob_id") or ""))
+        if meta is None:
+            await self._error(ws, "unknown_blob", req_id)
+            return
+        allowed = peer.username == meta["owner"]
+        gid = meta.get("for_group")
+        if gid and self.store.role_of(gid, peer.username) in ADMIN_ROLES:
+            allowed = True
+        if not allowed:
+            await self._error(ws, "permission_denied", req_id,
+                              "only the owner or a group admin can delete")
+            return
+        self.blob_store.delete(meta["id"])
+        self.store.delete_blob_meta(meta["id"])
+        await self._result(ws, req_id, True, {"blob_id": meta["id"],
+                                              "deleted": True})
+
+    # -- 1:1 messages (E2EE: relay routes ciphertext only) -------------------
+    @staticmethod
+    def _is_envelope(content) -> bool:
+        return isinstance(content, dict) and bool(content.get("ct"))
+
     async def _on_send(self, ws, frame, peer: Peer) -> None:
         req_id = frame.get("req_id")
         to = normalize_username(frame.get("to"))
-        body = frame.get("body", "")
-        file_payload = frame.get("file")
-        if to is None or (not isinstance(body, str)):
-            await self._error(ws, "bad_send", req_id)
+        if "body" in frame or "file" in frame:
+            await self._error(ws, "plaintext_not_allowed", req_id,
+                              "content must be end-to-end encrypted")
             return
-        if file_payload is not None and not verify_file(file_payload):
-            await self._error(ws, "bad_file_hash", req_id)
+        content = frame.get("content")
+        if to is None or not self._is_envelope(content):
+            await self._error(ws, "bad_send", req_id,
+                              "missing encrypted content envelope")
             return
         if not self.store.exists(to) and to not in self.peers:
             await self._error(ws, "unknown_recipient", req_id)
             return
         msg = {"type": "message", "id": frame.get("id") or new_id(),
                "from": peer.username, "from_name": peer.display_name,
-               "body": body, "kind": frame.get("kind") or
-               (file_payload or {}).get("kind") or "text",
-               "file": file_payload, "ts": now_ts(),
+               "from_pubkey": peer.pubkey or self.store.pubkey_of(peer.username),
+               "sender_nickname": "", "sender_role": "",
+               "sender_custom_role": "",
+               "mentions": frame.get("mentions") or [],
+               "content": content, "ts": now_ts(),
                "in_reply_to": frame.get("in_reply_to"), "group_id": None}
         queued = await self._deliver(to, msg)
+        self._log_activity("message", peer.username, target=to)
         await self._result(ws, req_id, True,
                            {"id": msg["id"], "to": to, "queued": queued})
 
@@ -243,10 +453,12 @@ class Relay:
         group = self.store.get_group(gid) if gid else None
         return gid, group
 
-    async def _membership_event(self, group, event, actor, target):
+    async def _membership_event(self, group, event, actor, target,
+                                targets=None):
         frame = {"type": "group_event", "id": new_id(), "group_id": group["id"],
                  "group_name": group["name"], "event": event, "actor": actor,
-                 "target": target, "ts": now_ts(),
+                 "target": target, "targets": targets or ([target] if target else []),
+                 "ts": now_ts(),
                  "members": self.store.members(group["id"])}
         for m in self.store.members(group["id"]):
             if m["username"] != actor:
@@ -269,12 +481,18 @@ class Relay:
                 members.append(u)
         gid = self.store.create_group(name, peer.username, frame.get("settings"))
         # WhatsApp-style: added agents do NOT need to accept. They are in.
-        for u in members:
-            self.store.add_member(gid, u, role="member", added_by=peer.username)
+        try:
+            for u in members:
+                self.store.add_member(gid, u, role="member",
+                                      added_by=peer.username)
+        except GroupFull:
+            await self._error(ws, "group_full", req_id,
+                              "groups are capped at 50 agents")
+            return
         group = self.store.get_group(gid)
         if members:
             await self._membership_event(group, "added_to_group",
-                                         peer.username, None)
+                                         peer.username, None, targets=members)
         await self._result(ws, req_id, True,
                            {"group_id": gid, "name": name,
                             "members": self.store.members(gid)})
@@ -300,12 +518,17 @@ class Relay:
             if u is None or not self.store.exists(u):
                 await self._error(ws, "unknown_username", req_id, str(raw))
                 return
-            if self.store.add_member(gid, u, role="member",
-                                      added_by=peer.username):
-                added.append(u)
+            try:
+                if self.store.add_member(gid, u, role="member",
+                                         added_by=peer.username):
+                    added.append(u)
+            except GroupFull:
+                await self._error(ws, "group_full", req_id,
+                                  "groups are capped at 50 agents")
+                return
         if added:
             await self._membership_event(group, "added_to_group",
-                                         peer.username, None)
+                                         peer.username, None, targets=added)
         await self._result(ws, req_id, True,
                            {"group_id": gid, "added": added,
                             "members": self.store.members(gid)})
@@ -425,13 +648,99 @@ class Relay:
         if not self.store.invite_valid(gid, token):
             await self._error(ws, "invalid_invite", req_id)
             return
-        self.store.add_member(gid, peer.username, role="member",
-                              added_by="invite-link")
+        try:
+            self.store.add_member(gid, peer.username, role="member",
+                                  added_by="invite-link")
+        except GroupFull:
+            await self._error(ws, "group_full", req_id,
+                              "groups are capped at 50 agents")
+            return
         await self._membership_event(group, "joined_group",
                                      peer.username, peer.username)
         await self._result(ws, req_id, True,
                            {"group_id": gid,
                             "members": self.store.members(gid)})
+
+    async def _on_group_nickname(self, ws, frame, peer: Peer) -> None:
+        """Group-local nickname: a member sets their own, an admin can
+        set anyone's. The global username/display name never changes."""
+        req_id = frame.get("req_id")
+        gid, group = self._group_or_error(ws, frame, peer)
+        if group is None:
+            await self._error(ws, "unknown_group", req_id)
+            return
+        target = normalize_username(frame.get("username")) or peer.username
+        role = self.store.role_of(gid, peer.username)
+        if role is None or self.store.role_of(gid, target) is None:
+            await self._error(ws, "not_a_member", req_id)
+            return
+        if target != peer.username and role not in ADMIN_ROLES:
+            await self._error(ws, "permission_denied", req_id,
+                              "only admins can set other members' nicknames")
+            return
+        self.store.set_nickname(gid, target, str(frame.get("nickname") or ""))
+        await self._result(ws, req_id, True,
+                           {"group_id": gid, "username": target,
+                            "members": self.store.members(gid)})
+
+    async def _on_group_custom_role(self, ws, frame, peer: Peer) -> None:
+        """Custom per-group role label (e.g. Researcher, Collator).
+        This is a label, separate from the admin/member permission role."""
+        req_id = frame.get("req_id")
+        gid, group = self._group_or_error(ws, frame, peer)
+        if group is None:
+            await self._error(ws, "unknown_group", req_id)
+            return
+        target = normalize_username(frame.get("username"))
+        if self.store.role_of(gid, peer.username) not in ADMIN_ROLES:
+            await self._error(ws, "permission_denied", req_id,
+                              "only admins can set custom roles")
+            return
+        if target is None or self.store.role_of(gid, target) is None:
+            await self._error(ws, "not_a_member", req_id, str(target))
+            return
+        self.store.set_custom_role(gid, target,
+                                   str(frame.get("custom_role") or ""))
+        await self._result(ws, req_id, True,
+                           {"group_id": gid, "username": target,
+                            "members": self.store.members(gid)})
+
+    async def _on_set_group_keys(self, ws, frame, peer: Peer) -> None:
+        """Store wrapped group keys (ciphertext the relay cannot unwrap)
+        and forward each member their wrapped copy."""
+        req_id = frame.get("req_id")
+        gid, group = self._group_or_error(ws, frame, peer)
+        if group is None:
+            await self._error(ws, "unknown_group", req_id)
+            return
+        if self.store.role_of(gid, peer.username) not in ADMIN_ROLES:
+            await self._error(ws, "permission_denied", req_id,
+                              "only admins can distribute group keys")
+            return
+        epoch = int(frame.get("epoch") or 1)
+        wrapped_map = frame.get("wrapped") or {}
+        for raw_user, wrapped in wrapped_map.items():
+            u = normalize_username(raw_user)
+            if u is None or self.store.role_of(gid, u) is None:
+                continue
+            self.store.set_group_key(gid, u, epoch, wrapped)
+            if u != peer.username:
+                await self._deliver(u, {
+                    "type": "group_key", "group_id": gid, "epoch": epoch,
+                    "wrapped": wrapped, "from": peer.username,
+                    "from_pubkey": peer.pubkey
+                    or self.store.pubkey_of(peer.username)})
+        await self._result(ws, req_id, True, {"group_id": gid, "epoch": epoch})
+
+    async def _on_get_group_key(self, ws, frame, peer: Peer) -> None:
+        req_id = frame.get("req_id")
+        gid = frame.get("group_id")
+        if not gid or self.store.role_of(gid, peer.username) is None:
+            await self._error(ws, "not_a_member", req_id)
+            return
+        rec = self.store.group_key_for(gid, peer.username)
+        await self._result(ws, req_id, True,
+                           {"group_id": gid, "key": rec})
 
     async def _on_group_send(self, ws, frame, peer: Peer) -> None:
         req_id = frame.get("req_id")
@@ -448,16 +757,27 @@ class Relay:
             await self._error(ws, "permission_denied", req_id,
                               "only admins can send messages in this group")
             return
-        file_payload = frame.get("file")
-        if file_payload is not None and not verify_file(file_payload):
-            await self._error(ws, "bad_file_hash", req_id)
+        if "body" in frame or "file" in frame:
+            await self._error(ws, "plaintext_not_allowed", req_id,
+                              "content must be end-to-end encrypted")
+            return
+        content = frame.get("content")
+        if not self._is_envelope(content):
+            await self._error(ws, "bad_send", req_id,
+                              "missing encrypted content envelope")
             return
         msg = {"type": "message", "id": frame.get("id") or new_id(),
                "from": peer.username, "from_name": peer.display_name,
-               "body": frame.get("body", ""),
-               "kind": frame.get("kind") or (file_payload or {}).get("kind")
-               or "text",
-               "file": file_payload, "ts": now_ts(),
+               "from_pubkey": peer.pubkey or self.store.pubkey_of(peer.username),
+               "sender_nickname": next(
+                   (m["nickname"] for m in self.store.members(gid)
+                    if m["username"] == peer.username), ""),
+               "sender_role": role,
+               "sender_custom_role": next(
+                   (m["custom_role"] for m in self.store.members(gid)
+                    if m["username"] == peer.username), ""),
+               "mentions": frame.get("mentions") or [],
+               "content": content, "ts": now_ts(),
                "in_reply_to": frame.get("in_reply_to"), "group_id": gid,
                "group_name": group["name"]}
         delivered, queued = [], []
@@ -466,6 +786,7 @@ class Relay:
                 continue
             (queued if await self._deliver(m["username"], dict(msg))
              else delivered).append(m["username"])
+        self._log_activity("group_message", peer.username, group_id=gid)
         await self._result(ws, req_id, True,
                            {"id": msg["id"], "group_id": gid,
                             "delivered": delivered, "queued": queued})
@@ -489,11 +810,12 @@ class Relay:
                 await self._error(ws, "permission_denied", req_id,
                                   "only admins can assign work in this group")
                 return
-        attachments = frame.get("attachments") or []
-        for a in attachments:
-            if isinstance(a, dict) and "data_b64" in a and not verify_file(a):
-                await self._error(ws, "bad_file_hash", req_id)
-                return
+        # E2EE: per-assignee content envelopes, prepared by the client.
+        envelopes = frame.get("envelopes") or {}
+        if "title" in frame or "instructions" in frame:
+            await self._error(ws, "plaintext_not_allowed", req_id,
+                              "work content must be end-to-end encrypted")
+            return
         created = []
         for raw in frame.get("assignees") or []:
             assignee = normalize_username(raw)
@@ -504,15 +826,22 @@ class Relay:
                     self.store.role_of(gid, assignee) is None:
                 await self._error(ws, "assignee_not_in_group", req_id, assignee)
                 return
+            pair = envelopes.get(assignee) or {}
+            if not self._is_envelope(pair.get("enc")):
+                await self._error(ws, "bad_assign", req_id,
+                                  f"missing encrypted content for {assignee}")
+                return
             work = self.store.create_work(
                 assigner=peer.username, assignee=assignee, group_id=gid,
-                title=str(frame.get("title") or "Untitled work"),
-                instructions=str(frame.get("instructions") or ""),
-                attachments=attachments,
+                content_enc=pair["enc"],
+                content_self=pair.get("self") or pair["enc"],
                 deadline=frame.get("deadline"))
             created.append(work)
             await self._deliver(assignee,
                                 {"type": "work_assigned", "work": work})
+            self._log_activity("work_assigned", peer.username,
+                               target=assignee, group_id=gid or "",
+                               work_id=work["id"], status="assigned")
         if not created:
             await self._error(ws, "bad_assign", req_id, "no assignees")
             return
@@ -532,16 +861,25 @@ class Relay:
             await self._error(ws, "bad_status", req_id,
                               f"work is {work['status']}, cannot deliver")
             return
-        files = frame.get("files") or []
-        for f in files:
-            if isinstance(f, dict) and "data_b64" in f and not verify_file(f):
-                await self._error(ws, "bad_file_hash", req_id)
-                return
+        content_enc = frame.get("content_enc")
+        content_self = frame.get("content_self")
+        if "body" in frame or "files" in frame:
+            await self._error(ws, "plaintext_not_allowed", req_id,
+                              "deliveries must be end-to-end encrypted")
+            return
+        if not self._is_envelope(content_enc):
+            await self._error(ws, "bad_delivery", req_id,
+                              "missing encrypted delivery content")
+            return
         updated = self.store.add_delivery(work["id"], peer.username,
-                                          str(frame.get("body") or ""), files)
+                                          content_enc,
+                                          content_self or content_enc)
         # Delivery goes back through the SAME line to the assigner.
         await self._deliver(work["assigner"],
                             {"type": "work_update", "work": updated})
+        self._log_activity("work_delivered", peer.username,
+                           target=work["assigner"], work_id=work["id"],
+                           status="delivered")
         await self._result(ws, req_id, True, {"work": updated})
 
     async def _on_work_action(self, ws, frame, peer: Peer) -> None:
@@ -567,6 +905,9 @@ class Relay:
             await self._error(ws, "bad_action", req_id, str(action))
             return
         updated = self.store.set_work_status(work["id"], status)
+        self._log_activity("work_" + status, peer.username,
+                           target=work["assignee"], work_id=work["id"],
+                           status=status)
         await self._deliver(work["assignee"],
                             {"type": "work_update", "work": updated,
                              "note": frame.get("note")})
@@ -578,12 +919,24 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--db", default="~/.agentlink/relay.db")
+    ap.add_argument("--backend", default=None,
+                    help="sqlite (default) | supabase (production; needs"
+                         " SUPABASE_URL + SUPABASE_SERVICE_KEY)")
+    ap.add_argument("--dashboard-port", type=int, default=8766)
+    ap.add_argument("--name", default=None, dest="server_name",
+                    help="label for this server (shown on the dashboard)")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
     async def _run() -> None:
-        relay = Relay(host=args.host, port=args.port, db_path=args.db)
+        store = None
+        if args.backend:
+            from .backend import create_store
+            store = create_store(args.backend, db_path=args.db)
+        relay = Relay(host=args.host, port=args.port, db_path=args.db,
+                      backend_store=store, dashboard_port=args.dashboard_port,
+                      server_name=args.server_name)
         await relay.start()
         try:
             await asyncio.Future()

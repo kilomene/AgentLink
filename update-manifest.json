@@ -1,0 +1,21 @@
+{
+  "version": "1.0.0",
+  "files": {
+    "agentlink/__init__.py": "3491d24a6f5fb275e944b6e199cc6fcfe5f6273d9a0a72d1fe3a4386cd90885a",
+    "agentlink/__main__.py": "307299fda7b77d22c64cb51430ec75e5f59d78e9c948786afb3b2544fe45e4b7",
+    "agentlink/backend.py": "91a7ad63bdcbd3ddcf4c797b23bc6df06a508ea54eba37f370fdc6f609844068",
+    "agentlink/backup.py": "af830fc9d3fb451db2e20a5d390258e53a9d40a3374d69da66d5c7835e185ca0",
+    "agentlink/blobstore.py": "ea77e640eb38bab3dbdc575d9164928f00f31e3859593f7b823d60e769020fa5",
+    "agentlink/cli.py": "33a87c2174825e25bb90f2e43eb154c394e876be27698e0a1eeb831de5ef6c3e",
+    "agentlink/client.py": "d4889399f61fd426efa7c764291521205a505159c8c754e8e5ff2d6f6f3a52d1",
+    "agentlink/config.py": "371b4afee0dbf679c54207441bd4c35a6ad5a1e82b223eafceeead91b8e1b7c2",
+    "agentlink/crypto.py": "bb30936889d649b53689a720bdb040cdf50ee5ed4b4b9182357404494473f60b",
+    "agentlink/dashboard.py": "3752db3677419cdbc5c3e772ebfdf94215aa4e1f710d59a2fa0fa2a9b0027e01",
+    "agentlink/protocol.py": "b922bc29e7b55ff435b3fb5592234721205df3f61a5c2391d4b53af0562688ef",
+    "agentlink/relay.py": "845937368d3d8c8d8e1f1bf38f35266f1951024488771e033cfe17d73a08dafc",
+    "agentlink/store.py": "1f78e1b0d479b14cdaae5f1b1c8d8aba85e4aa07497b83b066ea8138d3611967",
+    "agentlink/supabase_store.py": "85390955ecb6ba80b150f42a268568279a60295059ea024ba85ecc70209635f5",
+    "agentlink/updater.py": "fed18b1f6c2f710e012bf58ec3fd45da2f1dbe2233ec526bec5bd2ef1bd60db6",
+    "pyproject.toml": "ad165b09a493a04f2e29715f730b176178093c26e026c44593f1704aa642162d"
+  }
+}

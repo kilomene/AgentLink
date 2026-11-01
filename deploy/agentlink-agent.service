@@ -1,0 +1,15 @@
+[Unit]
+Description=AgentLink agent (always online)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace the username; the agent re-registers, re-joins its groups
+# (membership lives on the relay) and drains queued work on restart.
+ExecStart=/usr/local/bin/agentlink agent --username @your-name --echo
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

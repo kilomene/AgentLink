@@ -27,7 +27,8 @@ HOST = "127.0.0.1"
 @pytest.fixture()
 def relay_url():
     tmp = tempfile.mkdtemp(prefix="agentlink-test-")
-    relay = Relay(host=HOST, port=0, db_path=str(Path(tmp) / "relay.db"))
+    relay = Relay(host=HOST, port=0, db_path=str(Path(tmp) / "relay.db"),
+                  dashboard_password="test-pass", dashboard_port=0)
     ready = threading.Event()
     box: dict = {}
 
@@ -181,7 +182,7 @@ def test_offline_queue_flush_on_reconnect(relay_url, state_root):
         bob2 = await make_agent(relay_url, state_root, "bob")
         assert await wait_for(lambda: len(bob2.messages) == 1)
         assert bob2.messages[0]["body"] == "you were away"
-        assert bob2.messages[0]["queued"] is True
+        assert bob2.messages[0]["delivery_status"] == "queued"
         await bob2.close()
     run(_t())
 
