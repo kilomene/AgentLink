@@ -31,7 +31,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 log = logging.getLogger("agentlink.dashboard")
 
-SESSION_TTL = 7 * 24 * 3600  # 7 days
+from .timing import DEVICE_TRUST_SECONDS
+
+SESSION_TTL = DEVICE_TRUST_SECONDS  # 7 days — see agentlink/timing.py
 COOKIE = "agentlink_dash"
 MAX_FAILURES = 5
 FAILURE_WINDOW = 300  # seconds
@@ -250,59 +252,187 @@ DASHBOARD_HTML = """<!DOCTYPE html>
  body{font-family:system-ui,sans-serif;background:#fafafa;color:#111;margin:0;padding:24px}
  header{display:flex;justify-content:space-between;align-items:center}
  h1{font-size:22px;margin:0}.sub{color:#666;margin:4px 0 20px}
- .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:16px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
  .card{background:#fff;border:1px solid #e7e7e7;border-radius:14px;padding:18px;
        box-shadow:0 2px 10px rgba(0,0,0,.03)}
  .card h2{font-size:15px;margin:0 0 12px}
  table{width:100%;border-collapse:collapse;font-size:13px}
- td,th{padding:5px 6px;border-bottom:1px solid #f2f2f2;text-align:left}
+ td,th{padding:5px 6px;border-bottom:1px solid #f2f2f2;text-align:left;vertical-align:top}
  .on{color:#0a7d2c;font-weight:600}.off{color:#999}
  .pill{display:inline-block;padding:1px 9px;border-radius:99px;background:#f0f0f0;font-size:12px}
+ .pill.urgent{background:#b00020;color:#fff;font-weight:700}
+ .pill.high{background:#ffecb3}
+ .pill.claimed{background:#fff3e0;color:#a35b00;border:1px solid #f0c27a}
+ .pill.verified{background:#e6f4ea;color:#0a7d2c;border:1px solid #9fd3ab}
+ .pill.trust{background:#eef2ff;color:#243b8b}
+ .bar{background:#eee;border-radius:99px;height:8px;min-width:90px}
+ .bar>i{display:block;height:8px;border-radius:99px;background:#0a7d2c;transition:width .4s}
+ tr.urgent-row{background:#fff1f1}
+ .conv{cursor:pointer}.conv:hover{background:#f7f7f7}
+ .hidden{display:none}
  .live{color:#0a7d2c;font-size:12px}
  button{background:none;border:1px solid #ddd;border-radius:8px;padding:6px 12px;cursor:pointer}
+ input{padding:7px;border:1px solid #ddd;border-radius:8px}
  footer{color:#999;font-size:12px;margin-top:20px}
+ .alert{background:#fff8e1;border:1px solid #f0c27a;border-radius:10px;padding:8px 12px;margin-bottom:8px;font-size:13px}
+ .alert.res{opacity:.55}
+ small{color:#777}
 </style></head><body>
 <header><h1>AgentLink — Live Dashboard</h1>
  <form method="post" action="/logout"><button type="submit">Log out (revoke device)</button></form></header>
-<div class="sub"><span class="live">● LIVE</span> — updates are pushed in real
-time. Metadata only: message and file contents are end-to-end encrypted and
-can never appear here.</div>
+<div class="sub"><span class="live">● LIVE</span> — server-pushed in real time.
+Monitor only: this dashboard can never send, assign or chat. Contents are
+end-to-end encrypted and can never appear here; you see envelope details,
+<span class="pill claimed">claimed</span> (agent-reported) vs
+<span class="pill verified">verified</span> (proof/heartbeat/hash-checked) —
+always separated. All deadlines render in Pacific Time only.</div>
+<div id="alerts"></div>
 <div class="grid">
- <div class="card"><h2>Agents</h2><div id="users">…</div></div>
- <div class="card"><h2>Groups</h2><div id="groups">…</div></div>
- <div class="card"><h2>Work</h2><div id="work">…</div></div>
+ <div class="card"><h2>Agents — presence, activity, trust</h2><div id="users">…</div></div>
+ <div class="card"><h2>Groups &amp; Channels</h2><div id="groups">…</div></div>
+ <div class="card"><h2>Work — progress, deadlines (PT), proofs</h2><div id="work">…</div></div>
+ <div class="card"><h2>Chains</h2><div id="chains">…</div></div>
+ <div class="card"><h2>Conversations — click for envelope drill-down</h2>
+   <div id="convs">…</div><div id="convdetail"></div></div>
+ <div class="card"><h2>Delivery Library (metadata)</h2><div id="library">…</div></div>
+ <div class="card"><h2>Group Vault (metadata)</h2><div id="vault">…</div></div>
+ <div class="card"><h2>Voice Rooms — signalling only, media is WebRTC P2P</h2>
+   <div id="rooms">…</div>
+   <div style="margin-top:10px">
+     <input id="roomid" placeholder="room id" size="16">
+     <button id="joinroom" type="button">Join room with mic</button>
+     <button id="leaveroom" type="button">Leave</button>
+     <div id="voicestatus"><small>Browser voice client: joins as an ephemeral
+     browser peer (visible in room metadata). Agents join from their own
+     WebRTC stack; the relay never carries audio.</small></div>
+     <div id="audios"></div>
+   </div></div>
  <div class="card"><h2>Activity — who is transmitting to whom</h2><div id="act">…</div></div>
 </div>
 <footer>Trusted device session · expires after 7 days · <span id="stamp"></span></footer>
 <script>
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let seenAct='';
+const ptFmt=new Intl.DateTimeFormat('en-US',{timeZone:'America/Los_Angeles',
+  year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
+function pt(ts){ if(!ts) return ''; const d=new Date(ts*1000);
+  const off=-d.toLocaleString('en-US',{timeZone:'America/Los_Angeles',timeZoneName:'longOffset'}).split('GMT')[1];
+  return ptFmt.format(d)+' PT'; }
+function countdown(w){ if(!w.deadline) return '';
+  const left=w.deadline-Math.floor(Date.now()/1000);
+  if(w.status==='completed') return 'done';
+  if(left<0) return '<b style="color:#b00020">overdue '+Math.floor(-left/60)+'m</b>';
+  if(left<3600) return Math.floor(left/60)+'m left';
+  return Math.floor(left/3600)+'h '+Math.floor(left%3600/60)+'m left'; }
+let seenAct='', lastData=null, openConv='';
 function notify(title, body){
   if(!('Notification' in window)) return;
   if(Notification.permission==='default') Notification.requestPermission();
   if(Notification.permission==='granted') new Notification(title,{body});
 }
 function render(d){
+ lastData=d;
  document.getElementById('stamp').textContent='updated '+new Date().toLocaleTimeString();
+ document.getElementById('alerts').innerHTML=(d.alerts||[]).filter(a=>a.status==='open').map(a=>
+  `<div class="alert">⚠ <b>${esc(a.kind)}</b> — ${esc(a.subject)} <small>${esc(a.detail||'')} · ${pt(a.created_at)}</small></div>`).join('');
  document.getElementById('users').innerHTML='<table>'+d.users.map(u=>
-  `<tr><td>@${esc(u.username)}</td><td class="${u.online?'on':'off'}">${u.online?'online':'offline'}</td><td>${u.online&&u.riding?'riding '+esc(u.riding):''}${u.home&&u.riding&&u.home!==u.riding?' (home: '+esc(u.home)+')':''}</td></tr>`).join('')+'</table>';
- document.getElementById('groups').innerHTML='<table>'+d.groups.map(g=>
-  `<tr><td>${esc(g.name)}</td><td><span class="pill">${g.member_count} members</span></td><td>by @${esc(g.creator)}</td></tr>`).join('')+'</table>';
+  `<tr><td>@${esc(u.username)}<br><small>${esc((u.capabilities||[]).join(', '))}</small></td>
+   <td class="${u.online?'on':'off'}">${u.online?'online':'offline'}<br><small>${esc(u.activity_state||'')}</small></td>
+   <td><span class="pill trust">trust ${u.trust_score}</span></td>
+   <td>${u.reachability?esc(u.reachability):''}${u.home&&u.riding&&u.home!==u.riding?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`).join('')+'</table>';
+ document.getElementById('groups').innerHTML='<table>'+
+  d.groups.map(g=>`<tr><td>${esc(g.name)}</td><td><span class="pill">${g.member_count} members</span></td><td>by @${esc(g.creator)}</td></tr>`).join('')+
+  (d.channels||[]).map(c=>`<tr><td>📣 ${esc(c.name)}</td><td><span class="pill">${c.member_count} subscribers</span></td><td>channel · by @${esc(c.creator)}</td></tr>`).join('')+'</table>';
  document.getElementById('work').innerHTML='<table>'+d.work.map(w=>
-  `<tr><td>${esc(w.id)}</td><td>@${esc(w.assigner)} → @${esc(w.assignee)}</td><td><span class="pill">${esc(w.status)}</span></td></tr>`).join('')+'</table>';
+  `<tr class="${w.priority==='urgent'?'urgent-row':''}"><td>${esc(w.id)}<br><small>${pt(w.updated_at)}</small></td>
+   <td>@${esc(w.assigner)} → @${esc(w.assignee)}${w.group_id?'<br><small>'+esc(w.group_id)+'</small>':''}</td>
+   <td><span class="pill">${esc(w.status)}</span> ${w.priority==='urgent'?'<span class="pill urgent">URGENT</span>':''}
+   <div class="bar"><i style="width:${w.progress_percent||0}%"></i></div>
+   <small>${w.progress_percent||0}% agent-reported</small>
+   ${w.deadline?'<br><small>⏰ '+pt(w.deadline)+' · '+countdown(w)+'</small>':''}
+   ${w.proof_verified?'<br><span class="pill verified">signed proof ✓</span>':''}</td></tr>`).join('')+'</table>';
+ document.getElementById('chains').innerHTML='<table>'+(d.chains||[]).map(c=>
+  `<tr><td>${esc(c.id)}<br><small>by @${esc(c.creator)}</small></td>
+   <td><span class="pill">${esc(c.status)}</span></td>
+   <td>${c.steps.map(s=>`<div>${s.position}. ${esc(s.target||s.target_type)} — ${esc(s.work_status||s.status)} ${s.progress_percent? '('+s.progress_percent+'%)':''}</div>`).join('')}</td></tr>`).join('')+'</table>';
+ document.getElementById('convs').innerHTML='<table>'+(d.conversations||[]).map(c=>
+  `<tr class="conv" data-key="${esc(c.key)}"><td>${c.group_id?'group '+esc(c.group_id):'@'+c.participants.join(' ↔ @')}</td><td>${c.items.length} items</td><td><small>${pt(c.items[c.items.length-1].ts)}</small></td></tr>`).join('')+'</table>';
+ document.querySelectorAll('.conv').forEach(r=>r.onclick=()=>{ openConv=r.dataset.key; showConv(); });
+ showConv();
+ document.getElementById('library').innerHTML='<table>'+(d.library||[]).map(e=>
+  `<tr><td>${esc(e.filename)}<br><small>${esc(e.sha256).slice(0,12)}… · ${e.size} B</small></td><td>@${esc(e.sender)} → @${esc(e.to_user)}</td><td><small>${pt(e.ts)}</small></td></tr>`).join('')+'</table>';
+ document.getElementById('vault').innerHTML='<table>'+(d.vault||[]).map(v=>
+  `<tr><td>${v.pinned?'📌 ':''}${esc(v.name)}<br><small>${esc(v.sha256).slice(0,12)}… · ${v.size} B</small></td><td>${esc(v.group_id)}</td><td><small>by @${esc(v.added_by)}</small></td></tr>`).join('')+'</table>';
+ document.getElementById('rooms').innerHTML='<table>'+(d.rooms||[]).map(r=>
+  `<tr><td>${esc(r.id)}</td><td>${esc(r.group_id)}</td><td>${r.participants.map(p=>'@'+esc(p)).join(', ')}</td></tr>`).join('')+'</table>';
  document.getElementById('act').innerHTML='<table>'+d.activity.map(a=>
-  `<tr><td>${new Date(a.ts*1000).toLocaleTimeString()}</td><td>${esc(a.kind)}</td><td>@${esc(a.from)}${a.to?' → @'+esc(a.to):''}${a.group_id?' in '+esc(a.group_id):''}</td></tr>`).join('')+'</table>';
+  `<tr class="${a.priority==='urgent'?'urgent-row':''}"><td><small>${pt(a.ts)}</small></td><td>${esc(a.kind)} <span class="pill ${a.evidence}">${a.evidence}</span>${a.priority==='urgent'?' <span class="pill urgent">URGENT</span>':''}</td><td>@${esc(a.from)}${a.to?' → @'+esc(a.to):''}${a.group_id?' in '+esc(a.group_id):''}${a.status?' · '+esc(a.status):''}</td></tr>`).join('')+'</table>';
  const top=d.activity[0];
  if(top){ const sig=top.ts+'|'+top.kind+'|'+top.from+'|'+(top.to||'');
-   if(seenAct && sig!==seenAct && (top.kind.startsWith('work_')||top.kind==='online'))
+   if(seenAct && sig!==seenAct && (top.kind.startsWith('work_')||top.kind==='online'||top.kind==='alert'))
      notify('AgentLink: '+top.kind.replaceAll('_',' '),
             '@'+top.from+(top.to?' → @'+top.to:'')+(top.status?' ('+top.status+')':''));
    seenAct=sig; }
+}
+function showConv(){
+ const el=document.getElementById('convdetail');
+ if(!openConv||!lastData){ el.innerHTML=''; return; }
+ const c=(lastData.conversations||[]).find(x=>x.key===openConv);
+ if(!c){ el.innerHTML=''; return; }
+ el.innerHTML='<h3 style="margin:12px 0 6px;font-size:14px">Envelope details — '+esc(openConv)+'</h3><table>'+
+  c.items.map(i=>`<tr><td><small>${pt(i.ts)}</small></td><td>@${esc(i.from)}${i.to?' → @'+esc(i.to):''}</td>
+   <td>${esc(i.kind)}<br><small>id ${esc(i.id)} · ${i.size} B ct · mentions ${(i.mentions||[]).map(m=>'@'+esc(m)).join(' ')||'—'} · ${esc(i.priority)} · ${esc(i.status||'')}</small></td>
+   <td><span class="pill ${i.evidence}">${i.evidence}</span></td></tr>`).join('')+'</table>';
 }
 const es=new EventSource('/api/stream');
 es.onmessage=e=>render(JSON.parse(e.data));
 es.onerror=()=>{ /* browser auto-reconnects the stream */ };
 if('Notification' in window && Notification.permission==='default')
   Notification.requestPermission();
+/* ---- Browser voice client (WebRTC peer-to-peer; relay = signalling
+   only). Media flows browser<->agent directly over DTLS-SRTP. ---- */
+let vws=null, vstream=null, vroom='', vname='', vpeers={};
+function vsend(o){ if(vws&&vws.readyState===1) vws.send(JSON.stringify(o)); }
+function vstatus(t){ document.getElementById('voicestatus').innerHTML='<small>'+esc(t)+'</small>'; }
+async function makePeer(other, offer){
+  const pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  vpeers[other]=pc;
+  vstream.getTracks().forEach(t=>pc.addTrack(t, vstream));
+  pc.onicecandidate=e=>{ if(e.candidate) vsend({type:'room_signal', room_id:vroom, to:other, kind:'ice', payload:e.candidate, req_id:'v'+Math.random()}); };
+  pc.ontrack=e=>{ const a=document.createElement('audio'); a.autoplay=true; a.srcObject=e.streams[0]; a.id='aud-'+other; document.getElementById('audios').appendChild(a); };
+  if(offer){ const off=await pc.createOffer(); await pc.setLocalDescription(off);
+    vsend({type:'room_signal', room_id:vroom, to:other, kind:'offer', payload:off, req_id:'v'+Math.random()}); }
+  return pc;
+}
+document.getElementById('joinroom').onclick=async()=>{
+  vroom=document.getElementById('roomid').value.trim(); if(!vroom) return;
+  try{ vstream=await navigator.mediaDevices.getUserMedia({audio:true}); }
+  catch(e){ vstatus('microphone unavailable: '+e.message); return; }
+  const proto=location.protocol==='https:'?'wss:':'ws:';
+  const data=lastData; const label=(data&&data.server)||'';
+  const m=label.match(/^(wss?):\\/\\/([^/]+)/);
+  const url=m?label:(proto+'//'+location.hostname+':8765');
+  vws=new WebSocket(url);
+  vws.onopen=()=>vsend({type:'hello', ephemeral:true, display_name:'dashboard browser'});
+  vws.onmessage=async ev=>{
+    const f=JSON.parse(ev.data);
+    if(f.type==='welcome'){ vname=f.username;
+      vsend({type:'room_join', room_id:vroom, req_id:'vj'});
+      vstatus('joined room '+vroom+' as '+vname+' (ephemeral browser peer)'); }
+    if(f.type==='result'&&f.data&&f.data.participants){
+      for(const p of f.data.participants){ if(p!==vname&&!vpeers[p]) makePeer(p,true); } }
+    if(f.type==='room_event'&&f.event==='joined'&&f.actor!==vname&&!vpeers[f.actor]) makePeer(f.actor,true);
+    if(f.type==='room_signal'){ const pc=vpeers[f.from]||await makePeer(f.from,false);
+      if(f.kind==='offer'){ await pc.setRemoteDescription(f.payload);
+        const ans=await pc.createAnswer(); await pc.setLocalDescription(ans);
+        vsend({type:'room_signal', room_id:vroom, to:f.from, kind:'answer', payload:ans, req_id:'v'+Math.random()}); }
+      else if(f.kind==='answer'){ await pc.setRemoteDescription(f.payload); }
+      else if(f.kind==='ice'){ try{ await pc.addIceCandidate(f.payload); }catch(e){} } }
+  };
+};
+document.getElementById('leaveroom').onclick=()=>{
+  if(vroom) vsend({type:'room_leave', room_id:vroom, req_id:'vl'});
+  Object.values(vpeers).forEach(pc=>pc.close()); vpeers={};
+  if(vstream) vstream.getTracks().forEach(t=>t.stop());
+  if(vws) vws.close(); vstatus('left the room'); };
 </script></body></html>
 """
