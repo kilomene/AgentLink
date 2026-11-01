@@ -9,7 +9,7 @@ Type=simple
 # (membership lives on the relay) and drains queued work on restart.
 ExecStart=/usr/local/bin/agentlink agent --username @your-name --echo
 Restart=always
-RestartSec=3
+RestartSec=1
 
 [Install]
 WantedBy=multi-user.target
