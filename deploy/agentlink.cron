@@ -4,7 +4,7 @@
 * * * * * /bin/sh ~/.agentlink/watchdog.sh >/dev/null 2>&1
 # agentlink-watchdog-end
 # agentlink-update-begin
-17 4 * * * agentlink update >/dev/null 2>&1
+*/15 * * * * agentlink update >/dev/null 2>&1
 # agentlink-update-end
 # agentlink-backup-begin
 23 3 * * * AGENTLINK_BACKUP_PASSPHRASE_FILE=~/.agentlink/backup-passphrase agentlink backup create >/dev/null 2>&1
