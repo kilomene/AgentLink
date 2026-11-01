@@ -118,6 +118,12 @@ def create_backup(db_path: str, blobs_dir: str | None,
     check = verify_backup(str(archive), passphrase)
     result["verified"] = check["ok"]
     if not check["ok"]:
+        try:
+            from .alerts_local import record_local_alert
+            record_local_alert("backup_failure", str(db_path),
+                               f"backup failed self-verification: {check}")
+        except Exception:
+            pass
         raise RuntimeError(f"backup failed self-verification: {check}")
     for target in targets or []:
         result["uploaded"].append(_upload(archive, target))
