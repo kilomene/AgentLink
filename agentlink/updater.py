@@ -120,6 +120,15 @@ class Updater:
         # 4) Health check; roll back automatically on failure.
         if not self._health_check(new_version):
             self._restore(backup, payloads.keys(), backed_up)
+            try:
+                from .alerts_local import record_local_alert
+                record_local_alert(
+                    "update_rollback", new_version,
+                    f"update to {new_version} failed its health check"
+                    f" and was rolled back to {self.current_version}",
+                    state_dir=self.state_dir)
+            except Exception:
+                pass
             raise UpdateError(
                 f"health check failed after installing {new_version};"
                 f" rolled back to {self.current_version} from {backup}")
