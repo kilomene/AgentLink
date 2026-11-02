@@ -71,13 +71,18 @@ def main(argv: list[str] | None = None) -> int:
         print("commands: relay register agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
               "alerts capabilities update doctor service backup "
-              "oversight-keygen")
+              "oversight-keygen deregister remove-user")
         return 0
     cmd, rest = argv[0], argv[1:]
 
     if cmd == "relay":
         _relay.main(rest)
         return 0
+
+    if cmd == "deregister":
+        return _deregister(rest)
+    if cmd == "remove-user":
+        return _remove_user(rest)
 
     if cmd == "register":
         ap = argparse.ArgumentParser(prog="agentlink register")
@@ -257,6 +262,107 @@ def main(argv: list[str] | None = None) -> int:
         return _capabilities(rest)
     print(f"unknown command {cmd!r}; see `agentlink --help`", file=sys.stderr)
     return 2
+
+
+def _deregister(rest: list[str]) -> int:
+    """Agent-side exit door (v1.1.10): remove THIS agent's own
+    registration from the relay, authenticated by its own secret
+    (the hello on its connection — the relay can only ever act on
+    the authenticated username). Fail-closed server-side: refused
+    while non-terminal work, undelivered queue frames or live
+    chain entanglements stand. Test hygiene (owner's standing
+    rule): after testing, ALWAYS delete the scratch registrations
+    the test created — this is the command."""
+    from .client import RegistrationFailed, RequestFailed
+    ap = argparse.ArgumentParser(prog="agentlink deregister")
+    _add_common(ap)
+    ap.add_argument("--wipe-home", action="store_true",
+                    help="also delete this agent's local home files"
+                         " (secret, keys, journal) after a successful"
+                         " deregistration")
+    args = ap.parse_args(rest)
+
+    async def _go(a):
+        return await a.deregister(wipe_local=args.wipe_home)
+    try:
+        _print(asyncio.run(_with_agent(args, _go)))
+    except (RegistrationFailed, RequestFailed) as exc:
+        print(f"deregister failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _remove_user(rest: list[str]) -> int:
+    """OPERATOR removal (v1.1.10): relay-host tooling for orphaned
+    registrations whose secret is lost (dead test identities).
+    DRY-RUN by default — prints exactly what would be removed, per
+    table, and removes nothing; --confirm executes. Refuses a
+    currently-ONLINE agent (live heartbeat inside the offline
+    grace) unless --force. The store records every executed
+    removal in the audit log (kind 'user_removed', via=operator),
+    and the audit trail itself is never part of the cascade.
+
+    Uses the relay's backend selection (AGENTLINK_BACKEND /
+    --backend + --db), so it addresses the same store the relay
+    serves — SQLite file or Supabase (production)."""
+    from .backend import create_store
+    from .protocol import normalize_username, now_ts
+    from .store import NotFound
+    from .timing import OFFLINE_GRACE_SECONDS
+    ap = argparse.ArgumentParser(prog="agentlink remove-user")
+    ap.add_argument("username")
+    ap.add_argument("--confirm", action="store_true",
+                    help="execute the removal (default: dry run)")
+    ap.add_argument("--force", action="store_true",
+                    help="remove even if the agent is currently online")
+    ap.add_argument("--backend", default=None,
+                    help="sqlite (default) | supabase")
+    ap.add_argument("--db", default="~/.agentlink/relay.db")
+    args = ap.parse_args(rest)
+    username = normalize_username(args.username)
+    if username is None:
+        print(f"bad username {args.username!r}", file=sys.stderr)
+        return 2
+    store = create_store(args.backend, db_path=args.db)
+    try:
+        plan = store.removal_plan(username)
+        if not plan["exists"]:
+            print(f"no such registration: @{username}", file=sys.stderr)
+            return 2
+        last_seen = store.last_seen_of(username)
+        online = bool(last_seen) and \
+            (now_ts() - last_seen) <= OFFLINE_GRACE_SECONDS
+        _print({"username": username, "online": online,
+                "last_seen": last_seen,
+                "blockers": plan["blockers"],
+                "remove": plan["remove"],
+                "kept": "audit_log (append-only trail, incl. the"
+                        " removal record itself), groups/channels"
+                        " the agent created, vault entries, blob"
+                        " bytes (content-addressed, shared)"})
+        if not args.confirm:
+            print("dry run — nothing removed. Re-run with --confirm"
+                  " to execute.")
+            return 0
+        if online and not args.force:
+            print(f"refusing: @{username} is currently ONLINE"
+                  " (live heartbeat). Stop the agent first, or"
+                  " pass --force.", file=sys.stderr)
+            return 2
+        result = store.remove_user(username, force=True,
+                                   actor="operator", via="operator")
+        _print({"removed": result["removed"], "total": result["total"],
+                "audit": "recorded as kind 'user_removed'"
+                         " (via=operator)"})
+        return 0
+    except NotFound:
+        print(f"no such registration: @{username}", file=sys.stderr)
+        return 2
+    finally:
+        try:
+            store.close()
+        except Exception:
+            pass
 
 
 def _oversight_keygen(rest: list[str]) -> int:
