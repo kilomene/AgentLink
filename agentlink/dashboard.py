@@ -44,6 +44,12 @@ SESSION_TTL = DEVICE_TRUST_SECONDS  # 7 days — see agentlink/timing.py
 COOKIE = "agentlink_dash"
 MAX_FAILURES = 5
 FAILURE_WINDOW = 300  # seconds
+# Snapshot cache TTL (v1.1.4): /api/status and the /api/stream connect
+# snapshot serve the cached payload immediately and revalidate in the
+# background once it is older than this. State changes already arrive
+# via notify() (coalesced rebuild ≤1s), so the TTL is only a backstop;
+# the SSE stream corrects any first-paint staleness live.
+SNAPSHOT_TTL = 5.0  # seconds
 
 
 def _hash(token: str) -> str:
@@ -109,6 +115,19 @@ class DashboardServer:
         self._lock = threading.Lock()
         self._dirty = False
         self._builder: threading.Thread | None = None
+        # Snapshot cache (v1.1.4, stale-while-revalidate): the exact
+        # JSON string _build_snapshot produces, kept server-side so a
+        # cold /api/status or /api/stream connect answers immediately
+        # instead of paying a full store scan (measured 6–11s against
+        # the Supabase-backed store) on every first paint. Only
+        # complete JSON strings are ever published, under the lock —
+        # a half-built snapshot can never be served. Freshness stays
+        # honest: notify() rebuilds within ~1s of any real event and
+        # pushes over SSE; the cache only spares duplicate builds.
+        self._snap_lock = threading.Lock()
+        self._snap_json: str | None = None
+        self._snap_at = 0.0  # time.monotonic() when _snap_json was built
+        self._builds = 0     # completed snapshot builds (tests, doctor)
         self._failures: dict[str, list[float]] = {}
         self._oversight = _load_oversight_identity()
         # Oversight-unwrapped file keys, learned while opening
@@ -139,6 +158,12 @@ class DashboardServer:
                                         daemon=True)
         self._thread.start()
         log.info("dashboard listening on %s:%s", self.host, self.port)
+        # Warm the snapshot cache in the background (v1.1.4): the
+        # first build still costs a full store scan, but it happens
+        # once at boot — not inside the operator's first page load.
+        # notify() starts the coalesced builder thread, which builds
+        # within ~1s and publishes into the cache.
+        self.notify()
         return self
 
     def stop(self) -> None:
@@ -155,7 +180,8 @@ class DashboardServer:
         # a network-backed store (hundreds of round trips). Builds now
         # run on a dedicated thread, at most once per second, only
         # when something changed; subscribers still get pushed fresh
-        # snapshots, and /api/status still builds on demand.
+        # snapshots, and every build also publishes the cached
+        # snapshot /api/status serves (v1.1.4).
         with self._lock:
             self._dirty = True
             if self._builder is None:
@@ -170,7 +196,7 @@ class DashboardServer:
                 self._dirty = False
             if dirty:
                 try:
-                    snapshot = json.dumps(self._serve_data())
+                    snapshot = self._build_snapshot()
                 except Exception:
                     snapshot = None
                 if snapshot is not None:
@@ -182,6 +208,35 @@ class DashboardServer:
                         except queue.Full:
                             pass
             time.sleep(1.0)
+
+    # -- snapshot cache (stale-while-revalidate, v1.1.4) ------------------
+    def _build_snapshot(self) -> str:
+        """Build the dashboard payload once and atomically publish it
+        as the cached snapshot. The JSON string is complete before it
+        is stored, so readers only ever see whole snapshots."""
+        snapshot = json.dumps(self._serve_data())
+        with self._snap_lock:
+            self._snap_json = snapshot
+            self._snap_at = time.monotonic()
+            self._builds += 1
+        return snapshot
+
+    def _snapshot_json(self) -> str:
+        """The payload for /api/status and the /api/stream connect
+        snapshot. Serves the cache immediately when one exists; a
+        stale cache (> SNAPSHOT_TTL) is served too and revalidated in
+        the background via the same coalesced builder notify() drives
+        (the SSE push then corrects the open page live). Only with no
+        snapshot at all — cold start, warmup still running — does the
+        caller pay a synchronous build, exactly as before the cache."""
+        with self._snap_lock:
+            snap = self._snap_json
+            at = self._snap_at
+        if snap is not None:
+            if time.monotonic() - at > SNAPSHOT_TTL:
+                self.notify()
+            return snap
+        return self._build_snapshot()
 
     # -- owner oversight: open sealed content for the operator session --
     # The protocol emits exactly ONE wrap shape (crypto.encrypt_to_
@@ -638,7 +693,7 @@ class DashboardServer:
                         return self._send(401, '{"error":"login required"}',
                                           "application/json")
                     return self._send(
-                        200, json.dumps(dash._serve_data()),
+                        200, dash._snapshot_json(),
                         "application/json")
                 if path.startswith("/api/blob/"):
                     # Oversight file rendering: bytes are decrypted
@@ -767,8 +822,8 @@ class DashboardServer:
                 with dash._lock:
                     dash._subscribers.add(q)
                 try:
-                    self.wfile.write(b"data: " + json.dumps(
-                        dash._serve_data()).encode() + b"\n\n")
+                    self.wfile.write(b"data: " + dash._snapshot_json(
+                        ).encode() + b"\n\n")
                     self.wfile.flush()
                     while True:
                         try:
