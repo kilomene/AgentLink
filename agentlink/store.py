@@ -205,6 +205,12 @@ class Store:
                     oversight TEXT NOT NULL DEFAULT '',
                     content_envelope TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS message_reads (
+                    message_id TEXT NOT NULL,
+                    reader TEXT NOT NULL,
+                    read_at INTEGER NOT NULL,
+                    PRIMARY KEY (message_id, reader)
+                );
                 CREATE TABLE IF NOT EXISTS alerts (
                     id TEXT PRIMARY KEY,
                     kind TEXT NOT NULL,
@@ -793,12 +799,26 @@ class Store:
         return cur.rowcount > 0
 
     def vault_meta(self) -> list[dict]:
+        """Operator (dashboard) view: all vault metadata PLUS the
+        blob_id and parsed descriptor — the dashboard needs the
+        descriptor's oversight wrap to offer the owner a download;
+        it strips the descriptor before anything reaches the
+        browser (see dashboard._serve_data)."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT id, group_id, name, size, sha256, added_by,"
-                " pinned, ts FROM vault ORDER BY pinned DESC, ts DESC"
-                " LIMIT 500").fetchall()
-        return [dict(r) for r in rows]
+                "SELECT id, group_id, name, size, sha256, blob_id,"
+                " descriptor, added_by, pinned, ts FROM vault"
+                " ORDER BY pinned DESC, ts DESC LIMIT 500").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["descriptor"] = json.loads(d.get("descriptor") or "{}")
+            except Exception:
+                d["descriptor"] = {}
+            d["pinned"] = bool(d["pinned"])
+            out.append(d)
+        return out
 
     # -- dashboard sessions (trusted devices, 7-day) -------------------------
     def create_session(self, token_hash: str, expires_at: int) -> None:
@@ -872,6 +892,75 @@ class Store:
                 out.append(d)
             return out
         return [dict(r) for r in rows]
+
+    # -- read receipts (v1.1.2: WhatsApp-style Seen state) -------------------
+    def message_meta(self, message_id: str) -> dict | None:
+        """The audit row for one message id (the row's ref_id): kind,
+        sender (actor), recipient (target), group/channel (group_id).
+        Backs read-receipt validation — the relay derives the
+        conversation from this row, never from the reader's claim."""
+        if not message_id:
+            return None
+        with self._lock:
+            row = self._db.execute(
+                "SELECT kind, actor, target, group_id FROM audit_log"
+                " WHERE ref_id = ? AND kind IN"
+                " ('message', 'group_message', 'channel_message')"
+                " ORDER BY seq ASC LIMIT 1", (message_id,)).fetchone()
+        return dict(row) if row else None
+
+    def record_read(self, message_id: str, reader: str,
+                    read_at: int | None = None) -> int:
+        """Record that `reader` read `message_id`. First read wins
+        (Seen carries the FIRST time the message was taken in).
+        Returns the stored read_at (the existing one when the reader
+        had already read it)."""
+        ts = int(read_at or now_ts())
+        with self._lock:
+            self._db.execute(
+                "INSERT OR IGNORE INTO message_reads"
+                " (message_id, reader, read_at) VALUES (?, ?, ?)",
+                (message_id, reader, ts))
+            self._db.commit()
+            row = self._db.execute(
+                "SELECT read_at FROM message_reads"
+                " WHERE message_id = ? AND reader = ?",
+                (message_id, reader)).fetchone()
+        return int(row[0]) if row else ts
+
+    def reads_for(self, message_ids) -> dict:
+        """{message_id: [{"username": reader, "read_at": ts}, ...]}
+        for the given ids, each list ordered by read_at. Ids with no
+        reads are ABSENT from the result — a message nobody read
+        carries no read state anywhere (honesty rule)."""
+        ids = [str(i) for i in (message_ids or []) if i]
+        if not ids:
+            return {}
+        out: dict[str, list] = {}
+        with self._lock:
+            marks = ",".join("?" * len(ids))
+            rows = self._db.execute(
+                "SELECT message_id, reader, read_at FROM message_reads"
+                f" WHERE message_id IN ({marks})"
+                " ORDER BY read_at ASC", ids).fetchall()
+        for r in rows:
+            out.setdefault(r[0], []).append(
+                {"username": r[1], "read_at": int(r[2])})
+        return out
+
+    def set_audit_status(self, ref_id: str, status: str) -> None:
+        """Delivery-state upgrade for a message audit row — e.g. a
+        message that waited in the offline queue is 'sent' until the
+        recipient's hello flush hands it over, then 'delivered'."""
+        if not ref_id:
+            return
+        with self._lock:
+            self._db.execute(
+                "UPDATE audit_log SET status = ? WHERE ref_id = ?"
+                " AND kind IN"
+                " ('message', 'group_message', 'channel_message')",
+                (status, ref_id))
+            self._db.commit()
 
     def close(self) -> None:
         with self._lock:
