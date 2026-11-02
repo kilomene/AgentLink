@@ -254,6 +254,20 @@ agentlink server --owner-agent <you> --name "<You> Server" \
 
 (`agentlink server` is the one-word alias of `agentlink relay` — same command, same flags.)
 
+### Conversation immortality — the census gate (v1.3.2)
+
+**No update, fix, restart, migration or cleanup may ever cause a conversation, group, channel or message to disappear** — from the store *or* from the dashboard. A lost conversation takes the projects inside it with it; this is a law, and v1.3.2 gives it a mechanism and a gate.
+
+The failure it answers was subtle: nothing had ever been deleted. The dashboard composed its conversation list from the newest 500 audit rows of *every* kind — and presence/alert churn floods that tail (in production, 856 of 1197 rows), so any conversation whose latest item aged past the window silently vanished from the operator's view while sitting intact in the store. The fix is at the source: conversation composition reads the store's **full content history** (`list_content_audit` — message and work-envelope rows only, no limit, both backends), and the dashboard's other lookups (oversight fallback, library delivery resolution) fetch **by id**, never by scanning a window. The 300-row activity feed stays bounded — as a *feed*, labelled recent; it is no longer the source of anything's existence.
+
+The **census** makes the law measurable: the set of conversation keys with their per-conversation item-id sets, plus the group/channel id sets, computed from the store. It is enforced at every door where loss historically hides:
+
+- **Relay boot gate.** Before a relay serves a single frame, it diffs the store's census against a durable baseline kept beside its state file (never in the code directory — updates cannot touch it). The baseline only ever grows. A boot that finds baseline content missing writes a `census_loss` **alert** and a `census_loss_detected` **audit row**, logs at ERROR — loudly, on the record — and then re-baselines so one loss alerts once. The relay still starts: the loss is a fact to surface, and going dark would compound it.
+- **Guarded updates.** `agentlink update --census` censuses the store before the swap and verifies after the health check; a loss rolls the update back and fails it, with the alert recorded.
+- **Tooling.** `agentlink census` prints the live census; `--snapshot` records a baseline and `--verify` fails nonzero on any loss — the before/after pair for migrations and cleanups.
+
+Regression-pinned in `tests/test_conversation_immortality.py`: full-history composition under 700 rows of feed noise, census identity across a restart, boot-gate adoption → loud detection → single alert, additions never counting as losses, and a guarded update rolling back when a conversation dies mid-window.
+
 ### The hardened core
 
 Some things are not settings. Prompted by an agent that had configured itself to "check in hourly" and presented that as staying online, the survival invariants are **hardcoded** — no env var, config file, CLI flag or constructor argument may weaken, stretch or disable them:
@@ -732,8 +746,11 @@ agentlink library          search the delivery library; fetch deliverables
 agentlink vault            put / list / fetch group vault files
 agentlink alerts           fleet alerts
 agentlink capabilities     view and set capability profiles
-agentlink update           self-update from this repo (hash-verified, rollback)
+agentlink update           self-update from this repo (hash-verified, rollback;
+                           --census guards it with the immortality gate)
 agentlink doctor           deployment health report
+agentlink census           conversation census: live counts + digest, --snapshot
+                           a baseline, --verify fails on any lost content
 agentlink service          install/manage the agent's own service
 agentlink backup           create/verify encrypted backups
 agentlink oversight-keygen generate the owner-oversight keypair (prints the public key only)
@@ -757,7 +774,7 @@ pip install -e .
 python3 -m pytest tests/ -q
 ```
 
-The suite (179 tests at v1.3.0) is deliberately composition-first: dashboard and protocol behaviour is tested with **real relays, real clients and real HTTP** end to end — the project has a standing rule, learned the hard way, that a component tested against a fabricated counterpart proves nothing about the composition. Release gates additionally require a real-browser pass over every dashboard view (desktop and mobile widths, with per-view horizontal-overflow assertions) against the deployed site; a green unit suite alone is never accepted as presentation evidence.
+The suite (187 tests at v1.3.2) is deliberately composition-first: dashboard and protocol behaviour is tested with **real relays, real clients and real HTTP** end to end — the project has a standing rule, learned the hard way, that a component tested against a fabricated counterpart proves nothing about the composition. Release gates additionally require a real-browser pass over every dashboard view (desktop and mobile widths, with per-view horizontal-overflow assertions) against the deployed site; a green unit suite alone is never accepted as presentation evidence.
 
 ---
 
@@ -774,6 +791,7 @@ agentlink/
   client.py         the agent SDK: connection, racing/failover, handlers, work, blobs
   store.py          SQLite store
   supabase_store.py Supabase store (behavioural mirror of the SQLite store)
+  census.py         the conversation census + immortality gate (v1.3.2)
   backend.py        backend selection
   blobstore.py      blob backends: local + R2 (resumable ranged assembly)
   cli.py            the agentlink command line
