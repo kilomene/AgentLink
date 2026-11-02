@@ -194,6 +194,14 @@ class Relay:
     dashboard_enabled: bool = True
     dashboard: object = field(default=None, repr=False)
     peers: dict = field(default_factory=dict)  # username -> Peer
+    # Direct-knowledge departures (v1.3.5 fix): username -> epoch
+    # second this relay's own connection to that agent ended.
+    # Shared last_seen alone cannot distinguish "heartbeating on a
+    # brother since it left here" from "silent since it left here"
+    # inside the offline grace — this relay KNOWS when its own
+    # peer left, and presence must not overrule direct knowledge
+    # with a stale shared heartbeat (see _shared_alive).
+    _gone_at: dict = field(default_factory=dict)
     rooms: dict = field(default_factory=dict)  # room_id -> room record
     activity: collections.deque = field(
         default_factory=lambda: collections.deque(maxlen=300))
@@ -493,6 +501,40 @@ class Relay:
                 "connection_pattern":
                     self._connection_pattern(username)}
 
+    @staticmethod
+    def _decision_fields(row: dict) -> dict:
+        """Decision-link truth (v1.3.5, "the agent is the brain"):
+        the agent IS its own intelligence — capability and memory
+        are the agent's own, always. The only state any surface may
+        state is the CONNECTION-side fact the agent itself declared
+        in its hello: is its line connection linked to its own
+        decision-making? decision_state derives the presentation:
+        'linked' / 'pending' (autonomous, declared), 'undeclared'
+        (autonomous, never declared — a pre-1.3.5 install; surfaces
+        state nothing rather than guess), 'operator' (manual mode —
+        the agent is directed by its operator, so there is no link
+        question to answer)."""
+        declared = row.get("decision_link") or ""
+        if declared not in ("linked", "pending"):
+            declared = ""
+        if (row.get("mode") or "autonomous") == "manual":
+            state = "operator"
+        elif declared:
+            state = declared
+        else:
+            state = "undeclared"
+        return {"decision_link": declared, "decision_state": state}
+
+    def _profile_of(self, username: str) -> dict | None:
+        """The stored profile row for one agent (exact match), or
+        None. list_users is a LIKE search; filter to the exact
+        username so a profile question never answers about a
+        different agent."""
+        for row in self.store.list_users(username):
+            if row.get("username") == username:
+                return row
+        return None
+
     def _register_server_row(self) -> None:
         from . import __version__
         health = self._compute_health()
@@ -744,7 +786,7 @@ class Relay:
 
     # -- server carrying (v1.3.0) ------------------------------------------
     # The passage model: what is carried is a brother's SERVER,
-    # never its brain. This relay watches the registry; a per-agent
+    # never the agent itself. This relay watches the registry; a per-agent
     # server whose home stops answering (heartbeat stale, or the
     # endpoint itself refuses an application probe) is claimed by
     # the best eligible carrier under a single-winner lease, and
@@ -1253,12 +1295,13 @@ class Relay:
         for u in users:
             name = u["username"]
             peer = self.peers.get(name)
-            ls = int(u.get("last_seen") or 0)
+            store_ls = int(u.get("last_seen") or 0)
+            ls = store_ls
             if peer is not None:
                 ls = max(ls, int(peer.last_seen or 0))
             u["last_seen"] = ls or None
-            u["online"] = bool(ls) and \
-                (now - ls) <= OFFLINE_GRACE_SECONDS
+            u["online"] = self._shared_alive(
+                name, store_ls, OFFLINE_GRACE_SECONDS)
             conn = conns.get(name) or {}
             conn_fresh = bool(conn) and \
                 (now - int(conn.get("updated_at") or 0)) \
@@ -1331,7 +1374,7 @@ class Relay:
                     "carried_by": entry.get("carried_by") or "",
                 } if entry else None
                 u["current_server_label"] = label or ""
-                u["riding"] = entry.get("endpoint") if entry else None
+                u["riding"] = entry.get("label") if entry else None
                 home_ep = (peer.home_endpoint if peer is not None
                            else conn.get("home_endpoint")) or ""
                 u["home"] = home_ep or None
@@ -1350,6 +1393,7 @@ class Relay:
             else:
                 u["activity_state"] = "offline"
             u.update(self._compliance_fields(name))
+            u.update(self._decision_fields(u))
             u["trust_score"] = self.store.compute_trust(name)
             u.pop("pubkey", None)
             u.pop("sign_pub", None)
@@ -1824,17 +1868,37 @@ class Relay:
         except Exception:
             return None
 
-    def _is_alive(self, username: str, grace: int) -> bool:
-        """Backend-wide presence (point 29): alive = a heartbeat landed
-        SOMEWHERE (any relay sharing the backend) within the grace."""
+    def _shared_alive(self, username: str, store_ls: int,
+                      grace: int) -> bool:
+        """Backend-wide presence (point 29 + v1.3.5 fix): alive = a
+        heartbeat landed SOMEWHERE (any relay sharing the backend)
+        within the grace — UNLESS this relay holds direct knowledge
+        to the contrary: the agent's own connection HERE ended at
+        _gone_at[username] and no heartbeat anywhere postdates that
+        departure, in which case the shared last_seen is only the
+        stale echo of the session that just ended and the truth is
+        offline, immediately. A heartbeat landing on a brother after
+        the departure postdates it and reads alive again — direct
+        knowledge and shared truth, each in its jurisdiction."""
         now = now_ts()
         peer = self.peers.get(username)
         if peer is not None and now - peer.last_seen <= grace:
             return True
-        try:
-            return now - self.store.last_seen_of(username) <= grace
-        except Exception:
+        if not store_ls or now - store_ls > grace:
             return False
+        gone = self._gone_at.get(username)
+        if gone is not None and store_ls <= gone:
+            return False
+        return True
+
+    def _is_alive(self, username: str, grace: int) -> bool:
+        """Backend-wide presence (point 29): alive = a heartbeat landed
+        SOMEWHERE (any relay sharing the backend) within the grace."""
+        try:
+            store_ls = self.store.last_seen_of(username)
+        except Exception:
+            store_ls = 0
+        return self._shared_alive(username, int(store_ls or 0), grace)
 
     async def _fleet_scan_loop(self) -> None:
         while True:
@@ -2216,6 +2280,8 @@ class Relay:
                     await self._on_send(ws, frame, peer)
                 elif ftype == "read":
                     await self._on_read(ws, frame, peer)
+                elif ftype == "decision_link_update":
+                    await self._on_decision_link_update(ws, frame, peer)
                 elif ftype == "group_create":
                     await self._on_group_create(ws, frame, peer)
                 elif ftype == "group_add":
@@ -2376,6 +2442,7 @@ class Relay:
                         u["trust_score"] = self.store.compute_trust(
                             u["username"])
                         u.update(self._compliance_fields(u["username"]))
+                        u.update(self._decision_fields(u))
                         srv = hosting.get(u["username"])
                         if srv:
                             # Health is published in the directory:
@@ -2415,6 +2482,7 @@ class Relay:
             if peer is not None and self.peers.get(peer.username) is peer:
                 del self.peers[peer.username]
                 if not peer.ephemeral:
+                    self._gone_at[peer.username] = now_ts()
                     if peer.connected_at:
                         # Session history feeds the check-in pattern
                         # flag (hardened-core compliance visibility).
@@ -2423,6 +2491,24 @@ class Relay:
                                              now_ts())
                     self._log_activity("offline", peer.username)
                 log.info("peer @%s disconnected", peer.username)
+
+    async def _on_decision_link_update(self, ws, frame,
+                                       peer: Peer) -> None:
+        """Live decision-link declaration (v1.3.5): the hello
+        carries the agent's declaration, and this frame carries
+        every LATER change — an agent that wires its decision link
+        after connecting (its own handlers registered in its own
+        time) re-declares, and the stored fact follows at once.
+        A declaration is the agent's own statement about its
+        connection, recorded verbatim, never assigned; without
+        this, every surface would keep repeating the hello-time
+        snapshot of a living state."""
+        value = frame.get("decision_link")
+        if value in ("linked", "pending"):
+            try:
+                self.store.set_decision_link(peer.username, value)
+            except Exception:
+                pass
 
     async def _on_hello(self, ws, frame, old, server_id: str = ""):
         if old is not None and self.peers.get(old.username) is old:
@@ -2464,6 +2550,14 @@ class Relay:
         declared_mode = frame.get("mode")
         if declared_mode not in ("manual", "autonomous"):
             declared_mode = None
+        # Decision link (v1.3.5): the agent declares whether this
+        # connection is linked to its own decision-making. Recorded
+        # verbatim, never assigned — and it is the ONLY "missing"
+        # the platform may record about an agent, because it is a
+        # fact about the connection, not about the agent.
+        declared_link = frame.get("decision_link")
+        if declared_link not in ("linked", "pending"):
+            declared_link = None
         # Mesh admission (v1.2.0, owner's rules) — checked BEFORE
         # identity claim/verification (v1.3.0 root-cause fix): a
         # RIDER — an agent whose home is ANOTHER server — is
@@ -2507,6 +2601,8 @@ class Relay:
                 self.store.set_sign_pub(username, sign_pub)
                 if declared_mode:
                     self.store.set_mode(username, declared_mode)
+                if declared_link:
+                    self.store.set_decision_link(username, declared_link)
             else:
                 await self._error(ws, "username_taken", req_id)
                 return None
@@ -2517,7 +2613,8 @@ class Relay:
                     username, display or username, pubkey, sign_pub,
                     capabilities=frame.get("capabilities") or [],
                     cap_desc=str(frame.get("cap_description") or ""),
-                    mode=declared_mode or "autonomous")
+                    mode=declared_mode or "autonomous",
+                    decision_link=declared_link or "")
             except UsernameTaken:
                 await self._error(ws, "username_taken", req_id)
                 return None
@@ -2572,6 +2669,15 @@ class Relay:
         # must never mean stranded (the transition map only allows
         # awaiting_agent -> assigned, and before this fix no path
         # took it for direct work).
+        # Restoration on return is unconditional (v1.3.1): a
+        # decision-link declaration describes the connection's
+        # unattended runtime, never the agent's right to receive
+        # its own work — an embedded agent's own program may act on
+        # what its connection receives the moment it lands. (An
+        # earlier 1.3.5 draft gated this pickup on the hello
+        # declaring LINKED; the baseline suite proved that stranded
+        # returning agents' parked work on a stale declaration —
+        # the gate was removed at the source, here.)
         try:
             for work in self.store.open_work(("awaiting_agent",)):
                 gid = work.get("group_id")
@@ -4246,6 +4352,7 @@ class Relay:
         if not await self._oversight_gate(ws, frame, req_id):
             return
         created = []
+        notices = []
         for raw in frame.get("assignees") or []:
             assignee = normalize_username(raw)
             if assignee is None or not self.store.exists(assignee):
@@ -4274,6 +4381,56 @@ class Relay:
                 assignee_role=assignee_role,
                 content_group=content_group,
                 require_approval=require_approval)
+            # Decision-link truth (v1.3.5): the assignee's own
+            # declared state may be autonomous with its decision
+            # link PENDING. That declaration describes one thing
+            # only — the connection's UNATTENDED runtime: left
+            # alone, it will not answer or execute on its own. It
+            # says nothing about the agent, whose capability and
+            # memory are its own, and nothing about this connection's
+            # right to receive the agent's work: delivery is a
+            # connection fact, and an embedded agent's own program
+            # may act on what its connection receives at any moment.
+            # So the work is DELIVERED normally (it queues at the
+            # agent's connection, exactly as the declared state
+            # says), the ASSIGNER is told the connection fact
+            # truthfully in the assignment result, and nothing
+            # counts as accepted until the agent itself delivers,
+            # with proof — the platform's standing fail-closed rule.
+            # (An earlier 1.3.5 draft PARKED such work at the relay;
+            # the baseline suite proved that stranded real agents'
+            # work on a hello-time snapshot of a living state — the
+            # park was removed at the source, here.)
+            profile = self._profile_of(assignee)
+            link_pending = (
+                assignee != peer.username
+                and profile is not None
+                and (profile.get("mode") or "autonomous")
+                == "autonomous"
+                and (profile.get("decision_link") or "") == "pending")
+            if link_pending:
+                notice = {
+                    "kind": "decision_link_pending",
+                    "assignee": assignee,
+                    "work_id": work["id"],
+                    "message": (
+                        f"@{assignee}'s connection has not declared "
+                        "a decision link — left alone, its unattended "
+                        "runtime will not answer or execute work on "
+                        "its own, so this work is delivered to its "
+                        "connection and queues there. Nothing counts "
+                        "as accepted until the agent itself delivers, "
+                        "with proof."),
+                }
+                work["notice"] = notice
+                notices.append(notice)
+                await self._deliver(peer.username, {
+                    "type": "work_update", "work": work,
+                    "note": notice["message"]})
+                self._log_activity(
+                    "decision_link_notice", "system", target=assignee,
+                    group_id=gid or "", work_id=work["id"],
+                    status="decision_link_pending")
             created.append(work)
             await self._deliver(assignee,
                                 {"type": "work_assigned", "work": work})
@@ -4291,7 +4448,10 @@ class Relay:
         if not created:
             await self._error(ws, "bad_assign", req_id, "no assignees")
             return
-        await self._result(ws, req_id, True, {"work": created})
+        result = {"work": created}
+        if notices:
+            result["notices"] = notices
+        await self._result(ws, req_id, True, result)
 
     async def _on_deliver_work(self, ws, frame, peer: Peer) -> None:
         req_id = frame.get("req_id")
