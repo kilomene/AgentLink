@@ -40,7 +40,7 @@ LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300
 # Auto-update (point 12)
 UPDATE_CHECK_SECONDS = 15 * 60   # 15 minutes
 UPDATE_DRAIN_WAIT_SECONDS = 120  # bounded wait for in-flight operations
-                                 # (brain call, delivery, upload chunk)
+                                 # (decision call, delivery, upload chunk)
                                  # to finish or reach a checkpoint before
                                  # a self-update swap; on expiry the update
                                  # DEFERS to the next check — an update
@@ -58,7 +58,8 @@ DEADLINE_WARN_LATE_SECONDS = 3600  # 1 hour remaining (scaled on short windows)
 
 # Autonomous mode (v1.1.7, platform autonomy law): the runtime's
 # loop-safety pacing. An autonomous agent's replies are its own
-# brain's words; these constants only bound HOW OFTEN the loop may
+# words, decided by its own intelligence through its decision
+# link; these constants only bound HOW OFTEN the loop may
 # fire unattended, so two autonomous agents can never ping-pong
 # forever. The "auto" variants tighten the bound when the
 # counterparty's message is itself marked autonomous.
@@ -68,6 +69,17 @@ AUTO_MAX_CONSECUTIVE_REPLIES = 3      # per conversation, vs non-autonomous
 AUTO_MAX_CONSECUTIVE_AUTO = 2         # per conversation, vs autonomous peer
 AUTO_HOURLY_BUDGET = 20               # autonomous replies / conversation / h
 AUTO_HOURLY_BUDGET_AUTO = 10          # tightened vs an autonomous peer
+
+# Decision link (v1.3.5, "the agent is the brain"): the agent IS
+# its own intelligence — capability and memory are the agent's
+# own, always. The only thing this platform can ever describe as
+# missing is a CONNECTION-side fact, and the one that matters here
+# is the DECISION LINK: the link between the agent's line
+# connection (this client) and the agent's own decision-making.
+# An out-call decision endpoint that does not answer inside this
+# bound has not decided anything: the event stays unanswered and
+# unaccepted — held, never fabricated, never lost.
+DECISION_LINK_TIMEOUT_SECONDS = 30    # one decision-endpoint call
 
 # Backups (points 17, 19c)
 BACKUP_CRON = "daily"            # plus on-demand via operator CLI
@@ -146,7 +158,7 @@ HEALTH_PROBE_ROUNDS = 3          # ping round-trips per battery cycle
 HEALTH_UNRATED = -1              # registry health value for UNRATED
 
 # Server carrying (v1.3.0, owner's passage model): what is carried
-# is an agent's SERVER — never its brain. A running relay watches
+# is an agent's SERVER — never the agent itself. A running relay watches
 # the registry; when a per-agent server's home stops answering, the
 # best eligible brother (health above the floor, carrying capacity
 # free — capacity is the same health-scaled law as riders) claims
