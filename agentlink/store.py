@@ -51,6 +51,25 @@ class NotFound(Exception):
     pass
 
 
+class RemovalBlocked(Exception):
+    """Registration removal refused (fail-closed): the agent still
+    has live entanglements — non-terminal work, undelivered queue
+    frames, or live chain steps. Carries the human-readable blocker
+    list; live work is never silently orphaned by a deregistration."""
+
+    def __init__(self, username: str, blockers: list[str]):
+        super().__init__(f"@{username}: " + "; ".join(blockers))
+        self.username = username
+        self.blockers = list(blockers)
+
+
+#: Work statuses the state machine can still move FROM — a work item
+#: in any of these is live, and blocks a self-deregistration.
+NON_TERMINAL_WORK_STATUSES = ("assigned", "in_progress",
+                              "changes_requested", "delivered",
+                              "awaiting_approval", "awaiting_agent")
+
+
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -1124,6 +1143,153 @@ class Store:
                     continue
                 out.append(d)
             return out
+
+    # -- registration removal (v1.1.10) --------------------------------
+    # Two doors, ONE cascade:
+    #   * SELF-DEREGISTER — an agent removes its own registration
+    #     (relay `deregister` frame on its authenticated connection).
+    #     Fail-closed: refused while live entanglements stand
+    #     (removal_blockers) — live work is never silently orphaned.
+    #   * OPERATOR REMOVAL — the relay host's operator removes an
+    #     orphaned/test registration whose secret is lost
+    #     (`agentlink remove-user`, dry-run first; force=True here,
+    #     and the CLI adds its own live-heartbeat guard).
+    # The cascade deletes everything that BELONGS to the identity:
+    # the user row, its offline queue, group/channel memberships and
+    # wrapped keys, invites it created, its read receipts, its
+    # upload sessions, its username-keyed alerts, its blob metadata
+    # and library entries, its work history (with the deliveries and
+    # checkpoints hanging off the work) and the chains it created
+    # (with their steps). KEPT, deliberately: the audit_log (an
+    # append-only trail — the removal itself is recorded there and
+    # must survive the deletion), the groups/channels it created
+    # (shared spaces; the creator name becomes provenance once its
+    # membership is gone), vault entries (group property; added_by
+    # is provenance) and blob BYTES (content-addressed ciphertext
+    # other registrations may share — only metadata rows go).
+
+    def _removal_refs(self, username: str) -> tuple[list[str], list[str]]:
+        """(work_ids, chain_ids) whose rows hang off this identity."""
+        with self._lock:
+            work_ids = [r["id"] for r in self._db.execute(
+                "SELECT id FROM work WHERE assigner = ? OR assignee = ?",
+                (username, username)).fetchall()]
+            chain_ids = [r["id"] for r in self._db.execute(
+                "SELECT id FROM chains WHERE creator = ?",
+                (username,)).fetchall()]
+        return work_ids, chain_ids
+
+    def _removal_steps(self, username: str) -> list[tuple[str, str, tuple]]:
+        """(table, WHERE clause, args) in delete order — shared by
+        removal_plan (COUNT) and remove_user (DELETE) so the dry run
+        can never drift from the execution."""
+        work_ids, chain_ids = self._removal_refs(username)
+        mw = ",".join("?" * len(work_ids)) or "NULL"
+        mc = ",".join("?" * len(chain_ids)) or "NULL"
+        u = username
+        return [
+            ("work_deliveries",
+             f"work_id IN ({mw}) OR deliverer = ?", (*work_ids, u)),
+            ("work_checkpoints",
+             f"work_id IN ({mw}) OR by_user = ?", (*work_ids, u)),
+            ("work", f"id IN ({mw})", tuple(work_ids)),
+            ("chain_steps", f"chain_id IN ({mc})", tuple(chain_ids)),
+            ("chains", f"id IN ({mc})", tuple(chain_ids)),
+            ("queue", "to_username = ?", (u,)),
+            ("message_reads", "reader = ?", (u,)),
+            ("group_keys", "username = ?", (u,)),
+            ("group_members", "username = ?", (u,)),
+            ("channel_keys", "username = ?", (u,)),
+            ("channel_members", "username = ?", (u,)),
+            ("invites", "created_by = ?", (u,)),
+            ("upload_sessions", "owner = ? OR for_user = ?", (u, u)),
+            ("alerts", "subject = ?", (u,)),
+            ("blobs", "owner = ? OR for_user = ?", (u, u)),
+            ("library", "sender = ? OR to_user = ?", (u, u)),
+            ("users", "username = ?", (u,)),
+        ]
+
+    def removal_blockers(self, username: str) -> list[str]:
+        """Live entanglements that refuse a SELF-deregistration."""
+        blockers: list[str] = []
+        with self._lock:
+            n = self._db.execute(
+                "SELECT COUNT(*) AS n FROM queue WHERE to_username = ?",
+                (username,)).fetchone()["n"]
+            if n:
+                blockers.append(
+                    f"{n} undelivered frame(s) in the offline queue")
+            marks = ",".join("?" * len(NON_TERMINAL_WORK_STATUSES))
+            n = self._db.execute(
+                "SELECT COUNT(*) AS n FROM work WHERE"
+                f" (assigner = ? OR assignee = ?) AND status IN ({marks})",
+                (username, username, *NON_TERMINAL_WORK_STATUSES)
+            ).fetchone()["n"]
+            if n:
+                blockers.append(
+                    f"{n} non-terminal work item(s) as assigner/assignee")
+            n = self._db.execute(
+                "SELECT COUNT(*) AS n FROM chains WHERE creator = ?"
+                " AND status IN ('running', 'paused')",
+                (username,)).fetchone()["n"]
+            if n:
+                blockers.append(f"{n} live chain(s) created by this agent")
+            n = self._db.execute(
+                "SELECT COUNT(*) AS n FROM chain_steps cs"
+                " JOIN chains ch ON ch.id = cs.chain_id"
+                " WHERE ch.creator != ?"
+                " AND ch.status IN ('running', 'paused')"
+                " AND cs.status IN ('pending', 'active')"
+                " AND (cs.target = ? OR cs.assignees LIKE ?)",
+                (username, username, f"%\"{username}\"%")
+            ).fetchone()["n"]
+            if n:
+                blockers.append(
+                    f"{n} live chain step(s) in other agents' chains"
+                    " target this agent")
+        return blockers
+
+    def removal_plan(self, username: str) -> dict:
+        """Exactly what remove_user(username) would delete, counted
+        per table — the dry-run view. Performs no writes."""
+        plan: dict = {"username": username,
+                      "exists": self.exists(username),
+                      "blockers": [], "remove": {}}
+        if not plan["exists"]:
+            return plan
+        plan["blockers"] = self.removal_blockers(username)
+        steps = self._removal_steps(username)
+        with self._lock:
+            for table, where, args in steps:
+                plan["remove"][table] = self._db.execute(
+                    f"SELECT COUNT(*) AS n FROM {table} WHERE {where}",
+                    args).fetchone()["n"]
+        return plan
+
+    def remove_user(self, username: str, *, force: bool = False,
+                    actor: str = "", via: str = "self") -> dict:
+        """Delete a registration and everything that belongs to it
+        (the cascade above). Returns the per-table counts actually
+        removed. Raises NotFound for an unknown username and, unless
+        force, RemovalBlocked while live entanglements stand. The
+        removal is written to the audit log AFTER the cascade, so
+        the record survives the deletion it describes."""
+        if not self.exists(username):
+            raise NotFound(username)
+        blockers = [] if force else self.removal_blockers(username)
+        if blockers:
+            raise RemovalBlocked(username, blockers)
+        removed: dict[str, int] = {}
+        steps = self._removal_steps(username)
+        with self._lock:
+            for table, where, args in steps:
+                removed[table] = self._db.execute(
+                    f"DELETE FROM {table} WHERE {where}", args).rowcount
+            self._db.commit()
+        total = sum(removed.values())
+        self.audit("user_removed", actor or username, target=username,
+                   status=f"via={via};rows={total}")
+        return {"username": username, "removed": removed, "total": total}
 
     # -- offline queue ----------------------------------------------------
     def enqueue(self, to_username: str, payload: dict) -> None:
