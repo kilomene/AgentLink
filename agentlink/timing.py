@@ -118,6 +118,50 @@ DISCOVERED_SERVER_TTL_SECONDS = 180  # a discovered peer that no relay
                                  # staleness threshold): dead entries
                                  # must not linger in the race set
 
+# Earned health (v1.3.0, owner's law): a server's health percentage
+# is EARNED THROUGH TESTING, every time — never assigned, never a
+# static default, never settable by config/env/operator. On first
+# registration a server is UNRATED (health -1, "testing"): it carries
+# NO percentage and is eligible neither to be ridden nor to carry
+# another agent's server until its first test battery completes.
+# The battery is ACTIVE and CONTINUOUS: every cycle exercises the
+# real server end-to-end (probe round-trips, hello handshakes,
+# registry write/read-back integrity, a real message round-trip, a
+# chunked file round-trip verified by hash, heartbeat stability),
+# and the rolling trailing-window signals keep re-testing it for
+# the rest of its life. Stop testing and the evidence ages out of
+# the window — the percentage falls with it.
+HEALTH_TEST_CYCLE_SECONDS = 2    # battery cycle cadence
+HEALTH_FRAME_TIMEOUT_SECONDS = 30  # per-frame wait inside a battery
+                                 # cycle: the battery measures the
+                                 # REAL backend (a production file
+                                 # round-trip through R2 + the shared
+                                 # store legitimately takes ~20s), so
+                                 # a slow success must count as the
+                                 # evidence it is — only a genuine
+                                 # failure or a 30s silence fails
+HEALTH_INITIAL_CYCLES = 3        # completed cycles before a server
+                                 # earns its first rating
+HEALTH_PROBE_ROUNDS = 3          # ping round-trips per battery cycle
+HEALTH_UNRATED = -1              # registry health value for UNRATED
+
+# Server carrying (v1.3.0, owner's passage model): what is carried
+# is an agent's SERVER — never its brain. A running relay watches
+# the registry; when a per-agent server's home stops answering, the
+# best eligible brother (health above the floor, carrying capacity
+# free — capacity is the same health-scaled law as riders) claims
+# the carry under a single-winner lease and serves the server's
+# identity (same label, same owner) from its own machine. The owner
+# never changes; the carrier is a temporary helper. When home has
+# answered strongly for the handback window, the carrier releases
+# and the server goes home; if the carrier falls first, the lease
+# expires and the next brother claims — the server hops again.
+CARRY_WATCH_SECONDS = 5          # carrier registry watch cadence
+CARRY_LEASE_SECONDS = 45         # claim lease; renewed every watch
+                                 # cycle by the holding carrier
+CARRY_HANDBACK_SECONDS = 60      # home must answer continuously
+                                 # this long before handback
+
 # Hardened core — compliance visibility (v1.2.0): the relay watches
 # HOW each agent connects. A "check-in pattern" — repeated SHORT
 # sessions separated by LONG dark gaps — is an agent that configured
