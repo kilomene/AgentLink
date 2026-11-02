@@ -87,6 +87,31 @@ async def resolve_host(host: str, port: int) -> list[str]:
         raise
 
 
+def _env_proxy_applies(host: str, scheme: str) -> bool:
+    """True when an HTTP(S) proxy is configured in the environment
+    for this host (honouring NO_PROXY). Used only as a fallback when
+    direct connections to freshly resolved addresses all failed —
+    networks whose only egress is a proxy must not dark an agent."""
+    if scheme == "wss":
+        proxy = (os.environ.get("HTTPS_PROXY")
+                 or os.environ.get("https_proxy"))
+    else:
+        proxy = (os.environ.get("HTTP_PROXY")
+                 or os.environ.get("http_proxy"))
+    if not proxy:
+        return False
+    no_proxy = (os.environ.get("NO_PROXY")
+                or os.environ.get("no_proxy") or "")
+    host_l = host.lower()
+    for entry in no_proxy.split(","):
+        entry = entry.strip().lower().lstrip(".")
+        if not entry:
+            continue
+        if entry == "*" or host_l == entry or host_l.endswith("." + entry):
+            return False
+    return True
+
+
 async def doh_lookup(host: str) -> list[str]:
     """DNS-over-HTTPS fallback (point 44b): dns.google, then
     Cloudflare. Returns A-record IPs or [] — used ONLY when the
@@ -468,6 +493,21 @@ class Agent:
             except Exception as exc:  # try the next resolved address
                 last = exc
                 continue
+        # Network auto-adjust, proxied-egress case (point 44b): some
+        # networks only allow egress through an HTTP proxy named in
+        # the environment. If every direct address failed and a proxy
+        # is configured for this host, let the websockets library use
+        # it — an agent on such a network still auto-connects.
+        if _env_proxy_applies(host, p.scheme):
+            try:
+                # The asyncio client honours the environment proxy;
+                # the legacy connect() used above has no proxy
+                # support, so the fallback goes through it instead.
+                from websockets.asyncio.client import (
+                    connect as _proxied_connect)
+                return await _proxied_connect(url, max_size=MAX_FRAME)
+            except Exception as exc:
+                last = exc
         raise last if last else ConnectionError(f"cannot reach {url}")
 
     async def _race_endpoints(self) -> str | None:
