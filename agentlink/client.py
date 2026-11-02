@@ -574,8 +574,34 @@ class Agent:
             "ephemeral": self.ephemeral,
             "home_endpoint": self.endpoint,
         })
+        # Bounded welcome wait (v1.1 hardening): a hello that lands in
+        # a bad egress window — or on a relay whose loop is briefly
+        # busy — must not park this client on a silent socket forever.
+        # On timeout the socket closes and the run() loop retries
+        # (unlimited attempts, 5s pacing cap) until a hello lands in a
+        # good window; no service restart is ever needed to recover.
+        from .timing import HELLO_TIMEOUT_SECONDS
+        _hello_deadline = (asyncio.get_event_loop().time()
+                           + HELLO_TIMEOUT_SECONDS)
         while True:
-            raw = await self._ws.recv()
+            _left = _hello_deadline - asyncio.get_event_loop().time()
+            if _left <= 0:
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+                raise ConnectionError(
+                    "hello timed out waiting for welcome")
+            try:
+                raw = await asyncio.wait_for(self._ws.recv(),
+                                             timeout=_left)
+            except asyncio.TimeoutError:
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+                raise ConnectionError(
+                    "hello timed out waiting for welcome")
             frame = json.loads(raw)
             if frame.get("type") == "welcome":
                 self.username = frame["username"]
@@ -1307,8 +1333,10 @@ class Agent:
             if interrupt_after is not None and sent >= interrupt_after:
                 raise ConnectionError(
                     "simulated drop mid-upload (session kept server-side)")
-        resp = await self._request({"type": "blob_session_finish",
-                                    "session_id": session_id})
+        resp = await self._request({
+            "type": "blob_session_finish", "session_id": session_id,
+            "for_user": for_user, "for_group": for_group,
+            "for_channel": for_channel})
         return resp["blob_id"]
 
     async def start_upload_session(self, data: bytes, *,
@@ -1669,6 +1697,7 @@ class Agent:
             "priority": raw.get("priority") or "normal",
             "progress_percent": raw.get("progress_percent", 0),
             "progress_at": raw.get("progress_at", 0),
+            "require_approval": bool(raw.get("require_approval")),
             "proof_verified": bool(raw.get("proof_verified")),
             "proof_hash": raw.get("proof_hash", ""),
             "created_at": raw.get("created_at"),
@@ -1813,7 +1842,8 @@ class Agent:
                           deadline=None,
                           priority: str = "normal",
                           target_role: str | None = None,
-                          auto_reassign: bool = True) -> list[dict]:
+                          auto_reassign: bool = True,
+                          require_approval: bool = False) -> list[dict]:
         payloads = [make_file_payload(p) for p in (attachments or [])]
         obj = {"title": title, "instructions": instructions,
                "attachments": payloads}
@@ -1842,6 +1872,8 @@ class Agent:
                     rec["key"], json.dumps(obj).encode())
         if target_role:
             frame["target_role"] = target_role
+        if require_approval:
+            frame["require_approval"] = True
         data = await self._request(frame)
         return [self._decrypt_work(w) for w in data["work"]]
 
@@ -1849,7 +1881,8 @@ class Agent:
                                instructions: str = "",
                                attachments: list[str] | None = None,
                                deadline: int | None = None,
-                               priority: str = "normal") -> list[dict]:
+                               priority: str = "normal",
+                               require_approval: bool = False) -> list[dict]:
         """Assign to EVERY current holder of a custom role in a group.
         One delivery satisfies the whole batch; the rest are 'covered'.
         The relay re-resolves the role server-side; an empty role is
@@ -1860,7 +1893,7 @@ class Agent:
         return await self.assign_work(
             holders, title, instructions, group_id=group_id,
             attachments=attachments, deadline=deadline, priority=priority,
-            target_role=role)
+            target_role=role, require_approval=require_approval)
 
     def delivery_proof(self, work_id: str, obj: dict) -> dict:
         """Signed delivery proof (point 23): Ed25519 signature from the
@@ -1966,6 +1999,23 @@ class Agent:
     async def request_changes(self, work_id: str, note: str = "") -> dict:
         data = await self._request({"type": "work_action", "work_id": work_id,
                                     "action": "request_changes", "note": note})
+        return self._decrypt_work(data["work"])
+
+    async def approve_work(self, work_id: str, note: str = "") -> dict:
+        """Approval gate (v1.1.0): decide a delivery parked in
+        awaiting_approval. Only the assigner (or a group admin for
+        group work) may decide; approval completes the work \u2014 and
+        only NOW does a chain advance."""
+        data = await self._request({"type": "work_action", "work_id": work_id,
+                                    "action": "approve", "note": note})
+        return self._decrypt_work(data["work"])
+
+    async def reject_work(self, work_id: str, reason: str = "") -> dict:
+        """Approval gate (v1.1.0): reject a parked delivery with a
+        reason \u2014 the work returns to changes_requested (the reason
+        rides the note to the assignee) and a chain stays paused."""
+        data = await self._request({"type": "work_action", "work_id": work_id,
+                                    "action": "reject", "note": reason})
         return self._decrypt_work(data["work"])
 
     async def work_inbox(self, status: str | None = None,
@@ -2141,7 +2191,8 @@ class Agent:
                     "group_id": st.get("group_id") or group_id or "",
                     "assignees": [], "envelopes": {},
                     "deadline": parse_deadline(st.get("deadline")),
-                    "priority": st.get("priority", "normal")}
+                    "priority": st.get("priority", "normal"),
+                    "require_approval": bool(st.get("require_approval"))}
             self_pub = self.identity.public_key_b64
             if st.get("role"):
                 gid = st.get("group_id") or group_id
