@@ -1,23 +1,23 @@
 {
- "version": "1.2.0",
+ "version": "1.2.1",
  "files": {
-  "agentlink/__init__.py": "32eefae811d30076f77e0246938a0dd0e08bf39b9aba553be16b39bee0cb7cd5",
+  "agentlink/__init__.py": "edd86b223aaa93bce6c77c7536116fbd4d2d7f5a38e9542af008d40165d93489",
   "agentlink/__main__.py": "307299fda7b77d22c64cb51430ec75e5f59d78e9c948786afb3b2544fe45e4b7",
   "agentlink/alerts_local.py": "c08cd95bfaf6f4e5968e3b4cc85c49d74c0b5b54f66e6120235e38b4078ca82d",
   "agentlink/backend.py": "91a7ad63bdcbd3ddcf4c797b23bc6df06a508ea54eba37f370fdc6f609844068",
   "agentlink/backup.py": "5fb14d8858586a1763b0a190a95ff182a912b83663822c76f8fa5e025f128619",
   "agentlink/blobstore.py": "a53e22b5bba59ee4b33ac9c1f20e00877512fb576c2a685fced8d2ff6108ce96",
   "agentlink/cli.py": "26856014053344c8eaa08200d8decdfefe9df4092ac1ac6a35b8deb84ddda58c",
-  "agentlink/client.py": "3931e3b06fda79039097d45c3feff915d67306ca3aa62918fb59d2eda7a89d87",
+  "agentlink/client.py": "a1208cf525a005ec4975d176a7a6045d179337fa9d56154781839558a04d654c",
   "agentlink/config.py": "903954c47bad67559cb7daaa828ab5ad154c80c075d34ce638ab6411e1c2e5a6",
   "agentlink/crypto.py": "6d653e0d5ae4999d65354e23c388314833c6c03c27e852357431921c78905637",
   "agentlink/dashboard.py": "cee7e94a17b73ce1b7f0aa3e022d6031b6b228c8fe426c48a51fca6f143af817",
   "agentlink/deadlines.py": "319d320c1bd29f3c05fbc689e381d50803608e6f4a71cceba8c3a82448134446",
   "agentlink/protocol.py": "a83906d0e200d32c04c2082f032de92c170a37664081407068c2949cd7478d1d",
-  "agentlink/relay.py": "2773b0b0a93a7304927d6421d3d4878d75bb2c58c5294319796e915273e9d18d",
+  "agentlink/relay.py": "7c1ca746906d667b30b6d45f9c186c0335e82cc8c2d1a251dd9542fc9f277173",
   "agentlink/store.py": "25c15a632057c715bb6e05a84b7d83b2d883e235c681b50dabf2852d9dcba101",
   "agentlink/supabase_store.py": "9f0574a3d465dceb235316793074b63b23d185928b8c6ad38f6e8274cc18afb1",
-  "agentlink/timing.py": "521e7271b10f85df98e3126282d0a87dcadb894cb39e12b767f8d3faac6fce94",
+  "agentlink/timing.py": "868bc4f0d7a86de22f086c1a7b621bba1e6b34d5b4162a83e88c784491a67600",
   "agentlink/updater.py": "cbb86f87b591b60e72a720c650ef61ffc8089b4935b8ab9dedd9da579d15e2ad"
  }
 }
