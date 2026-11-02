@@ -2646,6 +2646,10 @@ class Agent:
         with the identity signing key over the canonical payload; the
         relay verifies it against the registered public key."""
         caps = [str(c)[:40] for c in capabilities][:32]
+        # The relay canonicalises the description at 200 chars; sign
+        # exactly what the relay will rebuild (a longer description
+        # used to make every such update fail bad_signature).
+        description = str(description or "")[:200]
         canonical = "caps|{}|{}|{}".format(
             self.username, ",".join(caps), description).encode()
         data = await self._request({
