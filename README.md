@@ -312,6 +312,25 @@ Only the assignee can deliver; only the assigner can complete or request
 changes. Attachments ride the same frames as deliveries, hash-verified.
 Assignments to offline agents queue and land on reconnect.
 
+**Approval gates (v1.1).** Any assignment — and any chain step — can
+carry an approval gate: `agentlink assign --require-approval …`
+(SDK: `assign_work(..., require_approval=True)`, chain steps:
+`"require_approval": True`). The assignee's proven delivery then
+parks the work in a new status, **`awaiting_approval`**, instead of
+`delivered`. Nothing completes — and a chain does NOT advance — until
+the assigner decides on the line: `agentlink work approve <id>` /
+SDK `approve_work()` completes it (chains advance only now);
+`agentlink work reject <id> "reason"` / `reject_work()` returns it to
+`changes_requested` with the reason delivered to the assignee, and a
+chain stays paused. For group work a group admin may decide in the
+assigner's place; nobody else can. Every step is audited
+(`approval_gate_set`, `work_awaiting_approval`, `work_approved`,
+`work_approval_rejected`, alongside the usual `work_completed` /
+`work_changes_requested`). Trust follows the existing formula: the
+proven delivery earns its +1 while parked, completion lands the +4,
+rejection scores the −6 changes-requested round. With no gate set,
+the lifecycle is exactly the v1.0 flow above.
+
 **SDK equivalent:**
 
 ```python
@@ -602,6 +621,23 @@ claimed-vs-verified markers. **Metadata only, by design**: chat
 text and file contents are end-to-end encrypted and can never appear
 there. JSON is at `/api/status` (login required).
 
+**v1.1 dashboard.** Navigation is an animated slide-in **side
+drawer** (logo mark, grouped sections — Overview, Agents,
+Conversations, Work, Chains, Library, Vault, Voice Rooms,
+Alerts/Activity — and the live connection status; off-canvas with a
+backdrop on mobile widths). A pulsing LIVE indicator, keyed-diff
+rendering (new feed/conversation rows animate in as SSE pushes
+arrive — no bare page swaps), animated presence dots and
+`prefers-reduced-motion` support throughout. Conversation items
+carry the sender's in-group **nickname, role and custom role**, and
+group drill-downs open with the full participant list. The Agents
+board labels an agent **online (home)** by comparing its declared
+home endpoint against the relay's own endpoint identity (its bind
+address, its configured public endpoint, the product endpoint) —
+never against the friendly `--name` label. Gated work shows an
+**awaiting approval** state with who must decide (the decision
+itself happens on the line, never on the dashboard).
+
 **The dashboard is monitor-only.** It exposes no send / assign /
 chat actions at all. There is deliberately **no owner identity
 inside the line**: the protocol has no human user account. The owner
@@ -718,6 +754,8 @@ the map.
 | Offline grace | **15s** (3 missed beats) |
 | Fleet scan (staleness/deadlines/reassignment/alerts) | every **1s** |
 | Reconnect | first retry instant; pacing cap **5s**; no max attempts, ever |
+| Hello / welcome wait | bounded at **30s** per attempt, then close + retry — a hello in a bad window never wedges the client |
+| Fleet scan store work | offloaded to worker threads (never blocks the relay event loop) |
 | Endpoint race prefer-home grace | **0.3s** |
 | Home probe while riding a peer | every **5s**, uncapped |
 | Network-change watch | every **2s** |
