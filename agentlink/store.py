@@ -91,6 +91,7 @@ class Store:
                     sign_pub TEXT NOT NULL DEFAULT '',
                     capabilities TEXT NOT NULL DEFAULT '[]',
                     cap_desc TEXT NOT NULL DEFAULT '',
+                    mode TEXT NOT NULL DEFAULT 'autonomous',
                     last_seen INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL
                 );
@@ -386,6 +387,12 @@ class Store:
              "require_approval INTEGER NOT NULL DEFAULT 0")
         _add("chain_steps", "require_approval",
              "require_approval INTEGER NOT NULL DEFAULT 0")
+        # Platform autonomy law (v1.1.7): every profile carries a
+        # mode; the column default IS the law's presentation rule —
+        # a profile with no explicit mode is autonomous; manual is
+        # only ever an explicit opt-out recorded by the agent itself.
+        _add("users", "mode",
+             "mode TEXT NOT NULL DEFAULT 'autonomous'")
         db.commit()
 
     # -- blob metadata (ciphertext lives in the blob store) ----------------
@@ -969,19 +976,20 @@ class Store:
     # -- users -----------------------------------------------------------
     def claim(self, username: str, display_name: str, pubkey: str = "",
               sign_pub: str = "", capabilities=None,
-              cap_desc: str = "") -> str:
+              cap_desc: str = "", mode: str = "autonomous") -> str:
         secret = new_secret()
+        mode = mode if mode in ("manual", "autonomous") else "autonomous"
         with self._lock:
             try:
                 self._db.execute(
                     "INSERT INTO users (username, secret, display_name, pubkey,"
-                    " sign_pub, capabilities, cap_desc, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    " sign_pub, capabilities, cap_desc, mode, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     # Only the SHA-256 hash is stored — the relay DB never
                     # holds a usable secret.
                     (username, _hash_token(secret), display_name, pubkey,
                      sign_pub, json.dumps(capabilities or []), cap_desc,
-                     now_ts()),
+                     mode, now_ts()),
                 )
                 self._db.commit()
             except sqlite3.IntegrityError:
@@ -1029,6 +1037,20 @@ class Store:
                 (json.dumps(capabilities or []), cap_desc, username))
             self._db.commit()
 
+    def set_mode(self, username: str, mode: str) -> None:
+        """Persist the agent's platform mode (autonomy law, v1.1.7).
+        Recorded from the agent's own hello — an agent declares its
+        mode; the relay never assigns one. Unknown values are
+        refused so a profile can never drift out of the two lawful
+        states."""
+        if mode not in ("manual", "autonomous"):
+            return
+        with self._lock:
+            self._db.execute(
+                "UPDATE users SET mode = ? WHERE username = ?",
+                (mode, username))
+            self._db.commit()
+
     def sign_pub_of(self, username: str) -> str:
         with self._lock:
             row = self._db.execute(
@@ -1074,7 +1096,7 @@ class Store:
             if query:
                 rows = self._db.execute(
                     "SELECT username, display_name, pubkey, sign_pub,"
-                    " capabilities, cap_desc, last_seen, created_at"
+                    " capabilities, cap_desc, mode, last_seen, created_at"
                     " FROM users"
                     " WHERE username LIKE ? ORDER BY username",
                     (f"%{query}%",),
@@ -1082,7 +1104,7 @@ class Store:
             else:
                 rows = self._db.execute(
                     "SELECT username, display_name, pubkey, sign_pub,"
-                    " capabilities, cap_desc, last_seen, created_at"
+                    " capabilities, cap_desc, mode, last_seen, created_at"
                     " FROM users ORDER BY username"
                 ).fetchall()
             out = []
@@ -1093,6 +1115,10 @@ class Store:
                                                    or "[]")
                 except Exception:
                     d["capabilities"] = []
+                # Presentation rule (autonomy law): anything that is
+                # not an explicit 'manual' presents as autonomous.
+                d["mode"] = d.get("mode") if d.get("mode") in (
+                    "manual", "autonomous") else "autonomous"
                 if capability and capability.lower() not in \
                         [c.lower() for c in d["capabilities"]]:
                     continue
