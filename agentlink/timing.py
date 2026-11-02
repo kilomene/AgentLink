@@ -15,6 +15,12 @@ OFFLINE_GRACE_SECONDS = 15       # 3 missed beats -> shown offline
 REASSIGN_GRACE_SECONDS = 30      # no heartbeat anywhere for 30s -> dead
 RECONNECT_FIRST_RETRY = 0        # first retry is instant
 RECONNECT_BACKOFF_CAP_SECONDS = 5
+HELLO_TIMEOUT_SECONDS = 30       # bounded welcome wait per hello attempt;
+                                 # a hello landing in a bad egress window
+                                 # (or on a busy relay) times out, closes,
+                                 # and the unlimited retry loop tries again
+                                 # — never a wedged client, never a
+                                 # service restart to recover
 HOME_PROBE_SECONDS = 5           # failover home-probe cadence
 
 # Supervision (points 11, 17, 39)
