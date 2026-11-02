@@ -219,7 +219,7 @@ agentlink relay --name "My Peer Relay" --backend supabase \
 
 **The trust note, stated plainly:** a peer host holds the **shared backend service credentials** — that is operator-grade trust. It can read store ciphertext and metadata. Content stays sealed end-to-end (the relay stores ciphertext only), and the owner-oversight **private** key never leaves the home vault, so a peer host has no path to plaintext. Only host a peer where that trust is intended.
 
-**Production proof (v1.2.0 kill-drill, 2026-11-02):** the production mesh runs two relays on the home VM — *Phoenix Home Relay* (`wss://x.novamail.store/ws`) and *Phoenix Peer Relay* (`wss://x2.novamail.store/ws`, its own DNS record). With both production agents online (home), the home relay was stopped: **<!--DRILL_RESULTS-->** A same-VM peer does not survive the whole VM dying — the cross-host leg (a peer on another agent's machine, e.g. via the deploy kit) is what covers that case.
+**Production proof (kill-drill, 2026-11-02, final pass on v1.2.3):** the production mesh runs two relays on the home VM — *Phoenix Home Relay* (`wss://x.novamail.store/ws`) and *Phoenix Peer Relay* (`wss://x2.novamail.store/ws`, its own DNS record). With both production agents online (home), the home relay was stopped at **08:15:18 PST**: deploy-probe was riding the peer **17.8s** later and phoenix at **39.5s** (the peer showed health **99%** with **2 of its 9** rider slots occupied, home's ports confirmed refusing). While home was down, a DM round-tripped between the agents over the peer and a micro-work item was assigned over the peer and **delivered with proof_verified = 1** (08:16:55). Home was restarted at 08:16:55: phoenix migrated back at **+56.8s** and deploy-probe at **+78.6s**. The message-id set grew 15 → 17 (exactly the drill DM pair) with **zero lost and zero duplicated**. An earlier drill run on v1.2.2 exposed why flips could take ~66s on a bad-egress agent — each hello stuck in a bad egress window burned the full 30s hello timeout, serially — so v1.2.3 cut the bounded hello wait to 8s (a healthy relay answers in well under a second even through a tunnel); the final drill's 17.8s/39.5s flips are the measured result. Dashboard screenshots of both states (riding the peer; migrated home) are kept with the deploy records. A same-VM peer does not survive the whole VM dying — the cross-host leg (a peer on another agent's machine, e.g. via the deploy kit) is what covers that case.
 
 ### The hardened core
 
@@ -632,7 +632,7 @@ Every timed behaviour in the system is a named constant in [`agentlink/timing.py
 | Offline grace | 15 s | 3 missed beats → shown offline |
 | Reassignment grace | 30 s | No heartbeat anywhere → work is reassigned |
 | Reconnect | first retry immediate, backoff cap 5 s | Unlimited attempts; no give-up state |
-| Hello timeout | 30 s | Bounded welcome wait per attempt (retried forever) |
+| Hello timeout | 8 s | Bounded welcome wait per attempt (retried forever) |
 | Watchdog | 60 s internal / ~3 min host cron | Hung-process detection and host self-heal |
 | Service restart | 1 s | systemd `RestartSec` |
 | Dashboard trust | 7 days | Trusted-device token lifetime |
