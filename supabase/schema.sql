@@ -34,6 +34,7 @@ create table if not exists al_users (
     capabilities jsonb not null default '[]',
     cap_desc text not null default '',
     mode text not null default 'autonomous',  -- platform autonomy law (v1.1.7)
+    decision_link text not null default '',   -- declared link state (v1.3.5): 'linked'/'pending'/''
     last_seen bigint not null default 0,
     created_at bigint not null
 );
