@@ -1277,10 +1277,16 @@ class SupabaseStore:
         return out
 
     def vault_meta(self):
-        return self._get(
+        # Operator (dashboard) view: blob_id + descriptor ride along
+        # (parity with the SQLite store) so the dashboard can resolve
+        # the descriptor's oversight wrap into an owner download; the
+        # dashboard strips the descriptor before the browser payload.
+        rows = self._get(
             "vault",
-            "select=id,group_id,name,size,sha256,added_by,pinned,ts"
+            "select=id,group_id,name,size,sha256,blob_id,descriptor,"
+            "added_by,pinned,ts"
             "&order=pinned.desc,ts.desc&limit=500")
+        return [self._vault_norm(r) for r in rows]
 
     # -- dashboard sessions -----------------------------------------------------------------------
     def create_session(self, token_hash, expires_at):
@@ -1352,3 +1358,66 @@ class SupabaseStore:
                         "oversight": oversight,
                         "content_envelope": content_envelope})
         return out
+
+    # -- read receipts (v1.1.2: WhatsApp-style Seen state) -------------------
+    def message_meta(self, message_id):
+        """Parity with the SQLite Store: the audit row for one
+        message id, or None. The relay derives the conversation
+        from this row, never from the reader's claim."""
+        if not message_id:
+            return None
+        row = self._one("audit_log", self._eq("ref_id", message_id)
+                        + "&select=kind,actor,target,group_id")
+        if not row or row.get("kind") not in (
+                "message", "group_message", "channel_message"):
+            return None
+        return row
+
+    def record_read(self, message_id, reader, read_at=None):
+        """First read wins; returns the stored read_at."""
+        ts = int(read_at or now_ts())
+        existing = self._one(
+            "message_reads", self._eq("message_id", message_id)
+            + "&" + self._eq("reader", reader) + "&select=read_at")
+        if existing:
+            return int(existing["read_at"])
+        try:
+            self._req("POST", "message_reads", body={
+                "message_id": message_id, "reader": reader,
+                "read_at": ts}, prefer="return=minimal")
+        except Exception:
+            # Lost a concurrent first-read race: the primary key
+            # kept the earliest row — report its time.
+            existing = self._one(
+                "message_reads", self._eq("message_id", message_id)
+                + "&" + self._eq("reader", reader) + "&select=read_at")
+            if existing:
+                return int(existing["read_at"])
+            raise
+        return ts
+
+    def reads_for(self, message_ids):
+        """{message_id: [{"username", "read_at"}, ...]} ordered by
+        read_at; unread ids are absent (honesty rule). Message ids
+        are uuid hex — safe to inline into the in.(...) filter."""
+        ids = [str(i) for i in (message_ids or []) if i]
+        if not ids:
+            return {}
+        rows = self._get(
+            "message_reads",
+            "message_id=in.(" + ",".join(ids) + ")"
+            "&select=message_id,reader,read_at&order=read_at.asc")
+        out = {}
+        for r in rows:
+            out.setdefault(r["message_id"], []).append(
+                {"username": r["reader"],
+                 "read_at": int(r["read_at"])})
+        return out
+
+    def set_audit_status(self, ref_id, status):
+        if not ref_id:
+            return
+        self._req("PATCH", "audit_log",
+                  self._eq("ref_id", ref_id)
+                  + "&kind=in.(message,group_message,channel_message)",
+                  body={"status": status}, prefer="return=minimal")
