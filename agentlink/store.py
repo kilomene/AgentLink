@@ -206,6 +206,7 @@ class Store:
                     capabilities TEXT NOT NULL DEFAULT '[]',
                     cap_desc TEXT NOT NULL DEFAULT '',
                     mode TEXT NOT NULL DEFAULT 'autonomous',
+                    decision_link TEXT NOT NULL DEFAULT '',
                     last_seen INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL
                 );
@@ -542,6 +543,15 @@ class Store:
         # only ever an explicit opt-out recorded by the agent itself.
         _add("users", "mode",
              "mode TEXT NOT NULL DEFAULT 'autonomous'")
+        # Decision link (v1.3.5, "the agent is the brain"): the
+        # agent's own hello declares whether its line connection is
+        # linked to its decision-making — 'linked' / 'pending' / ''
+        # (never declared). It is a CONNECTION-side fact, the only
+        # kind of "missing" this platform may ever record about an
+        # agent: capability and memory are the agent's own, always,
+        # and are never modelled here as parts to be supplied.
+        _add("users", "decision_link",
+             "decision_link TEXT NOT NULL DEFAULT ''")
         # Peer mesh (v1.2.0): the server registry carries health,
         # rider load and effective capacity alongside identity.
         _add("servers", "health",
@@ -1234,20 +1244,24 @@ class Store:
     # -- users -----------------------------------------------------------
     def claim(self, username: str, display_name: str, pubkey: str = "",
               sign_pub: str = "", capabilities=None,
-              cap_desc: str = "", mode: str = "autonomous") -> str:
+              cap_desc: str = "", mode: str = "autonomous",
+              decision_link: str = "") -> str:
         secret = new_secret()
         mode = mode if mode in ("manual", "autonomous") else "autonomous"
+        decision_link = decision_link if decision_link in (
+            "linked", "pending") else ""
         with self._lock:
             try:
                 self._db.execute(
                     "INSERT INTO users (username, secret, display_name, pubkey,"
-                    " sign_pub, capabilities, cap_desc, mode, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " sign_pub, capabilities, cap_desc, mode, decision_link,"
+                    " created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     # Only the SHA-256 hash is stored — the relay DB never
                     # holds a usable secret.
                     (username, _hash_token(secret), display_name, pubkey,
                      sign_pub, json.dumps(capabilities or []), cap_desc,
-                     mode, now_ts()),
+                     mode, decision_link, now_ts()),
                 )
                 self._db.commit()
             except sqlite3.IntegrityError:
@@ -1669,6 +1683,21 @@ class Store:
                 (mode, username))
             self._db.commit()
 
+    def set_decision_link(self, username: str, state: str) -> None:
+        """Persist the agent's declared decision-link state
+        (v1.3.5). Recorded from the agent's own hello — the agent
+        declares whether its connection is linked to its own
+        decision-making; the relay never assigns one. Unknown
+        values are refused so a profile can never drift out of the
+        lawful states ('linked' / 'pending')."""
+        if state not in ("linked", "pending"):
+            return
+        with self._lock:
+            self._db.execute(
+                "UPDATE users SET decision_link = ? WHERE username = ?",
+                (state, username))
+            self._db.commit()
+
     def sign_pub_of(self, username: str) -> str:
         with self._lock:
             row = self._db.execute(
@@ -1714,7 +1743,8 @@ class Store:
             if query:
                 rows = self._db.execute(
                     "SELECT username, display_name, pubkey, sign_pub,"
-                    " capabilities, cap_desc, mode, last_seen, created_at"
+                    " capabilities, cap_desc, mode, decision_link,"
+                    " last_seen, created_at"
                     " FROM users"
                     " WHERE username LIKE ? ORDER BY username",
                     (f"%{query}%",),
@@ -1722,7 +1752,8 @@ class Store:
             else:
                 rows = self._db.execute(
                     "SELECT username, display_name, pubkey, sign_pub,"
-                    " capabilities, cap_desc, mode, last_seen, created_at"
+                    " capabilities, cap_desc, mode, decision_link,"
+                    " last_seen, created_at"
                     " FROM users ORDER BY username"
                 ).fetchall()
             out = []
