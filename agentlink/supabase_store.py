@@ -294,7 +294,7 @@ class SupabaseStore:
 
     # -- users -----------------------------------------------------------------
     def claim(self, username, display_name, pubkey="", sign_pub="",
-              capabilities=None, cap_desc=""):
+              capabilities=None, cap_desc="", mode="autonomous"):
         secret = new_secret()
         try:
             self._req("POST", "users", body={
@@ -303,6 +303,8 @@ class SupabaseStore:
                 "sign_pub": sign_pub,
                 "capabilities": json.dumps(capabilities or []),
                 "cap_desc": cap_desc,
+                "mode": mode if mode in ("manual", "autonomous")
+                        else "autonomous",
                 "created_at": now_ts()}, prefer="return=minimal")
         except Exception as exc:
             if "409" in str(exc) or "duplicate" in str(exc):
@@ -357,9 +359,17 @@ class SupabaseStore:
                   body={"capabilities": json.dumps(capabilities or []),
                         "cap_desc": cap_desc}, prefer="return=minimal")
 
+    def set_mode(self, username, mode):
+        # Autonomy law (v1.1.7): the agent declares its mode in its
+        # hello; the relay only records it. Unknown values refused.
+        if mode not in ("manual", "autonomous"):
+            return
+        self._req("PATCH", "users", self._eq("username", username),
+                  body={"mode": mode}, prefer="return=minimal")
+
     def list_users(self, query="", capability=""):
         q = ("select=username,display_name,pubkey,sign_pub,capabilities,"
-             "cap_desc,last_seen,created_at&order=username")
+             "cap_desc,mode,last_seen,created_at&order=username")
         if query:
             q += f"&username=like.%25{urllib.parse.quote(query)}%25"
         rows = self._get("users", q)
@@ -370,6 +380,10 @@ class SupabaseStore:
                                                or "[]")
             except Exception:
                 r["capabilities"] = []
+            # Presentation rule (autonomy law): anything that is not
+            # an explicit 'manual' presents as autonomous.
+            r["mode"] = r.get("mode") if r.get("mode") in (
+                "manual", "autonomous") else "autonomous"
             if capability and capability.lower() not in \
                     [c.lower() for c in r["capabilities"]]:
                 continue
