@@ -304,6 +304,20 @@ class Relay:
                 "evidence": "claimed" if r["kind"] in (
                     "work_progress", "message", "group_message",
                     "channel_message") else "verified"})
+        # Read receipts (v1.1.2): attach the recorded read state.
+        # Items nobody read gain NO key at all — no read state is
+        # ever fabricated for the dashboard payload (honesty rule).
+        try:
+            reads = self.store.reads_for(
+                [i["id"] for c in convs.values() for i in c["items"]
+                 if i["id"]])
+        except Exception:
+            reads = {}
+        for c in convs.values():
+            for item in c["items"]:
+                rb = reads.get(item["id"])
+                if rb:
+                    item["read_by"] = rb
         out = sorted(convs.values(),
                      key=lambda c: -(c["items"][0]["ts"] if c["items"]
                                      else 0))
@@ -742,6 +756,8 @@ class Relay:
                     await self._on_blob_delete(ws, frame, peer)
                 elif ftype == "send":
                     await self._on_send(ws, frame, peer)
+                elif ftype == "read":
+                    await self._on_read(ws, frame, peer)
                 elif ftype == "group_create":
                     await self._on_group_create(ws, frame, peer)
                 elif ftype == "group_add":
@@ -977,6 +993,13 @@ class Relay:
                                   self.oversight_pubkey or None})
         for q in queued:
             await self._send(ws, q)
+            if q.get("type") == "message" and q.get("id"):
+                # A queued message's audit row said 'sent'/'queued'
+                # while it waited; the flush IS the delivery.
+                try:
+                    self.store.set_audit_status(q["id"], "delivered")
+                except Exception:
+                    pass
         log.info("peer @%s registered, flushed %d queued", username, len(queued))
         # Awaiting-agent work: an agent coming online picks up pooled
         # group work immediately (point 29 fallback).
@@ -1165,11 +1188,69 @@ class Relay:
         msg["delivery_status"] = "queued" if queued else "live"
         self._log_activity("message", peer.username, target=to,
                            priority=msg["priority"],
+                           status="sent" if queued else "delivered",
                            size=len(str(content.get("ct") or "")),
                            mentions=msg["mentions"], ref_id=msg["id"],
                            oversight=frame.get("oversight"))
         await self._result(ws, req_id, True,
                            {"id": msg["id"], "to": to, "queued": queued})
+
+    async def _on_read(self, ws, frame, peer: Peer) -> None:
+        """Read receipts (v1.1.2, owner's WhatsApp requirement): a
+        recipient reports the message ids it has taken in. For each
+        id the relay derives the conversation from the message's own
+        audit row — the reader's claim about which conversation a
+        message belongs to is never trusted — and validates that the
+        reader is a participant: the addressee of a 1:1, a member of
+        the group, or a subscriber of the channel. A sender can never
+        read their own message. First read wins. Recorded reads are
+        pushed live to the sender as a `read_receipt` frame, logged
+        as verified activity, and surfaced on the dashboard payload
+        (item `read_by`) — the operator's Seen state. Read state is
+        metadata; it never touches content, so the oversight gate
+        does not apply. Older clients that never send this frame
+        simply never gain read state."""
+        req_id = frame.get("req_id")
+        raw = frame.get("ids")
+        if raw is None and frame.get("id"):
+            raw = [frame.get("id")]
+        ids = [str(i) for i in (raw or []) if i][:200]
+        recorded = []
+        for mid in ids:
+            meta = self.store.message_meta(mid)
+            if meta is None:
+                continue
+            sender = meta.get("actor") or ""
+            if peer.username == sender:
+                continue
+            kind = meta.get("kind")
+            gid = meta.get("group_id") or ""
+            if kind == "message":
+                if peer.username != (meta.get("target") or ""):
+                    continue
+            elif kind == "group_message":
+                if self.store.role_of(gid, peer.username) is None:
+                    continue
+            elif kind == "channel_message":
+                if self.store.channel_role_of(
+                        gid, peer.username) is None:
+                    continue
+            else:
+                continue
+            read_at = self.store.record_read(mid, peer.username)
+            recorded.append({"id": mid, "read_at": read_at})
+            self._log_activity("message_read", peer.username,
+                               target=sender, group_id=gid,
+                               ref_id=mid, status="read")
+            await self._deliver(sender, {
+                "type": "read_receipt", "id": mid,
+                "reader": peer.username, "read_at": read_at,
+                "group_id": gid or None,
+                "channel_id": gid if kind == "channel_message"
+                else None})
+        await self._result(ws, req_id, True,
+                           {"read": [r["id"] for r in recorded],
+                            "reads": recorded})
 
     # -- groups ---------------------------------------------------------------
     def _group_or_error(self, ws, frame, peer):
@@ -1543,6 +1624,7 @@ class Relay:
              else delivered).append(m["username"])
         self._log_activity("group_message", peer.username, group_id=gid,
                            priority=msg["priority"],
+                           status="delivered" if delivered else "sent",
                            size=len(str(content.get("ct") or "")),
                            mentions=msg["mentions"], ref_id=msg["id"],
                            sender_nickname=msg["sender_nickname"],
@@ -1758,6 +1840,7 @@ class Relay:
              else delivered).append(m["username"])
         self._log_activity("channel_message", peer.username, group_id=cid,
                            priority=msg["priority"],
+                           status="delivered" if delivered else "sent",
                            size=len(str(content.get("ct") or "")),
                            mentions=msg["mentions"], ref_id=msg["id"],
                            sender_role=role,
