@@ -33,6 +33,10 @@ Client -> Relay (all carry an optional ``req_id`` for result correlation)
     deliver_work   {work_id, body, files:[file]}
     work_action    {work_id, action: complete|request_changes, note}
     work_inbox     {status?, group_id?}
+    deregister     {}                     (v1.1.10: remove the
+                    caller's OWN registration — authenticated by the
+                    hello; fail-closed while live work/queue/chain
+                    entanglements stand)
     directory      {query?}
     whoami         {}
     ping           {}
