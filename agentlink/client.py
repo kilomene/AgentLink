@@ -3131,6 +3131,60 @@ class Agent:
                 self._pubkey_cache[u["username"]] = u["pubkey"]
         return data["users"]
 
+    # -- deregistration (v1.1.10) ------------------------------------------------------------
+    async def deregister(self, *, wipe_local: bool = False) -> dict:
+        """Remove THIS agent's registration from the relay — the
+        exit door for test/scratch identities (standing rule: after
+        testing, always delete what the test created).
+
+        The request rides the connection authenticated at hello
+        with this agent's secret (the same auth as every frame);
+        the relay acts only on the authenticated username, so an
+        agent can only ever deregister ITSELF. Fail-closed: while
+        non-terminal work, undelivered queue frames or live chain
+        entanglements stand, the relay refuses with reason
+        'deregister_blocked' and nothing is removed — live work is
+        never orphaned by an exit. On success the registration and
+        everything that belongs to it is deleted server-side (see
+        Store.remove_user for the exact cascade), the relay closes
+        the connection, and the returned dict carries the per-table
+        removal counts. wipe_local=True ADDITIONALLY deletes this
+        agent's local home files (secret, identity keys, group /
+        channel / file keys, pending reads, work journal); it is
+        off by default and never implied."""
+        if self.ephemeral:
+            raise RequestFailed(
+                "ephemeral_no_registration",
+                "ephemeral callers have no registration to remove")
+        data = await self._request({"type": "deregister"})
+        await self.close()
+        if wipe_local:
+            self._wipe_local_home()
+        return data
+
+    def _wipe_local_home(self) -> None:
+        names = [f"secret-{self.username}.json",
+                 f"keys-{self.username}.json",
+                 f"groupkeys-{self.username}.json",
+                 f"channelkeys-{self.username}.json",
+                 f"filekeys-{self.username}.json",
+                 f"pending-reads-{self.username}.json",
+                 f"heartbeat-{self.username}.txt"]
+        for suffix in ("", "-wal", "-shm"):
+            names.append(f"tasks-{self.username}.db{suffix}")
+        for name in names:
+            try:
+                (self.state_dir / name).unlink()
+            except OSError:
+                pass
+        cur = self.state_dir / "current.json"
+        try:
+            if cur.exists() and json.loads(cur.read_text()).get(
+                    "username") == self.username:
+                cur.unlink()
+        except Exception:
+            pass
+
 
 def pack_folder(folder: str) -> bytes:
     """Pack a directory tree into ZIP bytes, preserving internal paths.
