@@ -24,6 +24,19 @@ DEFAULT_SETTINGS = {
 }
 
 MAX_GROUP_MEMBERS = 50
+
+# The audit kinds that ARE conversation content (v1.3.2): messages and
+# the work-envelope lifecycle. Everything else in the audit log
+# (online/offline, alerts, reads, registry churn) is a FEED — it may be
+# windowed for display, but it must never decide which conversations
+# exist. Conversation composition and the immortality census read
+# ONLY these kinds, in full, with no row limit.
+CONTENT_AUDIT_KINDS = (
+    "message", "group_message", "channel_message",
+    "work_assigned", "work_delivered", "work_completed",
+    "work_changes_requested", "work_progress",
+    "work_awaiting_approval", "work_approved",
+    "work_approval_rejected")
 PRIORITY_WEIGHT = {"normal": 0, "high": 1, "urgent": 2}
 MAX_CHANNEL_SUBSCRIBERS = 1000
 CHUNK_SIZE = 1024 * 1024
@@ -1048,34 +1061,83 @@ class Store:
                  content_envelope or ""))
             self._db.commit()
 
+    @staticmethod
+    def _shape_audit_rows(rows) -> list[dict]:
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["mentions"] = json.loads(d.get("mentions") or "[]")
+            except Exception:
+                d["mentions"] = []
+            try:
+                d["oversight"] = json.loads(d.get("oversight") or "null")
+            except Exception:
+                d["oversight"] = None
+            try:
+                d["content_envelope"] = json.loads(
+                    d.get("content_envelope") or "null")
+            except Exception:
+                d["content_envelope"] = None
+            out.append(d)
+        return out
+
+    _AUDIT_COLS = ('SELECT ts, kind, actor AS "from", target AS "to",'
+                   " group_id, work_id, status, priority, size, mentions,"
+                   " ref_id, sender_nickname, sender_role,"
+                   " sender_custom_role, oversight, content_envelope"
+                   " FROM audit_log")
+
     def list_audit(self, limit: int = 300) -> list[dict]:
         with self._lock:
             rows = self._db.execute(
-                'SELECT ts, kind, actor AS "from", target AS "to",'
-                " group_id, work_id, status, priority, size, mentions,"
-                " ref_id, sender_nickname, sender_role, sender_custom_role,"
-                " oversight, content_envelope"
-                " FROM audit_log"
-                " ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
-            out = []
-            for r in rows:
-                d = dict(r)
-                try:
-                    d["mentions"] = json.loads(d.get("mentions") or "[]")
-                except Exception:
-                    d["mentions"] = []
-                try:
-                    d["oversight"] = json.loads(d.get("oversight") or "null")
-                except Exception:
-                    d["oversight"] = None
-                try:
-                    d["content_envelope"] = json.loads(
-                        d.get("content_envelope") or "null")
-                except Exception:
-                    d["content_envelope"] = None
-                out.append(d)
-            return out
-        return [dict(r) for r in rows]
+                self._AUDIT_COLS + " ORDER BY seq DESC LIMIT ?",
+                (limit,)).fetchall()
+            return self._shape_audit_rows(rows)
+
+    def list_content_audit(self) -> list[dict]:
+        """EVERY content row in the audit log (CONTENT_AUDIT_KINDS),
+        oldest first, NO limit (v1.3.2). This — never a windowed
+        list_audit — is the source for conversation composition and
+        the immortality census: a conversation exists because its
+        rows exist, however old they are."""
+        marks = ",".join("?" * len(CONTENT_AUDIT_KINDS))
+        with self._lock:
+            rows = self._db.execute(
+                self._AUDIT_COLS + f" WHERE kind IN ({marks})"
+                " ORDER BY seq ASC", CONTENT_AUDIT_KINDS).fetchall()
+            return self._shape_audit_rows(rows)
+
+    def audit_rows_for_ids(self, ids) -> list[dict]:
+        """Audit rows (any kind) whose ref_id OR work_id is in
+        ``ids`` — the targeted fetch behind the dashboard's oversight
+        fallback and library resolution, so neither ever needs to
+        scan a bounded activity window again."""
+        ids = [str(i) for i in (ids or []) if i]
+        if not ids:
+            return []
+        out: list[dict] = []
+        with self._lock:
+            for i in range(0, len(ids), 400):
+                chunk = ids[i:i + 400]
+                marks = ",".join("?" * len(chunk))
+                rows = self._db.execute(
+                    self._AUDIT_COLS
+                    + f" WHERE ref_id IN ({marks})"
+                    f" OR work_id IN ({marks}) ORDER BY seq ASC",
+                    chunk + chunk).fetchall()
+                out.extend(self._shape_audit_rows(rows))
+        return out
+
+    def audit_for_work(self, work_id: str) -> list[dict]:
+        """Every audit row recorded against one work id."""
+        if not work_id:
+            return []
+        with self._lock:
+            rows = self._db.execute(
+                self._AUDIT_COLS + " WHERE work_id = ?"
+                " ORDER BY seq ASC", (work_id,)).fetchall()
+            return self._shape_audit_rows(rows)
 
     # -- read receipts (v1.1.2: WhatsApp-style Seen state) -------------------
     def message_meta(self, message_id: str) -> dict | None:
@@ -1122,14 +1184,18 @@ class Store:
             return {}
         out: dict[str, list] = {}
         with self._lock:
-            marks = ",".join("?" * len(ids))
-            rows = self._db.execute(
-                "SELECT message_id, reader, read_at FROM message_reads"
-                f" WHERE message_id IN ({marks})"
-                " ORDER BY read_at ASC", ids).fetchall()
-        for r in rows:
-            out.setdefault(r[0], []).append(
-                {"username": r[1], "read_at": int(r[2])})
+            for i in range(0, len(ids), 400):
+                chunk = ids[i:i + 400]
+                marks = ",".join("?" * len(chunk))
+                rows = self._db.execute(
+                    "SELECT message_id, reader, read_at FROM message_reads"
+                    f" WHERE message_id IN ({marks})"
+                    " ORDER BY read_at ASC", chunk).fetchall()
+                for r in rows:
+                    out.setdefault(r[0], []).append(
+                        {"username": r[1], "read_at": int(r[2])})
+        for v in out.values():
+            v.sort(key=lambda x: x["read_at"])
         return out
 
     def set_audit_status(self, ref_id: str, status: str) -> None:
