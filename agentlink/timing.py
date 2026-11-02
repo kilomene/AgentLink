@@ -35,6 +35,12 @@ LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300
 
 # Auto-update (point 12)
 UPDATE_CHECK_SECONDS = 15 * 60   # 15 minutes
+UPDATE_DRAIN_WAIT_SECONDS = 120  # bounded wait for in-flight operations
+                                 # (brain call, delivery, upload chunk)
+                                 # to finish or reach a checkpoint before
+                                 # a self-update swap; on expiry the update
+                                 # DEFERS to the next check — an update
+                                 # never interrupts an operation
 
 # Fleet alerts (point 37)
 ALERT_OFFLINE_SECONDS = 300      # agent offline beyond 5 min -> alert
