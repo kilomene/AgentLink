@@ -98,6 +98,11 @@ SERVER_HEALTHY_MIN = 50          # ride only ABOVE this health (%)
 SERVER_HEALTH_WINDOW_SECONDS = 300  # trailing signal window (5 min)
 MESH_REFRESH_SECONDS = 30        # rider's discovery refresh cadence
                                  # while riding (health-drop watch)
+DISCOVERED_SERVER_TTL_SECONDS = 180  # a discovered peer that no relay
+                                 # has re-advertised for this long is
+                                 # forgotten client-side (6x the relay
+                                 # staleness threshold): dead entries
+                                 # must not linger in the race set
 
 # Hardened core — compliance visibility (v1.2.0): the relay watches
 # HOW each agent connects. A "check-in pattern" — repeated SHORT
