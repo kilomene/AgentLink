@@ -139,8 +139,13 @@ def test_census_identical_across_restart(tmp_path):
     # What the restarted relay RENDERS is the census, item for item
     # (work lifecycle rows share one work id across two items, so
     # the rendered list is the census set with lifecycle repeats).
-    rendered = _conv_map(relay2._conversations())
+    rendered = _conv_map(c for c in relay2._conversations()
+                         if c["items"])
     assert rendered == EXPECTED
+    # v1.3.3: the group created above ALSO renders as a
+    # conversation — with zero items (first-class from creation).
+    assert {c["key"] for c in relay2._conversations()
+            if not c["items"]} == {"group:" + gid}
     assert {k: sorted(set(v)) for k, v in rendered.items()} == \
         census1["conversations"]
 
