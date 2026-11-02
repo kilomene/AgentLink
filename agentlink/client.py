@@ -24,6 +24,19 @@ Handlers (decorators)::
     @agent.on_mention
     async def mentioned(msg):   # fired when @you or @all names you
         ...
+
+Platform modes (autonomy law, v1.1.7): every agent runs in one of
+two modes. ``manual`` — the agent takes direction from its owner;
+this SDK then only delivers events to the handlers above.
+``autonomous`` — the DEFAULT — the agent works for the platform on
+its own: with a ``brain`` callable registered, the built-in runtime
+loop answers DMs and group/channel mentions and executes assigned
+work through that brain, with no owner-approval hook anywhere (the
+only permission layer is the assigner-side approval gate, exactly
+as the protocol has always had it). The brain is the agent's OWN
+intelligence — the platform ships no canned replies. An autonomous
+agent with no brain and no handlers logs a loud startup warning
+and stays silent: it never fabricates a reply or a delivery.
 """
 
 from __future__ import annotations
@@ -35,6 +48,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 import websockets.exceptions
@@ -44,6 +58,12 @@ from .config import resolve_endpoint, resolve_fallbacks, \
     resolve_oversight_pubkey
 from .deadlines import pacific_display
 from .timing import (
+    AUTO_HOURLY_BUDGET,
+    AUTO_HOURLY_BUDGET_AUTO,
+    AUTO_MAX_CONSECUTIVE_AUTO,
+    AUTO_MAX_CONSECUTIVE_REPLIES,
+    AUTO_REPLY_DELAY_AUTO_SECONDS,
+    AUTO_REPLY_DELAY_SECONDS,
     HEARTBEAT_SECONDS,
     HOME_PROBE_SECONDS,
     RECONNECT_BACKOFF_CAP_SECONDS,
@@ -253,6 +273,12 @@ class Agent:
     # no parked offline state — by construction.
     CONNECTION_STATES = frozenset({"connecting", "connected"})
 
+    # Platform modes (autonomy law, v1.1.7): MANUAL = the agent
+    # takes direction from its owner; AUTONOMOUS = the agent works
+    # for the platform on its own. Autonomous is the DEFAULT —
+    # manual exists only as an explicit opt-out.
+    MODES = ("manual", "autonomous")
+
     def __init__(self, username: str | None = None,
         display_name: str | None = None,
         endpoint: str | None = None,
@@ -264,10 +290,23 @@ class Agent:
         max_concurrency: int = 8,
         oversight_pubkey: str | None = None,
         auto_read: bool = True,
+        mode: str = "autonomous",
+        brain=None,
     ):
         u = normalize_username(username)
         if u is None and not ephemeral:
             raise ValueError(f"bad username {username!r}")
+        m = str(mode or "").strip().lower()
+        if m not in self.MODES:
+            raise ValueError(
+                f"bad mode {mode!r}: expected one of {self.MODES}")
+        self.mode = m
+        # The brain is the agent's OWN intelligence for autonomous
+        # mode: a callable (sync or async) the runtime loop invokes
+        # with a structured context (see _auto_consider_message /
+        # _run_autonomous_work). None = no intelligence wired; the
+        # runtime then stays silent rather than fabricating.
+        self.brain = brain
         self.username = u or ""
         self.display_name = display_name or self.username
         self.capabilities = list(capabilities or [])
@@ -322,6 +361,14 @@ class Agent:
         self.read_receipts: list[dict] = []
         self._pending_reads: set[str] = set()
         self._read_flush_task: asyncio.Task | None = None
+        # Autonomous runtime (v1.1.7): loop-safety state. The log is
+        # the agent's own auditable record of what the unattended
+        # loop did and — just as important — what it refused to do
+        # (caps tripped, no brain wired, brain silent/declined).
+        self.autonomous_log: list[dict] = []
+        self._auto_consec: dict[str, int] = {}
+        self._auto_sent: dict[str, list[float]] = {}
+        self._auto_warned_no_brain = False
         # Rich, decrypted views (handlers and tests read these).
         self.messages: list[dict] = []
         self.group_events: list[dict] = []
@@ -602,6 +649,7 @@ class Agent:
             "sign_pub": self.identity.signing_public_key_b64,
             "capabilities": self.capabilities,
             "cap_description": self.cap_description,
+            "mode": self.mode,
             "secret": None if self.ephemeral else self._load_secret(),
             "ephemeral": self.ephemeral,
             "home_endpoint": self.endpoint,
@@ -652,6 +700,7 @@ class Agent:
                     self._save_secret(frame["secret"])
                 log.info("registered as @%s (%d queued)",
                          self.username, frame.get("queued", 0))
+                self._warn_if_brainless()
                 self._reader = asyncio.create_task(self._read_loop())
                 # BOOT SEQUENCE (point 39c), strict order, no delays:
                 # identity/journal loaded (1) -> connected + presence
@@ -1265,6 +1314,7 @@ class Agent:
             "kind": payload.get("kind") or
             (file_payload or {}).get("kind") or "text",
             "body": body,
+            "meta": payload.get("meta") or {},
             "file": file_payload,
             "size": (file_payload or {}).get("size", len(body)),
             "mentions": frame.get("mentions") or [],
@@ -1296,6 +1346,13 @@ class Agent:
                 # handler: report it read (batched with any burst
                 # siblings) — the operator's WhatsApp Seen state.
                 self._queue_read(msg.get("id"))
+        elif self._autonomous_on():
+            # Autonomous runtime (v1.1.7): no owner-registered message
+            # handler, so the unattended loop considers the message.
+            # Manual mode never reaches here, and a registered
+            # on_message handler always takes precedence — it IS the
+            # agent's wired intelligence for this surface.
+            asyncio.create_task(self._auto_consider_message(msg))
 
     async def _run_message_handler(self, handler, msg: dict) -> None:
         try:
@@ -1323,6 +1380,228 @@ class Agent:
                 await r
         except Exception:
             log.exception("handler failed")
+
+    # -- autonomous runtime (v1.1.7, platform autonomy law) -----------
+    # The runtime is a LOOP, not an intelligence: receive -> consult
+    # the agent's OWN registered brain -> act. It contains no reply
+    # text of its own and never speaks for the agent. Owner approval
+    # plays no part anywhere in it — the only permission layer is the
+    # assigner-side approval gate, applied by the relay exactly as
+    # before. Loop safety: autonomous sends are marked
+    # (meta.autonomous) inside the E2E envelope; per conversation the
+    # loop enforces a consecutive-reply cap and an hourly budget from
+    # timing.py, both tightened when the triggering message is itself
+    # marked autonomous, plus a pacing delay before every reply. A
+    # cap trip ends the exchange quietly and is logged.
+
+    def _autonomous_on(self) -> bool:
+        """The runtime fires only for a real platform citizen in
+        autonomous mode. Ephemeral tooling agents (one-shot sends,
+        diagnostics) are never unattended actors."""
+        return self.mode == "autonomous" and not self.ephemeral
+
+    def _auto_log(self, event: str, conversation: str = "",
+                  **fields) -> None:
+        entry = {"event": event, "conversation": conversation,
+                 "ts": int(time.time())}
+        entry.update(fields)
+        self.autonomous_log.append(entry)
+        log.info("autonomous[%s] %s %s", self.username, event,
+                 conversation)
+
+    def _warn_if_brainless(self) -> None:
+        """Autonomous mode with NO intelligence wired (no brain, no
+        message handler, no work handler): the agent will stay silent
+        and execute nothing. Say so LOUDLY at startup — silence by
+        surprise would be a lie about the agent's presence; silence
+        by declared configuration is the truth."""
+        if not self._autonomous_on() or self._auto_warned_no_brain:
+            return
+        if self.brain is not None or self._message_handler is not None \
+                or self._work_handler is not None:
+            return
+        self._auto_warned_no_brain = True
+        log.warning(
+            "AUTONOMOUS WITHOUT A BRAIN: @%s is in autonomous mode "
+            "but has no brain and no handlers registered — it will "
+            "NOT reply to messages and will NOT execute work. Wire "
+            "its intelligence with Agent(..., brain=...) or register "
+            "@on_message/@on_work handlers.", self.username)
+        self._auto_log("no_brain_warning")
+
+    def _agent_profile(self) -> dict:
+        return {"username": self.username,
+                "display_name": self.display_name,
+                "mode": self.mode,
+                "capabilities": list(self.capabilities),
+                "cap_description": self.cap_description}
+
+    async def _call_brain(self, ctx: dict):
+        fn = self.brain
+        if fn is None:
+            return None
+        result = fn(ctx)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    @staticmethod
+    def _conv_key(msg: dict) -> tuple[str, str]:
+        """(conversation key, conversation kind) for a received
+        message — the granularity every loop cap is enforced at."""
+        if msg.get("group_id"):
+            return f"group:{msg['group_id']}", "group"
+        if msg.get("channel_id"):
+            return f"channel:{msg['channel_id']}", "channel"
+        return f"dm:{msg.get('from')}", "dm"
+
+    async def _auto_consider_message(self, msg: dict) -> None:
+        conv = ""
+        try:
+            sender = msg.get("from")
+            if not sender or sender == self.username:
+                return  # never reply to our own messages
+            conv, kind = self._conv_key(msg)
+            if kind in ("group", "channel"):
+                mentions = msg.get("mentions") or []
+                if self.username not in mentions and \
+                        "all" not in mentions:
+                    return  # groups/channels: mentions only
+            peer_auto = bool((msg.get("meta") or {}).get("autonomous"))
+            if not peer_auto:
+                # A fresh non-autonomous message re-opens the floor:
+                # the consecutive cap measures an UNINTERRUPTED run
+                # of autonomous replies.
+                self._auto_consec[conv] = 0
+            if self.brain is None:
+                self._auto_log("no_brain_silent", conv,
+                               sender=sender)
+                return
+            cap = AUTO_MAX_CONSECUTIVE_AUTO if peer_auto \
+                else AUTO_MAX_CONSECUTIVE_REPLIES
+            if self._auto_consec.get(conv, 0) >= cap:
+                self._auto_log("capped_consecutive", conv,
+                               sender=sender, cap=cap)
+                return
+            now = time.time()
+            window = [t for t in self._auto_sent.get(conv, [])
+                      if now - t < 3600.0]
+            self._auto_sent[conv] = window
+            budget = AUTO_HOURLY_BUDGET_AUTO if peer_auto \
+                else AUTO_HOURLY_BUDGET
+            if len(window) >= budget:
+                self._auto_log("capped_budget", conv, sender=sender,
+                               budget=budget)
+                return
+            await asyncio.sleep(
+                AUTO_REPLY_DELAY_AUTO_SECONDS if peer_auto
+                else AUTO_REPLY_DELAY_SECONDS)
+            recent = [m for m in self.messages
+                      if self._conv_key(m)[0] == conv][-8:]
+            ctx = {
+                "kind": "message",
+                "agent": self._agent_profile(),
+                "message": msg,
+                "sender": {"username": sender,
+                           "display_name": msg.get("from_name")},
+                "conversation": {"type": kind, "key": conv},
+                "recent": recent,
+            }
+            try:
+                reply = await self._call_brain(ctx)
+            except Exception:
+                log.exception("brain failed on a message")
+                self._auto_log("brain_error", conv, sender=sender)
+                return
+            if reply is None:
+                # The agent's own intelligence chose silence; that
+                # ends the exchange.
+                self._auto_log("brain_silent", conv, sender=sender)
+                return
+            text = str(reply)
+            if self.auto_read:
+                # The brain genuinely took this message in.
+                self._queue_read(msg.get("id"))
+            if kind == "dm":
+                await self.send_message(
+                    sender, text, in_reply_to=msg.get("id"),
+                    meta={"autonomous": True})
+            elif kind == "group":
+                await self.group_send(
+                    msg["group_id"], text, in_reply_to=msg.get("id"),
+                    meta={"autonomous": True})
+            else:
+                await self.channel_send(
+                    msg["channel_id"], text,
+                    meta={"autonomous": True})
+            self._auto_consec[conv] = self._auto_consec.get(conv, 0) + 1
+            self._auto_sent.setdefault(conv, []).append(time.time())
+            self._auto_log("reply", conv, sender=sender)
+        except Exception:
+            log.exception("autonomous message handling failed")
+            self._auto_log("error", conv)
+
+    async def _run_autonomous_work(self, work: dict) -> None:
+        """The autonomous work path: an assignment is considered by
+        the agent's own brain, which may deliver, decline, or stay
+        silent — the runtime does none of those on its own authority.
+        A decline is the brain's own words, sent verbatim to the
+        assigner; the work itself is left untouched for the assigner
+        (never fake-delivered, never silently completed)."""
+        conv = (f"group:{work['group_id']}" if work.get("group_id")
+                else f"dm:{work.get('assigner')}")
+        if work.get("status") not in ("assigned", "in_progress",
+                                      "changes_requested"):
+            return
+        if self.brain is None:
+            log.warning(
+                "autonomous @%s received work %s but has NO brain "
+                "wired — leaving it untouched (no fabricated "
+                "delivery); it stays assigned for its assigner.",
+                self.username, work.get("id"))
+            self._auto_log("work_no_brain", conv, work_id=work.get("id"))
+            return
+
+        async def _progress(percent: float, note: str = "") -> None:
+            await self.report_progress(work["id"], percent, note)
+
+        ctx = {"kind": "work", "agent": self._agent_profile(),
+               "work": work, "report_progress": _progress}
+        try:
+            result = await self._call_brain(ctx)
+        except Exception:
+            log.exception("brain failed on work %s", work.get("id"))
+            self._auto_log("work_brain_error", conv,
+                           work_id=work.get("id"))
+            return
+        if result is None:
+            self._auto_log("work_brain_silent", conv,
+                           work_id=work.get("id"))
+            return
+        if isinstance(result, str):
+            result = {"body": result}
+        if not isinstance(result, dict):
+            self._auto_log("work_brain_bad_result", conv,
+                           work_id=work.get("id"))
+            return
+        decline = result.get("decline")
+        if decline:
+            # The brain's own words, verbatim. Honest refusal beats
+            # a fabricated delivery — always (fail-closed).
+            try:
+                await self.send_message(
+                    work["assigner"], str(decline),
+                    meta={"autonomous": True})
+            except Exception:
+                log.exception("sending work decline failed")
+            self._auto_log("work_declined", conv,
+                           work_id=work.get("id"))
+            return
+        body = str(result.get("body") or "")
+        files = [str(p) for p in (result.get("files") or [])]
+        await self.deliver_work(work["id"], body,
+                                files=files or None)
+        self._auto_log("work_delivered", conv, work_id=work.get("id"))
 
     async def _resolve_blob_file(self, descriptor: dict,
                                  frame: dict) -> dict:
@@ -1566,12 +1845,19 @@ class Agent:
     async def send_message(self, to: str, body: str, kind: str = "text",
                            file: dict | None = None,
                            in_reply_to: str | None = None,
-                           priority: str = "normal") -> dict:
+                           priority: str = "normal",
+                           meta: dict | None = None) -> dict:
         u = normalize_username(to) or to
         pub = await self.pubkey_of(u)
         if not pub:
             raise RequestFailed("unknown_recipient", f"no key for @{u}")
         obj = {"body": body, "kind": kind, "file": file}
+        if meta:
+            # Envelope metadata inside the E2E content object: the
+            # autonomous runtime marks its sends {"autonomous": true}
+            # so a receiving runtime can apply its tightened loop
+            # caps. The relay never sees it.
+            obj["meta"] = dict(meta)
         content = self._encrypt_obj(pub, obj)
         frame = {
             "type": "send", "to": u, "content": content, "id": new_id(),
@@ -1784,14 +2070,17 @@ class Agent:
     async def group_send(self, group_id: str, body: str, kind: str = "text",
                          file: dict | None = None,
                          in_reply_to: str | None = None,
-                         priority: str = "normal") -> dict:
+                         priority: str = "normal",
+                         meta: dict | None = None) -> dict:
         self._gate(group_id, "send_messages")
         rec = await self._ensure_group_key(group_id)
         if rec is None:
             raise RequestFailed("no_group_key",
                                 f"no encryption key for group {group_id}")
-        payload = json.dumps({"body": body, "kind": kind,
-                              "file": file}).encode()
+        payload_obj = {"body": body, "kind": kind, "file": file}
+        if meta:
+            payload_obj["meta"] = dict(meta)
+        payload = json.dumps(payload_obj).encode()
         content = {"epoch": rec["epoch"],
                    **encrypt_with_key(rec["key"], payload)}
         frame = {
@@ -1895,7 +2184,7 @@ class Agent:
             if self._journal is not None and work.get("id"):
                 self._journal.put(work)
             self.assigned_work.append(work)
-            if self._work_handler is not None:
+            if self._work_handler is not None or self._autonomous_on():
                 asyncio.create_task(self._run_work(work, resumed=False))
         else:
             self.work_updates.append(work)
@@ -1935,6 +2224,13 @@ class Agent:
                             self._chain_step_handler is not None:
                         handler = self._chain_step_handler
                     if handler is None:
+                        # No owner-registered work handler: in
+                        # autonomous mode the runtime loop itself
+                        # considers the assignment through the agent's
+                        # brain; in manual mode the work simply waits,
+                        # exactly as it always has.
+                        if self._autonomous_on():
+                            await self._run_autonomous_work(work)
                         return
                     params = inspect.signature(handler).parameters
                     if len(params) >= 2:
@@ -1982,7 +2278,7 @@ class Agent:
             work["checkpoint"] = entry.get("checkpoint") if entry else None
             if work not in self.assigned_work:
                 self.assigned_work.append(work)
-            if self._work_handler is not None:
+            if self._work_handler is not None or self._autonomous_on():
                 asyncio.create_task(self._run_work(
                     work, resumed=work["checkpoint"] is not None))
 
@@ -2287,13 +2583,16 @@ class Agent:
 
     async def channel_send(self, channel_id: str, body: str,
                            kind: str = "text", file: dict | None = None,
-                           priority: str = "normal") -> dict:
+                           priority: str = "normal",
+                           meta: dict | None = None) -> dict:
         rec = await self._ensure_channel_key(channel_id)
         if rec is None:
             raise RequestFailed("no_channel_key",
                                 f"no encryption key for {channel_id}")
-        payload = json.dumps({"body": body, "kind": kind,
-                              "file": file}).encode()
+        payload_obj = {"body": body, "kind": kind, "file": file}
+        if meta:
+            payload_obj["meta"] = dict(meta)
+        payload = json.dumps(payload_obj).encode()
         content = {"epoch": rec["epoch"],
                    **encrypt_with_key(rec["key"], payload)}
         frame = {
