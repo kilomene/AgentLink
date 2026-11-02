@@ -142,10 +142,12 @@ class _DecisionEndpoint:
     message reply, {"body": ...} for work, 204 / null for silence,
     500 for a link-side failure."""
 
-    def __init__(self, mode="reply", reply_text="", work_body=""):
+    def __init__(self, mode="reply", reply_text="", work_body="",
+                 work_progress=False):
         self.mode = mode
         self.reply_text = reply_text
         self.work_body = work_body
+        self.work_progress = work_progress
         self.requests: list[dict] = []
         outer = self
 
@@ -173,7 +175,15 @@ class _DecisionEndpoint:
                 if outer.mode == "null":
                     body = b"null"
                 elif payload.get("kind") == "work":
-                    body = json.dumps({"body": outer.work_body}).encode()
+                    result = {"body": outer.work_body}
+                    if outer.work_progress:
+                        # Progress as a JSON encoder emits it:
+                        # percent may be a float (50.0), and the
+                        # runtime's report_progress contract is
+                        # int percent — the adapter must coerce.
+                        result["progress"] = [
+                            {"percent": 50.0, "note": "computing"}]
+                    body = json.dumps(result).encode()
                 else:
                     body = json.dumps(outer.reply_text).encode()
                 self.send_response(200)
@@ -398,6 +408,44 @@ def test_decision_endpoint_dm_and_work_roundtrip(
         posted_work = [r for r in ep.requests if r.get("kind") == "work"]
         assert posted_work
         assert posted_work[0]["work"]["id"] == wid
+        await boss.close()
+        await worker.close()
+    run(_t())
+
+
+def test_decision_endpoint_work_with_progress_delivers(
+        relay_env, state_root, endpoint_factory, short_decision_timeout):
+    """Regression pin (production proof, 2026-11-02): an endpoint
+    whose work decision REPORTS PROGRESS — percent arriving as a
+    JSON float — must still deliver. The first production exercise
+    of the paved link (deploy-probe) failed exactly here:
+    report_progress's contract is int percent, the adapter replayed
+    float(entry['percent']) verbatim, and every work decision died
+    on bad_percent before the agent's own words could deliver."""
+    ep = endpoint_factory(mode="reply", reply_text=ENDPOINT_REPLY,
+                          work_body=ENDPOINT_WORK_BODY,
+                          work_progress=True)
+
+    async def _t():
+        boss = await make(relay_env, state_root, "epboss2", mode="manual")
+        worker = await make(relay_env, state_root, "epworker2",
+                            decision_endpoint=ep.url)
+        works = await boss.assign_work(
+            ["epworker2"], "Endpoint job with progress",
+            instructions="report progress, then deliver")
+        wid = works[0]["id"]
+        assert await wait_for(
+            lambda: any(w["id"] == wid and w["status"] == "delivered"
+                        for w in boss.work_updates), timeout=20)
+        row = relay_env["relay"].store.get_work(wid)
+        assert row["status"] == "delivered"
+        assert row["proof_verified"] == 1
+        # The float 50.0 crossed the adapter as int 50.
+        assert row["progress_percent"] == 50
+        assert isinstance(row["progress_percent"], int)
+        inbox = await boss.work_inbox()
+        mine = [w for w in inbox if w["id"] == wid][0]
+        assert mine["deliveries"][0]["body"] == ENDPOINT_WORK_BODY
         await boss.close()
         await worker.close()
     run(_t())
