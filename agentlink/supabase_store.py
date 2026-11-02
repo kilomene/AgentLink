@@ -355,6 +355,39 @@ class SupabaseStore:
                         + "&select=last_seen")
         return int(row["last_seen"]) if row else 0
 
+    # -- server registry (v1.2.0 peer mesh) --------------------------------
+    # Parity with the SQLite Store EXACTLY (same semantics): every
+    # relay registers itself on boot and heartbeats the row; clients
+    # discover the live mesh from any relay and race home + peers.
+
+    def register_server(self, label, endpoint, host_agent="",
+                        version="", health=100, riders=0, capacity=10):
+        # first_seen is written once (at first registration) and
+        # preserved on heartbeats — exactly the SQLite semantics.
+        existing = self._one("servers", self._eq("endpoint", endpoint)
+                             + "&select=endpoint,first_seen")
+        body = {"endpoint": endpoint, "label": label,
+                "host_agent": host_agent, "version": version,
+                "health": int(health), "riders": int(riders),
+                "capacity": int(capacity), "last_seen": now_ts()}
+        if existing is None:
+            body["first_seen"] = now_ts()
+        self._req("POST", "servers", body=body,
+                  prefer="return=minimal,resolution=merge-duplicates")
+
+    def list_servers(self, stale_after=None):
+        """Live servers only (fresh registry heartbeat); a dead
+        relay's row ages out and is never offered as a peer."""
+        from .timing import SERVER_STALE_SECONDS
+        if stale_after is None:
+            stale_after = SERVER_STALE_SECONDS
+        cutoff = now_ts() - int(stale_after)
+        rows = self._get(
+            "servers",
+            "select=endpoint,label,host_agent,version,health,riders,"
+            f"capacity,last_seen&last_seen=gte.{cutoff}&order=endpoint")
+        return [dict(r) for r in rows]
+
     def set_capabilities(self, username, capabilities, cap_desc=""):
         self._req("PATCH", "users", self._eq("username", username),
                   body={"capabilities": json.dumps(capabilities or []),
