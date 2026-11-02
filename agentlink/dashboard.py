@@ -2724,6 +2724,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
  .pill.verified{background:#f0f9e2;color:#3d6604;border:1px solid #b7dd7e}
  .pill.trust{background:#fdf0f8;color:#a3005e;border:1px solid #f5b9dc}
  .pill.gate{background:#eef2ff;color:#243b8b;border:1px solid #b9c6f5}
+ .pill.autonomous{background:#f0f9e2;color:#2f5d04;border:1px solid #8fce4e;font-weight:700}
+ .pill.manual{background:#eef1f4;color:#5a6a72;border:1px solid #ccd4da}
  .pill.awaiting{background:#fff3e0;color:#8a5a00;border:1px solid #e0a93e;font-weight:700}
  .bar{background:rgba(120,140,170,.22);border-radius:99px;height:8px;min-width:90px}
  .bar>i{display:block;height:8px;border-radius:99px;
@@ -3275,7 +3277,7 @@ function render(d){
  keyed(document.getElementById('users'), d.users||[], u=>u.username, u=>
   `<tr><td>@${esc(u.username)}<br><small>${esc((u.capabilities||[]).join(', '))}</small></td>
    <td class="${u.online?'on':'off'}"><span class="dot ${u.online?'on':''}"></span>${u.online?'online':'offline'}<br><small>${esc(u.activity_state||'')}</small></td>
-   <td><span class="pill trust">trust ${u.trust_score}</span></td>
+   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span></td>
    <td>${u.reachability?esc(u.reachability):''}${u.home&&u.riding&&u.home!==u.riding?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`);
  keyed(document.getElementById('groups'),
   [...(d.groups||[]).map(g=>({k:'g:'+g.id,html:`<tr><td>${esc(g.name)}</td><td><span class="pill">${g.member_count} members</span></td><td>by @${esc(g.creator)}</td></tr>`})),
