@@ -60,6 +60,7 @@ class Relay:
     server_name: str | None = None
     dashboard_password: str | None = None
     dashboard_port: int = 8766
+    public_endpoint: str | None = None
     dashboard_enabled: bool = True
     dashboard: object = field(default=None, repr=False)
     peers: dict = field(default_factory=dict)  # username -> Peer
@@ -103,10 +104,48 @@ class Relay:
     def server_label(self) -> str:
         return self.server_name or f"ws://{self.host}:{self.port}"
 
+    def _is_home_endpoint(self, endpoint: str) -> bool:
+        """Home = the agent's declared home endpoint IS this relay.
+        The comparison runs against the relay's own endpoint identity
+        — its ws/wss bind address, its configured public endpoint
+        (field or AGENTLINK_PUBLIC_ENDPOINT), and the fixed product
+        endpoint — NEVER against the friendly --name label (the
+        v1.0 bug: a named relay labelled its own home agents
+        'online (via <its own name>)')."""
+        if not endpoint:
+            return False
+        norm = str(endpoint).strip().rstrip("/").lower()
+        candidates = {f"ws://{self.host}:{self.port}",
+                      f"wss://{self.host}:{self.port}"}
+        ep = self.public_endpoint or \
+            os.environ.get("AGENTLINK_PUBLIC_ENDPOINT")
+        if ep:
+            candidates.add(str(ep).strip().rstrip("/").lower())
+        try:
+            from .config import DEFAULT_ENDPOINT
+            candidates.add(str(DEFAULT_ENDPOINT).strip().rstrip("/")
+                           .lower())
+        except Exception:
+            pass
+        return norm in candidates
+
+    def _sender_meta(self, username: str, group_id: str = ""):
+        """(nickname, role, custom_role) of a sender inside a group
+        — the identity stamped onto audit rows so dashboard
+        conversation items show who spoke, not just a username."""
+        if group_id:
+            for m in self.store.members(group_id):
+                if m["username"] == username:
+                    return (m.get("nickname", ""), m.get("role", ""),
+                            m.get("custom_role", ""))
+        return ("", "", "")
+
     def _log_activity(self, kind: str, actor: str, target: str = "",
                       group_id: str = "", work_id: str = "",
                       status: str = "", priority: str = "",
-                      size: int = 0, mentions=None, ref_id: str = "") -> None:
+                      size: int = 0, mentions=None, ref_id: str = "",
+                      sender_nickname: str = "", sender_role: str = "",
+                      sender_custom_role: str = "") -> None:
         """Metadata only — never content. Feeds the live dashboard.
 
         Evidence labelling (point 32): agent-reported claims (progress
@@ -121,11 +160,17 @@ class Relay:
             "ts": now_ts(), "kind": kind, "from": actor, "to": target,
             "group_id": group_id, "work_id": work_id, "status": status,
             "priority": priority,
+            "sender_nickname": sender_nickname,
+            "sender_role": sender_role,
+            "sender_custom_role": sender_custom_role,
             "evidence": "claimed" if claimed else "verified"})
         try:
             self.store.audit(kind, actor, target, group_id, work_id, status,
                              priority, size=size, mentions=mentions,
-                             ref_id=ref_id)
+                             ref_id=ref_id,
+                             sender_nickname=sender_nickname,
+                             sender_role=sender_role,
+                             sender_custom_role=sender_custom_role)
         except Exception:
             pass
         if getattr(self, "dashboard", None) is not None:
@@ -149,10 +194,7 @@ class Relay:
             if not u["online"]:
                 u["reachability"] = "unreachable — work protected"
             elif peer and peer.home_endpoint and \
-                    peer.home_endpoint != self.server_label and \
-                    peer.home_endpoint not in (
-                        f"ws://{self.host}:{self.port}",
-                        f"wss://{self.host}:{self.port}"):
+                    not self._is_home_endpoint(peer.home_endpoint):
                 u["reachability"] = f"online (via {self.server_label})"
             else:
                 u["reachability"] = "online (home)"
@@ -192,15 +234,25 @@ class Relay:
         the relay legitimately holds."""
         rows = self.store.list_audit(500)
         convs: dict[str, dict] = {}
+        part_cache: dict[str, list] = {}
         for r in rows:
             if r["kind"] not in ("message", "group_message",
                                  "channel_message", "work_assigned",
                                  "work_delivered", "work_completed",
-                                 "work_changes_requested", "work_progress"):
+                                 "work_changes_requested", "work_progress",
+                                 "work_awaiting_approval", "work_approved",
+                                 "work_approval_rejected"):
                 continue
             if r["group_id"]:
                 key = "group:" + r["group_id"]
-                participants = []
+                if key not in part_cache:
+                    part_cache[key] = [
+                        {"username": m["username"],
+                         "nickname": m.get("nickname", ""),
+                         "role": m.get("role", ""),
+                         "custom_role": m.get("custom_role", "")}
+                        for m in self.store.members(r["group_id"])]
+                participants = part_cache[key]
             else:
                 pair = sorted(x for x in (r["from"], r["to"]) if x)
                 key = "dm:" + "|".join(pair)
@@ -212,6 +264,9 @@ class Relay:
             c["items"].append({
                 "id": r.get("ref_id") or r.get("work_id") or "",
                 "ts": r["ts"], "from": r["from"], "to": r["to"],
+                "sender_nickname": r.get("sender_nickname", ""),
+                "sender_role": r.get("sender_role", ""),
+                "sender_custom_role": r.get("sender_custom_role", ""),
                 "kind": r["kind"], "size": r.get("size", 0),
                 "mentions": r.get("mentions") or [],
                 "priority": r.get("priority") or "normal",
@@ -320,44 +375,68 @@ class Relay:
 
     async def _fleet_scan_once(self) -> None:
         now = now_ts()
+        store = self.store
+        # v1.1 hardening: the scan's bulk store work runs on worker
+        # threads (asyncio.to_thread), never on the event loop. With a
+        # network-backed store (Supabase) every call is a round trip;
+        # on the loop it starved hello/message handling and wedged
+        # reconnecting agents. Semantics are unchanged — the scan
+        # still runs sequentially, once per tick, in the same order;
+        # only the waiting moved off the loop. Frame delivery stays on
+        # the loop (it owns the sockets).
+        #
         # Cross-relay live drain (points 16/18): frames queued via
         # ANOTHER relay sharing this backend (or while this agent was
         # between connections) are pushed to the agent on THIS relay
         # within one scan tick — real-time across the fleet, not
         # just at hello. dequeue is atomic in the store, and _deliver
         # re-queues on a dead socket, so nothing is lost or doubled.
-        for username, peer in list(self.peers.items()):
-            if getattr(peer, "ephemeral", False):
-                continue
-            try:
-                queued = self.store.dequeue_all(username)
-            except Exception:
-                continue
+        usernames = [u for u, p in list(self.peers.items())
+                     if not getattr(p, "ephemeral", False)]
+
+        def _drain():
+            out = {}
+            for u in usernames:
+                try:
+                    out[u] = store.dequeue_all(u)
+                except Exception:
+                    continue
+            return out
+
+        for username, queued in (await asyncio.to_thread(_drain)).items():
             for frame in queued:
                 await self._deliver(username, frame)
         grace = self.reassign_grace_seconds
-        for work in self.store.open_work():
-            if not work.get("auto_reassign"):
-                continue
-            assignee = work["assignee"]
-            if self._is_alive(assignee, grace):
-                continue
-            last = 0
-            try:
-                last = self.store.last_seen_of(assignee)
-            except Exception:
-                pass
-            peer = self.peers.get(assignee)
-            if peer is not None:
-                last = max(last, peer.last_seen)
-            if last and now - last <= grace:
-                continue
-            if not last and now - work["updated_at"] <= grace:
-                continue
+
+        def _reassign_candidates():
+            picked = []
+            for work in store.open_work():
+                if not work.get("auto_reassign"):
+                    continue
+                assignee = work["assignee"]
+                if self._is_alive(assignee, grace):
+                    continue
+                last = 0
+                try:
+                    last = store.last_seen_of(assignee)
+                except Exception:
+                    pass
+                peer = self.peers.get(assignee)
+                if peer is not None:
+                    last = max(last, peer.last_seen)
+                if last and now - last <= grace:
+                    continue
+                if not last and now - work["updated_at"] <= grace:
+                    continue
+                picked.append(work)
+            return picked
+
+        for work in await asyncio.to_thread(_reassign_candidates):
             await self._attempt_reassign(work)
         # Deadline pressure (point 36 — Pacific instants only).
         from .deadlines import pressure_thresholds, pacific_display
-        for work in self.store.open_work(
+        for work in await asyncio.to_thread(
+                self.store.open_work,
                 ("assigned", "in_progress", "changes_requested")):
             deadline = work.get("deadline")
             if not deadline:
@@ -380,7 +459,8 @@ class Relay:
             okey = key + ("overdue",)
             if now > deadline and okey not in self._pressure_fired:
                 self._pressure_fired.add(okey)
-                updated = self.store.escalate_work_priority(work["id"])
+                updated = await asyncio.to_thread(
+                    self.store.escalate_work_priority, work["id"])
                 await self._deliver(work["assigner"], {
                     "type": "work_overdue", "work": updated,
                     "deadline_pt": pacific_display(deadline)})
@@ -391,11 +471,12 @@ class Relay:
                                    target=work["assignee"],
                                    work_id=work["id"], status="overdue",
                                    priority="urgent")
-        for chain in self.store.list_chains_meta():
+        for chain in await asyncio.to_thread(self.store.list_chains_meta):
             if chain["status"] == "paused" and chain.get("paused_since") \
                     and now - chain["paused_since"] \
                     > self.chain_pause_alert_seconds:
-                alert = self.store.open_alert(
+                alert = await asyncio.to_thread(
+                    self.store.open_alert,
                     "chain_paused", chain["id"],
                     "chain paused on changes_requested")
                 await self._dispatch_alert(alert)
@@ -404,26 +485,35 @@ class Relay:
     async def _attempt_reassign(self, work: dict, forced: str = "") -> bool:
         gid = work.get("group_id")
         old = work["assignee"]
-        candidate = ""
-        if gid:
-            members = self.store.members(gid)
-            alive = [m for m in members
-                     if m["username"] not in (old, work["assigner"])
-                     and self._is_alive(m["username"],
-                                        self.reassign_grace_seconds)]
-            if forced:
-                candidate = forced if any(
-                    m["username"] == forced for m in alive) else ""
-            else:
-                role = (work.get("assignee_role") or "").lower()
-                same_role = [m for m in alive
-                             if (m.get("custom_role") or "").lower()
-                             == role and role]
-                pick = (same_role or alive)
-                candidate = pick[0]["username"] if pick else ""
+        store = self.store
+        grace = self.reassign_grace_seconds
+
+        def _pick():
+            # Store reads (member list + backend-wide liveness) run on
+            # this worker thread — see _fleet_scan_once (v1.1 offload).
+            candidate = ""
+            if gid:
+                members = store.members(gid)
+                alive = [m for m in members
+                         if m["username"] not in (old, work["assigner"])
+                         and self._is_alive(m["username"], grace)]
+                if forced:
+                    candidate = forced if any(
+                        m["username"] == forced for m in alive) else ""
+                else:
+                    role = (work.get("assignee_role") or "").lower()
+                    same_role = [m for m in alive
+                                 if (m.get("custom_role") or "").lower()
+                                 == role and role]
+                    pick = (same_role or alive)
+                    candidate = pick[0]["username"] if pick else ""
+            return candidate
+
+        candidate = await asyncio.to_thread(_pick)
         if not candidate:
             if work["status"] != "awaiting_agent":
-                updated = self.store.set_awaiting_agent(work["id"])
+                updated = await asyncio.to_thread(
+                    store.set_awaiting_agent, work["id"])
                 await self._deliver(work["assigner"], {
                     "type": "work_update", "work": updated,
                     "note": "assignee unreachable; awaiting an agent"})
@@ -432,7 +522,8 @@ class Relay:
                                    work_id=work["id"],
                                    status="awaiting_agent")
             return False
-        updated = self.store.reassign_work(work["id"], candidate)
+        updated = await asyncio.to_thread(
+            store.reassign_work, work["id"], candidate)
         # The replacement reads the GROUP-encrypted copy + the mirrored
         # checkpoint (checkpoints travel with the assignment, point 30).
         view = dict(updated)
@@ -449,7 +540,8 @@ class Relay:
         self._log_activity("work_reassigned", "system", target=candidate,
                            group_id=gid or "", work_id=work["id"],
                            status=f"attempt {updated['attempt']}")
-        alert = self.store.open_alert(
+        alert = await asyncio.to_thread(
+            store.open_alert,
             "reassignment", work["id"],
             f"{old} unreachable; reassigned to {candidate}")
         await self._dispatch_alert(alert)
@@ -509,44 +601,50 @@ class Relay:
             smtp.send_message(msg)
 
     async def _alert_scan(self, now: int) -> None:
+        # All store work offloaded (v1.1 — see _fleet_scan_once).
+        store = self.store
         # Agent offline beyond threshold -> exactly one open alert.
-        for u in self.store.list_users():
+        for u in await asyncio.to_thread(store.list_users):
             name = u["username"]
             if name in self.peers:
                 continue
             try:
-                last = self.store.last_seen_of(name)
+                last = await asyncio.to_thread(store.last_seen_of, name)
             except Exception:
                 last = 0
             if last and now - last > self.alert_offline_seconds:
-                alert = self.store.open_alert(
+                alert = await asyncio.to_thread(
+                    store.open_alert,
                     "agent_offline", name,
                     f"no heartbeat for {now - last}s")
                 await self._dispatch_alert(alert)
         # URGENT items sitting undelivered beyond threshold.
         try:
-            urgent = self.store.oldest_urgent_queued()
+            urgent = await asyncio.to_thread(store.oldest_urgent_queued)
         except Exception:
             urgent = []
         waiting = {r["to_username"] for r in urgent
                    if now - r["since"] > self.alert_urgent_seconds}
         for name in waiting:
-            alert = self.store.open_alert(
+            alert = await asyncio.to_thread(
+                store.open_alert,
                 "urgent_undelivered", name,
                 "urgent item waiting in the offline queue")
             await self._dispatch_alert(alert)
-        for alert in self.store.list_alerts(status="open"):
+        for alert in await asyncio.to_thread(
+                store.list_alerts, status="open"):
             if alert["kind"] == "urgent_undelivered" and \
                     alert["subject"] not in waiting and \
                     alert["subject"] not in {r["to_username"]
                                              for r in urgent}:
-                self.store.resolve_alerts("urgent_undelivered",
-                                          alert["subject"])
+                await asyncio.to_thread(
+                    store.resolve_alerts, "urgent_undelivered",
+                    alert["subject"])
             # Throttled reminders for still-open incidents.
             last_touch = max(alert["created_at"],
                              alert["last_reminder_at"])
             if now - last_touch > self.alert_reminder_seconds:
-                self.store.bump_reminder(alert["id"])
+                await asyncio.to_thread(store.bump_reminder, alert["id"])
                 await self._dispatch_alert(alert, reminder=True)
 
     # -- plumbing ---------------------------------------------------------
@@ -901,7 +999,15 @@ class Relay:
         if username in (meta["owner"], meta.get("for_user")):
             return True
         gid = meta.get("for_group")
-        return bool(gid) and self.store.role_of(gid, username) is not None
+        if bool(gid) and self.store.role_of(gid, username) is not None:
+            return True
+        # Channel-scoped blobs are readable by channel members — the
+        # symmetric counterpart of the membership check at upload
+        # session start (v1.0 recorded the scope but never honoured
+        # it here, so subscribers could never fetch channel files).
+        cid = meta.get("for_channel")
+        return bool(cid) and self.store.channel_role_of(
+            cid, username) is not None
 
     async def _on_blob_get(self, ws, frame, peer: Peer) -> None:
         import base64 as _b64
@@ -1348,7 +1454,10 @@ class Relay:
         self._log_activity("group_message", peer.username, group_id=gid,
                            priority=msg["priority"],
                            size=len(str(content.get("ct") or "")),
-                           mentions=msg["mentions"], ref_id=msg["id"])
+                           mentions=msg["mentions"], ref_id=msg["id"],
+                           sender_nickname=msg["sender_nickname"],
+                           sender_role=msg["sender_role"],
+                           sender_custom_role=msg["sender_custom_role"])
         await self._result(ws, req_id, True,
                            {"id": msg["id"], "group_id": gid,
                             "delivered": delivered, "queued": queued})
@@ -1555,7 +1664,8 @@ class Relay:
         self._log_activity("channel_message", peer.username, group_id=cid,
                            priority=msg["priority"],
                            size=len(str(content.get("ct") or "")),
-                           mentions=msg["mentions"], ref_id=msg["id"])
+                           mentions=msg["mentions"], ref_id=msg["id"],
+                           sender_role=role)
         await self._result(ws, req_id, True,
                            {"id": msg["id"], "channel_id": cid,
                             "delivered": delivered, "queued": queued})
@@ -1863,11 +1973,21 @@ class Relay:
             await self._error(ws, "bad_whole_hash", req_id,
                               "assembled ciphertext hash mismatch")
             return
+        # Channel scope (v1.1.0): upload sessions no longer persist
+        # it (canonical al_upload_sessions shape), so the client
+        # carries it on the finish frame and membership is re-verified
+        # here before the blob metadata is written.
+        fin_channel = str(frame.get("for_channel")
+                          or sess.get("for_channel") or "")
+        if fin_channel and self.store.channel_role_of(
+                fin_channel, peer.username) is None:
+            await self._error(ws, "not_a_member", req_id)
+            return
         blob_id = "b-" + sess["ct_sha"]
         self.blob_store.put(blob_id, data)
         self.store.put_blob_meta(
             blob_id, owner=peer.username, for_user=sess["for_user"],
-            for_group=sess["for_group"], for_channel=sess["for_channel"],
+            for_group=sess["for_group"], for_channel=fin_channel,
             whole_sha=sess["whole_sha"], size=len(data))
         for i in range(total):
             self.blob_store.delete(f"{sess['session_id']}-{i}")
@@ -2082,7 +2202,8 @@ class Relay:
                 priority=step.get("priority", "normal"),
                 auto_reassign=True, assignee_role=role,
                 content_group=step.get("content_group"),
-                chain_id=chain["id"], chain_step=step["position"])
+                chain_id=chain["id"], chain_step=step["position"],
+                require_approval=bool(step.get("require_approval")))
             view = dict(work)
             view["prev_deliverables"] = step.get("handoff") or []
             await self._deliver(assignee, {
@@ -2284,6 +2405,7 @@ class Relay:
         auto_reassign = frame.get("auto_reassign")
         if auto_reassign is None:
             auto_reassign = True  # default ON (group and 1:1 alike)
+        require_approval = bool(frame.get("require_approval"))
         content_group = frame.get("content_group")
         # E2EE: per-assignee content envelopes, prepared by the client.
         envelopes = frame.get("envelopes") or {}
@@ -2318,7 +2440,8 @@ class Relay:
                 deadline=deadline, batch_id=batch_id,
                 priority=priority, auto_reassign=bool(auto_reassign),
                 assignee_role=assignee_role,
-                content_group=content_group)
+                content_group=content_group,
+                require_approval=require_approval)
             created.append(work)
             await self._deliver(assignee,
                                 {"type": "work_assigned", "work": work})
@@ -2326,6 +2449,12 @@ class Relay:
                                target=assignee, group_id=gid or "",
                                work_id=work["id"], status="assigned",
                                priority=priority)
+            if require_approval:
+                self._log_activity("approval_gate_set", peer.username,
+                                   target=assignee, group_id=gid or "",
+                                   work_id=work["id"],
+                                   status="require_approval",
+                                   priority=priority)
         if not created:
             await self._error(ws, "bad_assign", req_id, "no assignees")
             return
@@ -2407,8 +2536,18 @@ class Relay:
                             {"type": "work_update", "work": updated})
         self._log_activity("work_delivered", peer.username,
                            target=work["assigner"], work_id=work["id"],
-                           status="delivered",
+                           status=updated["status"],
                            priority=work.get("priority", "normal"))
+        if updated["status"] == "awaiting_approval":
+            # Approval gate: the proven delivery is parked; nothing
+            # completes (and no chain advances) until the assigner
+            # (or a group admin) decides on the line.
+            self._log_activity("work_awaiting_approval", peer.username,
+                               target=work["assigner"],
+                               group_id=work["group_id"] or "",
+                               work_id=work["id"],
+                               status="awaiting_approval",
+                               priority=work.get("priority", "normal"))
         # Role batch: this delivery satisfies the whole batch.
         for covered in self.store.cover_batch(work.get("batch_id"),
                                               work["id"]):
@@ -2470,22 +2609,52 @@ class Relay:
         if work is None:
             await self._error(ws, "unknown_work", req_id)
             return
-        if work["assigner"] != peer.username:
-            await self._error(ws, "permission_denied", req_id,
-                              "only the assigner can do that")
-            return
-        if work["status"] != "delivered":
-            await self._error(ws, "bad_status", req_id,
-                              f"work is {work['status']}, not delivered")
-            return
-        if action == "complete":
-            status = "completed"
-        elif action == "request_changes":
-            status = "changes_requested"
+        gated_decision = work["status"] == "awaiting_approval"
+        if gated_decision:
+            # Approval gate (v1.1.0): only the assigner — or, for
+            # group work, a group admin — may decide. approve and
+            # complete are the same decision; reject and
+            # request_changes are the same decision (the reason rides
+            # the frame's note to the assignee, chain stays paused).
+            is_admin = bool(work.get("group_id")) and \
+                self.store.role_of(work["group_id"], peer.username) \
+                in ADMIN_ROLES
+            if work["assigner"] != peer.username and not is_admin:
+                await self._error(ws, "permission_denied", req_id,
+                                  "only the assigner or a group admin"
+                                  " can decide an approval gate")
+                return
+            if action in ("approve", "complete"):
+                status = "completed"
+            elif action in ("reject", "request_changes"):
+                status = "changes_requested"
+            else:
+                await self._error(ws, "bad_action", req_id, str(action))
+                return
         else:
-            await self._error(ws, "bad_action", req_id, str(action))
-            return
+            if work["assigner"] != peer.username:
+                await self._error(ws, "permission_denied", req_id,
+                                  "only the assigner can do that")
+                return
+            if work["status"] != "delivered":
+                await self._error(ws, "bad_status", req_id,
+                                  f"work is {work['status']}, not delivered")
+                return
+            if action == "complete":
+                status = "completed"
+            elif action == "request_changes":
+                status = "changes_requested"
+            else:
+                await self._error(ws, "bad_action", req_id, str(action))
+                return
         updated = self.store.set_work_status(work["id"], status)
+        if gated_decision:
+            self._log_activity(
+                "work_approved" if status == "completed"
+                else "work_approval_rejected", peer.username,
+                target=work["assignee"],
+                group_id=work["group_id"] or "", work_id=work["id"],
+                status=status)
         self._log_activity("work_" + status, peer.username,
                            target=work["assignee"], work_id=work["id"],
                            status=status)
@@ -2517,18 +2686,24 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--dashboard-port", type=int, default=8766)
     ap.add_argument("--name", default=None, dest="server_name",
                     help="label for this server (shown on the dashboard)")
+    ap.add_argument("--public-endpoint", default=None,
+                    help="this relay's canonical public endpoint"
+                         " (wss://...) \u2014 home agents are recognised"
+                         " against it, never against the --name label")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
     async def _run() -> None:
         store = None
-        if args.backend:
+        backend = args.backend or os.environ.get("AGENTLINK_BACKEND")
+        if backend:
             from .backend import create_store
-            store = create_store(args.backend, db_path=args.db)
+            store = create_store(backend, db_path=args.db)
         relay = Relay(host=args.host, port=args.port, db_path=args.db,
                       backend_store=store, dashboard_port=args.dashboard_port,
-                      server_name=args.server_name)
+                      server_name=args.server_name,
+                      public_endpoint=args.public_endpoint)
         await relay.start()
         try:
             await asyncio.Future()
