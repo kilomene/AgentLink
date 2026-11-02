@@ -73,3 +73,40 @@ FLEET_SCAN_SECONDS = 1
 SELF_CHECK_SECONDS = 60          # daemon self-heal cadence (point 43d)
 CONNECT_RACE_GRACE_SECONDS = 0.3  # prefer-home grace inside a race (44a)
 NETWORK_WATCH_SECONDS = 2         # network-change fingerprint watch (44b)
+
+# Peer mesh (v1.2.0, NO GOING DARK peer-server law): every relay
+# registers itself in the shared backend's server registry on boot
+# and heartbeats the row on this cadence; a client races home + every
+# LIVE registry entry. A peer is a waiting room, never a new home:
+# while riding, the client keeps probing home (HOME_PROBE_SECONDS)
+# and migrates back the moment home is healthy again.
+SERVER_HEARTBEAT_SECONDS = 5     # relay registry heartbeat cadence
+SERVER_STALE_SECONDS = 20        # registry entry older than this is
+                                 # not a live peer: never offered in
+                                 # welcome/discovery, never raced
+# Mesh rules (owner, 2026-11-02 ~05:52 PST, strict): hosting is
+# peer-to-peer ANYWHERE — no admin funnel, no server gets preference
+# except an agent's OWN home. Each server hosts a MAXIMUM of 10
+# riding agents; effective capacity scales with health:
+# capacity = floor(SERVER_MAX_RIDERS x health / 100). Every server
+# carries a HEALTH PERCENTAGE from real signals (see relay.py
+# compute_server_health); a client may ride ONLY a server above
+# SERVER_HEALTHY_MIN — at or below it the server is "not good",
+# never selected, and a rider migrates off it.
+SERVER_MAX_RIDERS = 10           # hard cap of riders per server
+SERVER_HEALTHY_MIN = 50          # ride only ABOVE this health (%)
+SERVER_HEALTH_WINDOW_SECONDS = 300  # trailing signal window (5 min)
+MESH_REFRESH_SECONDS = 30        # rider's discovery refresh cadence
+                                 # while riding (health-drop watch)
+
+# Hardened core — compliance visibility (v1.2.0): the relay watches
+# HOW each agent connects. A "check-in pattern" — repeated SHORT
+# sessions separated by LONG dark gaps — is an agent that configured
+# itself out of continuous connection; it is flagged on its presence
+# ("check-in pattern — not continuously connected"), never silently
+# shown as compliant. A live daemon's session runs for hours, so it
+# can never trip this by accident.
+CHECKIN_WINDOW_SECONDS = 3600    # sessions considered over 1 hour
+CHECKIN_MIN_SESSIONS = 3         # need this many to call it a pattern
+CHECKIN_SESSION_MAX_SECONDS = 60  # each session shorter than this…
+CHECKIN_GAP_MIN_SECONDS = 120    # …with dark gaps longer than this
