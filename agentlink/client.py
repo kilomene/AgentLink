@@ -263,6 +263,7 @@ class Agent:
         cap_description: str = "",
         max_concurrency: int = 8,
         oversight_pubkey: str | None = None,
+        auto_read: bool = True,
     ):
         u = normalize_username(username)
         if u is None and not ephemeral:
@@ -297,6 +298,7 @@ class Agent:
         self._ws = None
         self._reader: asyncio.Task | None = None
         self._message_handler = None
+        self._read_handler = None
         self._work_handler = None
         self._group_handler = None
         self._mention_handler = None
@@ -309,6 +311,17 @@ class Agent:
         self._pubkey_cache: dict[str, str] = {}
         self._group_keys: dict[str, dict] = {}  # gid -> {epoch, key bytes}
         self._load_group_keys()
+        # Read receipts (v1.1.2): with auto_read on (the default),
+        # a message delivered into the registered on_message handler
+        # is reported read to the relay (batched) — the WhatsApp
+        # Seen state the operator dashboard renders. Runtimes that
+        # defer handling pass auto_read=False and call mark_read()
+        # themselves. read_receipts collects the receipts for
+        # messages THIS agent sent.
+        self.auto_read = auto_read
+        self.read_receipts: list[dict] = []
+        self._pending_reads: set[str] = set()
+        self._read_flush_task: asyncio.Task | None = None
         # Rich, decrypted views (handlers and tests read these).
         self.messages: list[dict] = []
         self.group_events: list[dict] = []
@@ -363,6 +376,13 @@ class Agent:
     # -- decorators ---------------------------------------------------------
     def on_message(self, fn):
         self._message_handler = fn
+        return fn
+
+    def on_read(self, fn):
+        """Fired when a recipient reads one of YOUR messages
+        (WhatsApp-style read receipt, validated and recorded by
+        the relay): fn({id, reader, read_at, group_id, ...})."""
+        self._read_handler = fn
         return fn
 
     def on_work(self, fn):
@@ -653,6 +673,10 @@ class Agent:
                         log.exception("resume/resync pass failed")
                     finally:
                         self._boot_gate.set()
+                if self._pending_reads:
+                    # Receipts that failed to flush while offline
+                    # retry on every (re)connect.
+                    self._queue_read(next(iter(self._pending_reads)))
                 return self.username
             if frame.get("type") == "error":
                 await self._ws.close()
@@ -668,6 +692,9 @@ class Agent:
             pass
 
     async def close(self) -> None:
+        if self._read_flush_task is not None:
+            self._read_flush_task.cancel()
+            self._read_flush_task = None
         if self._reader is not None:
             self._reader.cancel()
             self._reader = None
@@ -886,6 +913,12 @@ class Agent:
             # Spawned: processing may fetch group keys / pubkeys, whose
             # results this same read loop must deliver.
             asyncio.create_task(self._process_message(frame))
+            return
+        if ftype == "read_receipt":
+            self.read_receipts.append(frame)
+            if self._read_handler is not None:
+                asyncio.create_task(self._run_simple_handler(
+                    self._read_handler, frame))
             return
         if ftype == "group_key":
             try:
@@ -1258,6 +1291,11 @@ class Agent:
         if self._message_handler is not None:
             asyncio.create_task(self._run_message_handler(
                 self._message_handler, msg))
+            if self.auto_read and msg.get("from") != self.username:
+                # The message has been taken in by the registered
+                # handler: report it read (batched with any burst
+                # siblings) — the operator's WhatsApp Seen state.
+                self._queue_read(msg.get("id"))
 
     async def _run_message_handler(self, handler, msg: dict) -> None:
         try:
@@ -1568,6 +1606,56 @@ class Agent:
             return await asyncio.wait_for(fut, timeout=timeout)
         finally:
             self._reply_waiters.pop(message_id, None)
+
+    # -- read receipts (v1.1.2) -------------------------------------------
+    async def mark_read(self, message_ids) -> dict:
+        """Report message(s) as read. The relay validates — per
+        message, from its own audit row — that this agent is a
+        participant of the conversation, records the FIRST read
+        time, pushes a live read_receipt to the sender, and the
+        operator dashboard gains the Seen state. Accepts a single
+        message id or an iterable of ids. Returns the relay result:
+        {"read": [ids actually recorded], "reads": [{id, read_at}]}.
+        Ids that are unknown, already read by someone else only, or
+        not this agent's to read are silently absent from the
+        result."""
+        if isinstance(message_ids, str):
+            ids = [message_ids]
+        else:
+            ids = [str(m) for m in (message_ids or []) if m]
+        if not ids:
+            return {"read": [], "reads": []}
+        return await self._request({"type": "read", "ids": ids})
+
+    def _queue_read(self, message_id: str | None) -> None:
+        """Auto-read plumbing: accumulate ids and flush ONE read
+        frame per burst — a reconnect can deliver a whole queue of
+        messages at once, and each still gets its receipt."""
+        if not message_id:
+            return
+        self._pending_reads.add(str(message_id))
+        task = self._read_flush_task
+        if task is None or task.done():
+            self._read_flush_task = asyncio.create_task(
+                self._flush_reads_soon())
+
+    async def _flush_reads_soon(self) -> None:
+        try:
+            await asyncio.sleep(0.3)
+            while self._pending_reads:
+                ids = sorted(self._pending_reads)
+                self._pending_reads.clear()
+                try:
+                    await self._request({"type": "read", "ids": ids})
+                except Exception:
+                    # Offline / relay error: keep the ids pending —
+                    # the next queued read or the next start() (the
+                    # reconnect path) retries the flush. Receipts are
+                    # never silently dropped by this client.
+                    self._pending_reads.update(ids)
+                    return
+        except asyncio.CancelledError:
+            raise
 
     def mention_inbox(self, group_id: str | None = None) -> list[dict]:
         items = self.mention_inbox_items
