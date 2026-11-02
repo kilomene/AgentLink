@@ -142,24 +142,56 @@ class R2BlobStore:
                 f"SignedHeaders={signed}, Signature={signature}")
         url = f"{self.endpoint}/{self.bucket}/" + \
             urllib.parse.quote(blob_id, safe="")
+        status, _headers, body = self._request_raw(
+            method, blob_id, data=data, _auth=(auth, amz_date, payload_hash),
+            _url=url)
+        return body
+
+    def _request_once(self, method: str, blob_id: str, _auth,
+                      _url, data: bytes | None = None,
+                      extra_headers: dict | None = None):
+        """A single signed S3 request attempt. Returns (status,
+        headers, body). Raises BlobNotFound on 404; transport errors
+        (including http.client.IncompleteRead, whose .partial carries
+        the bytes that DID arrive) propagate to the caller.
+        extra_headers (e.g. Range) are sent unsigned — they are not
+        part of the SigV4 signed-header set."""
+        auth, amz_date, payload_hash = _auth
+        req = urllib.request.Request(_url, data=data, method=method)
+        req.add_header("Authorization", auth)
+        req.add_header("x-amz-date", amz_date)
+        req.add_header("x-amz-content-sha256", payload_hash)
+        for k, v in (extra_headers or {}).items():
+            req.add_header(k, v)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return resp.status, resp.headers, resp.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise BlobNotFound(blob_id)
+            raise
+
+    def _request_raw(self, method: str, blob_id: str,
+                     data: bytes | None = None,
+                     extra_headers: dict | None = None,
+                     attempts: int = 3, _auth=None, _url=None):
+        """_request_once with bounded retries on transient transport
+        errors (proxy drops, truncated bodies, 5xx)."""
         last = None
-        for attempt in range(3):
-            req = urllib.request.Request(url, data=data, method=method)
-            req.add_header("Authorization", auth)
-            req.add_header("x-amz-date", amz_date)
-            req.add_header("x-amz-content-sha256", payload_hash)
+        for attempt in range(attempts):
             try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    return resp.read()
+                return self._request_once(
+                    method, blob_id, _auth, _url, data=data,
+                    extra_headers=extra_headers)
+            except BlobNotFound:
+                raise
             except urllib.error.HTTPError as exc:
-                if exc.code == 404:
-                    raise BlobNotFound(blob_id)
                 if exc.code < 500:
                     raise
                 last = exc
-            except Exception as exc:  # proxy drop / timeout: retry
+            except Exception as exc:  # proxy drop / truncated: retry
                 last = exc
-            if attempt < 2:
+            if attempt < attempts - 1:
                 import time as _time
                 _time.sleep(0.6 * (attempt + 1))
         raise last
@@ -168,7 +200,119 @@ class R2BlobStore:
         self._signed_request("PUT", blob_id, data)
 
     def get(self, blob_id: str) -> bytes:
-        return self._signed_request("GET", blob_id)
+        import http.client as _hc
+        try:
+            return self._signed_request("GET", blob_id)
+        except _hc.IncompleteRead:
+            # The egress path intermittently truncates LARGE response
+            # bodies mid-read (observed cuts anywhere in the first
+            # ~8-26 KB through the proxy, varying per attempt). Fall
+            # back to a resumable ranged assembly.
+            return self._get_ranged(blob_id)
+
+    _RANGE_SLICE = 32768
+    _RANGE_MAX_STALLS = 16
+
+    def _sign_get(self, blob_id: str):
+        """SigV4 auth tuple + URL for a bodyless GET of blob_id —
+        identical signature to _signed_request('GET', ...)."""
+        parsed = urllib.parse.urlparse(self.endpoint)
+        host = parsed.netloc
+        uri = (f"{parsed.path}/{self.bucket}/"
+               f"{urllib.parse.quote(blob_id, safe='')}")
+        payload_hash = _sha256_hex(b"")
+        now = datetime.now(timezone.utc)
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        date_stamp = now.strftime("%Y%m%d")
+        headers = {"host": host,
+                   "x-amz-content-sha256": payload_hash,
+                   "x-amz-date": amz_date}
+        signed = "host;x-amz-content-sha256;x-amz-date"
+        canonical_headers = "".join(f"{k}:{headers[k]}\n"
+                                    for k in signed.split(";"))
+        canonical = "\n".join(["GET", uri, "", canonical_headers,
+                               signed, payload_hash])
+        scope = f"{date_stamp}/{self.region}/s3/aws4_request"
+        to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope,
+                             _sha256_hex(canonical.encode())])
+
+        def _hmac(key: bytes, msg: str) -> bytes:
+            return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+        k_date = _hmac(("AWS4" + self._sk).encode(), date_stamp)
+        k_region = _hmac(k_date, self.region)
+        k_service = _hmac(k_region, "s3")
+        k_signing = _hmac(k_service, "aws4_request")
+        signature = hmac.new(k_signing, to_sign.encode(),
+                             hashlib.sha256).hexdigest()
+        auth = (f"AWS4-HMAC-SHA256 Credential={self._ak}/{scope}, "
+                f"SignedHeaders={signed}, Signature={signature}")
+        url = f"{self.endpoint}/{self.bucket}/" + \
+            urllib.parse.quote(blob_id, safe="")
+        return (auth, amz_date, payload_hash), url
+
+    def _get_ranged(self, blob_id: str) -> bytes:
+        """Resumable ranged assembly: request slices starting at the
+        first byte not yet held; a truncated response contributes its
+        partial bytes (IncompleteRead.partial) and the next request
+        resumes exactly there. Progress is monotone, so a flickering
+        transport still converges; only repeated ZERO-progress
+        attempts (stalls) fail the read."""
+        import http.client as _hc
+        import time as _time
+        auth, url = self._sign_get(blob_id)
+        out = bytearray()
+        total: int | None = None
+        stalls = 0
+        while total is None or len(out) < total:
+            if stalls > self._RANGE_MAX_STALLS:
+                raise OSError(
+                    f"ranged GET for {blob_id} stalled at "
+                    f"{len(out)}/{total} after {stalls} empty attempts")
+            start = len(out)
+            end = (total - 1) if total is not None else \
+                start + self._RANGE_SLICE - 1
+            if total is not None:
+                end = min(end, total - 1)
+            try:
+                status, headers, body = self._request_once(
+                    "GET", blob_id, auth, url,
+                    extra_headers={"Range": f"bytes={start}-{end}"})
+            except _hc.IncompleteRead as exc:
+                partial = exc.partial or b""
+                if partial:
+                    out += partial
+                    stalls = 0
+                else:
+                    stalls += 1
+                    _time.sleep(0.4)
+                continue
+            except BlobNotFound:
+                raise
+            except Exception:
+                stalls += 1
+                _time.sleep(0.4)
+                continue
+            if status == 200:
+                if start == 0:
+                    return body
+                raise OSError(f"ranged GET for {blob_id}: server "
+                              "ignored Range mid-assembly")
+            cr = headers.get("Content-Range") or ""
+            try:
+                total = int(cr.rsplit("/", 1)[1])
+            except Exception:
+                raise OSError(f"ranged GET without Content-Range "
+                              f"for {blob_id}: {cr!r}")
+            if body:
+                out += body
+                stalls = 0
+            else:
+                stalls += 1
+        if total is not None and len(out) != total:
+            raise OSError(f"ranged GET size mismatch for {blob_id}: "
+                          f"{len(out)} != {total}")
+        return bytes(out)
 
     def delete(self, blob_id: str) -> None:
         self._signed_request("DELETE", blob_id)
