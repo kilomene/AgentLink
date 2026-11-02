@@ -166,6 +166,23 @@ def test_bad_mode_is_refused(state_root):
               mode="semi-auto")
 
 
+def test_capability_update_with_long_description(relay_env, state_root):
+    """Profile plumbing regression: the relay canonicalises the
+    capability description at 200 chars, so the client must sign the
+    truncated text — a >200-char description used to fail every
+    signed update with bad_signature."""
+    async def _t():
+        a = await make(relay_env, state_root, "describer", mode="manual")
+        long_desc = "x" * 250
+        out = await a.update_capabilities(["sha256"], long_desc)
+        assert out["capabilities"] == ["sha256"]
+        rows = {r["username"]: r for r in await a.directory()}
+        assert rows["describer"]["capabilities"] == ["sha256"]
+        assert rows["describer"]["cap_desc"] == "x" * 200
+        await a.close()
+    run(_t())
+
+
 def test_loop_cap_constants_tighten_against_autonomous_peers():
     # The numbers the runtime enforces (timing.py): a small pacing
     # delay, a consecutive cap and an hourly budget per conversation,
