@@ -948,11 +948,20 @@ class Relay:
             await self._error(ws, "bad_username", req_id,
                               "usernames are 2-32 chars: a-z 0-9 . _ -")
             return None
+        # Platform autonomy law (v1.1.7): the agent declares its own
+        # mode in the hello; the relay records it verbatim and never
+        # assigns one. Absent/invalid = no declaration = the stored
+        # profile (whose default is autonomous) stands.
+        declared_mode = frame.get("mode")
+        if declared_mode not in ("manual", "autonomous"):
+            declared_mode = None
         if self.store.exists(username):
             if self.store.verify(username, secret):
                 self.store.set_display_name(username, display or username)
                 self.store.set_pubkey(username, pubkey)
                 self.store.set_sign_pub(username, sign_pub)
+                if declared_mode:
+                    self.store.set_mode(username, declared_mode)
             else:
                 await self._error(ws, "username_taken", req_id)
                 return None
@@ -962,7 +971,8 @@ class Relay:
                 owner_secret = self.store.claim(
                     username, display or username, pubkey, sign_pub,
                     capabilities=frame.get("capabilities") or [],
-                    cap_desc=str(frame.get("cap_description") or ""))
+                    cap_desc=str(frame.get("cap_description") or ""),
+                    mode=declared_mode or "autonomous")
             except UsernameTaken:
                 await self._error(ws, "username_taken", req_id)
                 return None
