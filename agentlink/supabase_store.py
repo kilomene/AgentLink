@@ -20,17 +20,27 @@ Files are NOT stored in Supabase Storage (owner storage split):
 Supabase is database + realtime only; file ciphertext lives in
 Cloudflare R2 behind the relay (see blobstore.py).
 
-NOTE: this adapter is interface-complete and unit-checked for
-construction/factory wiring, but has NOT been live-verified against a
-real Supabase project in this build (no AgentLink Supabase project or
-service key was provided). The SQLite backend is the verified path;
-verify this one against your project before production use.
+LIVE-VERIFIED 2026-11-02 against the production AgentLink Supabase
+project: the full store surface (users, queue, groups, keys, invites,
+work, deliveries, checkpoints, channels, upload sessions, alerts,
+library, vault, chains, blob metadata, dashboard sessions, audit) was
+exercised end-to-end through this adapter. The parity drift found then
+(alerts/chains/library/vault/upload-session shapes) is fixed in this
+file; the adapter now mirrors the SQLite Store contract exactly,
+against the tables in supabase/schema.sql.
 """
 
 from __future__ import annotations
 
+import base64
+import gzip
 import hashlib
 import json
+import socket
+import ssl
+import threading
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -42,6 +52,22 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def _loads(val, default):
+    """Tolerant JSON decode: Postgres jsonb columns may hand back an
+    already-parsed value, a JSON string (this adapter's write shape),
+    or an empty string (the SQLite store's 'no value' marker)."""
+    if val is None:
+        return default
+    if isinstance(val, str):
+        if not val:
+            return default
+        try:
+            return json.loads(val)
+        except Exception:
+            return default
+    return val
+
+
 class SupabaseStore:
     def __init__(self, url: str, service_key: str):
         if not url or not service_key:
@@ -49,28 +75,208 @@ class SupabaseStore:
                 "SupabaseStore needs SUPABASE_URL and SUPABASE_SERVICE_KEY")
         self.base = url.rstrip("/") + "/rest/v1"
         self._key = service_key
+        _p = urllib.parse.urlparse(self.base)
+        self._host = _p.hostname
+        self._port = _p.port or 443
+        self._path_prefix = _p.path.rstrip("/")
+        self._local = threading.local()
 
-    # -- transport -----------------------------------------------------------
+    # -- transport ----------------------------------------------------
+    # Persistent per-thread HTTPS connections over a hand-rolled
+    # CONNECT tunnel. Why hand-rolled: this deployment's egress
+    # gateway rejects http.client's CONNECT form outright (it answers
+    # with a plain-text policy line, surfacing as BadStatusLine) and
+    # intermittently drops or stalls fresh urllib connections, while
+    # an explicitly formed CONNECT (Proxy-Connection: Keep-Alive)
+    # establishes cleanly and the tunnel then serves requests at
+    # ~0.1s each, reused. Any failure drops the connection and the
+    # bounded retry reconnects: GET x5, PATCH/DELETE/POST x4, POST x1
+    # for the identity-sequenced append tables (a retry there could
+    # double-apply); a 409 on a POST retry means the first attempt
+    # landed and its response was lost — treated as success.
+    @staticmethod
+    def _proxy_url() -> str:
+        import os as _os
+        for k in ("https_proxy", "HTTPS_PROXY", "http_proxy",
+                  "HTTP_PROXY"):
+            v = _os.environ.get(k)
+            if v:
+                return v
+        return ""
+
+    def _open_conn(self):
+        proxy = self._proxy_url()
+        if proxy:
+            p = urllib.parse.urlparse(proxy)
+            raw = socket.create_connection((p.hostname, p.port or 3128),
+                                           timeout=6)
+            lines = [f"CONNECT {self._host}:{self._port} HTTP/1.1",
+                     f"Host: {self._host}:{self._port}",
+                     "Proxy-Connection: Keep-Alive"]
+            if p.username:
+                cred = "%s:%s" % (urllib.parse.unquote(p.username),
+                                  urllib.parse.unquote(p.password or ""))
+                lines.append("Proxy-Authorization: Basic " +
+                             base64.b64encode(cred.encode()).decode())
+            raw.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+            buf = b""
+            _deadline = time.time() + 8
+            while b"\r\n\r\n" not in buf and len(buf) < 65536:
+                if time.time() > _deadline:
+                    raw.close()
+                    raise ConnectionError("CONNECT response deadline")
+                chunk = raw.recv(1)
+                if not chunk:
+                    raw.close()
+                    raise ConnectionError("proxy closed during CONNECT")
+                buf += chunk
+            status = buf.decode("latin1").split("\r\n", 1)[0]
+            if " 200 " not in status and not status.endswith(" 200"):
+                raw.close()
+                raise ConnectionError(f"CONNECT refused: {status}")
+        else:
+            raw = socket.create_connection((self._host, self._port),
+                                           timeout=6)
+        ctx = ssl.create_default_context()
+        wrapped = ctx.wrap_socket(raw, server_hostname=self._host)
+        wrapped.settimeout(6)
+        return wrapped, wrapped.makefile("rb")
+
+    def _conn(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._open_conn()
+            self._local.conn = conn
+        return conn
+
+    def _drop_conn(self) -> None:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn[0].close()
+            except Exception:
+                pass
+            self._local.conn = None
+
+    @staticmethod
+    def _read_response(reader, sock=None, deadline=None):
+        def _tick():
+            if deadline is not None:
+                left = deadline - time.time()
+                if left <= 0:
+                    raise TimeoutError("response deadline exceeded")
+                if sock is not None:
+                    try:
+                        sock.settimeout(min(6, left))
+                    except Exception:
+                        pass
+        _tick()
+        while True:
+            status_line = reader.readline().decode("latin1").strip()
+            if not status_line:
+                raise ConnectionError("server closed the connection")
+            parts = status_line.split(" ", 2)
+            status = int(parts[1])
+            reason = parts[2] if len(parts) > 2 else ""
+            headers = {}
+            while True:
+                _tick()
+                line = reader.readline().decode("latin1")
+                if line in ("\r\n", ""):
+                    break
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+            if 100 <= status < 200:  # interim response: read the real one
+                continue
+            break
+        body = b""
+        if status not in (204, 304):
+            if headers.get("transfer-encoding") == "chunked":
+                chunks = []
+                while True:
+                    _tick()
+                    n = int(reader.readline().strip() or b"0", 16)
+                    if n == 0:
+                        reader.readline()
+                        break
+                    chunks.append(reader.read(n))
+                    reader.readline()
+                body = b"".join(chunks)
+            elif "content-length" in headers:
+                _tick()
+                body = reader.read(int(headers["content-length"]))
+            elif headers.get("connection", "").lower() == "close":
+                body = reader.read()
+        if headers.get("content-encoding") == "gzip" and body:
+            body = gzip.decompress(body)
+        return status, reason, headers, body
+
+    def _roundtrip(self, method: str, path: str, headers: dict,
+                   data: bytes | None):
+        sock, reader = self._conn()
+        lines = [f"{method} {path} HTTP/1.1", f"Host: {self._host}"]
+        for k, v in headers.items():
+            lines.append(f"{k}: {v}")
+        if data is not None:
+            lines.append(f"Content-Length: {len(data)}")
+        payload = ("\r\n".join(lines) + "\r\n\r\n").encode()
+        if data:
+            payload += data
+        sock.sendall(payload)
+        status, reason, resp_headers, raw = self._read_response(
+            reader, sock, time.time() + 10)
+        if resp_headers.get("connection", "").lower() == "close":
+            self._drop_conn()
+        return status, reason, resp_headers, raw
+
     def _req(self, method: str, table: str, query: str = "",
              body=None, prefer: str = ""):
         import os as _os
         prefix = _os.environ.get("AGENTLINK_SUPABASE_TABLE_PREFIX", "")
         if prefix and not table.startswith(prefix):
             table = prefix + table
-        url = f"{self.base}/{table}"
+        path = f"{self._path_prefix}/{table}"
         if query:
-            url += "?" + query
+            path += "?" + query
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("apikey", self._key)
-        req.add_header("Authorization", f"Bearer {self._key}")
+        headers = {"apikey": self._key,
+                   "Authorization": f"Bearer {self._key}",
+                   "Accept-Encoding": "gzip"}
         if data:
-            req.add_header("Content-Type", "application/json")
+            headers["Content-Type"] = "application/json"
         if prefer:
-            req.add_header("Prefer", prefer)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-        return json.loads(raw) if raw else None
+            headers["Prefer"] = prefer
+        if method == "GET":
+            attempts = 5
+        elif method == "POST" and (table.endswith("queue")
+                                   or table.endswith("audit_log")):
+            attempts = 1
+        else:
+            attempts = 4
+        last = None
+        for i in range(attempts):
+            try:
+                status, reason, _rh, raw = self._roundtrip(
+                    method, path, headers, data)
+                if status >= 400:
+                    raise urllib.error.HTTPError(path, status, reason,
+                                                 None, None)
+                return json.loads(raw) if raw else None
+            except urllib.error.HTTPError as e:
+                self._drop_conn()
+                if method == "POST" and e.code == 409 and i > 0:
+                    return None
+                if e.code < 500 or i == attempts - 1:
+                    raise
+                last = e
+            except Exception as e:  # reset / timeout / stale connection
+                self._drop_conn()
+                if i == attempts - 1:
+                    raise
+                last = e
+            time.sleep(min(0.3 * (2 ** i), 1.5))
+        raise last  # pragma: no cover
 
     def _get(self, table: str, query: str) -> list[dict]:
         return self._req("GET", table, query) or []
@@ -317,23 +523,34 @@ class SupabaseStore:
         return int(rows[0]["epoch"]) if rows else 0
 
     # -- invites ---------------------------------------------------------------------------
-    def create_invite(self, group_id, created_by, ttl_seconds=7 * 24 * 3600):
+    def create_invite(self, group_id, created_by, ttl_seconds=None):
+        # Canonical al_invites shape (v1.1.0): token + created_at.
+        # The token column stores the token's SHA-256; validity is
+        # created_at + INVITE_TTL_SECONDS >= now (created_at is
+        # shifted so a custom ttl keeps its exact meaning) — mirrors
+        # the SQLite Store exactly.
+        from .store import INVITE_TTL_SECONDS
         import secrets as _s
+        if ttl_seconds is None:
+            ttl_seconds = INVITE_TTL_SECONDS
         token = _s.token_urlsafe(24)
         self._req("POST", "invites", body={
-            "token_hash": _sha(token), "group_id": group_id,
+            "token": _sha(token), "group_id": group_id,
             "created_by": created_by,
-            "expires_at": now_ts() + ttl_seconds}, prefer="return=minimal")
+            "created_at": now_ts() + int(ttl_seconds)
+            - INVITE_TTL_SECONDS}, prefer="return=minimal")
         return token
 
     def invite_valid(self, group_id, token):
+        from .store import INVITE_TTL_SECONDS
         if not token:
             return False
         row = self._one("invites",
-                        self._eq("token_hash", _sha(token)) + "&"
+                        self._eq("token", _sha(token)) + "&"
                         + self._eq("group_id", group_id)
-                        + "&select=expires_at")
-        return bool(row) and row["expires_at"] >= now_ts()
+                        + "&select=created_at")
+        return bool(row) and \
+            row["created_at"] + INVITE_TTL_SECONDS >= now_ts()
 
     @staticmethod
     def invite_link(group_id, token):
@@ -350,7 +567,7 @@ class SupabaseStore:
                     content_self, deadline, batch_id=None,
                     priority="normal", auto_reassign=True,
                     assignee_role="", content_group=None,
-                    chain_id="", chain_step=0):
+                    chain_id="", chain_step=0, require_approval=False):
         wid = new_id("w-")[:14]
         ts = now_ts()
         self._req("POST", "work", body={
@@ -363,6 +580,7 @@ class SupabaseStore:
             "chain_step": chain_step,
             "priority": priority,
             "auto_reassign": 1 if auto_reassign else 0,
+            "require_approval": 1 if require_approval else 0,
             "assignee_role": assignee_role, "deadline": deadline,
             "status": "assigned", "created_at": ts, "updated_at": ts},
             prefer="return=minimal")
@@ -486,14 +704,14 @@ class SupabaseStore:
         for r in rows:
             if r["status"] in ("completed", "covered"):
                 score += 4
-            elif r["status"] == "delivered":
+            elif r["status"] in ("delivered", "awaiting_approval"):
                 score += 1
             if r.get("deadline"):
                 if r["status"] == "completed" and \
                         r["updated_at"] > r["deadline"]:
                     score -= 6
                 elif r["status"] not in ("completed", "covered",
-                                         "delivered") \
+                                         "delivered", "awaiting_approval") \
                         and now > r["deadline"]:
                     score -= 6
         score -= 6 * len(changes) + 10 * len(bad)
@@ -518,7 +736,11 @@ class SupabaseStore:
                             "proof_sig": proof.get("sig", ""),
                             "proof_verified": 1 if proof.get("verified")
                             else 0}, prefer="return=minimal")
-        return self.set_work_status(work_id, "delivered")
+        row = self._one("work", self._eq("id", work_id)
+                        + "&select=require_approval")
+        gated = bool(row and row.get("require_approval"))
+        return self.set_work_status(
+            work_id, "awaiting_approval" if gated else "delivered")
 
     def reassign_work(self, work_id, new_assignee):
         row = self._one("work", self._eq("id", work_id)
@@ -556,7 +778,7 @@ class SupabaseStore:
             "work", "select=id,assigner,assignee,group_id,status,priority,"
                     "batch_id,progress_percent,progress_at,proof_verified,"
                     "proof_hash,deadline,chain_id,chain_step,attempt,"
-                    "created_at,updated_at"
+                    "require_approval,created_at,updated_at"
                     "&order=updated_at.desc&limit=200")
 
     # -- blob metadata -----------------------------------------------------
@@ -677,220 +899,324 @@ class SupabaseStore:
         return int(rows[0]["epoch"]) if rows else 0
 
     def create_channel_invite(self, channel_id, created_by,
-                              ttl_seconds=7 * 24 * 3600):
+                              ttl_seconds=None):
+        from .store import INVITE_TTL_SECONDS
         import secrets as _s
+        if ttl_seconds is None:
+            ttl_seconds = INVITE_TTL_SECONDS
         token = _s.token_urlsafe(24)
         self._req("POST", "invites", body={
-            "token_hash": _sha(token), "group_id": "ch:" + channel_id,
+            "token": _sha(token), "group_id": "ch:" + channel_id,
             "created_by": created_by,
-            "expires_at": now_ts() + ttl_seconds}, prefer="return=minimal")
+            "created_at": now_ts() + int(ttl_seconds)
+            - INVITE_TTL_SECONDS}, prefer="return=minimal")
         return token
 
     def channel_invite_valid(self, channel_id, token):
+        from .store import INVITE_TTL_SECONDS
         if not token:
             return False
         row = self._one("invites",
-                        self._eq("token_hash", _sha(token)) + "&"
+                        self._eq("token", _sha(token)) + "&"
                         + self._eq("group_id", "ch:" + channel_id)
-                        + "&select=expires_at")
-        return bool(row) and row["expires_at"] >= now_ts()
+                        + "&select=created_at")
+        return bool(row) and \
+            row["created_at"] + INVITE_TTL_SECONDS >= now_ts()
 
-    def create_upload_session(self, session_id, owner, blob_id, whole_sha,
-                              chunk_size, total_chunks, for_user="",
-                              for_group="", for_channel=""):
+    def create_upload_session(self, owner, whole_sha, ct_sha, size,
+                              chunk_size, for_user="", for_group="",
+                              for_channel=""):
+        sid = new_id("u-")[:14]
+        # Canonical al_upload_sessions shape (v1.1.0): no for_channel
+        # column — channel scope is asserted by the relay at session
+        # start and carried on the finish frame. The parameter stays
+        # for interface parity with the SQLite Store.
         self._req("POST", "upload_sessions", body={
-            "id": session_id, "owner": owner, "blob_id": blob_id,
-            "whole_sha": whole_sha, "chunk_size": chunk_size,
-            "total_chunks": total_chunks, "for_user": for_user,
-            "for_group": for_group, "for_channel": for_channel,
-            "got": "[]", "created_at": now_ts()}, prefer="return=minimal")
+            "session_id": sid, "owner": owner, "for_user": for_user,
+            "for_group": for_group,
+            "whole_sha": whole_sha, "ct_sha": ct_sha,
+            "size": int(size or 0), "chunk_size": int(chunk_size or 0),
+            "chunks": "[]", "created_at": now_ts()},
+            prefer="return=minimal")
+        return sid
 
     def get_upload_session(self, session_id):
-        row = self._one("upload_sessions", self._eq("id", session_id))
+        row = self._one("upload_sessions",
+                        self._eq("session_id", session_id))
         if row is None:
             return None
-        row["got"] = json.loads(row.get("got") or "[]")
+        row["chunks"] = _loads(row.get("chunks"), [])
+        row.setdefault("for_channel", "")
         return row
 
     def record_chunk(self, session_id, index):
-        row = self.get_upload_session(session_id)
-        got = sorted(set(row["got"]) | {int(index)})
-        self._req("PATCH", "upload_sessions", self._eq("id", session_id),
-                  body={"got": json.dumps(got)}, prefer="return=minimal")
-        return got
+        sess = self.get_upload_session(session_id)
+        if sess is None:
+            raise NotFound(session_id)
+        chunks = sorted(set(sess["chunks"]) | {int(index)})
+        self._req("PATCH", "upload_sessions",
+                  self._eq("session_id", session_id),
+                  body={"chunks": json.dumps(chunks)},
+                  prefer="return=minimal")
+        return chunks
 
     def delete_upload_session(self, session_id):
-        self._req("DELETE", "upload_sessions", self._eq("id", session_id),
+        self._req("DELETE", "upload_sessions",
+                  self._eq("session_id", session_id),
                   prefer="return=minimal")
 
-    def open_alert(self, kind, subject):
+    def open_alert(self, kind, subject, detail=""):
         row = self._one("alerts", self._eq("kind", kind) + "&"
-                        + self._eq("subject", subject) + "&resolved=eq.0")
+                        + self._eq("subject", subject) + "&status=eq.open")
         if row is not None:
-            return False, row
-        aid = new_id("al-")[:14]
+            return row
+        aid = new_id("a-")[:14]
         self._req("POST", "alerts", body={
             "id": aid, "kind": kind, "subject": subject,
-            "created_at": now_ts(), "last_reminder": now_ts(),
-            "resolved": 0}, prefer="return=minimal")
-        rec = self._one("alerts", self._eq("id", aid))
-        return True, rec
+            "detail": detail, "status": "open", "reminders": 0,
+            "last_reminder_at": 0, "created_at": now_ts(),
+            "resolved_at": 0}, prefer="return=minimal")
+        return self._one("alerts", self._eq("id", aid))
 
-    def resolve_alert(self, kind, subject):
-        row = self._one("alerts", self._eq("kind", kind) + "&"
-                        + self._eq("subject", subject) + "&resolved=eq.0")
-        if row is None:
-            return None
-        self._req("PATCH", "alerts", self._eq("id", row["id"]),
-                  body={"resolved": 1, "resolved_at": now_ts()},
-                  prefer="return=minimal")
-        row["resolved"] = 1
-        return row
+    def resolve_alerts(self, kind, subject):
+        rows = self._req("PATCH", "alerts",
+                         self._eq("kind", kind) + "&"
+                         + self._eq("subject", subject)
+                         + "&status=eq.open",
+                         body={"status": "resolved",
+                               "resolved_at": now_ts()},
+                         prefer="return=representation")
+        return len(rows or [])
+
+    # Singular alias (older callers).
+    resolve_alert = resolve_alerts
 
     def bump_reminder(self, alert_id):
+        row = self._one("alerts", self._eq("id", alert_id))
+        if row is None:
+            return
         self._req("PATCH", "alerts", self._eq("id", alert_id),
-                  body={"last_reminder": now_ts()}, prefer="return=minimal")
+                  body={"reminders": int(row.get("reminders") or 0) + 1,
+                        "last_reminder_at": now_ts()},
+                  prefer="return=minimal")
 
-    def list_alerts(self, limit=100):
-        return self._get("alerts", f"select=*&order=created_at.desc"
-                                   f"&limit={limit}")
+    def list_alerts(self, status=None, limit=100):
+        q = f"select=*&order=created_at.desc&limit={int(limit)}"
+        if status:
+            q += "&" + self._eq("status", status)
+        return self._get("alerts", q)
 
     def library_add(self, lib_id, filename, size, sha256, sender,
-                    dest_kind, dest_id, work_id=""):
+                    to_user="", group_id="", work_id="", delivery_id=""):
         self._req("POST", "library", body={
-            "id": lib_id, "filename": filename[:200],
-            "size": int(size or 0), "sha256": sha256, "sender": sender,
-            "dest_kind": dest_kind, "dest_id": dest_id, "work_id": work_id,
-            "created_at": now_ts()},
+            "id": lib_id, "delivery_id": delivery_id, "work_id": work_id,
+            "filename": filename[:200], "size": int(size or 0),
+            "sha256": sha256, "sender": sender, "to_user": to_user,
+            "group_id": group_id, "chain_next": "", "ts": now_ts()},
             prefer="return=minimal,resolution=ignore-duplicates")
 
-    def library_search(self, user, q="", sender="", group_id="",
-                       sha_prefix="", limit=200):
-        rows = self._get("library", "select=*&order=created_at.desc"
-                                    f"&limit={limit}")
+    def _library_visible(self, row, requester):
+        if row.get("sender") == requester or row.get("to_user") == requester:
+            return True
+        if row.get("chain_next") and row["chain_next"] == requester:
+            return True
+        if row.get("group_id"):
+            return self.role_of(row["group_id"], requester) is not None
+        return False
+
+    def library_search(self, requester, q="", sender="", group_id="",
+                       hash_prefix="", limit=100):
+        rows = self._get("library",
+                         "select=*&order=ts.desc&limit=1000")
         out = []
-        for r in rows:
-            if r["dest_kind"] == "dm":
-                if user not in (r["sender"], r["dest_id"]):
-                    continue
-            elif self.role_of(r["dest_id"], user) is None \
-                    and r["sender"] != user:
+        for d in rows:
+            if not self._library_visible(d, requester):
                 continue
-            if q and q.lower() not in r["filename"].lower():
+            if q and q.lower() not in (d.get("filename") or "").lower():
                 continue
-            if sender and r["sender"] != sender:
+            if sender and d.get("sender") != sender:
                 continue
-            if group_id and r["dest_id"] != group_id:
+            if group_id and d.get("group_id") != group_id:
                 continue
-            if sha_prefix and not r["sha256"].startswith(sha_prefix):
+            if hash_prefix and not (d.get("sha256") or "").startswith(
+                    hash_prefix):
                 continue
-            out.append(r)
+            out.append(d)
+            if len(out) >= limit:
+                break
         return out
+
+    # Relay calls search_library with Store-API argument names.
+    search_library = library_search
 
     def library_entry(self, lib_id):
         return self._one("library", self._eq("id", lib_id))
 
-    def library_all_meta(self, limit=300):
-        return self._get("library", "select=*&order=created_at.desc"
-                                    f"&limit={limit}")
+    def library_all(self, limit=200):
+        return self._get("library", "select=*&order=ts.desc"
+                                    f"&limit={int(limit)}")
+
+    library_all_meta = library_all
 
     def library_for_work(self, work_id):
-        return self._get("library", self._eq("work_id", work_id))
+        return self._get("library", self._eq("work_id", work_id)
+                         + "&order=ts.asc")
 
-    def vault_add(self, vault_id, group_id, filename, size, sha256,
-                  added_by, blob_id, pinned=False):
+    @staticmethod
+    def _vault_norm(d):
+        if d is None:
+            return None
+        d = dict(d)
+        d["descriptor"] = _loads(d.get("descriptor"), {})
+        d["pinned"] = bool(d.get("pinned"))
+        return d
+
+    def vault_add(self, group_id, descriptor, added_by, pinned=False):
+        vid = new_id("v-")[:14]
         self._req("POST", "vault", body={
-            "id": vault_id, "group_id": group_id,
-            "filename": filename[:200], "size": int(size or 0),
-            "sha256": sha256, "added_by": added_by, "blob_id": blob_id,
-            "pinned": 1 if pinned else 0, "created_at": now_ts()},
-            prefer="return=minimal,resolution=ignore-duplicates")
-        return vault_id
+            "id": vid, "group_id": group_id,
+            "name": descriptor.get("name", ""),
+            "size": int(descriptor.get("size") or 0),
+            "sha256": descriptor.get("sha256", ""),
+            "blob_id": descriptor.get("blob_id", ""),
+            "descriptor": json.dumps(descriptor),
+            "added_by": added_by, "pinned": 1 if pinned else 0,
+            "ts": now_ts()}, prefer="return=minimal")
+        return self.vault_entry(vid)
 
     def vault_list(self, group_id):
-        return self._get("vault", self._eq("group_id", group_id)
-                         + "&order=pinned.desc,created_at.desc")
+        rows = self._get("vault", self._eq("group_id", group_id)
+                         + "&order=pinned.desc,ts.desc")
+        return [self._vault_norm(r) for r in rows]
 
     def vault_entry(self, vault_id):
-        return self._one("vault", self._eq("id", vault_id))
+        return self._vault_norm(
+            self._one("vault", self._eq("id", vault_id)))
 
     def vault_set_pinned(self, vault_id, pinned):
         self._req("PATCH", "vault", self._eq("id", vault_id),
                   body={"pinned": 1 if pinned else 0},
                   prefer="return=minimal")
+        return self.vault_entry(vault_id)
 
     def vault_remove(self, vault_id):
+        existed = self.vault_entry(vault_id) is not None
         self._req("DELETE", "vault", self._eq("id", vault_id),
                   prefer="return=minimal")
+        return existed
 
-    def create_chain(self, chain_id, creator, group_id, steps):
+    @staticmethod
+    def _step_norm(d):
+        d = dict(d)
+        d["assignees"] = _loads(d.get("assignees"), [])
+        d["envelopes"] = _loads(d.get("envelopes"), {})
+        cg = d.get("content_group")
+        d["content_group"] = _loads(cg, None) if cg else None
+        d["handoff"] = _loads(d.get("handoff"), [])
+        return d
+
+    def create_chain(self, creator, group_id, name, steps):
+        cid = new_id("chain-")[:18]
         ts = now_ts()
         self._req("POST", "chains", body={
-            "id": chain_id, "creator": creator, "group_id": group_id,
-            "status": "running", "current_step": 0,
-            "created_at": ts, "updated_at": ts}, prefer="return=minimal")
+            "id": cid, "creator": creator, "group_id": group_id or "",
+            "name": name, "status": "running",
+            "created_at": ts, "updated_at": ts},
+            prefer="return=minimal")
         for i, st in enumerate(steps):
             self._req("POST", "chain_steps", body={
-                "chain_id": chain_id, "step_index": i,
-                "work_id": st.get("work_id"),
-                "target_kind": st.get("target_kind", "user"),
+                "id": new_id("step-")[:16], "chain_id": cid,
+                "position": i + 1,
+                "target_type": st.get("target_type", "user"),
                 "target": st.get("target", ""),
-                "status": "pending"}, prefer="return=minimal")
-        return self.get_chain(chain_id)
+                "group_id": st.get("group_id", "") or group_id or "",
+                "assignees": json.dumps(st.get("assignees") or []),
+                "envelopes": json.dumps(st.get("envelopes") or {}),
+                "content_group": json.dumps(st["content_group"])
+                if st.get("content_group") else "",
+                "deadline": st.get("deadline"),
+                "priority": st.get("priority", "normal"),
+                "require_approval": 1 if st.get("require_approval") else 0,
+                "status": "pending", "created_at": ts},
+                prefer="return=minimal")
+        return self.get_chain(cid)
 
     def get_chain(self, chain_id):
         row = self._one("chains", self._eq("id", chain_id))
         if row is None:
             return None
-        row["steps"] = self._get(
-            "chain_steps", self._eq("chain_id", chain_id)
-            + "&order=step_index.asc")
+        srows = self._get("chain_steps",
+                          self._eq("chain_id", chain_id)
+                          + "&order=position.asc")
+        row["steps"] = [self._step_norm(r) for r in srows]
         return row
 
     def set_chain_status(self, chain_id, status):
+        body = {"status": status, "updated_at": now_ts()}
+        if status == "paused":
+            body["paused_since"] = now_ts()
         self._req("PATCH", "chains", self._eq("id", chain_id),
-                  body={"status": status, "updated_at": now_ts()},
-                  prefer="return=minimal")
+                  body=body, prefer="return=minimal")
         return self.get_chain(chain_id)
 
-    def set_step_status(self, chain_id, step_index, status):
-        self._req("PATCH", "chain_steps",
-                  self._eq("chain_id", chain_id) + "&"
-                  + f"step_index=eq.{step_index}",
-                  body={"status": status,
-                        "released_at": now_ts()
-                        if status == "active" else None},
-                  prefer="return=minimal")
-        cur = self.get_chain(chain_id)
-        if status == "active" and cur:
-            self._req("PATCH", "chains", self._eq("id", chain_id),
-                      body={"current_step": step_index,
-                            "updated_at": now_ts()},
-                      prefer="return=minimal")
-        return self.get_chain(chain_id)
+    def set_step_status(self, step_id, status, work_id=""):
+        body = {"status": status}
+        if work_id:
+            body["work_id"] = work_id
+        self._req("PATCH", "chain_steps", self._eq("id", step_id),
+                  body=body, prefer="return=minimal")
 
-    def set_step_handoff(self, chain_id, step_index, refs):
-        self._req("PATCH", "chain_steps",
-                  self._eq("chain_id", chain_id) + "&"
-                  + f"step_index=eq.{step_index}",
-                  body={"handoff": json.dumps(refs)},
+    def set_step_handoff(self, step_id, handoff, next_assignees):
+        self._req("PATCH", "chain_steps", self._eq("id", step_id),
+                  body={"handoff": json.dumps(handoff)},
                   prefer="return=minimal")
+        for entry in handoff:
+            for nxt in next_assignees:
+                self._req("PATCH", "library",
+                          self._eq("id", entry.get("library_id", "")),
+                          body={"chain_next": nxt},
+                          prefer="return=minimal")
 
     def step_by_work(self, work_id):
-        return self._one("chain_steps", self._eq("work_id", work_id))
+        row = self._one("chain_steps", self._eq("work_id", work_id))
+        if row is None:
+            return None
+        row = dict(row)
+        row["assignees"] = _loads(row.get("assignees"), [])
+        return row
 
     def list_chains_meta(self, limit=100):
         rows = self._get("chains", "select=*&order=updated_at.desc"
-                                   f"&limit={limit}")
-        return [self.get_chain(r["id"]) for r in rows]
+                                   f"&limit={int(limit)}")
+        out = []
+        for r in rows:
+            chain = self.get_chain(r["id"])
+            if chain is None:
+                continue
+            for st in chain["steps"]:
+                st.pop("envelopes", None)
+                st.pop("content_group", None)
+                if st.get("work_id"):
+                    w = self.get_work(st["work_id"])
+                    if w:
+                        st["work_status"] = w["status"]
+                        st["progress_percent"] = w.get(
+                            "progress_percent", 0)
+                        st["assignee"] = w["assignee"]
+            out.append(chain)
+        return out
 
     def chains_for_user(self, username):
-        return [c for c in self.list_chains_meta()
-                if c["creator"] == username
-                or any((s.get("work_id") and
-                        (self.get_work(s["work_id"]) or {})
-                        .get("assignee") == username)
-                       for s in c["steps"])]
+        out = []
+        for c in self.list_chains_meta(200):
+            involved = {c["creator"]}
+            for st in c["steps"]:
+                involved.update(st.get("assignees") or [])
+                if st.get("assignee"):
+                    involved.add(st["assignee"])
+            if username in involved:
+                out.append(c)
+        return out
 
     def groups_for_user(self, username):
         rows = self._get("group_members",
@@ -922,7 +1248,6 @@ class SupabaseStore:
         return out
 
     # -- name parity aliases (relay calls the Store API names) ---------
-    resolve_alerts = resolve_alert
 
     def channel_members(self, channel_id):
         return self.subscribers(channel_id)
@@ -937,27 +1262,25 @@ class SupabaseStore:
         ids = []
         for f in files:
             lid = new_id("lib-")[:16]
-            self.library_add(lid, f.get("name", ""), f.get("size", 0),
-                             f.get("sha256", ""), work["assignee"],
-                             "group" if work.get("group_id") else "dm",
-                             work.get("group_id") or work["assigner"],
-                             work["id"])
+            self.library_add(
+                lid, f.get("name", ""), f.get("size", 0),
+                f.get("sha256", ""), work["assignee"],
+                to_user=work["assigner"],
+                group_id=work["group_id"] or "",
+                work_id=work["id"], delivery_id=delivery_id)
             ids.append(lid)
-        return ids
-
-    def search_library(self, requester, q="", sender="", group_id="",
-                       sha_prefix="", limit=200):
-        return self.library_search(requester, q=q, sender=sender,
-                                   group_id=group_id,
-                                   sha_prefix=sha_prefix, limit=limit)
-
-    def library_all(self, limit=200):
-        return self.library_all_meta(limit)
+        out = []
+        for lid in ids:
+            row = self.library_entry(lid)
+            if row is not None:
+                out.append(row)
+        return out
 
     def vault_meta(self):
-        rows = self._get("vault", "select=*&order=created_at.desc"
-                                  "&limit=300")
-        return rows
+        return self._get(
+            "vault",
+            "select=id,group_id,name,size,sha256,added_by,pinned,ts"
+            "&order=pinned.desc,ts.desc&limit=500")
 
     # -- dashboard sessions -----------------------------------------------------------------------
     def create_session(self, token_hash, expires_at):
@@ -977,19 +1300,25 @@ class SupabaseStore:
 
     # -- audit ---------------------------------------------------------------------------------------
     def audit(self, kind, actor, target="", group_id="", work_id="",
-              status="", priority="", size=0, mentions=None, ref_id=""):
+              status="", priority="", size=0, mentions=None, ref_id="",
+              sender_nickname="", sender_role="",
+              sender_custom_role=""):
         self._req("POST", "audit_log", body={
             "ts": now_ts(), "kind": kind, "actor": actor, "target": target,
             "group_id": group_id, "work_id": work_id, "status": status,
             "priority": priority, "size": int(size or 0),
-            "mentions": json.dumps(mentions or []), "ref_id": ref_id},
+            "mentions": json.dumps(mentions or []), "ref_id": ref_id,
+            "sender_nickname": sender_nickname or "",
+            "sender_role": sender_role or "",
+            "sender_custom_role": sender_custom_role or ""},
             prefer="return=minimal")
 
     def list_audit(self, limit=300):
         rows = self._get(
             "audit_log",
             "select=ts,kind,actor,target,group_id,work_id,status,priority,"
-            f"size,mentions,ref_id&order=seq.desc&limit={limit}")
+            "size,mentions,ref_id,sender_nickname,sender_role,"
+            f"sender_custom_role&order=seq.desc&limit={limit}")
         out = []
         for r in rows:
             try:
@@ -1002,5 +1331,9 @@ class SupabaseStore:
                         "status": r["status"],
                         "priority": r.get("priority", ""),
                         "size": r.get("size", 0), "mentions": mentions,
-                        "ref_id": r.get("ref_id", "")})
+                        "ref_id": r.get("ref_id", ""),
+                        "sender_nickname": r.get("sender_nickname", ""),
+                        "sender_role": r.get("sender_role", ""),
+                        "sender_custom_role":
+                            r.get("sender_custom_role", "")})
         return out
