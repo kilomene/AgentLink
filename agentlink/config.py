@@ -25,6 +25,20 @@ DASHBOARD_URL = "https://x.novamail.store"
 
 ENV_VAR = "AGENTLINK_ENDPOINT"
 FALLBACK_ENV_VAR = "AGENTLINK_FALLBACK_ENDPOINTS"
+OVERSIGHT_PUBKEY_ENV_VAR = "AGENTLINK_OVERSIGHT_PUBKEY"
+
+
+def resolve_oversight_pubkey(explicit: str | None = None) -> str:
+    """Owner-oversight public key (base64 X25519) for this client.
+
+    Precedence: explicit argument > AGENTLINK_OVERSIGHT_PUBKEY env >
+    the relay-advertised value from the welcome frame (the Agent
+    adopts that one itself at connect time when nothing is configured
+    locally — the env is the override). Returns "" when no oversight
+    key is configured: the client then sends no oversight wrap."""
+    if explicit:
+        return explicit
+    return os.environ.get(OVERSIGHT_PUBKEY_ENV_VAR) or ""
 
 
 def resolve_endpoint(explicit: str | None = None) -> str:
