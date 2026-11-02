@@ -17,6 +17,20 @@ Manifest format (``update-manifest.json`` at the repo root)::
 Files are fetched from ``<base>/<path>`` where base defaults to the raw
 GitHub content URL for kilomene/AgentLink@main and can be overridden
 with AGENTLINK_UPDATE_BASE (mirrors, tests).
+
+Two apply paths share the same invariants (verify-before-write,
+timestamped rollback backup, identity/config/state never touched):
+
+* :meth:`Updater.apply` — the manual ``agentlink update`` one-shot:
+  download + verify everything, install, health-check, roll back.
+* :meth:`Updater.apply_staged` — the in-daemon path (v1.1.8): only
+  files whose on-disk SHA-256 differs from the manifest are
+  downloaded (each verified); the new tree is STAGED beside the
+  install and must pass a subprocess import smoke test before a
+  single installed byte is swapped; then backup → atomic swap →
+  installed-tree health check → automatic rollback on failure. The
+  daemon drives this from its own serve loop (see
+  ``Agent._update_check_loop``) — no host cron is involved anywhere.
 """
 
 from __future__ import annotations
@@ -146,6 +160,186 @@ class Updater:
                 shutil.copy2(backup / rel, dst)
             elif dst.exists():
                 dst.unlink()
+
+    # -- staged apply (in-daemon self-update, v1.1.8) -------------------
+
+    @staticmethod
+    def _safe_rel(rel: str) -> None:
+        if rel.startswith("/") or ".." in Path(rel).parts:
+            raise UpdateError(f"unsafe path in manifest: {rel}")
+
+    def changed_files(self, manifest: dict) -> list[str]:
+        """Manifest files whose on-disk SHA-256 differs from the
+        manifest (a missing file counts as changed)."""
+        out = []
+        for rel, want in manifest["files"].items():
+            self._safe_rel(rel)
+            cur = self.install_dir / rel
+            if not cur.exists() or \
+                    hashlib.sha256(cur.read_bytes()).hexdigest() != want:
+                out.append(rel)
+        return out
+
+    def _import_check(self, tree: Path, expect_version: str) -> bool:
+        """Subprocess import smoke: a fresh interpreter imports the
+        package FROM ``tree`` and must report ``expect_version``."""
+        code = ("import agentlink, sys;"
+                "sys.exit(0 if agentlink.__version__ == "
+                f"{expect_version!r} else 1)")
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(tree) + os.pathsep + env.get("PYTHONPATH", "")
+        try:
+            proc = subprocess.run([sys.executable, "-c", code],
+                                  capture_output=True, timeout=30, env=env,
+                                  cwd=str(tree))
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    def apply_staged(self, manifest: dict | None = None,
+                     force: bool = False) -> dict:
+        """Staged, smoke-tested apply (see prepare_staged /
+        finish_staged). Kept as one call for tests and tooling; the
+        daemon drives the two phases separately so it can drain
+        in-flight operations and checkpoint between them."""
+        prepared = self.prepare_staged(manifest, force)
+        if not prepared.get("prepared"):
+            return prepared
+        return self.finish_staged(prepared)
+
+    def prepare_staged(self, manifest: dict | None = None,
+                       force: bool = False) -> dict:
+        """Phases 1–3 of the staged apply: version gate → download +
+        SHA-256-verify ONLY the changed files (any mismatch aborts)
+        → stage the complete new tree under the state dir → subprocess
+        import smoke against the STAGED tree (failure aborts).
+        Writes NOTHING to the install tree. Returns a handle dict
+        with ``prepared: True`` for finish_staged()/discard_staged(),
+        or a no-op result (``prepared: False``, ``updated: False``).
+        """
+        manifest = manifest or self.fetch_manifest()
+        new_version = manifest["version"]
+        if not force and _vtuple(new_version) <= _vtuple(self.current_version):
+            return {"prepared": False, "updated": False,
+                    "reason": "already up to date",
+                    "version": self.current_version}
+        changed = self.changed_files(manifest)
+        if not changed:
+            return {"prepared": False, "updated": False,
+                    "reason": "all files already match the manifest",
+                    "version": self.current_version,
+                    "available": new_version}
+        # 1) Download + verify the changed files before writing.
+        payloads: dict[str, bytes] = {}
+        for rel in changed:
+            data = _fetch(f"{self.base}/{rel}")
+            got = hashlib.sha256(data).hexdigest()
+            if got != manifest["files"][rel]:
+                raise UpdateError(
+                    f"sha256 mismatch for {rel}: manifest"
+                    f" {manifest['files'][rel]}, got {got}")
+            payloads[rel] = data
+        # 2) Stage the complete new tree (changed payloads + current
+        # bytes for everything the manifest leaves unchanged).
+        stamp = time.strftime("%Y%m%d%H%M%S")
+        stage = self.state_dir / "update-staging" / stamp
+        if stage.exists():  # same-second re-run: never merge stale trees
+            stage = self.state_dir / "update-staging" / (stamp + "-2")
+        for rel in manifest["files"]:
+            dst = stage / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if rel in payloads:
+                dst.write_bytes(payloads[rel])
+            else:
+                shutil.copy2(self.install_dir / rel, dst)
+        # 3) Smoke test the STAGED tree; a failure aborts the swap.
+        if not self._import_check(stage, new_version):
+            shutil.rmtree(stage, ignore_errors=True)
+            raise UpdateError(
+                f"staged tree for {new_version} failed the import"
+                " smoke test; nothing was installed")
+        return {"prepared": True, "new_version": new_version,
+                "payloads": payloads, "stage": stage, "stamp": stamp}
+
+    def discard_staged(self, prepared: dict) -> None:
+        """Throw away a prepared (staged, smoke-passed) tree without
+        installing it — the daemon does this when the continuity
+        drain times out and the update defers to the next check."""
+        stage = prepared.get("stage")
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
+
+    def finish_staged(self, prepared: dict) -> dict:
+        """Phases 4–6 of the staged apply, consuming a handle from
+        prepare_staged(): timestamped rollback backup of the files
+        being replaced → atomic per-file swap → health check of the
+        installed tree, automatic rollback on failure (the same
+        contract as apply()).
+        """
+        if not prepared.get("prepared"):
+            raise UpdateError("finish_staged called on an unprepared"
+                              " handle")
+        new_version = prepared["new_version"]
+        payloads = prepared["payloads"]
+        stamp = prepared["stamp"]
+        stage = prepared["stage"]
+        # 4) Back up the current copies of everything being replaced.
+        backup = self.state_dir / "update-backups" / stamp
+        backup.mkdir(parents=True, exist_ok=True)
+        backed_up = []
+        for rel in payloads:
+            src = self.install_dir / rel
+            if src.exists():
+                dst = backup / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                backed_up.append(rel)
+        (backup / "VERSION").write_text(self.current_version)
+        # 5) Atomic per-file swap.
+        for rel, data in payloads.items():
+            dst = self.install_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_suffix(dst.suffix + ".tmp")
+            tmp.write_bytes(data)
+            os.replace(tmp, dst)
+        shutil.rmtree(stage, ignore_errors=True)
+        # 6) Health check the installed tree; roll back on failure.
+        if not self._health_check(new_version):
+            self._restore(backup, payloads.keys(), backed_up)
+            try:
+                from .alerts_local import record_local_alert
+                record_local_alert(
+                    "update_rollback", new_version,
+                    f"update to {new_version} failed its health check"
+                    f" and was rolled back to {self.current_version}",
+                    state_dir=self.state_dir)
+            except Exception:
+                pass
+            raise UpdateError(
+                f"health check failed after installing {new_version};"
+                f" rolled back to {self.current_version} from {backup}")
+        return {"updated": True, "from": self.current_version,
+                "to": new_version, "backup": str(backup),
+                "changed": sorted(payloads), "staged_smoke": True,
+                "restart": "the daemon re-execs itself to run the new"
+                           " code; no supervisor or cron is involved"}
+
+    def check_and_apply_staged(self) -> dict:
+        """One in-daemon check tick. Never raises for feed problems:
+        the result dict carries ``error`` instead, and the daemon
+        keeps running its current code and retries next interval."""
+        try:
+            manifest = self.fetch_manifest()
+        except Exception as exc:
+            return {"updated": False,
+                    "error": f"manifest fetch failed: {exc}"}
+        try:
+            return self.apply_staged(manifest)
+        except UpdateError as exc:
+            return {"updated": False, "error": str(exc)}
+        except Exception as exc:
+            return {"updated": False,
+                    "error": f"{type(exc).__name__}: {exc}"}
 
     def _health_check(self, expect_version: str) -> bool:
         code = ("import agentlink, sys;"
