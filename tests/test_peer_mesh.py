@@ -187,10 +187,15 @@ def test_peer_mesh_kill_drill(state_root, tmp_path):
 
             # DISCOVERY: no fallbacks were configured — both agents
             # learned BOTH servers from the welcome payload alone.
+            # The peer starts UNRATED (earned health, v1.3.0): it
+            # joins the race set only once its battery has earned a
+            # rating above the floor.
+            assert await wait_for(
+                lambda: all(set(a.endpoints) == {home_url, peer_url}
+                            for a in (boss, worker)), timeout=40)
             for a in (boss, worker):
                 known = {s["endpoint"] for s in a.known_servers}
                 assert known == {home_url, peer_url}, known
-                assert set(a.endpoints) == {home_url, peer_url}
                 # …and the list PERSISTED into the state dir.
                 saved = json.loads(
                     (Path(a.state_dir) / "servers.json").read_text())
@@ -375,6 +380,9 @@ def test_boot_onto_peer_from_persisted_list(state_root):
     home, peer, home_url, peer_url = _mesh(tmp)
 
     async def _t():
+        # The peer must have EARNED its rating before the first
+        # boot's welcome can offer it as a fallback (v1.3.0).
+        assert await wait_for(lambda: peer.relay._rated, timeout=40)
         first = Agent("booter", endpoint=home_url,
                       state_dir=str(state_root / "booter"))
         task = asyncio.create_task(
@@ -438,22 +446,36 @@ from agentlink.relay import compute_server_health, effective_capacity  # noqa: E
 
 
 def test_health_formula_is_deterministic_and_real():
-    # No events, no load: a fresh error-free server is fully healthy.
-    assert compute_server_health() == 100
-    # Load pressure only: 3 connected peers -> -round(20 x 3/50) = -1.
-    assert compute_server_health(peers=3) == 99
-    assert compute_server_health(peers=50) == 80
-    # Scan errors: 10% of scan events failed -> -round(40 x 0.1) = -4.
-    assert compute_server_health(scan_ok=90, scan_fail=10) == 96
-    # Admission errors dominate their weight: all hellos failed -> -30.
-    assert compute_server_health(hello_ok=0, hello_fail=5) == 70
-    # Registry write failures: all failed -> -10.
-    assert compute_server_health(reg_ok=0, reg_fail=2) == 90
+    # Earned health (v1.3.0): the percentage comes ONLY from
+    # measured test evidence. No evidence at all earns NOTHING —
+    # the score is 0, and a server in that state publishes UNRATED,
+    # never a friendly static 100.
+    assert compute_server_health() == 0
+    full = dict(probe_ok=10, hello_ok=10, reg_ok=10, msg_ok=10,
+                file_ok=10, hb_ok=10, scan_ok=10)
+    # Clean evidence in every component earns the full 100.
+    assert compute_server_health(**full) == 100
+    # Load pressure: 50 peers -> -round(5 x 50/50) = -5.
+    assert compute_server_health(**full, peers=50) == 95
+    assert compute_server_health(**full, peers=3) == 100
+    # Probe failures: 10% of probe round-trips failed -> -round(2.5).
+    assert compute_server_health(
+        **{**full, "probe_ok": 90, "probe_fail": 10}) == 98
+    # Admission failures carry their weight: all hellos failed -> -20.
+    assert compute_server_health(
+        **{**full, "hello_ok": 0, "hello_fail": 5}) == 80
+    # Registry write/read-back failures: all failed -> -20.
+    assert compute_server_health(
+        **{**full, "reg_ok": 0, "reg_fail": 2}) == 80
+    # A component with NO evidence deducts its FULL weight:
+    # untested is unearned (no message round-trips -> -15).
+    no_msg = {k: v for k, v in full.items()
+              if not k.startswith("msg")}
+    assert compute_server_health(**no_msg) == 85
     # Everything broken at once floors at 0, never negative.
-    assert compute_server_health(scan_ok=0, scan_fail=10,
-                                 hello_ok=0, hello_fail=10,
-                                 reg_ok=0, reg_fail=10,
-                                 peers=50) == 0
+    assert compute_server_health(
+        probe_fail=10, hello_fail=10, reg_fail=10, msg_fail=10,
+        file_fail=10, hb_fail=10, scan_fail=10, peers=50) == 0
     # Capacity: floor(10 x health/100), hard max 10.
     assert effective_capacity(100) == 10
     assert effective_capacity(99) == 9
@@ -463,23 +485,51 @@ def test_health_formula_is_deterministic_and_real():
     assert effective_capacity(0) == 0
 
 
+def _craft_events(relay, spec):
+    """Shape a relay's measured-evidence window directly (the
+    events ARE the health currency in v1.3.0 — there is no override
+    to pin). spec maps event kind -> count; the battery keeps
+    adding its own trickle on top, so counts are large."""
+    import collections as _c
+    now = int(time.time())
+    dq = _c.deque(maxlen=20000)
+    for kind, n in spec.items():
+        dq.extend([(now, kind)] * n)
+    relay._health_events = dq
+    relay._register_server_row()
+
+
 def test_unhealthy_peer_is_never_selected(state_root):
     tmp = tempfile.mkdtemp(prefix="agentlink-mesh-health-")
     db = str(Path(tmp) / "shared.db")
     home = RelayHandle(db, "home-server")
     good = RelayHandle(db, "good-peer")
-    sick = RelayHandle(db, "sick-peer", health_override=50)
+    sick = RelayHandle(db, "sick-peer")
     home_url = home.start()
     good_url = good.start()
     sick_url = sick.start()
 
     async def _t():
+        # Both peers earn their ratings through the battery first.
+        assert await wait_for(
+            lambda: good.relay._rated and sick.relay._rated,
+            timeout=40)
+        # The sick peer's MEASURED evidence collapses (probe, hello
+        # and message round-trips failing in its window) — its
+        # percentage falls to the floor on real failures, never by
+        # an operator pin (v1.3.0: no health override exists).
+        _craft_events(sick.relay, {
+            "probe_fail": 2000, "hello_fail": 2000, "msg_fail": 2000,
+            "reg_ok": 2000, "file_ok": 2000, "hb_ok": 2000,
+            "scan_ok": 2000})
+        sick_health = sick.relay._compute_health()
+        assert 0 < sick_health <= 50, sick_health
         agent = Agent("chooser", endpoint=home_url,
                       state_dir=str(state_root / "chooser"))
         await agent.start()
         try:
             known = {s["endpoint"]: s for s in agent.known_servers}
-            assert known[sick_url]["health"] == 50
+            assert known[sick_url]["health"] <= 50
             assert known[good_url]["health"] > 50
             # At/below the floor: in the directory, NEVER in the
             # race set. The healthy peer is.
@@ -518,15 +568,23 @@ def test_rider_capacity_cap_and_deflection(state_root):
     tmp = tempfile.mkdtemp(prefix="agentlink-mesh-cap-")
     db = str(Path(tmp) / "shared.db")
     home = RelayHandle(db, "cap-home")
-    # Health pinned at 60 -> capacity floor(10 x 60/100) = 6 riders.
-    peer = RelayHandle(db, "cap-peer", health_override=60)
+    peer = RelayHandle(db, "cap-peer")
     home_url = home.start()
     peer_url = peer.start()
 
     async def _t():
-        assert peer.relay._compute_health() == 60
-        assert peer.relay._effective_capacity() == 6 \
-            if hasattr(peer.relay, "_effective_capacity") else True
+        # Earned health in the 60s -> capacity floor(10 x h/100) = 6
+        # riders. The percentage is shaped by MEASURED evidence
+        # (hello + message round-trips failing in the window) —
+        # v1.3.0 has no health pin to set.
+        assert await wait_for(lambda: peer.relay._rated, timeout=40)
+        _craft_events(peer.relay, {
+            "probe_ok": 2000, "hello_fail": 2000, "reg_ok": 2000,
+            "msg_fail": 2000, "file_ok": 2000, "hb_ok": 2000,
+            "scan_ok": 2000})
+        peer_health = peer.relay._compute_health()
+        assert 60 <= peer_health <= 69, peer_health
+        assert peer.relay._effective_capacity() == 6
         riders = []
         for i in range(6):
             r = Agent(f"cap-rider-{i}", endpoint=home_url,
@@ -663,10 +721,16 @@ def test_phantom_home_never_wins_the_race(state_root):
             reconnect_delay=0.5, home_probe_interval=1.0))
         try:
             # The race must see through the phantom (dwell) and land
-            # on the real peer.
+            # on the real peer. Under earned health (v1.3.0) the
+            # peer starts UNRATED: the first boarding attempt is
+            # deflected (server_unrated) and the agent boards for
+            # real once the peer's battery has earned its rating —
+            # so the wait is on actual peer membership, not on the
+            # endpoint label (which flips at attempt time).
             assert await wait_for(
-                lambda: agent.current_endpoint == peer_url, timeout=30)
-            assert peer.relay and "phantom-rider" in peer.relay.peers
+                lambda: peer.relay
+                and "phantom-rider" in peer.relay.peers, timeout=60)
+            assert agent.current_endpoint == peer_url
             # And the dwell-checked home probe must not knock it off
             # the peer every few seconds: still riding after 6s.
             await asyncio.sleep(6)
