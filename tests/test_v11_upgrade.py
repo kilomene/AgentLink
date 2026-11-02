@@ -17,6 +17,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import tarfile
 import tempfile
 import threading
@@ -147,6 +148,48 @@ def test_dashboard_html_has_drawer_and_animation_system(relay_env):
     # (decisions happen on the line, never here)
     assert "work_action" not in html and "blob_session" not in html
     assert 'id="convs"' in html and 'id="work"' in html
+
+
+# -- dashboard design law: real Nova logo, white theme, Nova company -----
+
+NOVA_LOGO_SHA256 = \
+    "d0c4f86e64a52875b0f7688132f0929807f2c0d2a043c02c34e7e6e73613f675"
+
+
+def _logo_hashes(html):
+    out = []
+    for m in re.finditer(r"data:image/jpeg;base64,([A-Za-z0-9+/=]+)", html):
+        out.append(hashlib.sha256(base64.b64decode(m.group(1))).hexdigest())
+    return out
+
+
+def test_dashboard_design_law_logo_and_theme(relay_env):
+    """Owner's standing design law: the dashboard carries HIS real Nova
+    logo (served bytes hash-match the authoritative logo file — never a
+    substitute glyph/mark), the drawer says 'A Nova company', and the
+    theme is the white/light Nova design system."""
+    html = dash_html(relay_env)
+    hashes = _logo_hashes(html)
+    assert hashes, "no embedded logo image served"
+    assert all(h == NOVA_LOGO_SHA256 for h in hashes), hashes
+    assert '<img' in html and 'class="mark"' in html
+    assert "◆" not in html  # the old substitute glyph is gone
+    assert "A <b>Nova</b> company" in html
+    # white/light design system markers
+    assert "--bg:#edf1f7" in html and "--card:#ffffff" in html
+    assert ".card{background:var(--card)" in html
+    assert "linear-gradient(180deg,#f4f7fb" in html
+
+
+def test_login_page_design_law(relay_env):
+    """The login page obeys the same law: real logo, light theme,
+    'A Nova company'."""
+    base = f"http://{HOST}:{relay_env['dash_port']}"
+    html = urllib.request.urlopen(base + "/", timeout=5).read().decode()
+    hashes = _logo_hashes(html)
+    assert hashes and all(h == NOVA_LOGO_SHA256 for h in hashes), hashes
+    assert "A <b>Nova</b> company" in html
+    assert "--bg:#edf1f7" in html and "◆" not in html
 
 
 # -- conversations: sender identity + group participants ------------------
