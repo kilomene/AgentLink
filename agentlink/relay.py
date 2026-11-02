@@ -156,7 +156,8 @@ class Relay:
                       size: int = 0, mentions=None, ref_id: str = "",
                       sender_nickname: str = "", sender_role: str = "",
                       sender_custom_role: str = "",
-                      oversight: dict | None = None) -> None:
+                      oversight: dict | None = None,
+                      content_envelope: dict | None = None) -> None:
         """Metadata only — never content. Feeds the live dashboard.
 
         Evidence labelling (point 32): agent-reported claims (progress
@@ -171,6 +172,13 @@ class Relay:
         # JSON — the relay stores it but can never open it (it holds
         # no oversight private key, by construction).
         oversight = json.dumps(oversight) if oversight else ""
+        # Group/channel content envelope {epoch, nonce, ct}: also
+        # ciphertext the relay cannot open (it holds no group key).
+        # Persisted so the dashboard can combine it with the
+        # oversight content-key wrap to render group/channel content
+        # for the operator session.
+        content_envelope = json.dumps(content_envelope) \
+            if content_envelope else ""
         self.activity.appendleft({
             "ts": now_ts(), "kind": kind, "from": actor, "to": target,
             "group_id": group_id, "work_id": work_id, "status": status,
@@ -179,6 +187,7 @@ class Relay:
             "sender_role": sender_role,
             "sender_custom_role": sender_custom_role,
             "oversight": oversight or None,
+            "content_envelope": content_envelope or None,
             "evidence": "claimed" if claimed else "verified"})
         try:
             self.store.audit(kind, actor, target, group_id, work_id, status,
@@ -187,7 +196,8 @@ class Relay:
                              sender_nickname=sender_nickname,
                              sender_role=sender_role,
                              sender_custom_role=sender_custom_role,
-                             oversight=oversight)
+                             oversight=oversight,
+                             content_envelope=content_envelope)
         except Exception:
             pass
         if getattr(self, "dashboard", None) is not None:
@@ -287,6 +297,7 @@ class Relay:
                 "kind": r["kind"], "size": r.get("size", 0),
                 "mentions": r.get("mentions") or [],
                 "oversight": r.get("oversight"),
+                "content_envelope": r.get("content_envelope"),
                 "priority": r.get("priority") or "normal",
                 "status": r.get("status", ""),
                 "work_id": r.get("work_id", ""),
@@ -1537,7 +1548,8 @@ class Relay:
                            sender_nickname=msg["sender_nickname"],
                            sender_role=msg["sender_role"],
                            sender_custom_role=msg["sender_custom_role"],
-                           oversight=frame.get("oversight"))
+                           oversight=frame.get("oversight"),
+                           content_envelope=content)
         await self._result(ws, req_id, True,
                            {"id": msg["id"], "group_id": gid,
                             "delivered": delivered, "queued": queued})
@@ -1749,7 +1761,8 @@ class Relay:
                            size=len(str(content.get("ct") or "")),
                            mentions=msg["mentions"], ref_id=msg["id"],
                            sender_role=role,
-                           oversight=frame.get("oversight"))
+                           oversight=frame.get("oversight"),
+                           content_envelope=content)
         await self._result(ws, req_id, True,
                            {"id": msg["id"], "channel_id": cid,
                             "delivered": delivered, "queued": queued})
