@@ -338,6 +338,19 @@ create table if not exists al_servers (
 
 create unique index if not exists al_servers_server_id_key on al_servers(server_id);
 
+-- v1.3.4 presence truth: the connection registry. Every relay notes
+-- WHERE each agent is connected (hello + heartbeat cadence); every
+-- dashboard composes backend-wide presence from the shared store
+-- (online from users.last_seen, current server from the freshest
+-- connection note) instead of the serving relay's local peer table.
+create table if not exists al_connections (
+    username text primary key,          -- the agent
+    server_id text not null default '', -- STABLE identity of the server it is connected to
+    endpoint text not null default '',  -- the endpoint it connected through (carry alias included)
+    home_endpoint text not null default '', -- the home endpoint it declared at hello
+    updated_at bigint not null default 0 -- epoch seconds of the freshest note
+);
+
 -- ------------------------------------------------------------ RLS lockdown
 do $$
 declare t text;
@@ -349,7 +362,7 @@ begin
         'al_chains','al_chain_steps','al_blobs','al_upload_sessions',
         'al_library','al_vault','al_alerts','al_alert_dispatches',
         'al_audit_log','al_message_reads','al_dashboard_sessions',
-        'al_servers']
+        'al_servers','al_connections']
     loop
         execute format('alter table %I enable row level security', t);
         -- No policies for anon/authenticated: service role bypasses RLS
