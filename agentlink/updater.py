@@ -70,7 +70,8 @@ class Updater:
     def __init__(self, base_url: str | None = None,
                  install_dir: str | Path | None = None,
                  state_dir: str | Path = "~/.agentlink",
-                 current_version: str = __version__):
+                 current_version: str = __version__,
+                 census_guard=None):
         self.base = (base_url or os.environ.get("AGENTLINK_UPDATE_BASE")
                      or DEFAULT_UPDATE_BASE).rstrip("/")
         # install_dir = the directory that CONTAINS the agentlink package
@@ -78,6 +79,60 @@ class Updater:
             Path(__file__).resolve().parent.parent
         self.state_dir = Path(state_dir).expanduser()
         self.current_version = current_version
+        # Immortality gate (v1.3.2): an optional CensusGuard over the
+        # deployment's store. When set, apply paths census the store
+        # BEFORE the swap and verify AFTER the health check — an
+        # update window in which a conversation, group or channel
+        # vanished is a FAILED update: roll back, alert, raise.
+        self.census_guard = census_guard
+        self._census_loss = None
+
+    # -- immortality gate (v1.3.2) --------------------------------------
+
+    def _census_before(self):
+        if self.census_guard is None:
+            return None
+        return self.census_guard.compute()
+
+    def _census_intact(self, before) -> bool:
+        """True when the post-update census still holds everything
+        the before-census held. On loss, the loss is written to the
+        record (alert + audit rows) before returning False."""
+        if before is None or self.census_guard is None:
+            return True
+        from .census import alert_loss, diff_census, losses_found
+        after = self.census_guard.compute()
+        diff = diff_census(before, after)
+        if not losses_found(diff):
+            return True
+        self._census_loss = diff
+        try:
+            alert_loss(self.census_guard.store, diff)
+        except Exception:
+            pass
+        return False
+
+    def _fail_census_loss(self, backup, rels, backed_up,
+                          new_version) -> None:
+        """Roll back and raise for a census-loss update failure.
+        Always raises UpdateError."""
+        from .census import describe_losses
+        self._restore(backup, rels, backed_up)
+        detail = describe_losses(self._census_loss or {})
+        try:
+            from .alerts_local import record_local_alert
+            record_local_alert(
+                "census_loss_rollback", new_version,
+                f"update to {new_version} coincided with lost "
+                f"conversation content ({detail}); rolled back to "
+                f"{self.current_version}",
+                state_dir=self.state_dir)
+        except Exception:
+            pass
+        raise UpdateError(
+            f"conversation census loss during update to "
+            f"{new_version} ({detail}); rolled back to "
+            f"{self.current_version} from {backup}")
 
     def fetch_manifest(self) -> dict:
         raw = _fetch(f"{self.base}/{MANIFEST_NAME}")
@@ -100,6 +155,8 @@ class Updater:
         if not force and _vtuple(new_version) <= _vtuple(self.current_version):
             return {"updated": False, "reason": "already up to date",
                     "version": self.current_version}
+        # Immortality gate (v1.3.2): census BEFORE anything changes.
+        census_before = self._census_before()
         # 1) Download + verify EVERY file before writing anything.
         payloads: dict[str, bytes] = {}
         for rel, want_sha in manifest["files"].items():
@@ -146,6 +203,11 @@ class Updater:
             raise UpdateError(
                 f"health check failed after installing {new_version};"
                 f" rolled back to {self.current_version} from {backup}")
+        # 5) Immortality gate (v1.3.2): a clean file swap over a
+        # store that lost conversations is still a failed update.
+        if not self._census_intact(census_before):
+            self._fail_census_loss(backup, payloads.keys(), backed_up,
+                                   new_version)
         return {"updated": True, "from": self.current_version,
                 "to": new_version, "backup": str(backup),
                 "restart": "restart the agent daemon to pick up the new"
@@ -283,6 +345,8 @@ class Updater:
         payloads = prepared["payloads"]
         stamp = prepared["stamp"]
         stage = prepared["stage"]
+        # Immortality gate (v1.3.2): census BEFORE the swap.
+        census_before = self._census_before()
         # 4) Back up the current copies of everything being replaced.
         backup = self.state_dir / "update-backups" / stamp
         backup.mkdir(parents=True, exist_ok=True)
@@ -318,6 +382,11 @@ class Updater:
             raise UpdateError(
                 f"health check failed after installing {new_version};"
                 f" rolled back to {self.current_version} from {backup}")
+        # 7) Immortality gate (v1.3.2): as in apply() — the swap is
+        # only a success while every conversation survives it.
+        if not self._census_intact(census_before):
+            self._fail_census_loss(backup, payloads.keys(), backed_up,
+                                   new_version)
         return {"updated": True, "from": self.current_version,
                 "to": new_version, "backup": str(backup),
                 "changed": sorted(payloads), "staged_smoke": True,
@@ -363,8 +432,28 @@ def main(argv=None) -> int:
     ap.add_argument("--check", action="store_true",
                     help="only report whether an update exists")
     ap.add_argument("--base", default=None)
+    ap.add_argument("--census", action="store_true",
+                    help="guard the update with the conversation "
+                         "census (immortality gate): census the store "
+                         "before the swap and verify after — any lost "
+                         "conversation, group or channel rolls the "
+                         "update back and fails it loudly")
+    ap.add_argument("--db", default="~/.agentlink/relay.db",
+                    help="relay DB path (sqlite census store source; "
+                         "the baseline lives beside it)")
+    ap.add_argument("--census-baseline", default=None,
+                    help="census baseline path (default: beside "
+                         "--db, matching the relay boot gate)")
     args = ap.parse_args(argv)
-    up = Updater(base_url=args.base)
+    guard = None
+    if args.census:
+        from .backend import create_store
+        from .census import CensusGuard
+        store = create_store(db_path=args.db)
+        baseline = args.census_baseline or str(
+            Path(args.db).expanduser().parent / "census-baseline.json")
+        guard = CensusGuard(store, baseline)
+    up = Updater(base_url=args.base, census_guard=guard)
     if args.check:
         print(json.dumps(up.check(), indent=2))
         return 0
