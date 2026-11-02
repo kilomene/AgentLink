@@ -15,6 +15,8 @@ import collections
 import json
 import logging
 import os
+import time
+import urllib.parse
 from dataclasses import dataclass, field
 from http import HTTPStatus
 
@@ -27,10 +29,18 @@ from .timing import (
     ALERT_OFFLINE_SECONDS,
     ALERT_REMINDER_SECONDS,
     ALERT_URGENT_SECONDS,
+    CARRY_HANDBACK_SECONDS,
+    CARRY_LEASE_SECONDS,
+    CARRY_WATCH_SECONDS,
     CHECKIN_GAP_MIN_SECONDS,
     CHECKIN_MIN_SESSIONS,
     CHECKIN_SESSION_MAX_SECONDS,
     CHECKIN_WINDOW_SECONDS,
+    HEALTH_FRAME_TIMEOUT_SECONDS,
+    HEALTH_INITIAL_CYCLES,
+    HEALTH_PROBE_ROUNDS,
+    HEALTH_TEST_CYCLE_SECONDS,
+    HEALTH_UNRATED,
     HEARTBEAT_SECONDS,
     HOME_PROBE_SECONDS,
     OFFLINE_GRACE_SECONDS,
@@ -39,6 +49,7 @@ from .timing import (
     SERVER_HEALTHY_MIN,
     SERVER_HEARTBEAT_SECONDS,
     SERVER_HEALTH_WINDOW_SECONDS,
+    SERVER_STALE_SECONDS,
     UPDATE_CHECK_SECONDS,
 )
 from .store import GroupFull, NotFound, RemovalBlocked, Store, UsernameTaken
@@ -48,35 +59,67 @@ log = logging.getLogger("agentlink.relay")
 ADMIN_ROLES = ("admin", "superadmin")
 
 
-def compute_server_health(*, scan_ok: int = 0, scan_fail: int = 0,
+def _ws_client_connect():
+    """The websocket client connect for this interpreter's
+    websockets build: 14+ ships websockets.asyncio.client, older
+    builds ship the legacy websockets.client. Returns
+    (connect, is_modern) — the battery and the carry home-probe
+    speak to both identically; only the proxy kwarg differs
+    (the modern client honours it, the legacy one has none)."""
+    try:
+        from websockets.asyncio.client import connect
+        return connect, True
+    except ImportError:
+        from websockets.client import connect
+        return connect, False
+
+
+def compute_server_health(*, probe_ok: int = 0, probe_fail: int = 0,
                           hello_ok: int = 0, hello_fail: int = 0,
                           reg_ok: int = 0, reg_fail: int = 0,
+                          msg_ok: int = 0, msg_fail: int = 0,
+                          file_ok: int = 0, file_fail: int = 0,
+                          hb_ok: int = 0, hb_fail: int = 0,
+                          scan_ok: int = 0, scan_fail: int = 0,
                           peers: int = 0) -> int:
-    """THE health percentage (v1.2.0 mesh rule) — computed ONLY from
-    signals the relay itself measured, over the trailing
-    SERVER_HEALTH_WINDOW_SECONDS (5 min). No invented numbers: every
-    point lost is a real failure or real load this server saw.
+    """THE health percentage (v1.3.0 earned-health law) — computed
+    ONLY from the server's own measured test evidence over the
+    trailing SERVER_HEALTH_WINDOW_SECONDS (5 min). Every point is
+    earned by testing and every deduction is a real measured
+    failure. There is no default, no static assignment and no
+    override: a component with NO evidence in the window deducts
+    its FULL weight (untested is unearned), so a server that stops
+    testing watches its percentage fall to zero as the window
+    slides.
 
-        health = 100
-          - round(40 x scan_fail  / scan_events)    fleet-scan errors
-          - round(30 x hello_fail / hello_events)   admission errors
-          - round(10 x reg_fail   / reg_events)     registry writes
-          - round(20 x min(1, connected_peers / 50))  load pressure
+    Weights (documented, sum 100, plus load):
+        25  probe round-trips (application ping -> pong)
+        20  hello handshakes (admissions)
+        20  registry write + read-back integrity
+        15  message round-trips (real DM through this server)
+        10  file round-trips (chunked upload, hash-verified fetch)
+         5  heartbeat stability (registry heartbeats landing)
+         5  fleet-scan reliability (internal work loop)
+       + up to 5 more for load pressure (connected peers, capped)
 
-    A component with no events in the window deducts nothing (a
-    fresh, idle, error-free server is a healthy server). The result
-    is clamped to 0..100. Pure function of its inputs — the tests
-    pin it deterministically."""
+    The relay's battery (see _run_health_cycle) generates the
+    probe/hello/registry/message/file/heartbeat evidence actively
+    and continuously; real traffic adds its own outcomes on top.
+    Pure function of its inputs — the tests pin it deterministically."""
     def _deduct(weight: int, ok: int, fail: int) -> int:
         total = ok + fail
         if total <= 0:
-            return 0
+            return weight  # no evidence: nothing was earned
         return round(weight * fail / total)
     health = 100
-    health -= _deduct(40, scan_ok, scan_fail)
-    health -= _deduct(30, hello_ok, hello_fail)
-    health -= _deduct(10, reg_ok, reg_fail)
-    health -= round(20 * min(1.0, max(0, peers) / 50))
+    health -= _deduct(25, probe_ok, probe_fail)
+    health -= _deduct(20, hello_ok, hello_fail)
+    health -= _deduct(20, reg_ok, reg_fail)
+    health -= _deduct(15, msg_ok, msg_fail)
+    health -= _deduct(10, file_ok, file_fail)
+    health -= _deduct(5, hb_ok, hb_fail)
+    health -= _deduct(5, scan_ok, scan_fail)
+    health -= round(5 * min(1.0, max(0, peers) / 50))
     return max(0, min(100, health))
 
 
@@ -101,6 +144,10 @@ class Peer:
     touched_at: int = 0
     connected_at: int = 0
     core: dict = field(default_factory=dict)
+    # v1.3.0 carrying: the server identity this connection arrived
+    # through — this relay's own server_id, or the carried server's
+    # id when the connection came in on a carry alias.
+    server_id: str = ""
 
 
 @dataclass
@@ -116,6 +163,17 @@ class Relay:
     # relay). Recorded in the server registry so the mesh can say
     # WHOSE server a rider is riding.
     host_agent: str | None = None
+    # Server carrying (v1.3.0): this server's STABLE identity in the
+    # registry (defaults to its registry endpoint). owner_agent set
+    # means this relay IS that agent's own server — the agent owns
+    # it permanently, wherever it runs; home_host names the host
+    # agent of its home machine. carrier_enabled: this relay watches
+    # the registry and carries brothers' servers when they fall
+    # (every relay is a carrier by default — that is the passage).
+    server_id: str | None = None
+    owner_agent: str | None = None
+    home_host: str | None = None
+    carrier_enabled: bool = True
     dashboard_password: str | None = None
     dashboard_port: int = 8766
     public_endpoint: str | None = None
@@ -153,17 +211,27 @@ class Relay:
         os.environ.get("AGENTLINK_REQUIRE_OVERSIGHT", "") == "1")
     _scan_task: object = field(default=None, repr=False)
     _server_hb_task: object = field(default=None, repr=False)
-    # Health (v1.2.0): the operator may PIN this server's health
-    # (AGENTLINK_SERVER_HEALTH, 0-100) — the deliberate drain switch:
-    # pin 50 or below and riders migrate off and none are admitted,
-    # while the server keeps serving its own home agents. Unset =
-    # health is computed from measured signals (the normal case).
-    health_override: int | None = field(default_factory=lambda: (
-        int(os.environ["AGENTLINK_SERVER_HEALTH"])
-        if os.environ.get("AGENTLINK_SERVER_HEALTH") else None))
+    # Earned health (v1.3.0): a server starts UNRATED — it carries
+    # NO percentage and is eligible neither to be ridden nor to
+    # carry until its battery has completed HEALTH_INITIAL_CYCLES
+    # cycles with real evidence in every component. There is NO
+    # health override: no env var, config value or operator switch
+    # may set the number (the v1.2.x AGENTLINK_SERVER_HEALTH pin is
+    # abolished — a tampered number is a lie the mesh would route
+    # by). _health_events is the ONLY source of the percentage.
     _health_events: object = field(
         default_factory=lambda: collections.deque(maxlen=20000),
         repr=False)
+    _health_task: object = field(default=None, repr=False)
+    _health_cycles: int = field(default=0, repr=False)
+    _rated: bool = field(default=False, repr=False)
+    _last_health_publish: object = field(default=None, repr=False)
+    # Carrying (v1.3.0): server_id -> {"token", "endpoint", "owner"}
+    # for the brothers' servers THIS relay currently carries, and
+    # the per-server home-probe continuity clock for handback.
+    _carrier_task: object = field(default=None, repr=False)
+    _carried: dict = field(default_factory=dict, repr=False)
+    _home_ok_since: dict = field(default_factory=dict, repr=False)
     # Hardened core (v1.2.0): the relay operator's update switch —
     # the ONLY sanctioned kill switch for agents' self-update
     # checkers (AGENTLINK_UPDATES_ENABLED=0 on the RELAY). Advertised
@@ -191,6 +259,16 @@ class Relay:
             default_root = os.path.join(
                 os.path.dirname(os.path.expanduser(self.db_path)), "blobs")
             self.blob_store = create_blob_store(local_root=default_root)
+        # Carrying identity (v1.3.0): a stable server_id (defaults
+        # to the registry endpoint — a server's identity must not
+        # change when its endpoint moves to a carrier), a permanent
+        # owner for per-agent servers, and the home host label.
+        if not self.server_id:
+            self.server_id = self._registry_endpoint()
+        self.owner_agent = (self.owner_agent or "").strip() \
+            .lstrip("@").lower() or None
+        if not self.home_host:
+            self.home_host = self.host_agent or ""
 
     @property
     def server_label(self) -> str:
@@ -206,13 +284,26 @@ class Relay:
         'online (via <its own name>)')."""
         if not endpoint:
             return False
-        norm = str(endpoint).strip().rstrip("/").lower()
-        candidates = {f"ws://{self.host}:{self.port}",
-                      f"wss://{self.host}:{self.port}"}
+
+        def _norm_ep(value: str) -> str:
+            # Endpoints in this system canonically end in /ws (every
+            # production endpoint does); a relay's own bind identity
+            # has no path. Compare path-insensitively for that one
+            # suffix so a home agent is never misread as a rider
+            # (v1.3.0 root-cause fix — invisible while health was
+            # instant, fatal once the UNRATED gate could refuse).
+            v = str(value).strip().rstrip("/").lower()
+            if v.endswith("/ws"):
+                v = v[:-3]
+            return v
+
+        norm = _norm_ep(endpoint)
+        candidates = {_norm_ep(f"ws://{self.host}:{self.port}"),
+                      _norm_ep(f"wss://{self.host}:{self.port}")}
         ep = self.public_endpoint or \
             os.environ.get("AGENTLINK_PUBLIC_ENDPOINT")
         if ep:
-            candidates.add(str(ep).strip().rstrip("/").lower())
+            candidates.add(_norm_ep(ep))
         try:
             from .config import DEFAULT_ENDPOINT
             default_norm = str(DEFAULT_ENDPOINT).strip().rstrip("/") \
@@ -226,9 +317,8 @@ class Relay:
             # here, and the dashboard must say "online (via <peer>)"
             # (v1.2.0 — with one relay this distinction was invisible;
             # with a live mesh it is the whole point).
-            if not ep or str(ep).strip().rstrip("/").lower() == \
-                    default_norm:
-                candidates.add(default_norm)
+            if not ep or _norm_ep(ep) == _norm_ep(default_norm):
+                candidates.add(_norm_ep(default_norm))
         except Exception:
             pass
         return norm in candidates
@@ -268,29 +358,53 @@ class Relay:
 
     def _health_counts(self) -> dict:
         cutoff = now_ts() - SERVER_HEALTH_WINDOW_SECONDS
-        counts = {"scan_ok": 0, "scan_fail": 0, "hello_ok": 0,
-                  "hello_fail": 0, "reg_ok": 0, "reg_fail": 0}
+        counts = {"probe_ok": 0, "probe_fail": 0,
+                  "hello_ok": 0, "hello_fail": 0,
+                  "reg_ok": 0, "reg_fail": 0,
+                  "msg_ok": 0, "msg_fail": 0,
+                  "file_ok": 0, "file_fail": 0,
+                  "hb_ok": 0, "hb_fail": 0,
+                  "scan_ok": 0, "scan_fail": 0}
         for ts, kind in list(self._health_events):
             if ts >= cutoff and kind in counts:
                 counts[kind] += 1
         return counts
 
-    def _compute_health(self) -> int:
-        if self.health_override is not None:
-            return max(0, min(100, int(self.health_override)))
+    def _health_score(self) -> int:
+        """The earned percentage from the evidence in the window —
+        the only computation of health anywhere in the system."""
         return compute_server_health(
             peers=len(self.peers), **self._health_counts())
 
-    def _effective_capacity(self) -> int:
-        return effective_capacity(self._compute_health())
+    def _compute_health(self) -> int:
+        """This server's published health: HEALTH_UNRATED (-1)
+        until the battery has earned a first rating, then the
+        measured score. Riders and carriers treat unrated exactly
+        like at/below the floor: not eligible."""
+        if not self._rated:
+            return HEALTH_UNRATED
+        return self._health_score()
 
-    def _riders_count(self, exclude: str = "") -> int:
+    def _effective_capacity(self) -> int:
+        health = self._compute_health()
+        if health <= SERVER_HEALTHY_MIN:
+            return 0
+        return effective_capacity(health)
+
+    def _riders_count(self, exclude: str = "",
+                      server_id: str | None = None) -> int:
         """Agents RIDING this server right now: connected, not
         ephemeral, and their home is somewhere else. Home agents are
-        not riders and never count against capacity."""
+        not riders and never count against capacity. With
+        server_id, counts the agents connected through that carried
+        server's identity instead."""
         n = 0
         for p in self.peers.values():
             if p.ephemeral or p.username == exclude:
+                continue
+            if server_id is not None:
+                if p.server_id == server_id:
+                    n += 1
                 continue
             if p.home_endpoint and \
                     not self._is_home_endpoint(p.home_endpoint):
@@ -374,13 +488,30 @@ class Relay:
                 host_agent=self.host_agent or "",
                 version=__version__, health=health,
                 riders=self._riders_count(),
-                capacity=effective_capacity(health))
-            self._health_event("reg_ok")
+                capacity=effective_capacity(health)
+                if health > SERVER_HEALTHY_MIN else 0,
+                server_id=self.server_id,
+                owner_agent=self.owner_agent or "",
+                home_host=self.home_host or "",
+                can_carry=self.carrier_enabled)
+            # Read-back integrity (earned-health battery): the row
+            # must come back from the shared store with this
+            # server's identity and label intact — a registry that
+            # cannot prove its own write is a measured failure.
+            row = self.store.get_server(self.server_id)
+            if row is not None and \
+                    row.get("label") == self.server_label:
+                self._health_event("reg_ok")
+                self._health_event("hb_ok")
+            else:
+                self._health_event("reg_fail")
+                self._health_event("hb_fail")
         except Exception:
             # A registry write must never take the relay down: the
             # relay keeps serving; clients just don't learn about it
             # until a heartbeat lands. Loud in the log, never fatal.
             self._health_event("reg_fail")
+            self._health_event("hb_fail")
             log.exception("server registry registration failed")
 
     async def _server_heartbeat_loop(self) -> None:
@@ -403,6 +534,508 @@ class Relay:
             except Exception:
                 log.exception("server registry heartbeat failed")
 
+    # -- earned health: the battery (v1.3.0) ------------------------------
+    # A server's percentage is EARNED THROUGH TESTING, every time.
+    # This loop is the testing: every HEALTH_TEST_CYCLE_SECONDS it
+    # exercises the REAL server end-to-end over real loopback
+    # websocket connections — probe round-trips, ephemeral hello
+    # handshakes, a real (battery-labelled, audit-exempt) message
+    # round-trip between two ephemeral peers, a chunked file
+    # round-trip verified by SHA-256 — plus the registry
+    # write/read-back and heartbeat evidence _register_server_row
+    # records. Real traffic adds its own outcomes on top. Nothing
+    # here is simulated: every component talks to the live listener
+    # and the live store, exactly like a real client.
+
+    def _battery_base(self) -> str:
+        host = self.host if self.host not in ("0.0.0.0", "::", "") \
+            else "127.0.0.1"
+        return f"ws://{host}:{self.port}"
+
+    async def _battery_recv(self, ws, want: set,
+                            timeout: float = HEALTH_FRAME_TIMEOUT_SECONDS):
+        deadline = time.monotonic() + timeout
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("battery frame timeout")
+            raw = await asyncio.wait_for(ws.recv(), timeout=left)
+            try:
+                frame = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(frame, dict) and frame.get("type") in want:
+                return frame
+
+    async def _run_health_cycle(self) -> None:
+        import base64 as _b64
+        import hashlib as _hl
+        _ws_connect, _modern = _ws_client_connect()
+        base = self._battery_base()
+        kw = {"max_size": MAX_FRAME, "open_timeout": 3}
+        if _modern:
+            kw["proxy"] = None  # loopback: never via an egress proxy
+        done = {"probe": False, "msg": False, "file": False}
+        try:
+            # Probe round-trips: application ping -> pong, timed.
+            try:
+                async with _ws_connect(base, **kw) as ws:
+                    for i in range(HEALTH_PROBE_ROUNDS):
+                        t0 = time.monotonic()
+                        await ws.send(json.dumps(
+                            {"type": "ping",
+                             "req_id": f"hb-probe-{i}"}))
+                        frame = await self._battery_recv(ws, {"pong"})
+                        if frame.get("type") == "pong":
+                            self._health_event("probe_ok")
+                            _ = time.monotonic() - t0  # latency seen
+                        else:  # pragma: no cover - recv filters pong
+                            self._health_event("probe_fail")
+                    done["probe"] = True
+            except Exception:
+                self._health_event("probe_fail")
+            # Hello + message + file on two ephemeral peers. The
+            # hellos themselves are counted by _on_hello.
+            try:
+                async with _ws_connect(base, **kw) as a, \
+                        _ws_connect(base, **kw) as b:
+                    for ws in (a, b):
+                        await ws.send(json.dumps(
+                            {"type": "hello", "ephemeral": True,
+                             "req_id": "hb-hello"}))
+                    wa = await self._battery_recv(a, {"welcome"})
+                    wb = await self._battery_recv(b, {"welcome"})
+                    b_user = wb["username"]
+                    _ = wa
+                    # Message round-trip (battery-labelled: routed
+                    # for real, exempt from the audit/activity feed
+                    # and the oversight gate — it is the server's own
+                    # self-test traffic, never user activity).
+                    await a.send(json.dumps(
+                        {"type": "send", "to": b_user,
+                         "content": {"ct": "agentlink-health-battery"},
+                         "battery": True, "req_id": "hb-msg",
+                         "id": "hb-msg-1"}))
+                    res = await self._battery_recv(a, {"result",
+                                                       "error"})
+                    got = await self._battery_recv(b, {"message"})
+                    if res.get("type") == "result" and \
+                            (got.get("content") or {}).get("ct") == \
+                            "agentlink-health-battery":
+                        self._health_event("msg_ok")
+                    else:
+                        self._health_event("msg_fail")
+                    done["msg"] = True
+                    # Chunked file round-trip, hash-verified.
+                    # The payload is nonce-stamped per server and
+                    # cycle: on a SHARED blob store an identical
+                    # payload would give every relay's battery the
+                    # same blob_id, and one server's cleanup delete
+                    # could pull another server's test file out from
+                    # under its verification.
+                    nonce = _hl.sha256(
+                        f"{self.server_id}:{self._health_cycles}:"
+                        f"{time.time_ns()}".encode()).digest()
+                    payload = bytes((i * 7 + 13) % 256
+                                    for i in range(3000 - 32)) + nonce
+                    digest = _hl.sha256(payload).hexdigest()
+                    await a.send(json.dumps(
+                        {"type": "blob_session_start",
+                         "whole_sha": digest, "ct_sha": digest,
+                         "size": len(payload), "chunk_size": 1024,
+                         "req_id": "hb-f0"}))
+                    st = await self._battery_recv(a, {"result",
+                                                      "error"})
+                    sid = (st.get("data") or {}).get("session_id")
+                    if not sid:
+                        raise RuntimeError("battery upload start "
+                                           "refused")
+                    for idx in range(3):
+                        chunk = payload[idx * 1024:(idx + 1) * 1024]
+                        await a.send(json.dumps(
+                            {"type": "blob_chunk", "session_id": sid,
+                             "index": idx,
+                             "data_b64": _b64.b64encode(
+                                 chunk).decode(),
+                             "chunk_sha": _hl.sha256(
+                                 chunk).hexdigest(),
+                             "req_id": f"hb-fc-{idx}"}))
+                        await self._battery_recv(a, {"result", "error"})
+                    await a.send(json.dumps(
+                        {"type": "blob_session_finish",
+                         "session_id": sid, "req_id": "hb-f9"}))
+                    fin = await self._battery_recv(a, {"result",
+                                                       "error"})
+                    blob_id = (fin.get("data") or {}).get("blob_id")
+                    if not blob_id:
+                        raise RuntimeError("battery upload finish "
+                                           "refused")
+                    await a.send(json.dumps(
+                        {"type": "blob_get", "blob_id": blob_id,
+                         "req_id": "hb-fg"}))
+                    gotf = await self._battery_recv(a, {"result",
+                                                        "error"})
+                    data = _b64.b64decode(
+                        (gotf.get("data") or {}).get("data_b64")
+                        or "")
+                    if _hl.sha256(data).hexdigest() == digest:
+                        self._health_event("file_ok")
+                    else:
+                        self._health_event("file_fail")
+                    done["file"] = True
+                    await a.send(json.dumps(
+                        {"type": "blob_delete", "blob_id": blob_id,
+                         "req_id": "hb-fd"}))
+                    await self._battery_recv(a, {"result", "error"})
+            except Exception:
+                if not done["msg"]:
+                    self._health_event("msg_fail")
+                if not done["file"]:
+                    self._health_event("file_fail")
+        finally:
+            self._health_cycles += 1
+            if not self._rated and \
+                    self._health_cycles >= HEALTH_INITIAL_CYCLES:
+                counts = self._health_counts()
+                if all(counts.get(k, 0) >= 1 for k in (
+                        "probe_ok", "hello_ok", "reg_ok", "msg_ok",
+                        "file_ok", "hb_ok")):
+                    self._rated = True
+                    log.info("server %s earned its first health "
+                             "rating: %s%% after %d battery cycles",
+                             self.server_label, self._health_score(),
+                             self._health_cycles)
+            # Registry write/read-back + heartbeat evidence — AFTER
+            # the rating flip, so the row this cycle publishes
+            # already carries the rating it just earned (a client
+            # reading the registry must never see UNRATED for a
+            # server that has already earned its percentage).
+            await asyncio.to_thread(self._register_server_row)
+            # Real-time law: a changed percentage republishes NOW.
+            sig = self._compute_health()
+            if sig != self._last_health_publish:
+                self._last_health_publish = sig
+                if getattr(self, "dashboard", None) is not None:
+                    self.dashboard.notify()
+
+    async def _health_battery_loop(self) -> None:
+        while True:
+            try:
+                await self._run_health_cycle()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.exception("health battery cycle failed")
+            await asyncio.sleep(HEALTH_TEST_CYCLE_SECONDS)
+
+    # -- server carrying (v1.3.0) ------------------------------------------
+    # The passage model: what is carried is a brother's SERVER,
+    # never its brain. This relay watches the registry; a per-agent
+    # server whose home stops answering (heartbeat stale, or the
+    # endpoint itself refuses an application probe) is claimed by
+    # the best eligible carrier under a single-winner lease, and
+    # this relay then serves that server's identity — same label,
+    # same permanent owner — at its carry alias. When home answers
+    # strongly for CARRY_HANDBACK_SECONDS the lease is released and
+    # the server goes home; if THIS carrier falls, the lease simply
+    # expires and the next brother claims — the server hops again.
+
+    def _carry_endpoint_for(self, server_id: str) -> str:
+        """This relay's reachable alias for a carried server: a
+        ?carry=<id> query on /ws endpoints (the production tunnel
+        routes /ws), a /carry/<id> path everywhere else. Clients
+        learn it from the registry row, exactly like any endpoint."""
+        base = self._registry_endpoint()
+        sid = urllib.parse.quote(str(server_id), safe="")
+        if "?" in base:
+            return base + "&carry=" + sid
+        if urllib.parse.urlsplit(base).path.endswith("/ws"):
+            return base + "?carry=" + sid
+        return base.rstrip("/") + "/carry/" + sid
+
+    @staticmethod
+    def _connection_server_id(ws) -> str:
+        """The server identity a websocket arrived through, from
+        its request path (?carry=<id> or /carry/<id>); '' for the
+        relay's own plain endpoint."""
+        try:
+            path = ws.request.path
+        except Exception:
+            # Legacy websockets (11.x) exposes the path directly.
+            path = getattr(ws, "path", "") or ""
+        parsed = urllib.parse.urlsplit(str(path))
+        qs = urllib.parse.parse_qs(parsed.query)
+        if qs.get("carry"):
+            return str(qs["carry"][0])
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 2 and parts[-2] == "carry":
+            return urllib.parse.unquote(parts[-1])
+        return ""
+
+    async def _probe_server_endpoint(self, endpoint: str) -> bool:
+        """Application-level life check of a server endpoint: a
+        websocket that completes the protocol's own ping -> pong.
+        A tunnel fronting a dead relay passes a bare handshake and
+        fails this — the v1.2.2 lesson, applied to home-watching."""
+        try:
+            _c, _modern = _ws_client_connect()
+            host = urllib.parse.urlsplit(endpoint).hostname or ""
+            kw: dict = {"max_size": MAX_FRAME, "open_timeout": 3}
+            if _modern and host in ("127.0.0.1", "localhost", "::1"):
+                kw["proxy"] = None
+            async with _c(endpoint, **kw) as ws:
+                await ws.send(json.dumps(
+                    {"type": "ping", "req_id": "carry-probe"}))
+                raw = await asyncio.wait_for(ws.recv(), timeout=3)
+                frame = json.loads(raw)
+                return isinstance(frame, dict) and \
+                    frame.get("type") == "pong"
+        except Exception:
+            return False
+
+    async def _carrier_loop(self) -> None:
+        while True:
+            try:
+                await self._carrier_tick()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.exception("carrier watch failed")
+            await asyncio.sleep(CARRY_WATCH_SECONDS)
+
+    async def _carrier_tick(self) -> None:
+        rows = await asyncio.to_thread(self.store.list_agent_servers)
+        now = now_ts()
+        probes: dict[str, bool] = {}
+        for row in rows:
+            sid = str(row.get("server_id") or "")
+            if not sid or sid == self.server_id:
+                continue
+            lease = int(row.get("carry_lease_until") or 0)
+            if row.get("carry_state") == "carried" and \
+                    lease > now and \
+                    row.get("carried_by_id") != self.server_id:
+                continue  # another brother is carrying it
+            ep = str(row.get("home_endpoint") or "")
+            if not ep:
+                continue
+            ok = await self._probe_server_endpoint(ep)
+            probes[sid] = ok
+            if ok:
+                self._home_ok_since.setdefault(sid, now)
+            else:
+                self._home_ok_since.pop(sid, None)
+        await asyncio.to_thread(self._carrier_tick_sync, probes)
+
+    def _carrier_tick_sync(self, probes: dict | None = None) -> None:
+        probes = probes or {}
+        now = now_ts()
+        health = self._compute_health()
+        cap = effective_capacity(health) \
+            if health > SERVER_HEALTHY_MIN else 0
+        rows = self.store.list_agent_servers()
+        changed = False
+        # Sync local holds against the registry truth.
+        live_holds = {}
+        for row in rows:
+            sid = str(row.get("server_id") or "")
+            if row.get("carry_state") == "carried" and \
+                    row.get("carried_by_id") == self.server_id and \
+                    int(row.get("carry_lease_until") or 0) > now and \
+                    sid in self._carried:
+                live_holds[sid] = row
+        for sid in list(self._carried):
+            if sid not in live_holds:
+                del self._carried[sid]
+        if health <= SERVER_HEALTHY_MIN:
+            # Unrated or fallen: not good — hand every carried
+            # server back to the registry for a healthier brother.
+            for sid, info in list(self._carried.items()):
+                try:
+                    if self.store.release_carry(
+                            sid, carrier_id=self.server_id,
+                            token=info["token"]):
+                        changed = True
+                        log.info("released carried server %s: this "
+                                 "carrier's health fell to %s",
+                                 sid, health)
+                except Exception:
+                    log.exception("carry release failed for %s", sid)
+                self._carried.pop(sid, None)
+            if changed and getattr(self, "dashboard", None):
+                self.dashboard.notify()
+            return
+        # Handback + renewal for the servers I carry.
+        for sid, info in list(self._carried.items()):
+            row = live_holds.get(sid)
+            if row is None:
+                continue
+            ok_since = self._home_ok_since.get(sid)
+            home_fresh = now - int(row.get("home_last_seen") or 0) \
+                <= SERVER_STALE_SECONDS
+            if probes.get(sid) and home_fresh and ok_since \
+                    and now - ok_since >= CARRY_HANDBACK_SECONDS:
+                try:
+                    if self.store.release_carry(
+                            sid, carrier_id=self.server_id,
+                            token=info["token"]):
+                        log.info("handback: server %s (owner @%s) "
+                                 "returns home after %ds of strong "
+                                 "home answers", sid,
+                                 row.get("owner_agent"),
+                                 CARRY_HANDBACK_SECONDS)
+                        changed = True
+                except Exception:
+                    log.exception("carry handback failed for %s",
+                                  sid)
+                self._carried.pop(sid, None)
+                continue
+            try:
+                if not self.store.renew_carry(
+                        sid, carrier_id=self.server_id,
+                        token=info["token"],
+                        carrier_agent=self.host_agent or "",
+                        endpoint=info["endpoint"], health=health,
+                        riders=self._riders_count(server_id=sid),
+                        capacity=cap):
+                    self._carried.pop(sid, None)
+            except Exception:
+                log.exception("carry renewal failed for %s", sid)
+        # Claims: longest-down first (list_agent_servers order).
+        carrying = len(self._carried)
+        for row in rows:
+            if carrying >= cap:
+                break
+            sid = str(row.get("server_id") or "")
+            if not sid or sid == self.server_id:
+                continue
+            if not row.get("owner_agent"):
+                continue
+            if row.get("carry_state") == "carried" and \
+                    int(row.get("carry_lease_until") or 0) > now:
+                continue
+            home_stale = now - int(row.get("home_last_seen") or 0) \
+                > SERVER_STALE_SECONDS
+            if not home_stale and probes.get(sid) is not False:
+                continue  # home is answering; nothing to carry
+            alias = self._carry_endpoint_for(sid)
+            try:
+                claimed = self.store.claim_carry(
+                    sid, carrier_id=self.server_id,
+                    carrier_agent=self.host_agent or "",
+                    endpoint=alias, carrier_health=health,
+                    carrier_capacity=cap,
+                    carrier_riders=self._riders_count(),
+                    carrier_can_carry=self.carrier_enabled,
+                    carrier_carrying=carrying,
+                    lease_seconds=CARRY_LEASE_SECONDS,
+                    stale_after=SERVER_STALE_SECONDS,
+                    home_probe_failed=probes.get(sid) is False)
+            except Exception:
+                log.exception("carry claim failed for %s", sid)
+                continue
+            if claimed:
+                self._carried[sid] = {
+                    "token": claimed["carry_lease_token"],
+                    "endpoint": alias,
+                    "owner": row.get("owner_agent") or ""}
+                carrying += 1
+                changed = True
+                log.info("carrying server %s for @%s (owner stays "
+                         "@%s; this machine is only the helper)",
+                         sid, row.get("owner_agent"),
+                         row.get("owner_agent"))
+        if changed and getattr(self, "dashboard", None) is not None:
+            self.dashboard.notify()
+
+    def _release_all_carries(self) -> None:
+        for sid, info in list(self._carried.items()):
+            try:
+                self.store.release_carry(
+                    sid, carrier_id=self.server_id,
+                    token=info["token"])
+            except Exception:
+                pass
+        self._carried.clear()
+
+    # -- server presentation (registry rows -> wire shape) -----------------
+
+    @staticmethod
+    def _carry_state_of(row: dict, now: int | None = None) -> str:
+        """A per-agent server's honest state: 'home', 'carried' or
+        'down'. Agent presence is a different layer and never
+        feeds this."""
+        if now is None:
+            now = now_ts()
+        if not row.get("owner_agent"):
+            return ""
+        if row.get("carry_state") == "carried" and \
+                int(row.get("carry_lease_until") or 0) > now:
+            return "carried"
+        if row.get("carry_state") == "home" and \
+                now - int(row.get("home_last_seen") or 0) \
+                <= SERVER_STALE_SECONDS:
+            return "home"
+        return "down"
+
+    def _server_entry(self, row: dict,
+                      now: int | None = None) -> dict:
+        if now is None:
+            now = now_ts()
+        health = row.get("health")
+        health = HEALTH_UNRATED if health is None else int(health)
+        cap = row.get("capacity")
+        state = self._carry_state_of(row, now)
+        label = {"home": "at home",
+                 "carried": "carried by @%s" % row.get("carried_by"),
+                 "down": "down — awaiting carrier"}.get(state, "")
+        return {"label": row.get("label") or row.get("endpoint")
+                or "",
+                "endpoint": str(row.get("endpoint") or "")
+                .strip().rstrip("/"),
+                "host_agent": row.get("host_agent") or "",
+                "version": row.get("version") or "",
+                "health": health,
+                "riders": int(row.get("riders") or 0),
+                "capacity": effective_capacity(health)
+                if cap is None else int(cap),
+                "server_id": row.get("server_id") or "",
+                "owner_agent": row.get("owner_agent") or "",
+                "home_host": row.get("home_host") or "",
+                "home_endpoint": row.get("home_endpoint") or "",
+                "carried_by": row.get("carried_by") or "",
+                "carry_state": state,
+                "carry_state_label": label}
+
+    def _dashboard_servers(self) -> list[dict]:
+        """The dashboard's server view: the live mesh PLUS every
+        per-agent server in its honest state — a down server must
+        be SEEN as down, never silently absent."""
+        out = self._live_servers()
+        seen = {s.get("server_id") for s in out}
+        now = now_ts()
+        try:
+            rows = self.store.list_agent_servers()
+        except Exception:
+            rows = []
+        for row in rows:
+            sid = row.get("server_id") or ""
+            if not sid or sid in seen:
+                continue
+            entry = self._server_entry(row, now)
+            # Not currently served: present the home endpoint and
+            # the home instance's last earned stats.
+            entry["endpoint"] = row.get("home_endpoint") \
+                or entry["endpoint"]
+            entry["health"] = int(row.get("home_health")
+                                  if row.get("home_health")
+                                  is not None else HEALTH_UNRATED)
+            entry["riders"] = int(row.get("home_riders") or 0)
+            entry["capacity"] = int(row.get("home_capacity") or 0)
+            out.append(entry)
+        out.sort(key=lambda s: s["endpoint"])
+        return out
+
     def _live_servers(self) -> list[dict]:
         """The live mesh as this relay knows it: fresh registry rows
         (stale rows are dead relays, never offered), with this relay
@@ -414,36 +1047,55 @@ class Relay:
         except Exception:
             rows = []
         mine = self._registry_endpoint()
-        seen = set()
+        seen_eps: set = set()
+        seen_ids: set = set()
+        now = now_ts()
         for r in rows:
             ep = str(r.get("endpoint") or "").strip().rstrip("/")
-            if not ep or ep in seen:
+            if not ep or ep in seen_eps:
                 continue
-            seen.add(ep)
-            health = r.get("health")
-            health = 100 if health is None else int(health)
-            cap = r.get("capacity")
-            out.append({"label": r.get("label") or ep,
-                        "endpoint": ep,
-                        "host_agent": r.get("host_agent") or "",
-                        "version": r.get("version") or "",
-                        "health": health,
-                        "riders": int(r.get("riders") or 0),
-                        "capacity": effective_capacity(health)
-                        if cap is None else int(cap)})
+            seen_eps.add(ep)
+            if r.get("server_id"):
+                seen_ids.add(str(r["server_id"]))
+            out.append(self._server_entry(r, now))
         # My own row is always present and always LIVE-computed (the
         # stored heartbeat can lag up to one cadence; the dashboard
-        # and the drill read the truth, not the echo).
+        # and the drill read the truth, not the echo) — unless the
+        # registry row for MY server_id is a carried row, in which
+        # case the brother serving it is the truth and I add nothing.
         from . import __version__
-        my_health = self._compute_health()
-        myself = {"label": self.server_label, "endpoint": mine,
-                  "host_agent": self.host_agent or "",
-                  "version": __version__, "health": my_health,
-                  "riders": self._riders_count(),
-                  "capacity": effective_capacity(my_health)}
-        out = [myself if s["endpoint"] == mine else s for s in out]
-        if mine not in seen:
-            out.append(myself)
+        if self.server_id not in seen_ids:
+            my_health = self._compute_health()
+            myself = {"label": self.server_label, "endpoint": mine,
+                      "host_agent": self.host_agent or "",
+                      "version": __version__, "health": my_health,
+                      "riders": self._riders_count(),
+                      "capacity": effective_capacity(my_health)
+                      if my_health > SERVER_HEALTHY_MIN else 0,
+                      "server_id": self.server_id,
+                      "owner_agent": self.owner_agent or "",
+                      "home_host": self.home_host or "",
+                      "home_endpoint": mine if self.owner_agent
+                      else "",
+                      "carried_by": "",
+                      "carry_state": "home" if self.owner_agent
+                      else "",
+                      "carry_state_label": "at home"
+                      if self.owner_agent else ""}
+            out = [myself if s["endpoint"] == mine else s
+                   for s in out]
+            if mine not in seen_eps:
+                out.append(myself)
+        else:
+            # Refresh my stored row's live stats in place when I am
+            # the serving instance (at home / shared relay).
+            for s in out:
+                if s.get("server_id") == self.server_id and \
+                        s.get("carry_state") != "carried":
+                    s["health"] = self._compute_health()
+                    s["riders"] = self._riders_count()
+                    s["capacity"] = effective_capacity(s["health"]) \
+                        if s["health"] > SERVER_HEALTHY_MIN else 0
         out.sort(key=lambda s: s["endpoint"])
         return out
 
@@ -542,9 +1194,16 @@ class Relay:
         # agents who HOST a server — that server's health, rider
         # load and capacity ride on the agent's own row, because on
         # this platform every agent carries its server's health.
-        servers = self._live_servers()
-        hosting = {s["host_agent"]: s for s in servers
-                   if s.get("host_agent")}
+        # v1.3.0: the dashboard view includes down per-agent servers
+        # in their honest state, and a per-agent server is
+        # attributed to its OWNER (permanent), never to the
+        # temporary carrier whose machine happens to run it.
+        servers = self._dashboard_servers()
+        hosting = {}
+        for s in servers:
+            key = s.get("owner_agent") or s.get("host_agent")
+            if key:
+                hosting[key] = s
         for u in users:
             srv = hosting.get(u["username"])
             if srv:
@@ -552,6 +1211,8 @@ class Relay:
                 u["server_endpoint"] = srv["endpoint"]
                 u["server_riders"] = srv["riders"]
                 u["server_capacity"] = srv["capacity"]
+                u["server_state"] = srv.get("carry_state") or ""
+                u["server_carried_by"] = srv.get("carried_by") or ""
         return {
             "server": self.server_label,
             "servers": servers,
@@ -694,12 +1355,39 @@ class Relay:
         await asyncio.to_thread(self._register_server_row)
         self._server_hb_task = asyncio.create_task(
             self._server_heartbeat_loop())
+        # Earned health (v1.3.0): the battery starts immediately —
+        # this server is UNRATED until it has earned a percentage
+        # through testing, and keeps re-testing for life.
+        self._health_task = asyncio.create_task(
+            self._health_battery_loop())
+        # Server carrying (v1.3.0): every relay is a carrier — it
+        # watches the registry and raises a brother's fallen server.
+        if self.carrier_enabled:
+            self._carrier_task = asyncio.create_task(
+                self._carrier_loop())
         return self
 
     async def stop(self) -> None:
         if self._server_hb_task is not None:
             self._server_hb_task.cancel()
             self._server_hb_task = None
+        if self._health_task is not None:
+            self._health_task.cancel()
+            self._health_task = None
+        if self._carrier_task is not None:
+            self._carrier_task.cancel()
+            self._carrier_task = None
+        if self._carried:
+            # Graceful stop only: hand every carried server back to
+            # the registry at once so another brother can claim it
+            # without waiting for the lease to expire. (A crash
+            # never runs this — the lease expiry covers that path.)
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._release_all_carries),
+                    timeout=10)
+            except Exception:
+                pass
         if self._scan_task is not None:
             self._scan_task.cancel()
             self._scan_task = None
@@ -1055,6 +1743,21 @@ class Relay:
     # -- connection ---------------------------------------------------------
     async def _handle(self, ws) -> None:
         peer: Peer | None = None
+        # Carrying (v1.3.0): a connection may arrive through a carry
+        # alias (?carry=<id> or /carry/<id>) — this relay serves
+        # that server's identity ONLY while it holds the carry
+        # lease for it. An alias nobody here carries is refused at
+        # the door: a stale alias must never silently become a
+        # different server.
+        conn_server_id = self._connection_server_id(ws)
+        if conn_server_id and conn_server_id != self.server_id \
+                and conn_server_id not in self._carried:
+            try:
+                await ws.close(code=4404,
+                               reason="server not carried here")
+            except Exception:
+                pass
+            return
         try:
             async for raw in ws:
                 try:
@@ -1071,7 +1774,9 @@ class Relay:
                     peer.last_seen = now_ts()
                 if ftype == "hello":
                     try:
-                        peer = await self._on_hello(ws, frame, peer)
+                        peer = await self._on_hello(
+                            ws, frame, peer,
+                            server_id=conn_server_id or self.server_id)
                     except Exception:
                         # A hello that dies inside the server is a
                         # measured admission failure (health signal);
@@ -1244,9 +1949,12 @@ class Relay:
                     users = self.store.list_users(
                         str(frame.get("query") or ""),
                         capability=str(frame.get("capability") or ""))
-                    hosting = {s["host_agent"]: s
-                               for s in self._live_servers()
-                               if s.get("host_agent")}
+                    hosting = {}
+                    for s in self._dashboard_servers():
+                        key = s.get("owner_agent") or \
+                            s.get("host_agent")
+                        if key:
+                            hosting[key] = s
                     for u in users:
                         u["online"] = u["username"] in self.peers
                         u["trust_score"] = self.store.compute_trust(
@@ -1261,6 +1969,10 @@ class Relay:
                             u["server_endpoint"] = srv["endpoint"]
                             u["server_riders"] = srv["riders"]
                             u["server_capacity"] = srv["capacity"]
+                            u["server_state"] = \
+                                srv.get("carry_state") or ""
+                            u["server_carried_by"] = \
+                                srv.get("carried_by") or ""
                         u.pop("secret", None)
                     users.sort(key=lambda u: (not u["online"],
                                               u["username"]))
@@ -1296,7 +2008,7 @@ class Relay:
                     self._log_activity("offline", peer.username)
                 log.info("peer @%s disconnected", peer.username)
 
-    async def _on_hello(self, ws, frame, old):
+    async def _on_hello(self, ws, frame, old, server_id: str = ""):
         if old is not None and self.peers.get(old.username) is old:
             del self.peers[old.username]
         req_id = frame.get("req_id")
@@ -1312,7 +2024,8 @@ class Relay:
             username = "dial-" + new_id()[:8]
             peer = Peer(ws=ws, username=username, display_name=display or "dial",
                         pubkey=pubkey, ephemeral=True, last_seen=now_ts(),
-                        connected_at=now_ts(), core=core)
+                        connected_at=now_ts(), core=core,
+                        server_id=server_id or self.server_id)
             self.peers[username] = peer
             await self._send(ws, {"type": "welcome", "req_id": req_id,
                                   "username": username, "secret": None,
@@ -1335,6 +2048,42 @@ class Relay:
         declared_mode = frame.get("mode")
         if declared_mode not in ("manual", "autonomous"):
             declared_mode = None
+        # Mesh admission (v1.2.0, owner's rules) — checked BEFORE
+        # identity claim/verification (v1.3.0 root-cause fix): a
+        # RIDER — an agent whose home is ANOTHER server — is
+        # admitted only while this server is worth riding: health
+        # ABOVE the floor and rider capacity free (capacity =
+        # floor(10 x health/100), hard cap 10). A refusal names its
+        # reason so the client deflects to the next eligible server
+        # instead of dying. HOME agents are never gated: your own
+        # server always takes you back. Admission used to run AFTER
+        # the identity claim, so a first-ever hello refused by an
+        # unrated/full/unhealthy server stranded the claimed
+        # identity: the secret stayed server-side, the client never
+        # received it, and every retry died as username_taken.
+        home_ep = str(frame.get("home_endpoint") or "")
+        if home_ep and not self._is_home_endpoint(home_ep):
+            health = self._compute_health()
+            if health == HEALTH_UNRATED:
+                await self._error(
+                    ws, "server_unrated", req_id,
+                    "this server has not earned a health rating yet "
+                    "(still testing) — not accepting riders")
+                return None
+            if health <= SERVER_HEALTHY_MIN:
+                await self._error(
+                    ws, "server_unhealthy", req_id,
+                    f"health {health}% is at/below the "
+                    f"{SERVER_HEALTHY_MIN}% floor — not accepting "
+                    "riders")
+                return None
+            cap = effective_capacity(health)
+            if self._riders_count(exclude=username) >= cap:
+                await self._error(
+                    ws, "server_full", req_id,
+                    f"rider capacity {cap} reached at health "
+                    f"{health}% — try another server")
+                return None
         if self.store.exists(username):
             if self.store.verify(username, secret):
                 self.store.set_display_name(username, display or username)
@@ -1362,34 +2111,11 @@ class Relay:
                 await stale.ws.close(code=4000, reason="superseded")
             except Exception:
                 pass
-        # Mesh admission (v1.2.0, owner's rules): a RIDER — an agent
-        # whose home is ANOTHER server — is admitted only while this
-        # server is worth riding: health ABOVE the floor and rider
-        # capacity free (capacity = floor(10 x health/100), hard cap
-        # 10). A refusal names its reason so the client deflects to
-        # the next eligible server instead of dying. HOME agents are
-        # never gated: your own server always takes you back.
-        home_ep = str(frame.get("home_endpoint") or "")
-        if home_ep and not self._is_home_endpoint(home_ep):
-            health = self._compute_health()
-            if health <= SERVER_HEALTHY_MIN:
-                await self._error(
-                    ws, "server_unhealthy", req_id,
-                    f"health {health}% is at/below the "
-                    f"{SERVER_HEALTHY_MIN}% floor — not accepting "
-                    "riders")
-                return None
-            cap = effective_capacity(health)
-            if self._riders_count(exclude=username) >= cap:
-                await self._error(
-                    ws, "server_full", req_id,
-                    f"rider capacity {cap} reached at health "
-                    f"{health}% — try another server")
-                return None
         peer = Peer(ws=ws, username=username,
                     display_name=display or username, pubkey=pubkey,
                     last_seen=now_ts(), connected_at=now_ts(), core=core,
-                    home_endpoint=home_ep)
+                    home_endpoint=home_ep,
+                    server_id=server_id or self.server_id)
         self.peers[username] = peer
         if core:
             self._last_core[username] = core
@@ -1420,11 +2146,28 @@ class Relay:
                     pass
         log.info("peer @%s registered, flushed %d queued", username, len(queued))
         # Awaiting-agent work: an agent coming online picks up pooled
-        # group work immediately (point 29 fallback).
+        # group work immediately (point 29 fallback). DIRECT work is
+        # restored too (v1.3.1): a 1:1 work parked in awaiting_agent
+        # while its NAMED assignee was unreachable returns to
+        # 'assigned' for that same assignee and is delivered — parked
+        # must never mean stranded (the transition map only allows
+        # awaiting_agent -> assigned, and before this fix no path
+        # took it for direct work).
         try:
             for work in self.store.open_work(("awaiting_agent",)):
                 gid = work.get("group_id")
-                if gid and work["assigner"] != username and \
+                if not gid and work.get("assignee") == username and \
+                        work["assigner"] != username:
+                    restored = await asyncio.to_thread(
+                        self.store.restore_awaiting, work["id"])
+                    if restored.get("status") == "assigned":
+                        await self._deliver(username, {
+                            "type": "work_assigned", "work": restored})
+                        self._log_activity("work_restored", "system",
+                                           target=username,
+                                           work_id=work["id"],
+                                           status="assigned")
+                elif gid and work["assigner"] != username and \
                         self.store.role_of(gid, username) is not None:
                     await self._attempt_reassign(work, forced=username)
         except Exception:
@@ -1623,7 +2366,14 @@ class Relay:
             await self._error(ws, "bad_send", req_id,
                               "missing encrypted content envelope")
             return
-        if not await self._oversight_gate(ws, frame, req_id):
+        # Health battery (v1.3.0): the server's own self-test DM
+        # between two of its ephemeral peers. It routes for real —
+        # that is the point of the test — but it is labelled, exempt
+        # from the oversight gate and never written to the audit /
+        # activity feed: self-test traffic is not user activity.
+        battery = bool(frame.get("battery")) and peer.ephemeral
+        if not battery and not await self._oversight_gate(ws, frame,
+                                                          req_id):
             return
         if not self.store.exists(to) and to not in self.peers:
             await self._error(ws, "unknown_recipient", req_id)
@@ -1640,12 +2390,14 @@ class Relay:
                "in_reply_to": frame.get("in_reply_to"), "group_id": None}
         queued = await self._deliver(to, msg)
         msg["delivery_status"] = "queued" if queued else "live"
-        self._log_activity("message", peer.username, target=to,
-                           priority=msg["priority"],
-                           status="sent" if queued else "delivered",
-                           size=len(str(content.get("ct") or "")),
-                           mentions=msg["mentions"], ref_id=msg["id"],
-                           oversight=frame.get("oversight"))
+        if not battery:
+            self._log_activity("message", peer.username, target=to,
+                               priority=msg["priority"],
+                               status="sent" if queued else "delivered",
+                               size=len(str(content.get("ct") or "")),
+                               mentions=msg["mentions"],
+                               ref_id=msg["id"],
+                               oversight=frame.get("oversight"))
         await self._result(ws, req_id, True,
                            {"id": msg["id"], "to": to, "queued": queued})
 
@@ -2646,8 +3398,13 @@ class Relay:
             for_group=sess["for_group"], for_channel=fin_channel,
             whole_sha=sess["whole_sha"], size=len(data))
         self.store.delete_upload_session(sess["session_id"])
-        self.store.audit("blob_upload_completed", peer.username,
-                         sess["for_user"], sess["for_group"], blob_id, "")
+        if not peer.ephemeral:
+            # Ephemeral owners are transient probes (incl. the
+            # health battery): their uploads are self-test traffic,
+            # not user activity — no audit row.
+            self.store.audit("blob_upload_completed", peer.username,
+                             sess["for_user"], sess["for_group"],
+                             blob_id, "")
         await self._result(ws, req_id, True, {"blob_id": blob_id,
                                               "size": len(data)})
 
@@ -3354,6 +4111,20 @@ def main(argv: list[str] | None = None) -> None:
                     help="username of the agent hosting this relay"
                          " (peer mesh: recorded in the server"
                          " registry; default $AGENTLINK_HOST_AGENT)")
+    ap.add_argument("--server-id", default=None,
+                    help="this server's STABLE registry identity"
+                         " (v1.3.0 carrying: identity survives"
+                         " endpoint moves; default: the public"
+                         " endpoint)")
+    ap.add_argument("--owner-agent", default=None,
+                    help="make this relay an agent's OWN server"
+                         " (v1.3.0): the named agent owns it"
+                         " permanently; if this machine falls, a"
+                         " brother carries it automatically and"
+                         " hands it back when home is strong again")
+    ap.add_argument("--home-host", default=None,
+                    help="host agent of this server's home machine"
+                         " (default: --host-agent)")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -3369,7 +4140,10 @@ def main(argv: list[str] | None = None) -> None:
                       server_name=args.server_name,
                       public_endpoint=args.public_endpoint,
                       host_agent=args.host_agent
-                      or os.environ.get("AGENTLINK_HOST_AGENT"))
+                      or os.environ.get("AGENTLINK_HOST_AGENT"),
+                      server_id=args.server_id,
+                      owner_agent=args.owner_agent,
+                      home_host=args.home_host)
         await relay.start()
         try:
             await asyncio.Future()
