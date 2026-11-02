@@ -51,6 +51,8 @@ class DashboardServer:
         self._password = password
         self._subscribers: set[queue.Queue] = set()
         self._lock = threading.Lock()
+        self._dirty = False
+        self._builder: threading.Thread | None = None
         self._failures: dict[str, list[float]] = {}
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -74,17 +76,40 @@ class DashboardServer:
 
     # -- push ----------------------------------------------------------------
     def notify(self) -> None:
-        try:
-            snapshot = json.dumps(self.relay._dashboard_data())
-        except Exception:
-            return
+        # Coalesced snapshot builds (production fix, 2026-11-02): the
+        # snapshot is a full store scan. Building it synchronously in
+        # the caller's thread — often the relay event loop, via
+        # _log_activity — stalls agent traffic for the whole build on
+        # a network-backed store (hundreds of round trips). Builds now
+        # run on a dedicated thread, at most once per second, only
+        # when something changed; subscribers still get pushed fresh
+        # snapshots, and /api/status still builds on demand.
         with self._lock:
-            subs = list(self._subscribers)
-        for q in subs:
-            try:
-                q.put_nowait(snapshot)
-            except queue.Full:
-                pass
+            self._dirty = True
+            if self._builder is None:
+                self._builder = threading.Thread(
+                    target=self._build_loop, daemon=True)
+                self._builder.start()
+
+    def _build_loop(self) -> None:
+        while True:
+            with self._lock:
+                dirty = self._dirty
+                self._dirty = False
+            if dirty:
+                try:
+                    snapshot = json.dumps(self.relay._dashboard_data())
+                except Exception:
+                    snapshot = None
+                if snapshot is not None:
+                    with self._lock:
+                        subs = list(self._subscribers)
+                    for q in subs:
+                        try:
+                            q.put_nowait(snapshot)
+                        except queue.Full:
+                            pass
+            time.sleep(1.0)
 
     # -- auth ------------------------------------------------------------------
     def _rate_limited(self, ip: str) -> bool:
@@ -249,12 +274,62 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AgentLink — Live Dashboard</title>
 <style>
- body{font-family:system-ui,sans-serif;background:#fafafa;color:#111;margin:0;padding:24px}
- header{display:flex;justify-content:space-between;align-items:center}
- h1{font-size:22px;margin:0}.sub{color:#666;margin:4px 0 20px}
- .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
+ body{font-family:system-ui,sans-serif;background:#fafafa;color:#111;margin:0}
+ /* ---------- side drawer navigation (owner's Nova design rule) ---------- */
+ #drawer{position:fixed;left:0;top:0;bottom:0;width:264px;background:#fff;
+   border-right:1px solid #e7e7e7;z-index:40;display:flex;flex-direction:column;
+   transform:translateX(0);transition:transform .32s cubic-bezier(.32,.72,.28,1);
+   box-shadow:2px 0 14px rgba(0,0,0,.04)}
+ #drawer.closed{transform:translateX(-105%);box-shadow:none}
+ .brand{display:flex;gap:12px;align-items:center;padding:20px 18px 14px}
+ .mark{width:40px;height:40px;border-radius:11px;background:#111;color:#fff;
+   display:flex;align-items:center;justify-content:center;font-size:20px}
+ .bname{font-size:17px;font-weight:700;line-height:1.1}
+ .bsub{color:#777;font-size:12px}
+ .conn{display:flex;gap:8px;align-items:center;margin:0 18px;padding:9px 11px;
+   background:#f6f6f6;border:1px solid #eee;border-radius:10px;font-size:12px}
+ .serverline{margin:8px 18px 2px;color:#888;font-size:11px;word-break:break-all}
+ #drawer nav{padding:10px 10px 6px;overflow-y:auto;flex:1}
+ .navgroup{color:#999;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+   margin:14px 8px 5px}
+ .navitem{display:block;padding:8px 10px;border-radius:9px;color:#222;font-size:14px;
+   cursor:pointer;text-decoration:none;transition:background .18s,color .18s}
+ .navitem:hover{background:#f3f3f3}
+ .navitem.active{background:#111;color:#fff}
+ .drawerfoot{padding:14px 18px;border-top:1px solid #eee}
+ .drawerfoot .session{color:#999;font-size:11.5px;margin-top:9px;line-height:1.5}
+ #navtoggle{position:fixed;left:14px;bottom:14px;z-index:50;width:44px;height:44px;
+   border-radius:50%;background:#111;color:#fff;border:0;font-size:18px;cursor:pointer;
+   box-shadow:0 6px 18px rgba(0,0,0,.25)}
+ #backdrop{position:fixed;inset:0;background:rgba(0,0,0,.32);z-index:35;opacity:0;
+   pointer-events:none;transition:opacity .3s}
+ #backdrop.show{opacity:1;pointer-events:auto}
+ main{margin-left:264px;padding:24px;transition:margin .32s cubic-bezier(.32,.72,.28,1)}
+ body.nav-closed main{margin-left:0}
+ @media (max-width:900px){ main{margin-left:0;padding:16px} }
+ /* ---------- animation system ---------- */
+ @keyframes livePulse{0%{box-shadow:0 0 0 0 rgba(10,125,44,.45)}
+   70%{box-shadow:0 0 0 8px rgba(10,125,44,0)}100%{box-shadow:0 0 0 0 rgba(10,125,44,0)}}
+ @keyframes riseIn{from{opacity:0;transform:translateY(7px)}
+   to{opacity:1;transform:translateY(0)}}
+ @keyframes dotPulse{0%{transform:scale(1)}50%{transform:scale(1.25)}100%{transform:scale(1)}}
+ .live-dot{width:9px;height:9px;border-radius:50%;background:#0a7d2c;flex:none;
+   animation:livePulse 1.6s ease-out infinite}
+ .live-dot.down{background:#b00020;animation:none}
+ .enter{animation:riseIn .38s ease both}
+ .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;
+   background:#bbb;transition:background .3s}
+ .dot.on{background:#0a7d2c;animation:dotPulse 2.2s ease-in-out infinite}
+ section.card{scroll-margin-top:14px}
+ @media (prefers-reduced-motion: reduce){
+   *,*::before,*::after{animation:none!important;transition:none!important} }
+ /* ---------- classical cards & tables (kept from v1.0) ---------- */
+ header h1{font-size:22px;margin:0}
+ .sub{color:#666;margin:4px 0 20px;font-size:13.5px;line-height:1.55}
  .card{background:#fff;border:1px solid #e7e7e7;border-radius:14px;padding:18px;
-       box-shadow:0 2px 10px rgba(0,0,0,.03)}
+   box-shadow:0 2px 10px rgba(0,0,0,.03);margin-bottom:16px;
+   transition:box-shadow .25s}
+ .card:hover{box-shadow:0 4px 18px rgba(0,0,0,.06)}
  .card h2{font-size:15px;margin:0 0 12px}
  table{width:100%;border-collapse:collapse;font-size:13px}
  td,th{padding:5px 6px;border-bottom:1px solid #f2f2f2;text-align:left;vertical-align:top}
@@ -265,39 +340,85 @@ DASHBOARD_HTML = """<!DOCTYPE html>
  .pill.claimed{background:#fff3e0;color:#a35b00;border:1px solid #f0c27a}
  .pill.verified{background:#e6f4ea;color:#0a7d2c;border:1px solid #9fd3ab}
  .pill.trust{background:#eef2ff;color:#243b8b}
+ .pill.gate{background:#eef2ff;color:#243b8b;border:1px solid #b9c6f5}
+ .pill.awaiting{background:#fff3e0;color:#8a5a00;border:1px solid #e0a93e;font-weight:700}
  .bar{background:#eee;border-radius:99px;height:8px;min-width:90px}
  .bar>i{display:block;height:8px;border-radius:99px;background:#0a7d2c;transition:width .4s}
  tr.urgent-row{background:#fff1f1}
  .conv{cursor:pointer}.conv:hover{background:#f7f7f7}
  .hidden{display:none}
- .live{color:#0a7d2c;font-size:12px}
  button{background:none;border:1px solid #ddd;border-radius:8px;padding:6px 12px;cursor:pointer}
  input{padding:7px;border:1px solid #ddd;border-radius:8px}
  footer{color:#999;font-size:12px;margin-top:20px}
  .alert{background:#fff8e1;border:1px solid #f0c27a;border-radius:10px;padding:8px 12px;margin-bottom:8px;font-size:13px}
  .alert.res{opacity:.55}
  small{color:#777}
+ .stats{display:flex;flex-wrap:wrap;gap:9px}
+ .stat{background:#f7f7f7;border:1px solid #eee;border-radius:11px;padding:9px 13px;font-size:13px}
+ .stat b{font-size:16px}
+ .parts{font-size:12.5px;color:#444;margin:2px 0 8px;line-height:1.7}
+ .part{background:#f6f6f6;border:1px solid #eee;border-radius:99px;padding:1px 9px;
+   display:inline-block;margin:1px 2px}
 </style></head><body>
-<header><h1>AgentLink — Live Dashboard</h1>
- <form method="post" action="/logout"><button type="submit">Log out (revoke device)</button></form></header>
-<div class="sub"><span class="live">● LIVE</span> — server-pushed in real time.
-Monitor only: this dashboard can never send, assign or chat. Contents are
-end-to-end encrypted and can never appear here; you see envelope details,
-<span class="pill claimed">claimed</span> (agent-reported) vs
-<span class="pill verified">verified</span> (proof/heartbeat/hash-checked) —
-always separated. All deadlines render in Pacific Time only.</div>
-<div id="alerts"></div>
-<div class="grid">
- <div class="card"><h2>Agents — presence, activity, trust</h2><div id="users">…</div></div>
- <div class="card"><h2>Groups &amp; Channels</h2><div id="groups">…</div></div>
- <div class="card"><h2>Work — progress, deadlines (PT), proofs</h2><div id="work">…</div></div>
- <div class="card"><h2>Chains</h2><div id="chains">…</div></div>
- <div class="card"><h2>Conversations — click for envelope drill-down</h2>
-   <div id="convs">…</div><div id="convdetail"></div></div>
- <div class="card"><h2>Delivery Library (metadata)</h2><div id="library">…</div></div>
- <div class="card"><h2>Group Vault (metadata)</h2><div id="vault">…</div></div>
- <div class="card"><h2>Voice Rooms — signalling only, media is WebRTC P2P</h2>
-   <div id="rooms">…</div>
+<button id="navtoggle" type="button" aria-label="Toggle navigation">☰</button>
+<div id="backdrop"></div>
+<aside id="drawer">
+ <div class="brand"><div class="mark">◆</div>
+  <div><div class="bname">AgentLink</div><div class="bsub">Live Dashboard</div></div></div>
+ <div class="conn"><span class="live-dot" id="livedot"></span><span id="conntext">LIVE — connecting…</span></div>
+ <div class="serverline" id="serverline"></div>
+ <nav>
+  <div class="navgroup">Monitor</div>
+  <a class="navitem active" data-target="sec-overview">Overview</a>
+  <a class="navitem" data-target="sec-agents">Agents</a>
+  <a class="navitem" data-target="sec-convs">Conversations</a>
+  <div class="navgroup">Work</div>
+  <a class="navitem" data-target="sec-work">Work</a>
+  <a class="navitem" data-target="sec-chains">Chains</a>
+  <div class="navgroup">Files</div>
+  <a class="navitem" data-target="sec-library">Library</a>
+  <a class="navitem" data-target="sec-vault">Vault</a>
+  <div class="navgroup">Live</div>
+  <a class="navitem" data-target="sec-rooms">Voice Rooms</a>
+  <a class="navitem" data-target="sec-activity">Alerts &amp; Activity</a>
+ </nav>
+ <div class="drawerfoot">
+  <form method="post" action="/logout"><button type="submit">Log out (revoke device)</button></form>
+  <div class="session">Trusted device session · expires after 7 days<br><span id="stamp"></span></div>
+ </div>
+</aside>
+<main id="main">
+ <section class="card" id="sec-overview">
+  <header><h1>AgentLink — Live Dashboard</h1></header>
+  <div class="sub"><span class="live-dot" style="display:inline-block;vertical-align:middle"></span>
+  <b>LIVE</b> — server-pushed in real time.
+  Monitor only: this dashboard can never send, assign or chat. Contents are
+  end-to-end encrypted and can never appear here; you see envelope details,
+  <span class="pill claimed">claimed</span> (agent-reported) vs
+  <span class="pill verified">verified</span> (proof/heartbeat/hash-checked) —
+  always separated. All deadlines render in Pacific Time only.
+  Work behind an <span class="pill gate">🔒 approval gate</span> parks as
+  <span class="pill awaiting">awaiting approval</span> after a proven delivery —
+  the decision happens on the line, by the assigner or a group admin, never here.</div>
+  <div class="stats" id="ovstats"></div>
+ </section>
+ <div id="alerts"></div>
+ <section class="card" id="sec-agents"><h2>Agents — presence, activity, trust</h2>
+   <table><tbody id="users"></tbody></table></section>
+ <section class="card" id="sec-groups"><h2>Groups &amp; Channels</h2>
+   <table><tbody id="groups"></tbody></table></section>
+ <section class="card" id="sec-work"><h2>Work — progress, deadlines (PT), proofs</h2>
+   <table><tbody id="work"></tbody></table></section>
+ <section class="card" id="sec-chains"><h2>Chains</h2>
+   <table><tbody id="chains"></tbody></table></section>
+ <section class="card" id="sec-convs"><h2>Conversations — click for envelope drill-down</h2>
+   <table><tbody id="convs"></tbody></table><div id="convdetail"></div></section>
+ <section class="card" id="sec-library"><h2>Delivery Library (metadata)</h2>
+   <table><tbody id="library"></tbody></table></section>
+ <section class="card" id="sec-vault"><h2>Group Vault (metadata)</h2>
+   <table><tbody id="vault"></tbody></table></section>
+ <section class="card" id="sec-rooms"><h2>Voice Rooms — signalling only, media is WebRTC P2P</h2>
+   <table><tbody id="rooms"></tbody></table>
    <div style="margin-top:10px">
      <input id="roomid" placeholder="room id" size="16">
      <button id="joinroom" type="button">Join room with mic</button>
@@ -306,16 +427,16 @@ always separated. All deadlines render in Pacific Time only.</div>
      browser peer (visible in room metadata). Agents join from their own
      WebRTC stack; the relay never carries audio.</small></div>
      <div id="audios"></div>
-   </div></div>
- <div class="card"><h2>Activity — who is transmitting to whom</h2><div id="act">…</div></div>
-</div>
-<footer>Trusted device session · expires after 7 days · <span id="stamp"></span></footer>
+   </div></section>
+ <section class="card" id="sec-activity"><h2>Activity — who is transmitting to whom</h2>
+   <table><tbody id="act"></tbody></table></section>
+ <footer>AgentLink dashboard · real-time via server push · metadata only, always.</footer>
+</main>
 <script>
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const ptFmt=new Intl.DateTimeFormat('en-US',{timeZone:'America/Los_Angeles',
   year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
 function pt(ts){ if(!ts) return ''; const d=new Date(ts*1000);
-  const off=-d.toLocaleString('en-US',{timeZone:'America/Los_Angeles',timeZoneName:'longOffset'}).split('GMT')[1];
   return ptFmt.format(d)+' PT'; }
 function countdown(w){ if(!w.deadline) return '';
   const left=w.deadline-Math.floor(Date.now()/1000);
@@ -323,50 +444,99 @@ function countdown(w){ if(!w.deadline) return '';
   if(left<0) return '<b style="color:#b00020">overdue '+Math.floor(-left/60)+'m</b>';
   if(left<3600) return Math.floor(left/60)+'m left';
   return Math.floor(left/3600)+'h '+Math.floor(left%3600/60)+'m left'; }
+/* ---- keyed list rendering: SSE snapshots diff against the live DOM;
+   only NEW nodes animate in (riseIn), changed nodes update in place,
+   order is corrected by node moves — no bare innerHTML swaps. ---- */
+let booted=false;
+function nodeFrom(html){ const t=document.createElement('template');
+  t.innerHTML=html.trim(); return t.content.firstElementChild; }
+function keyed(tbody, items, keyFn, htmlFn, bindFn){
+  const seen=new Set(), counts={};
+  const existing=new Map();
+  [...tbody.children].forEach(n=>{ if(n.dataset&&n.dataset.k) existing.set(n.dataset.k,n); });
+  let prev=null;
+  for(const it of items){
+    let k=keyFn(it); const base=k;
+    if(seen.has(k)){ counts[base]=(counts[base]||1)+1; k=base+'#'+counts[base]; }
+    seen.add(k);
+    const html=htmlFn(it);
+    let node=existing.get(k);
+    if(node){ existing.delete(k);
+      if(node._h!==html){ node.innerHTML=nodeFrom(html).innerHTML; node._h=html; if(bindFn) bindFn(node,it); } }
+    else{ node=nodeFrom(html); node.dataset.k=k; node._h=html;
+      if(booted) node.classList.add('enter');
+      if(bindFn) bindFn(node,it); }
+    if(prev){ if(prev.nextSibling!==node) tbody.insertBefore(node, prev.nextSibling); }
+    else if(tbody.firstChild!==node) tbody.insertBefore(node, tbody.firstChild);
+    prev=node;
+  }
+  existing.forEach(n=>n.remove());
+}
 let seenAct='', lastData=null, openConv='';
 function notify(title, body){
   if(!('Notification' in window)) return;
   if(Notification.permission==='default') Notification.requestPermission();
   if(Notification.permission==='granted') new Notification(title,{body});
 }
+function senderBits(i){ let h='';
+  if(i.sender_nickname) h+=' <small>“'+esc(i.sender_nickname)+'”</small>';
+  if(i.sender_role) h+=' <span class="pill">'+esc(i.sender_role)+'</span>';
+  if(i.sender_custom_role) h+=' <span class="pill">'+esc(i.sender_custom_role)+'</span>';
+  return h; }
 function render(d){
  lastData=d;
  document.getElementById('stamp').textContent='updated '+new Date().toLocaleTimeString();
- document.getElementById('alerts').innerHTML=(d.alerts||[]).filter(a=>a.status==='open').map(a=>
-  `<div class="alert">⚠ <b>${esc(a.kind)}</b> — ${esc(a.subject)} <small>${esc(a.detail||'')} · ${pt(a.created_at)}</small></div>`).join('');
- document.getElementById('users').innerHTML='<table>'+d.users.map(u=>
+ document.getElementById('serverline').textContent=d.server||'';
+ document.getElementById('livedot').classList.remove('down');
+ document.getElementById('conntext').textContent='LIVE — real-time push connected';
+ const openAlerts=(d.alerts||[]).filter(a=>a.status==='open');
+ document.getElementById('alerts').innerHTML=openAlerts.map(a=>
+  `<div class="alert enter">⚠ <b>${esc(a.kind)}</b> — ${esc(a.subject)} <small>${esc(a.detail||'')} · ${pt(a.created_at)}</small></div>`).join('');
+ const openWork=(d.work||[]).filter(w=>!['completed','covered'].includes(w.status));
+ const awaiting=(d.work||[]).filter(w=>w.status==='awaiting_approval');
+ document.getElementById('ovstats').innerHTML=
+  `<span class="stat"><b>${(d.online||[]).length}</b> agents online</span>`+
+  `<span class="stat"><b>${openWork.length}</b> work open</span>`+
+  `<span class="stat"><b>${awaiting.length}</b> awaiting approval</span>`+
+  `<span class="stat"><b>${(d.chains||[]).filter(c=>c.status==='running').length}</b> chains running</span>`+
+  `<span class="stat"><b>${openAlerts.length}</b> alerts open</span>`;
+ keyed(document.getElementById('users'), d.users||[], u=>u.username, u=>
   `<tr><td>@${esc(u.username)}<br><small>${esc((u.capabilities||[]).join(', '))}</small></td>
-   <td class="${u.online?'on':'off'}">${u.online?'online':'offline'}<br><small>${esc(u.activity_state||'')}</small></td>
+   <td class="${u.online?'on':'off'}"><span class="dot ${u.online?'on':''}"></span>${u.online?'online':'offline'}<br><small>${esc(u.activity_state||'')}</small></td>
    <td><span class="pill trust">trust ${u.trust_score}</span></td>
-   <td>${u.reachability?esc(u.reachability):''}${u.home&&u.riding&&u.home!==u.riding?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`).join('')+'</table>';
- document.getElementById('groups').innerHTML='<table>'+
-  d.groups.map(g=>`<tr><td>${esc(g.name)}</td><td><span class="pill">${g.member_count} members</span></td><td>by @${esc(g.creator)}</td></tr>`).join('')+
-  (d.channels||[]).map(c=>`<tr><td>📣 ${esc(c.name)}</td><td><span class="pill">${c.member_count} subscribers</span></td><td>channel · by @${esc(c.creator)}</td></tr>`).join('')+'</table>';
- document.getElementById('work').innerHTML='<table>'+d.work.map(w=>
+   <td>${u.reachability?esc(u.reachability):''}${u.home&&u.riding&&u.home!==u.riding?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`);
+ keyed(document.getElementById('groups'),
+  [...(d.groups||[]).map(g=>({k:'g:'+g.id,html:`<tr><td>${esc(g.name)}</td><td><span class="pill">${g.member_count} members</span></td><td>by @${esc(g.creator)}</td></tr>`})),
+   ...(d.channels||[]).map(c=>({k:'c:'+c.id,html:`<tr><td>📣 ${esc(c.name)}</td><td><span class="pill">${c.member_count} subscribers</span></td><td>channel · by @${esc(c.creator)}</td></tr>`}))],
+  x=>x.k, x=>x.html);
+ keyed(document.getElementById('work'), d.work||[], w=>w.id, w=>
   `<tr class="${w.priority==='urgent'?'urgent-row':''}"><td>${esc(w.id)}<br><small>${pt(w.updated_at)}</small></td>
    <td>@${esc(w.assigner)} → @${esc(w.assignee)}${w.group_id?'<br><small>'+esc(w.group_id)+'</small>':''}</td>
-   <td><span class="pill">${esc(w.status)}</span> ${w.priority==='urgent'?'<span class="pill urgent">URGENT</span>':''}
+   <td>${w.status==='awaiting_approval'?'<span class="pill awaiting">⏳ awaiting approval</span>':'<span class="pill">'+esc(w.status)+'</span>'} ${w.priority==='urgent'?'<span class="pill urgent">URGENT</span>':''} ${w.require_approval?'<span class="pill gate">🔒 approval gate</span>':''}
    <div class="bar"><i style="width:${w.progress_percent||0}%"></i></div>
    <small>${w.progress_percent||0}% agent-reported</small>
+   ${w.status==='awaiting_approval'?'<br><small>⏳ decision by @'+esc(w.assigner)+(w.group_id?' or a group admin':'')+' — on the line, not here</small>':''}
    ${w.deadline?'<br><small>⏰ '+pt(w.deadline)+' · '+countdown(w)+'</small>':''}
-   ${w.proof_verified?'<br><span class="pill verified">signed proof ✓</span>':''}</td></tr>`).join('')+'</table>';
- document.getElementById('chains').innerHTML='<table>'+(d.chains||[]).map(c=>
+   ${w.proof_verified?'<br><span class="pill verified">signed proof ✓</span>':''}</td></tr>`);
+ keyed(document.getElementById('chains'), d.chains||[], c=>c.id, c=>
   `<tr><td>${esc(c.id)}<br><small>by @${esc(c.creator)}</small></td>
    <td><span class="pill">${esc(c.status)}</span></td>
-   <td>${c.steps.map(s=>`<div>${s.position}. ${esc(s.target||s.target_type)} — ${esc(s.work_status||s.status)} ${s.progress_percent? '('+s.progress_percent+'%)':''}</div>`).join('')}</td></tr>`).join('')+'</table>';
- document.getElementById('convs').innerHTML='<table>'+(d.conversations||[]).map(c=>
-  `<tr class="conv" data-key="${esc(c.key)}"><td>${c.group_id?'group '+esc(c.group_id):'@'+c.participants.join(' ↔ @')}</td><td>${c.items.length} items</td><td><small>${pt(c.items[c.items.length-1].ts)}</small></td></tr>`).join('')+'</table>';
- document.querySelectorAll('.conv').forEach(r=>r.onclick=()=>{ openConv=r.dataset.key; showConv(); });
+   <td>${(c.steps||[]).map(s=>`<div>${s.position}. ${esc(s.target||s.target_type)} — ${esc(s.work_status||s.status)} ${s.progress_percent? '('+s.progress_percent+'%)':''}</div>`).join('')}</td></tr>`);
+ keyed(document.getElementById('convs'), d.conversations||[], c=>c.key, c=>
+  `<tr class="conv" data-key="${esc(c.key)}"><td>${c.group_id?'group '+esc(c.group_id)+' <small>· '+(c.participants||[]).length+' participants</small>':'@'+(c.participants||[]).join(' ↔ @')}</td><td>${c.items.length} items</td><td><small>${c.items.length?pt(c.items[c.items.length-1].ts):''}</small></td></tr>`,
+  (node,c)=>{ node.onclick=()=>{ openConv=c.key; showConv(); }; });
  showConv();
- document.getElementById('library').innerHTML='<table>'+(d.library||[]).map(e=>
-  `<tr><td>${esc(e.filename)}<br><small>${esc(e.sha256).slice(0,12)}… · ${e.size} B</small></td><td>@${esc(e.sender)} → @${esc(e.to_user)}</td><td><small>${pt(e.ts)}</small></td></tr>`).join('')+'</table>';
- document.getElementById('vault').innerHTML='<table>'+(d.vault||[]).map(v=>
-  `<tr><td>${v.pinned?'📌 ':''}${esc(v.name)}<br><small>${esc(v.sha256).slice(0,12)}… · ${v.size} B</small></td><td>${esc(v.group_id)}</td><td><small>by @${esc(v.added_by)}</small></td></tr>`).join('')+'</table>';
- document.getElementById('rooms').innerHTML='<table>'+(d.rooms||[]).map(r=>
-  `<tr><td>${esc(r.id)}</td><td>${esc(r.group_id)}</td><td>${r.participants.map(p=>'@'+esc(p)).join(', ')}</td></tr>`).join('')+'</table>';
- document.getElementById('act').innerHTML='<table>'+d.activity.map(a=>
-  `<tr class="${a.priority==='urgent'?'urgent-row':''}"><td><small>${pt(a.ts)}</small></td><td>${esc(a.kind)} <span class="pill ${a.evidence}">${a.evidence}</span>${a.priority==='urgent'?' <span class="pill urgent">URGENT</span>':''}</td><td>@${esc(a.from)}${a.to?' → @'+esc(a.to):''}${a.group_id?' in '+esc(a.group_id):''}${a.status?' · '+esc(a.status):''}</td></tr>`).join('')+'</table>';
- const top=d.activity[0];
+ keyed(document.getElementById('library'), d.library||[], e=>e.id, e=>
+  `<tr><td>${esc(e.filename)}<br><small>${esc(e.sha256).slice(0,12)}… · ${e.size} B</small></td><td>@${esc(e.sender)} → @${esc(e.to_user)}</td><td><small>${pt(e.ts)}</small></td></tr>`);
+ keyed(document.getElementById('vault'), d.vault||[], v=>v.id, v=>
+  `<tr><td>${v.pinned?'📌 ':''}${esc(v.name)}<br><small>${esc(v.sha256).slice(0,12)}… · ${v.size} B</small></td><td>${esc(v.group_id)}</td><td><small>by @${esc(v.added_by)}</small></td></tr>`);
+ keyed(document.getElementById('rooms'), d.rooms||[], r=>r.id, r=>
+  `<tr><td>${esc(r.id)}</td><td>${esc(r.group_id)}</td><td>${(r.participants||[]).map(p=>'@'+esc(p)).join(', ')}</td></tr>`);
+ keyed(document.getElementById('act'), d.activity||[],
+  a=>[a.ts,a.kind,a.from,a.to||'',a.work_id||'',a.status||''].join('|'), a=>
+  `<tr class="${a.priority==='urgent'?'urgent-row':''}"><td><small>${pt(a.ts)}</small></td><td>${esc(a.kind)} <span class="pill ${a.evidence}">${a.evidence}</span>${a.priority==='urgent'?' <span class="pill urgent">URGENT</span>':''}</td><td>@${esc(a.from)}${senderBits(a)}${a.to?' → @'+esc(a.to):''}${a.group_id?' in '+esc(a.group_id):''}${a.status?' · '+esc(a.status):''}</td></tr>`);
+ booted=true;
+ const top=(d.activity||[])[0];
  if(top){ const sig=top.ts+'|'+top.kind+'|'+top.from+'|'+(top.to||'');
    if(seenAct && sig!==seenAct && (top.kind.startsWith('work_')||top.kind==='online'||top.kind==='alert'))
      notify('AgentLink: '+top.kind.replaceAll('_',' '),
@@ -378,14 +548,36 @@ function showConv(){
  if(!openConv||!lastData){ el.innerHTML=''; return; }
  const c=(lastData.conversations||[]).find(x=>x.key===openConv);
  if(!c){ el.innerHTML=''; return; }
- el.innerHTML='<h3 style="margin:12px 0 6px;font-size:14px">Envelope details — '+esc(openConv)+'</h3><table>'+
-  c.items.map(i=>`<tr><td><small>${pt(i.ts)}</small></td><td>@${esc(i.from)}${i.to?' → @'+esc(i.to):''}</td>
+ let head='';
+ if(c.group_id){
+   head='<div class="parts"><b>Participants</b> '+(c.participants||[]).map(p=>
+     `<span class="part">@${esc(p.username)}${p.nickname?' “'+esc(p.nickname)+'”':''}${p.role?' · '+esc(p.role):''}${p.custom_role?' · '+esc(p.custom_role):''}</span>`).join(' ')+'</div>';
+ } else {
+   head='<div class="parts"><b>Direct conversation</b> — '+(c.participants||[]).map(p=>'@'+esc(p)).join(' ↔ ')+'</div>';
+ }
+ el.innerHTML='<h3 style="margin:12px 0 6px;font-size:14px">Envelope details — '+esc(c.key)+'</h3>'+head+'<table><tbody>'+
+  c.items.map(i=>`<tr><td><small>${pt(i.ts)}</small></td><td>@${esc(i.from)}${senderBits(i)}${i.to?' → @'+esc(i.to):''}</td>
    <td>${esc(i.kind)}<br><small>id ${esc(i.id)} · ${i.size} B ct · mentions ${(i.mentions||[]).map(m=>'@'+esc(m)).join(' ')||'—'} · ${esc(i.priority)} · ${esc(i.status||'')}</small></td>
-   <td><span class="pill ${i.evidence}">${i.evidence}</span></td></tr>`).join('')+'</table>';
+   <td><span class="pill ${i.evidence}">${i.evidence}</span></td></tr>`).join('')+'</tbody></table>';
 }
+/* ---- drawer behaviour ---- */
+const drawer=document.getElementById('drawer'), backdrop=document.getElementById('backdrop');
+function setDrawer(open){ drawer.classList.toggle('closed',!open);
+  document.body.classList.toggle('nav-closed',!open);
+  backdrop.classList.toggle('show', open&&window.innerWidth<900); }
+document.getElementById('navtoggle').onclick=()=>setDrawer(drawer.classList.contains('closed'));
+backdrop.onclick=()=>setDrawer(false);
+if(window.innerWidth<900) setDrawer(false);
+document.querySelectorAll('.navitem').forEach(a=>{ a.onclick=()=>{
+  document.querySelectorAll('.navitem').forEach(x=>x.classList.remove('active'));
+  a.classList.add('active');
+  const t=document.getElementById(a.dataset.target);
+  if(t) t.scrollIntoView({behavior:'smooth',block:'start'});
+  if(window.innerWidth<900) setDrawer(false); }; });
 const es=new EventSource('/api/stream');
 es.onmessage=e=>render(JSON.parse(e.data));
-es.onerror=()=>{ /* browser auto-reconnects the stream */ };
+es.onerror=()=>{ document.getElementById('livedot').classList.add('down');
+  document.getElementById('conntext').textContent='RECONNECTING…'; };
 if('Notification' in window && Notification.permission==='default')
   Notification.requestPermission();
 /* ---- Browser voice client (WebRTC peer-to-peer; relay = signalling
@@ -409,7 +601,7 @@ document.getElementById('joinroom').onclick=async()=>{
   catch(e){ vstatus('microphone unavailable: '+e.message); return; }
   const proto=location.protocol==='https:'?'wss:':'ws:';
   const data=lastData; const label=(data&&data.server)||'';
-  const m=label.match(/^(wss?):\\/\\/([^/]+)/);
+  const m=label.match(new RegExp('^(wss?)://([^/]+)'));
   const url=m?label:(proto+'//'+location.hostname+':8765');
   vws=new WebSocket(url);
   vws.onopen=()=>vsend({type:'hello', ephemeral:true, display_name:'dashboard browser'});
