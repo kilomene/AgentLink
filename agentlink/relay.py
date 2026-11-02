@@ -1304,6 +1304,10 @@ class Relay:
         secret = frame.get("secret")
         pubkey = str(frame.get("pubkey") or "")
         sign_pub = str(frame.get("sign_pub") or "")
+        # Hardened core (v1.2.0): the client declares its core
+        # fingerprint; the relay records it verbatim and judges it
+        # against the hardcoded constants — never trusts it.
+        core = self._sanitize_core(frame.get("core"))
         if frame.get("ephemeral"):
             username = "dial-" + new_id()[:8]
             peer = Peer(ws=ws, username=username, display_name=display or "dial",
@@ -1331,10 +1335,6 @@ class Relay:
         declared_mode = frame.get("mode")
         if declared_mode not in ("manual", "autonomous"):
             declared_mode = None
-        # Hardened core (v1.2.0): the client declares its core
-        # fingerprint; the relay records it verbatim and judges it
-        # against the hardcoded constants — never trusts it.
-        core = self._sanitize_core(frame.get("core"))
         if self.store.exists(username):
             if self.store.verify(username, secret):
                 self.store.set_display_name(username, display or username)
