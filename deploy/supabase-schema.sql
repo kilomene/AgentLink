@@ -184,10 +184,35 @@ create table if not exists chain_steps (
   target text not null default '', status text not null default 'pending',
   handoff text, released_at double precision,
   primary key (chain_id, step_index));
+-- v1.3.0 server carrying + earned health:
+--   health is EARNED by the server's test battery (-1 = UNRATED, still
+--   in the test battery, no percentage earned) — never assigned.
+--   owner_agent is PERMANENT ownership of a per-agent server
+--   ('' = shared/platform relay); carried_by is a TEMPORARY helper
+--   agent running the server while carried (never the owner) —
+--   carrying is never a transfer of ownership.
 create table if not exists servers (
   endpoint text primary key, label text not null default '',
   host_agent text not null default '', version text not null default '',
-  health integer not null default 100, riders integer not null default 0,
+  health integer not null default -1, riders integer not null default 0,
   capacity integer not null default 10,
   last_seen double precision not null default 0,
-  first_seen double precision not null default 0);
+  first_seen double precision not null default 0,
+  server_id text not null default '',
+  owner_agent text not null default '',
+  home_host text not null default '',
+  home_endpoint text not null default '',
+  home_last_seen bigint not null default 0,
+  home_healthy_since bigint not null default 0,
+  home_health integer not null default -1,
+  home_riders integer not null default 0,
+  home_capacity integer not null default 0,
+  carry_state text not null default '',
+  carried_by text not null default '',
+  carried_by_id text not null default '',
+  carry_endpoint text not null default '',
+  carry_lease_token text not null default '',
+  carry_lease_until bigint not null default 0,
+  carry_claimed_at bigint not null default 0,
+  can_carry integer not null default 1);
+create unique index if not exists servers_server_id_key on servers(server_id);
