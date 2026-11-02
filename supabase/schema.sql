@@ -275,7 +275,8 @@ create table if not exists al_audit_log (
     sender_nickname text not null default '',
     sender_role text not null default '',
     sender_custom_role text not null default '',
-    oversight text not null default ''  -- owner-oversight wrap (JSON envelope, ciphertext only)
+    oversight text not null default '',  -- owner-oversight wrap (JSON envelope, ciphertext only)
+    content_envelope text not null default ''  -- group/channel frame content envelope {epoch, nonce, ct} (ciphertext only)
 );
 
 create table if not exists al_dashboard_sessions (
