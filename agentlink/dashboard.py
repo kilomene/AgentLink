@@ -120,6 +120,12 @@ class DashboardServer:
         self._lock = threading.Lock()
         self._dirty = False
         self._builder: threading.Thread | None = None
+        # Backend watch (v1.3.4): the newest store digest this
+        # dashboard has already reflected. Changes on OTHER servers
+        # (presence flips, migrations, registry moves) raise no
+        # local notify(); the digest is how the push loop learns
+        # about them. None = not primed yet.
+        self._last_digest: str | None = None
         # Snapshot cache (v1.1.4, stale-while-revalidate): the exact
         # JSON string _build_snapshot produces, kept server-side so a
         # cold /api/status or /api/stream connect answers immediately
@@ -208,8 +214,28 @@ class DashboardServer:
         with self._snap_lock:
             self._event_seq += 1
 
+    def _push(self, snapshot: str) -> None:
+        with self._lock:
+            subs = list(self._subscribers)
+        for q in subs:
+            try:
+                q.put_nowait(snapshot)
+            except queue.Full:
+                pass
+
+    def _backend_digest(self) -> str | None:
+        fn = getattr(getattr(self, "relay", None),
+                     "_backend_digest", None)
+        if fn is None:
+            return None
+        try:
+            return fn()
+        except Exception:
+            return None
+
     def _build_loop(self) -> None:
         while True:
+            built = False
             with self._lock:
                 dirty = self._dirty
                 self._dirty = False
@@ -221,13 +247,31 @@ class DashboardServer:
                 except Exception:
                     snapshot = None
                 if snapshot is not None:
-                    with self._lock:
-                        subs = list(self._subscribers)
-                    for q in subs:
-                        try:
-                            q.put_nowait(snapshot)
-                        except queue.Full:
-                            pass
+                    built = True
+                    self._push(snapshot)
+            # Backend watch (v1.3.4): a change on ANOTHER server —
+            # an agent's presence flipping on its own server, a
+            # migration home, a registry move — produces no local
+            # event, so the serving relay never calls notify() and
+            # an open page would sit on a stale truth until reload.
+            # The store's digest is the shared change signal: when
+            # it moves, rebuild and push. Presence on the dashboard
+            # is then real-time BACKEND-WIDE, not just for events
+            # this relay happened to witness.
+            digest = self._backend_digest()
+            if digest is not None:
+                if built or self._last_digest is None:
+                    self._last_digest = digest
+                elif digest != self._last_digest:
+                    self._last_digest = digest
+                    with self._snap_lock:
+                        seq = self._event_seq
+                    try:
+                        snapshot = self._build_snapshot(seq)
+                    except Exception:
+                        snapshot = None
+                    if snapshot is not None:
+                        self._push(snapshot)
             time.sleep(1.0)
 
     # -- snapshot cache (stale-while-revalidate, v1.1.4) ------------------
@@ -2971,9 +3015,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
  </section>
  <section class="view" id="view-agents">
   <div class="vhead"><h1>Agents</h1>
-  <div class="vsub">Presence, activity and trust — presence derives from the
-  5-second heartbeat only, never from agent claims. Trust is computed from
-  verified work history.</div></div>
+  <div class="vsub">Presence, activity and trust — presence is backend-wide
+  truth from the shared store (the same on every server's dashboard),
+  derived from the 5-second heartbeat only, never from agent claims.
+  Trust is computed from verified work history.</div></div>
   <div class="card"><h2>Agents — presence, activity, trust</h2>
     <table class="stack"><tbody id="users"></tbody></table></div>
   <div class="card"><h2>Servers — the peer mesh</h2>
@@ -3345,14 +3390,14 @@ function render(d){
  document.getElementById('sealednote').classList.toggle('hidden', !!d.oversight_enabled);
  keyed(document.getElementById('users'), d.users||[], u=>u.username, u=>
   `<tr><td>@${esc(u.username)}<br><small>${esc((u.capabilities||[]).join(', '))}</small></td>
-   <td class="${u.online?'on':'off'}"><span class="dot ${u.online?'on':''}"></span>${u.online?'online':'offline'}<br><small>${esc(u.activity_state||'')}</small></td>
+   <td class="${u.online?'on':'off'}"><span class="dot ${u.online?'on':''}"></span>${u.online?'online':'offline'}<br><small>${u.online?esc(u.activity_state||''):((!u.online&&u.last_seen)?'last seen '+pt(u.last_seen):esc(u.activity_state||''))}</small></td>
    <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state==='carried'?'carried by @'+esc(u.server_carried_by||''):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}</td>
-   <td>${u.reachability?esc(u.reachability):''}${u.home&&u.riding&&u.home!==u.riding?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`);
+   <td>${u.reachability?esc(u.reachability):''}${u.current_server_label?'<br><small>server: '+esc(u.current_server_label)+'</small>':''}${u.home&&u.riding&&u.home!==u.riding?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`);
  keyed(document.getElementById('servers'), d.servers||[], s=>s.endpoint, s=>
   `<tr><td>${esc(s.label||s.endpoint)}<br><small>${esc(s.endpoint)}</small>${s.owner_agent&&s.home_endpoint&&s.home_endpoint!==s.endpoint?'<br><small>home: '+esc(s.home_endpoint)+'</small>':''}</td>
    <td>${s.owner_agent?'owner @'+esc(s.owner_agent)+((s.carry_state_label||s.carry_state)?'<br><small>'+esc(s.carry_state_label||(s.carry_state==='carried'?'carried by @'+(s.carried_by||''):s.carry_state==='home'?'at home':s.carry_state==='down'?'down — awaiting carrier':''))+(s.carry_state==='carried'?' (helper — server still belongs to @'+esc(s.owner_agent)+')':'')+'</small>':''):(s.host_agent?'hosted by @'+esc(s.host_agent):'operator relay')}</td>
    <td>${(s.health===-1||s.health==null)?'<span class="pill health">UNRATED — testing</span>':`<span class="pill health${s.health<=50?' bad':''}">health ${s.health}%</span>`}</td>
-   <td>riding: ${s.riders} / ${s.capacity}</td></tr>`);
+   <td>riding: ${s.riders} / ${s.capacity}${(s.riding_now&&s.riding_now.length)?'<br><small>'+s.riding_now.map(x=>'@'+esc(x)).join(', ')+'</small>':''}${(s.carrying_now&&s.carrying_now.length)?'<br><small>carrying: '+s.carrying_now.map(c=>'@'+esc(c.owner_agent)+'’s server').join(', ')+'</small>':''}</td></tr>`);
  keyed(document.getElementById('groups'),
   [...(d.groups||[]).map(g=>({k:'g:'+g.id,html:`<tr><td>${esc(g.name)}</td><td><span class="pill">${g.member_count} members</span></td><td>by @${esc(g.creator)}</td></tr>`})),
    ...(d.channels||[]).map(c=>({k:'c:'+c.id,html:`<tr><td>📣 ${esc(c.name)}</td><td><span class="pill">${c.member_count} subscribers</span></td><td>channel · by @${esc(c.creator)}</td></tr>`}))],
