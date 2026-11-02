@@ -395,6 +395,19 @@ def test_boot_onto_peer_from_persisted_list(state_root):
         # must boot straight onto the peer.
         home.kill()
         await asyncio.sleep(0.3)
+        # The persisted list is also HOURS old by the time of this
+        # boot (learned_at backdated past the TTL): restored entries
+        # are the agent's memory of the mesh and must NOT be pruned
+        # before the first live learn — that was the second half of
+        # the v1.2.0 production drill failure.
+        import json as _json
+        p = state_root / "booter" / "servers.json"
+        data = _json.loads(p.read_text())
+        data["saved_at"] -= 7200
+        for e in data["servers"]:
+            if "learned_at" in e:
+                e["learned_at"] -= 7200
+        p.write_text(_json.dumps(data))
         second = Agent("booter", endpoint=home_url,
                        state_dir=str(state_root / "booter"))
         assert peer_url in second.endpoints  # loaded from disk
@@ -565,4 +578,106 @@ def test_rider_capacity_cap_and_deflection(state_root):
                 pass
     run(_t())
     home.kill()
+    peer.stop()
+
+
+# ---------------------------------------------------------------------------
+# Phantom endpoints (v1.2.2): the production shape the staging drill
+# could not see — an endpoint fronted by a tunnel completes the WS
+# handshake even when the relay behind it is dead, then closes. A
+# bare-open race probe crowns the phantom forever (the v1.2.0
+# production kill-drill failure). Probes now dwell.
+# ---------------------------------------------------------------------------
+
+class PhantomHandle:
+    """A WS server that accepts the handshake, then closes within
+    ~0.2s — exactly what a tunnel fronting a dead relay looks like
+    to a client."""
+
+    def __init__(self):
+        self.port = 0
+        self.loop = None
+        self.thread = None
+        self.server = None
+
+    def start(self):
+        from websockets.server import serve as _ws_serve
+        ready = threading.Event()
+
+        def _thread():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self.loop = loop
+
+            async def _main():
+                async def handler(ws, path=None):
+                    await asyncio.sleep(0.2)
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                self.server = await _ws_serve(handler, HOST, self.port)
+                self.port = self.server.sockets[0].getsockname()[1]
+                ready.set()
+                await asyncio.Future()
+
+            try:
+                loop.run_until_complete(_main())
+            except (RuntimeError, asyncio.CancelledError):
+                pass
+
+        self.thread = threading.Thread(target=_thread, daemon=True)
+        self.thread.start()
+        assert ready.wait(timeout=10)
+        return f"ws://{HOST}:{self.port}"
+
+    def stop(self):
+        if self.loop is not None and self.server is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    _close_server(self.server), self.loop)
+                fut.result(timeout=5)
+            except Exception:
+                pass
+            self.server = None
+
+
+async def _close_server(server):
+    server.close()
+    await server.wait_closed()
+
+
+def test_phantom_home_never_wins_the_race(state_root):
+    tmp = tempfile.mkdtemp(prefix="agentlink-mesh-phantom-")
+    db = str(Path(tmp) / "shared.db")
+    peer = RelayHandle(db, "real-peer")
+    peer_url = peer.start()
+    phantom = PhantomHandle()
+    phantom_url = phantom.start()
+
+    async def _t():
+        agent = Agent("phantom-rider", endpoint=phantom_url,
+                      fallbacks=[peer_url],
+                      state_dir=str(state_root / "phantom-rider"))
+        task = asyncio.create_task(agent.run(
+            reconnect_delay=0.5, home_probe_interval=1.0))
+        try:
+            # The race must see through the phantom (dwell) and land
+            # on the real peer.
+            assert await wait_for(
+                lambda: agent.current_endpoint == peer_url, timeout=30)
+            assert peer.relay and "phantom-rider" in peer.relay.peers
+            # And the dwell-checked home probe must not knock it off
+            # the peer every few seconds: still riding after 6s.
+            await asyncio.sleep(6)
+            assert agent.current_endpoint == peer_url
+            assert "phantom-rider" in peer.relay.peers
+        finally:
+            task.cancel()
+            try:
+                await agent.close()
+            except Exception:
+                pass
+    run(_t())
+    phantom.stop()
     peer.stop()
