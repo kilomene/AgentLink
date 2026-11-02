@@ -12,16 +12,18 @@ Semantics pinned here, all against a real relay + real clients:
     the dashboard payload all say so with no mode argument anywhere;
     manual appears only when explicitly chosen;
   * the runtime is a LOOP, not an intelligence: it consults the
-    agent's OWN registered brain. No brain wired -> a loud startup
-    warning + silence (never a fabricated reply or delivery);
+    agent's OWN decision-making through its decision link. Link not
+    wired -> a loud startup warning + the line held (never a
+    fabricated reply or delivery);
   * two autonomous agents CANNOT ping-pong forever: autonomous sends
     are meta-marked, per-conversation consecutive caps tighten
     against an autonomous counterparty, and the exchange STOPS;
-  * autonomous work round-trips for real: brain executes, reports
-    progress, delivers with a relay-verified signed proof;
-  * a brain decline is honest: the assigner hears the brain's own
+  * autonomous work round-trips for real: the agent's own decision
+    executes, reports progress, delivers with a relay-verified
+    signed proof;
+  * a decline is honest: the assigner hears the agent's own
     reason, the work is NOT delivered;
-  * a manual-mode agent never auto-replies, brain or not.
+  * a manual-mode agent never auto-replies, link or not.
 """
 
 from __future__ import annotations
@@ -301,7 +303,7 @@ def test_two_autonomous_agents_stop(relay_env, state_root):
     run(_t())
 
 
-def test_brain_silence_ends_exchange(relay_env, state_root):
+def test_decision_silence_ends_exchange(relay_env, state_root):
     async def silent(ctx):
         return None
 
@@ -312,21 +314,28 @@ def test_brain_silence_ends_exchange(relay_env, state_root):
         await human.send_message("quietone", "anyone there?")
         await asyncio.sleep(3.0)
         assert human.messages == []
-        assert any(e["event"] == "brain_silent"
+        assert any(e["event"] == "decision_silent"
                    for e in quiet.autonomous_log)
         await human.close()
         await quiet.close()
     run(_t())
 
 
-def test_no_brain_autonomous_is_silent_and_warns(relay_env, state_root):
+def test_unlinked_autonomous_holds_the_line(relay_env, state_root):
     """No canned persona exists to fall back on: an autonomous agent
-    with NO brain wired warns loudly at startup and then does
-    NOTHING — no reply, no delivery, no decline chatter."""
+    whose decision link is NOT wired warns loudly at startup and
+    then does NOTHING on its own behalf — no reply, no delivery, no
+    decline chatter. And the platform says so truthfully (v1.3.5):
+    work assigned to it is DELIVERED to its connection and queues
+    there with a decision-link notice to the assigner — never
+    fake-accepted, and never stranded at the relay either: the
+    declaration describes the connection's unattended runtime, not
+    the agent's right to receive its own work (an embedded agent's
+    own program may act on what its connection receives)."""
     async def _t():
         human = await make(relay_env, state_root, "boss", mode="manual")
         hollow = await make(relay_env, state_root, "hollow")
-        assert any(e["event"] == "no_brain_warning"
+        assert any(e["event"] == "decision_link_pending_warning"
                    for e in hollow.autonomous_log)
         await human.send_message("hollow", "hello?")
         works = await human.assign_work(["hollow"], "Do a thing",
@@ -337,9 +346,11 @@ def test_no_brain_autonomous_is_silent_and_warns(relay_env, state_root):
         assert human.work_updates == [] or all(
             w["status"] != "delivered" for w in human.work_updates)
         row = relay_env["relay"].store.get_work(wid)
-        assert row["status"] == "assigned"   # untouched, honestly
-        assert any(e["event"] == "work_no_brain"
-                   for e in hollow.autonomous_log)
+        assert row["status"] == "assigned"   # delivered, queued there
+        assert [w["id"] for w in hollow.assigned_work] == [wid]
+        notice = works[0].get("notice") or {}
+        assert notice.get("kind") == "decision_link_pending"
+        assert "decision link" in (notice.get("message") or "")
         await human.close()
         await hollow.close()
     run(_t())
