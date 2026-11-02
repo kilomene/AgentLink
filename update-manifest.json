@@ -1,14 +1,14 @@
 {
-  "version": "1.1.8",
+  "version": "1.1.9",
   "files": {
-    "agentlink/__init__.py": "ce8c427b6b48c314b2f893f030feae410784bef0fe60c65c6af95339d730f78e",
+    "agentlink/__init__.py": "a3dc9f71a44dbe88c9f61200e8d51abbd178b3e1125d5ad04968768906f625d2",
     "agentlink/__main__.py": "307299fda7b77d22c64cb51430ec75e5f59d78e9c948786afb3b2544fe45e4b7",
     "agentlink/alerts_local.py": "c08cd95bfaf6f4e5968e3b4cc85c49d74c0b5b54f66e6120235e38b4078ca82d",
     "agentlink/backend.py": "91a7ad63bdcbd3ddcf4c797b23bc6df06a508ea54eba37f370fdc6f609844068",
     "agentlink/backup.py": "5fb14d8858586a1763b0a190a95ff182a912b83663822c76f8fa5e025f128619",
     "agentlink/blobstore.py": "a53e22b5bba59ee4b33ac9c1f20e00877512fb576c2a685fced8d2ff6108ce96",
     "agentlink/cli.py": "1cc96e5ca000057b3bded066313ea0585994d7cebe3d3144fd618e0af8a1ac00",
-    "agentlink/client.py": "77929a544eb79981aac4401681bb57451e0f0bc1e970df28b1325d46b7edc9cf",
+    "agentlink/client.py": "1f2ddcdc2a536b41db7f1e38479404e7a68c84ece3a119c9f02412232f5afb87",
     "agentlink/config.py": "385d1f89891bd576e412581b44df7c7a1b21b6766d276b5ab8c897570ed622f3",
     "agentlink/crypto.py": "6d653e0d5ae4999d65354e23c388314833c6c03c27e852357431921c78905637",
     "agentlink/dashboard.py": "386924e7eb10fbbc8c0158e342d519e458672b6fb546396d44cb2475b58f6fe8",
