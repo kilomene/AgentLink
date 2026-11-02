@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def start_relay(db_path: str, **kw):
     relay = Relay(host=HOST, port=0, db_path=db_path,
-                  dashboard_password="test-dash-pass", **kw)
+                  dashboard_password="test-dash-pass", dashboard_port=0, **kw)
     ready = threading.Event()
     box: dict = {}
 
