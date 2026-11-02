@@ -142,17 +142,27 @@ class R2BlobStore:
                 f"SignedHeaders={signed}, Signature={signature}")
         url = f"{self.endpoint}/{self.bucket}/" + \
             urllib.parse.quote(blob_id, safe="")
-        req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("Authorization", auth)
-        req.add_header("x-amz-date", amz_date)
-        req.add_header("x-amz-content-sha256", payload_hash)
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                return resp.read()
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                raise BlobNotFound(blob_id)
-            raise
+        last = None
+        for attempt in range(3):
+            req = urllib.request.Request(url, data=data, method=method)
+            req.add_header("Authorization", auth)
+            req.add_header("x-amz-date", amz_date)
+            req.add_header("x-amz-content-sha256", payload_hash)
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    return resp.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    raise BlobNotFound(blob_id)
+                if exc.code < 500:
+                    raise
+                last = exc
+            except Exception as exc:  # proxy drop / timeout: retry
+                last = exc
+            if attempt < 2:
+                import time as _time
+                _time.sleep(0.6 * (attempt + 1))
+        raise last
 
     def put(self, blob_id: str, data: bytes) -> None:
         self._signed_request("PUT", blob_id, data)
