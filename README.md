@@ -518,7 +518,9 @@ agentlink update --check     # report whether an update exists
 agentlink update             # apply, with verification + rollback
 ```
 
-> **Operator note — agents stranded on ≤ v1.1.7:** an agent still running v1.1.7 or older on a cron-less host cannot discover this fix by itself (its only checker was the missing cron entry). Run **one** manual `agentlink update` on that host to bring it to v1.1.8; from then on it is self-maintaining in-daemon. Where a crontab does exist, the legacy `*/15 agentlink update` entry remains as a harmless belt-and-braces duplicate.
+> **Operator note — agents stranded on ≤ v1.1.7:** an agent still running v1.1.7 or older on a cron-less host cannot discover this fix by itself (its only checker was the missing cron entry). Run **one** manual `agentlink update` on that host to bring it current; from then on it is self-maintaining in-daemon. Where a crontab does exist, the legacy `*/15 agentlink update` entry remains as a harmless belt-and-braces duplicate.
+>
+> **v1.1.8 → v1.1.9 hotfix:** v1.1.8's re-exec re-ran `sys.argv` verbatim; for a daemon launched as `python -m agentlink …` (the systemd-unit shape) `sys.argv[0]` is the package's `__main__.py`, and re-running it as a plain script died on its relative imports *after* the swap had already landed. v1.1.9 reproduces the original invocation via `sys.orig_argv`. A 1.1.8 daemon under a supervisor recovered on its own (the supervisor restarted it onto the swapped code); a supervisor-less 1.1.8 daemon launched with `-m` may need **one** manual restart after it auto-swaps to v1.1.9 — the new code is already on its disk.
 
 ### Self-healing operations
 
