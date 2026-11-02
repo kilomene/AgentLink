@@ -74,6 +74,74 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def carry_claim_blocked(rows: list[dict], *, claimant_id: str,
+                        claimant_health: int, claimant_capacity: int,
+                        claimant_riders: int = 0,
+                        claimant_can_carry: bool = True,
+                        claimant_carrying: int = 0,
+                        now: int, stale_after: int) -> bool:
+    """Single-winner carry arbitration, shared verbatim by both
+    stores: True when this claimant must NOT claim — it is unrated
+    or at/below the health floor, it cannot carry, its carrying
+    capacity is full, or a strictly better eligible brother (higher
+    health, then fewer carried servers, then fewer riders, then
+    server_id for determinism) is live in the registry. Platform
+    relays get NO preference: every live carrier-capable instance
+    ranks by the same key, owner and stranger alike."""
+    if not claimant_can_carry:
+        return True
+    if int(claimant_health) <= 50 or int(claimant_capacity) <= 0:
+        return True
+    if int(claimant_carrying) >= int(claimant_capacity):
+        return True
+    carrying: dict[str, int] = {}
+    for r in rows:
+        if r.get("owner_agent") and r.get("carry_state") == "carried" \
+                and int(r.get("carry_lease_until") or 0) > now:
+            cid = str(r.get("carried_by_id") or "")
+            if cid:
+                carrying[cid] = carrying.get(cid, 0) + 1
+    my_key = (-int(claimant_health), int(claimant_carrying),
+              int(claimant_riders), str(claimant_id))
+    for r in rows:
+        sid = str(r.get("server_id") or "")
+        if not sid or sid == claimant_id:
+            continue
+        if not int(r.get("can_carry") if r.get("can_carry") is not None
+                   else 1):
+            continue
+        # Is this row a LIVE carrier instance right now? A shared
+        # relay lives by its registry heartbeat; a per-agent server's
+        # home instance lives by its home heartbeat while at home.
+        if r.get("owner_agent"):
+            if r.get("carry_state") != "home":
+                continue
+            if now - int(r.get("home_last_seen") or 0) > stale_after:
+                continue
+            health = int(r.get("home_health")
+                         if r.get("home_health") is not None
+                         else r.get("health") or -1)
+            capacity = int(r.get("home_capacity")
+                           if r.get("home_capacity") is not None
+                           else r.get("capacity") or 0)
+            riders = int(r.get("home_riders") or 0)
+        else:
+            if now - int(r.get("last_seen") or 0) > stale_after:
+                continue
+            health = int(r.get("health")
+                         if r.get("health") is not None else -1)
+            capacity = int(r.get("capacity") or 0)
+            riders = int(r.get("riders") or 0)
+        if health <= 50 or capacity <= 0:
+            continue
+        load = carrying.get(sid, 0)
+        if load >= capacity:
+            continue
+        if (-health, load, riders, sid) < my_key:
+            return True
+    return False
+
+
 class Store:
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser()
@@ -89,6 +157,12 @@ class Store:
             pass
         self._lock = threading.Lock()
         self._db = sqlite3.connect(str(self.path), check_same_thread=False)
+        # WAL lets readers and one writer coexist; busy_timeout makes
+        # a writer WAIT for the lock instead of failing instantly —
+        # several relay processes share one file in the mesh, and
+        # their 5s registry heartbeats + health-battery writes must
+        # queue, never error out (v1.3.0 root-cause fix).
+        self._db.execute("PRAGMA busy_timeout=10000")
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         integrity = self._db.execute("PRAGMA integrity_check").fetchone()[0]
@@ -341,11 +415,28 @@ class Store:
                     label TEXT NOT NULL DEFAULT '',
                     host_agent TEXT NOT NULL DEFAULT '',
                     version TEXT NOT NULL DEFAULT '',
-                    health INTEGER NOT NULL DEFAULT 100,
+                    health INTEGER NOT NULL DEFAULT -1,
                     riders INTEGER NOT NULL DEFAULT 0,
                     capacity INTEGER NOT NULL DEFAULT 10,
                     last_seen INTEGER NOT NULL DEFAULT 0,
-                    first_seen INTEGER NOT NULL DEFAULT 0
+                    first_seen INTEGER NOT NULL DEFAULT 0,
+                    server_id TEXT NOT NULL DEFAULT '',
+                    owner_agent TEXT NOT NULL DEFAULT '',
+                    home_host TEXT NOT NULL DEFAULT '',
+                    home_endpoint TEXT NOT NULL DEFAULT '',
+                    home_last_seen INTEGER NOT NULL DEFAULT 0,
+                    home_healthy_since INTEGER NOT NULL DEFAULT 0,
+                    home_health INTEGER NOT NULL DEFAULT -1,
+                    home_riders INTEGER NOT NULL DEFAULT 0,
+                    home_capacity INTEGER NOT NULL DEFAULT 0,
+                    carry_state TEXT NOT NULL DEFAULT '',
+                    carried_by TEXT NOT NULL DEFAULT '',
+                    carried_by_id TEXT NOT NULL DEFAULT '',
+                    carry_endpoint TEXT NOT NULL DEFAULT '',
+                    carry_lease_token TEXT NOT NULL DEFAULT '',
+                    carry_lease_until INTEGER NOT NULL DEFAULT 0,
+                    carry_claimed_at INTEGER NOT NULL DEFAULT 0,
+                    can_carry INTEGER NOT NULL DEFAULT 1
                 );
                 """
             )
@@ -431,6 +522,54 @@ class Store:
              "riders INTEGER NOT NULL DEFAULT 0")
         _add("servers", "capacity",
              "capacity INTEGER NOT NULL DEFAULT 10")
+        # Server carrying + earned health (v1.3.0): a server has a
+        # STABLE identity (server_id) distinct from its current
+        # endpoint — while carried, the endpoint moves to the
+        # carrier and the identity must not. owner_agent is the
+        # PERMANENT owner of a per-agent server ('' = shared relay);
+        # carried_by is only the temporary helper whose machine is
+        # running it — never a transfer of ownership. Health is
+        # earned by testing: -1 = UNRATED (no percentage yet).
+        for _col, _ddl in (
+                ("server_id", "server_id TEXT NOT NULL DEFAULT ''"),
+                ("owner_agent", "owner_agent TEXT NOT NULL DEFAULT ''"),
+                ("home_host", "home_host TEXT NOT NULL DEFAULT ''"),
+                ("home_endpoint",
+                 "home_endpoint TEXT NOT NULL DEFAULT ''"),
+                ("home_last_seen",
+                 "home_last_seen INTEGER NOT NULL DEFAULT 0"),
+                ("home_healthy_since",
+                 "home_healthy_since INTEGER NOT NULL DEFAULT 0"),
+                ("home_health",
+                 "home_health INTEGER NOT NULL DEFAULT -1"),
+                ("home_riders",
+                 "home_riders INTEGER NOT NULL DEFAULT 0"),
+                ("home_capacity",
+                 "home_capacity INTEGER NOT NULL DEFAULT 0"),
+                ("carry_state", "carry_state TEXT NOT NULL DEFAULT ''"),
+                ("carried_by", "carried_by TEXT NOT NULL DEFAULT ''"),
+                ("carried_by_id",
+                 "carried_by_id TEXT NOT NULL DEFAULT ''"),
+                ("carry_endpoint",
+                 "carry_endpoint TEXT NOT NULL DEFAULT ''"),
+                ("carry_lease_token",
+                 "carry_lease_token TEXT NOT NULL DEFAULT ''"),
+                ("carry_lease_until",
+                 "carry_lease_until INTEGER NOT NULL DEFAULT 0"),
+                ("carry_claimed_at",
+                 "carry_claimed_at INTEGER NOT NULL DEFAULT 0"),
+                ("can_carry", "can_carry INTEGER NOT NULL DEFAULT 1")):
+            _add("servers", _col, _ddl)
+        db.execute(
+            "UPDATE servers SET server_id = endpoint"
+            " WHERE server_id = ''")
+        db.execute(
+            "UPDATE servers SET home_endpoint = endpoint,"
+            " home_last_seen = last_seen, carry_state = 'home'"
+            " WHERE owner_agent <> '' AND home_endpoint = ''")
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_servers_server_id"
+            " ON servers(server_id)")
         db.commit()
 
     # -- blob metadata (ciphertext lives in the blob store) ----------------
@@ -1073,26 +1212,134 @@ class Store:
     # every live peer. The registry is how "another agent's server"
     # becomes a real, findable thing instead of a configured guess.
 
+    # -- server registry (v1.2.0 peer mesh; v1.3.0 carrying) -------------
+    # Every relay registers ITSELF in the shared backend on boot and
+    # heartbeats the row; clients discover the live mesh from any
+    # relay (welcome payload / 'servers' request) and race home +
+    # every live peer. The registry is how "another agent's server"
+    # becomes a real, findable thing instead of a configured guess.
+    #
+    # v1.3.0: a server's identity is its server_id — STABLE across
+    # endpoint changes. A per-agent server (owner_agent set) keeps
+    # its permanent home endpoint in home_endpoint; while a brother
+    # carries it, `endpoint` points at the carrier's alias for it,
+    # carried_by names the temporary helper, and a lease
+    # (carry_lease_token/until) makes the claim single-winner.
+    # Ownership NEVER moves: owner_agent is permanent.
+
     def register_server(self, label: str, endpoint: str,
                         host_agent: str = "", version: str = "",
-                        health: int = 100, riders: int = 0,
-                        capacity: int = 10) -> None:
+                        health: int = -1, riders: int = 0,
+                        capacity: int = 10, server_id: str = "",
+                        owner_agent: str = "", home_host: str = "",
+                        home_endpoint: str = "",
+                        can_carry: bool = True) -> None:
+        from .timing import (CARRY_HANDBACK_SECONDS,
+                             SERVER_STALE_SECONDS)
         now = now_ts()
+        sid = server_id or endpoint
+        home_ep = home_endpoint or (endpoint if owner_agent else "")
         with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM servers WHERE server_id = ?",
+                (sid,)).fetchone()
+            if row is None:
+                self._db.execute(
+                    "INSERT INTO servers (endpoint, label, host_agent,"
+                    " version, health, riders, capacity, last_seen,"
+                    " first_seen, server_id, owner_agent, home_host,"
+                    " home_endpoint, home_last_seen,"
+                    " home_healthy_since, home_health, home_riders,"
+                    " home_capacity, carry_state, can_carry)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                    " ?, ?, ?, ?, ?, ?, ?)",
+                    (endpoint, label, host_agent, version,
+                     int(health), int(riders), int(capacity), now, now,
+                     sid, owner_agent, home_host or host_agent,
+                     home_ep, now if owner_agent else 0,
+                     now if owner_agent else 0,
+                     int(health) if owner_agent else -1,
+                     int(riders) if owner_agent else 0,
+                     int(capacity) if owner_agent else 0,
+                     "home" if owner_agent else "",
+                     1 if can_carry else 0))
+                self._db.commit()
+                return
+            row = dict(row)
+            if owner_agent:
+                # This call is the HOME instance heartbeating. Its
+                # home stats always update; the CURRENT serving
+                # fields belong to whoever serves the server now.
+                prev_home = int(row.get("home_last_seen") or 0)
+                if prev_home and now - prev_home <= \
+                        SERVER_STALE_SECONDS:
+                    healthy_since = int(
+                        row.get("home_healthy_since") or now)
+                else:
+                    healthy_since = now
+                state = row.get("carry_state") or "home"
+                lease_until = int(row.get("carry_lease_until") or 0)
+                if state == "carried" and lease_until > now:
+                    # A brother is carrying this server: record the
+                    # home heartbeat ONLY — never steal the serving
+                    # row back from under the carrier.
+                    self._db.execute(
+                        "UPDATE servers SET home_last_seen = ?,"
+                        " home_healthy_since = ?, home_health = ?,"
+                        " home_riders = ?, home_capacity = ?,"
+                        " version = ?, can_carry = ?"
+                        " WHERE server_id = ?",
+                        (now, healthy_since, int(health),
+                         int(riders), int(capacity), version,
+                         1 if can_carry else 0, sid))
+                    self._db.commit()
+                    return
+                if state == "carried" and lease_until <= now and \
+                        now - healthy_since < CARRY_HANDBACK_SECONDS:
+                    # The carrier is gone (lease expired) but home
+                    # has not yet proven itself strongly: stay
+                    # 'carried' on paper until the handback window
+                    # completes — nobody serves a half-returned home.
+                    self._db.execute(
+                        "UPDATE servers SET home_last_seen = ?,"
+                        " home_healthy_since = ?, home_health = ?,"
+                        " home_riders = ?, home_capacity = ?,"
+                        " version = ?, can_carry = ?"
+                        " WHERE server_id = ?",
+                        (now, healthy_since, int(health),
+                         int(riders), int(capacity), version,
+                         1 if can_carry else 0, sid))
+                    self._db.commit()
+                    return
+                # At home (or reclaiming after the handback window):
+                # the home instance IS the serving instance.
+                self._db.execute(
+                    "UPDATE servers SET endpoint = ?, label = ?,"
+                    " host_agent = ?, version = ?, health = ?,"
+                    " riders = ?, capacity = ?, last_seen = ?,"
+                    " home_host = ?, home_endpoint = ?,"
+                    " home_last_seen = ?, home_healthy_since = ?,"
+                    " home_health = ?, home_riders = ?,"
+                    " home_capacity = ?, carry_state = 'home',"
+                    " carried_by = '', carried_by_id = '',"
+                    " carry_endpoint = '', carry_lease_token = '',"
+                    " carry_lease_until = 0, carry_claimed_at = 0,"
+                    " can_carry = ? WHERE server_id = ?",
+                    (home_ep, label, host_agent, version,
+                     int(health), int(riders), int(capacity), now,
+                     home_host or host_agent, home_ep, now,
+                     healthy_since, int(health), int(riders),
+                     int(capacity), 1 if can_carry else 0, sid))
+                self._db.commit()
+                return
             self._db.execute(
-                "INSERT INTO servers (endpoint, label, host_agent,"
-                " version, health, riders, capacity, last_seen,"
-                " first_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT(endpoint) DO UPDATE SET"
-                " label = excluded.label,"
-                " host_agent = excluded.host_agent,"
-                " version = excluded.version,"
-                " health = excluded.health,"
-                " riders = excluded.riders,"
-                " capacity = excluded.capacity,"
-                " last_seen = excluded.last_seen",
+                "UPDATE servers SET endpoint = ?, label = ?,"
+                " host_agent = ?, version = ?, health = ?,"
+                " riders = ?, capacity = ?, last_seen = ?,"
+                " can_carry = ? WHERE server_id = ?",
                 (endpoint, label, host_agent, version, int(health),
-                 int(riders), int(capacity), now, now))
+                 int(riders), int(capacity), now,
+                 1 if can_carry else 0, sid))
             self._db.commit()
 
     def list_servers(self, stale_after: int | None = None) -> list[dict]:
@@ -1105,11 +1352,149 @@ class Store:
         cutoff = now_ts() - int(stale_after)
         with self._lock:
             rows = self._db.execute(
-                "SELECT endpoint, label, host_agent, version, health,"
-                " riders, capacity, last_seen"
-                " FROM servers WHERE last_seen >= ? ORDER BY endpoint",
-                (cutoff,)).fetchall()
+                "SELECT * FROM servers WHERE last_seen >= ?"
+                " ORDER BY endpoint", (cutoff,)).fetchall()
         return [dict(r) for r in rows]
+
+    def list_agent_servers(self) -> list[dict]:
+        """ALL per-agent servers (owner_agent set), fresh or not —
+        the carrier watch list and the dashboard's honest state
+        view. Oldest home heartbeat first, so the longest-down
+        server is claimed first."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM servers WHERE owner_agent <> ''"
+                " ORDER BY home_last_seen, server_id").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_server(self, server_id: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM servers WHERE server_id = ?",
+                (server_id,)).fetchone()
+        return dict(row) if row else None
+
+    def claim_carry(self, server_id: str, *, carrier_id: str,
+                    carrier_agent: str, endpoint: str,
+                    carrier_health: int, carrier_capacity: int,
+                    carrier_riders: int = 0,
+                    carrier_can_carry: bool = True,
+                    carrier_carrying: int = 0,
+                    now: int | None = None,
+                    lease_seconds: int = 45,
+                    stale_after: int = 20,
+                    home_probe_failed: bool = False) -> dict | None:
+        """Claim the carry of a DOWN per-agent server — single
+        winner. The claim lands only if, atomically at write time:
+        the target's home heartbeat is stale, no live lease stands,
+        and the lease token still equals the one read (optimistic
+        concurrency: a racing brother's landed claim changes the
+        token and this write matches zero rows). The claimant must
+        also be the best eligible carrier (carry_claim_blocked)."""
+        if now is None:
+            now = now_ts()
+        if carrier_id == server_id:
+            return None  # a server never carries itself
+        with self._lock:
+            rows = [dict(r) for r in self._db.execute(
+                "SELECT * FROM servers").fetchall()]
+            target = next((r for r in rows
+                           if r.get("server_id") == server_id), None)
+            if target is None or not target.get("owner_agent"):
+                return None
+            if not home_probe_failed and \
+                    now - int(target.get("home_last_seen") or 0) \
+                    <= stale_after:
+                return None  # home is still answering
+            if target.get("carry_state") == "carried" and \
+                    int(target.get("carry_lease_until") or 0) > now:
+                return None  # a brother already carries it
+            if carry_claim_blocked(
+                    rows, claimant_id=carrier_id,
+                    claimant_health=carrier_health,
+                    claimant_capacity=carrier_capacity,
+                    claimant_riders=carrier_riders,
+                    claimant_can_carry=carrier_can_carry,
+                    claimant_carrying=carrier_carrying,
+                    now=now, stale_after=stale_after):
+                return None
+            token = secrets.token_hex(16)
+            cur = self._db.execute(
+                "UPDATE servers SET endpoint = ?, host_agent = ?,"
+                " health = ?, riders = 0, capacity = ?,"
+                " last_seen = ?, carry_state = 'carried',"
+                " carried_by = ?, carried_by_id = ?,"
+                " carry_endpoint = ?, carry_lease_token = ?,"
+                " carry_lease_until = ?, carry_claimed_at = ?"
+                " WHERE server_id = ? AND carry_lease_token = ?"
+                " AND carry_lease_until = ?",
+                (endpoint, carrier_agent, int(carrier_health),
+                 int(carrier_capacity), now, carrier_agent,
+                 carrier_id, endpoint, token, now + lease_seconds,
+                 now, server_id,
+                 str(target.get("carry_lease_token") or ""),
+                 int(target.get("carry_lease_until") or 0)))
+            self._db.commit()
+            if cur.rowcount != 1:
+                return None
+            row = self._db.execute(
+                "SELECT * FROM servers WHERE server_id = ?",
+                (server_id,)).fetchone()
+        return dict(row) if row else None
+
+    def renew_carry(self, server_id: str, *, carrier_id: str,
+                    token: str, carrier_agent: str, endpoint: str,
+                    health: int, riders: int, capacity: int,
+                    now: int | None = None,
+                    lease_seconds: int = 45) -> bool:
+        """Extend a held lease and refresh the carried row's live
+        stats. Matches on the lease token: a carrier that lost the
+        lease (handback, expiry + re-claim) renews nothing."""
+        if now is None:
+            now = now_ts()
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE servers SET endpoint = ?, host_agent = ?,"
+                " health = ?, riders = ?, capacity = ?,"
+                " last_seen = ?, carry_lease_until = ?"
+                " WHERE server_id = ? AND carry_state = 'carried'"
+                " AND carried_by_id = ? AND carry_lease_token = ?",
+                (endpoint, carrier_agent, int(health), int(riders),
+                 int(capacity), now, now + lease_seconds, server_id,
+                 carrier_id, token))
+            self._db.commit()
+        return cur.rowcount == 1
+
+    def release_carry(self, server_id: str, *, carrier_id: str,
+                      token: str, now: int | None = None) -> bool:
+        """Release a held lease: the row flips back to its home
+        endpoint with the home instance's last known stats and
+        state 'down' — the home instance's next heartbeat (it is
+        heartbeating throughout a handback) flips it to 'home'.
+        Until then the row is honestly not-serving."""
+        if now is None:
+            now = now_ts()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM servers WHERE server_id = ?",
+                (server_id,)).fetchone()
+            if row is None:
+                return False
+            row = dict(row)
+            cur = self._db.execute(
+                "UPDATE servers SET endpoint = home_endpoint,"
+                " host_agent = home_host, health = home_health,"
+                " riders = home_riders, capacity = home_capacity,"
+                " last_seen = home_last_seen,"
+                " carry_state = 'down', carried_by = '',"
+                " carried_by_id = '', carry_endpoint = '',"
+                " carry_lease_token = '', carry_lease_until = 0,"
+                " carry_claimed_at = 0 WHERE server_id = ?"
+                " AND carry_state = 'carried'"
+                " AND carried_by_id = ? AND carry_lease_token = ?",
+                (server_id, carrier_id, token))
+            self._db.commit()
+        return cur.rowcount == 1
 
     def set_capabilities(self, username: str, capabilities,
                          cap_desc: str = "") -> None:
@@ -1690,6 +2075,20 @@ class Store:
             self._db.execute(
                 "UPDATE work SET status = 'awaiting_agent', updated_at = ?"
                 " WHERE id = ?", (now_ts(), work_id))
+            self._db.commit()
+        return self.get_work(work_id)
+
+    def restore_awaiting(self, work_id: str) -> dict:
+        """Direct-work restoration (v1.3.1): the NAMED assignee of a
+        parked 1:1 work is back, so the work returns to 'assigned'
+        unchanged — same assignee, same attempt (it was parked, never
+        reassigned to a replacement). Guarded on the parked status so
+        a racing sweep/reassign can never be clobbered."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE work SET status = 'assigned', updated_at = ?"
+                " WHERE id = ? AND status = 'awaiting_agent'",
+                (now_ts(), work_id))
             self._db.commit()
         return self.get_work(work_id)
 
