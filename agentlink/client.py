@@ -2306,7 +2306,12 @@ class Agent:
                 for entry in progress:
                     if isinstance(entry, dict) \
                             and entry.get("percent") is not None:
-                        await report(float(entry["percent"]),
+                        # JSON numbers arrive as int or float
+                        # depending on the agent's encoder;
+                        # report_progress's contract is int percent
+                        # — the adapter coerces, the range check
+                        # inside still rejects out-of-range values.
+                        await report(int(float(entry["percent"])),
                                      str(entry.get("note") or ""))
         return result
 
