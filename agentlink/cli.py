@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         print(__doc__)
         print("commands: relay server register agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
-              "alerts capabilities update doctor service backup "
+              "alerts capabilities update doctor census service backup "
               "oversight-keygen deregister remove-user")
         return 0
     cmd, rest = argv[0], argv[1:]
@@ -243,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
         return _update_main(rest)
     if cmd == "doctor":
         return _doctor(rest)
+    if cmd == "census":
+        return _census(rest)
     if cmd == "service":
         return _service(rest)
     if cmd == "group":
@@ -394,6 +396,54 @@ def _oversight_keygen(rest: list[str]) -> int:
     key = OversightKey.generate()
     key.save(out)
     print(key.public_key_b64)
+    return 0
+
+
+def _census(rest: list[str]) -> int:
+    """Conversation census tooling (immortality gate, v1.3.2).
+
+    Default: print the store's live census (counts + digest).
+    --snapshot: record the durable baseline (the BEFORE of a guarded
+    operation). --verify: compare the store against the baseline —
+    any lost conversation/group/channel is reported, alerted on the
+    store, and exits nonzero. Migration and cleanup tooling runs
+    snapshot before and verify after; the relay ALSO verifies at
+    every boot and the updater can guard itself with --census."""
+    from .backend import create_store
+    from .census import (CensusGuard, CensusLossError, census_summary,
+                         compute_census)
+
+    ap = argparse.ArgumentParser(prog="agentlink census")
+    ap.add_argument("--db", default="~/.agentlink/relay.db")
+    ap.add_argument("--backend", default=None,
+                    help="sqlite|supabase (default: AGENTLINK_BACKEND "
+                         "env or sqlite)")
+    ap.add_argument("--baseline", default=None,
+                    help="baseline path (default: beside --db)")
+    ap.add_argument("--snapshot", action="store_true")
+    ap.add_argument("--verify", action="store_true")
+    args = ap.parse_args(rest)
+    store = create_store(args.backend, db_path=args.db)
+    baseline = args.baseline or str(
+        Path(args.db).expanduser().parent / "census-baseline.json")
+    guard = CensusGuard(store, baseline)
+    if args.snapshot:
+        census = guard.snapshot()
+        _print({"snapshotted": baseline, **census_summary(census)})
+        return 0
+    if args.verify:
+        try:
+            result = guard.verify()
+        except CensusLossError as exc:
+            _print({"status": "LOSS", "detail": str(exc),
+                    "diff": exc.diff})
+            return 1
+        _print(result)
+        return 0
+    census = compute_census(store)
+    _print({"baseline": baseline,
+            "baseline_exists": guard.load_baseline() is not None,
+            **census_summary(census)})
     return 0
 
 
