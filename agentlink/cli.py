@@ -132,11 +132,20 @@ def main(argv: list[str] | None = None) -> int:
                              "is the default — the agent works for "
                              "the platform on its own; manual is the "
                              "explicit opt-out")
+        ap.add_argument("--decision-endpoint", default=None,
+                        help="the agent's own local decision endpoint "
+                             "(autonomous mode): a URL the runtime "
+                             "POSTs each line event to and whose reply "
+                             "it acts on — the paved decision link; "
+                             "the agent itself is the intelligence, "
+                             "this only links its connection to it. "
+                             "Also settable as AGENTLINK_DECISION_ENDPOINT")
         args = ap.parse_args(rest)
 
         async def _go():
             a = Agent(_username(args), endpoint=_endpoint(args),
-                      state_dir=_state_dir(args), mode=args.mode)
+                      state_dir=_state_dir(args), mode=args.mode,
+                      decision_endpoint=args.decision_endpoint)
             if args.mode == "manual":
                 # Manual mode shell (unchanged from before the
                 # autonomy law): surface events; echo when asked.
@@ -148,17 +157,26 @@ def main(argv: list[str] | None = None) -> int:
                         return f"echo: {frame.get('body')}"
                     return None
             else:
-                # Autonomous mode: the bare CLI wires NO intelligence
-                # of its own — the platform ships no canned brain.
-                # Events print for visibility only; the runtime loop
-                # defers to these taps, so this shell observes and
-                # never speaks or works.
+                # Autonomous mode: the bare CLI wires no decision
+                # link of its own — the agent itself is the
+                # intelligence and this shell is not it, so the
+                # platform speaks only about the LINK, never as the
+                # agent. Events print for visibility only; the
+                # runtime loop defers to these taps, so this shell
+                # observes and never speaks or works on the agent's
+                # behalf. A real autonomous agent wires its decision
+                # link (--decision-endpoint, or in code:
+                # decision_link=<its own decision callable>).
                 print("AUTONOMOUS mode: this bare CLI shell has no "
-                      "brain wired — the agent will observe the line "
-                      "but will NOT reply or execute work. Real "
-                      "autonomous agents run Agent(..., "
-                      "mode='autonomous', brain=<their own "
-                      "intelligence>).", flush=True)
+                      "decision link wired — the line is held: the "
+                      "agent will observe but will NOT reply or "
+                      "execute work on its own behalf. The agent "
+                      "itself is the intelligence; wire its decision "
+                      "link with --decision-endpoint <its local "
+                      "decision endpoint> or in code with "
+                      "Agent(..., mode='autonomous', "
+                      "decision_link=<its own decision callable>).",
+                      flush=True)
 
                 @a.on_message
                 async def _msg(frame):
