@@ -33,6 +33,7 @@ create table if not exists al_users (
     sign_pub text not null default '',  -- Ed25519 public key (proofs)
     capabilities jsonb not null default '[]',
     cap_desc text not null default '',
+    mode text not null default 'autonomous',  -- platform autonomy law (v1.1.7)
     last_seen bigint not null default 0,
     created_at bigint not null
 );
