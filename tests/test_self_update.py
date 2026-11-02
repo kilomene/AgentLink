@@ -450,6 +450,61 @@ def _pid_of(line: str) -> int:
     return int(re.search(r"pid=(\d+)", line).group(1))
 
 
+def test_a2_cli_module_daemon_self_updates(tmp_path):
+    """The production entrypoint shape: `python -m agentlink agent`
+    (what the systemd units run). Its sys.argv[0] is the package's
+    __main__.py — a re-exec that re-runs that file as a plain
+    script dies on relative imports, so the checker must reproduce
+    the -m invocation (sys.orig_argv)."""
+    import site as _site
+    _, endpoint = _start_relay(tmp_path)
+    install = _make_install(tmp_path)
+    feed = _make_feed(tmp_path, NEXT_VERSION)
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    deps = [p for p in (_site.getsitepackages()
+                        + [_site.getusersitepackages()])
+            if Path(p).exists()]
+    env = {
+        "PATH": str(shim),  # no crontab here either
+        "HOME": str(home),  # fresh identity under the scrubbed HOME
+        "PYTHONPATH": os.pathsep.join([str(install), *deps]),
+        "PYTHONUNBUFFERED": "1",
+        "AGENTLINK_SELF_UPDATE": "1",
+        "AGENTLINK_UPDATE_CHECK_SECONDS": "3",
+        "AGENTLINK_UPDATE_BASE": feed.as_uri(),
+        "AGENTLINK_ENDPOINT": endpoint,
+    }
+    assert shutil.which("crontab", path=env["PATH"]) is None
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "agentlink", "agent",
+         "--username", "upd-a2"],
+        # cwd pinned AWAY from the repo root: for `-m`, sys.path[0]
+        # is the CWD, which would otherwise shadow PYTHONPATH and
+        # the daemon would import (and update!) the repo tree.
+        cwd=str(tmp_path),
+        env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True)
+    lines = _Lines(proc)
+    try:
+        lines.wait_for("online as upd-a2")
+        lines.wait_for(
+            f"installed {RUNNING_VERSION} -> {NEXT_VERSION}",
+            timeout=180)
+        # The re-exec'd process rejoins on the new code.
+        lines.wait_count("online as upd-a2", 2, timeout=120)
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+    assert (f'__version__ = "{NEXT_VERSION}"'
+            in (install / "agentlink" / "__init__.py").read_text())
+    # The identity the daemon created lives in its own state dir
+    # and survived the update.
+    assert (home / ".agentlink" / "secret-upd-a2.json").exists()
+
+
 # ------------------------------------------------------------------
 # (b/c/d) staged apply gates, driven in-process
 # ------------------------------------------------------------------
