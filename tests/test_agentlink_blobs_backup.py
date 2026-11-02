@@ -190,6 +190,67 @@ def test_r2_store_signed_round_trip_against_fake_s3():
     assert local.list_ids() == ["b-x"]
 
 
+def test_r2_get_falls_back_to_ranges_when_body_truncated():
+    """Production defect (v1.1.1 release): the egress proxy truncates
+    large R2 GET bodies mid-read (http.client.IncompleteRead after
+    ~10-26 KB), so the dashboard's /api/blob for a 91 KB image 404'd
+    while every other path worked. R2BlobStore.get must reassemble
+    the object from ranged slices when the plain GET truncates."""
+    payload = bytes((i * 31 + 7) % 256 for i in range(90_000))
+    store: dict[str, bytes] = {"b-big": payload}
+    ranged: list[str] = []
+
+    class TruncatingS3(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _key(self):
+            return self.path.rsplit("/", 1)[1]
+
+        def do_GET(self):
+            if self._key() not in store:
+                self.send_response(404)
+                self.end_headers()
+                return
+            data = store[self._key()]
+            rng = self.headers.get("Range")
+            if rng:
+                ranged.append(rng)
+                a, b = rng.removeprefix("bytes=").split("-")
+                a, b = int(a), min(int(b), len(data) - 1)
+                chunk = data[a:b + 1]
+                self.send_response(206)
+                self.send_header("Content-Range",
+                                 f"bytes {a}-{b}/{len(data)}")
+                self.send_header("Content-Length", str(len(chunk)))
+                self.end_headers()
+                # Even slices truncate: promise the whole slice,
+                # deliver a prefix, drop. The client must resume
+                # from the partial bytes it did receive.
+                self.wfile.write(chunk[:9000])
+                self.connection.close()
+                return
+            # Plain GET: headers promise the whole body, the wire
+            # delivers a prefix then drops — the observed proxy cut.
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data[:9000])
+            self.connection.close()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), TruncatingS3)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        endpoint = f"http://127.0.0.1:{srv.server_address[1]}"
+        r2 = R2BlobStore(bucket="agentlink-blobs", access_key="AKID",
+                         secret_key="SECRET", endpoint=endpoint)
+        got = r2.get("b-big")
+        assert got == payload
+        assert len(ranged) >= 2  # reassembled from multiple slices
+    finally:
+        srv.shutdown()
+
+
 def test_backup_create_verify_and_tamper(relay_env, tmp_path):
     # Seed a blob into the relay's blob dir so the archive covers it.
     blobs = LocalBlobStore(Path(relay_env["tmp"]) / "blobs")
