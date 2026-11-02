@@ -40,14 +40,16 @@ from pathlib import Path
 import websockets.exceptions
 from websockets.client import connect
 
-from .config import resolve_endpoint, resolve_fallbacks
+from .config import resolve_endpoint, resolve_fallbacks, \
+    resolve_oversight_pubkey
 from .deadlines import pacific_display
 from .timing import (
     HEARTBEAT_SECONDS,
     HOME_PROBE_SECONDS,
     RECONNECT_BACKOFF_CAP_SECONDS,
 )
-from .crypto import Identity, decrypt_with_key, encrypt_with_key, new_group_key
+from .crypto import Identity, decrypt_with_key, encrypt_to_pubkey, \
+    encrypt_with_key, new_group_key
 from .protocol import (
     MAX_FRAME,
     make_file_payload,
@@ -260,6 +262,7 @@ class Agent:
         capabilities: list[str] | None = None,
         cap_description: str = "",
         max_concurrency: int = 8,
+        oversight_pubkey: str | None = None,
     ):
         u = normalize_username(username)
         if u is None and not ephemeral:
@@ -269,6 +272,15 @@ class Agent:
         self.capabilities = list(capabilities or [])
         self.cap_description = cap_description
         self.max_concurrency = max(1, int(max_concurrency))
+        # Owner oversight (2026-11-01): when a pubkey is known, every
+        # content send ALSO seals a copy to the oversight key (see
+        # _oversight_for_obj / _oversight_for_key). Local config —
+        # constructor arg or AGENTLINK_OVERSIGHT_PUBKEY — wins; when
+        # nothing is configured locally, the relay-advertised key from
+        # the welcome frame is adopted in start().
+        self._oversight_configured = resolve_oversight_pubkey(
+            oversight_pubkey)
+        self.oversight_pubkey = self._oversight_configured
         self.endpoint = resolve_endpoint(endpoint)
         # Failover, own server first: home (self.endpoint) is always
         # tried first; fallbacks are only ridden while home is down,
@@ -605,6 +617,14 @@ class Agent:
             frame = json.loads(raw)
             if frame.get("type") == "welcome":
                 self.username = frame["username"]
+                if not self._oversight_configured and \
+                        frame.get("oversight_pubkey"):
+                    # Relay-advertised oversight key: fleet agents
+                    # pick it up with zero manual config. A locally
+                    # configured key (env/arg) is the override and is
+                    # never replaced by the relay's value.
+                    self.oversight_pubkey = str(
+                        frame["oversight_pubkey"])
                 if not self.ephemeral and \
                         self.identity.path is None:
                     pass
@@ -820,6 +840,34 @@ class Agent:
 
     def _decrypt_obj(self, envelope: dict) -> dict:
         return json.loads(self.identity.decrypt_envelope(envelope))
+
+    # -- owner oversight wraps ------------------------------------------------
+    def _oversight_wrap(self, plaintext: bytes, kind: str) -> dict | None:
+        """Seal a copy for the owner's oversight key, or None when no
+        oversight pubkey is known (client then sends no wrap — a relay
+        with AGENTLINK_REQUIRE_OVERSIGHT=1 will reject the send).
+
+        The wrap is the standard encrypt_for envelope plus a ``kind``
+        discriminator: ``content`` = the wrapped plaintext is the
+        content payload JSON itself; ``content_key`` = the wrapped
+        plaintext is the raw symmetric key that decrypts the sibling
+        content envelope (group/channel messages, file keys)."""
+        pub = self.oversight_pubkey
+        if not pub:
+            return None
+        try:
+            env = encrypt_to_pubkey(pub, plaintext)
+        except Exception:
+            log.exception("oversight wrap failed; sending without it")
+            return None
+        env["kind"] = kind
+        return env
+
+    def _oversight_for_obj(self, obj: dict) -> dict | None:
+        return self._oversight_wrap(json.dumps(obj).encode(), "content")
+
+    def _oversight_for_key(self, key: bytes) -> dict | None:
+        return self._oversight_wrap(key, "content_key")
 
     # -- dispatch ------------------------------------------------------------------------
     async def _dispatch(self, frame: dict) -> None:
@@ -1256,9 +1304,30 @@ class Agent:
         # (the file existed, the relay answered, too late). Bounded
         # at 120s — a fetch that cannot land in two minutes is a
         # failure the caller hears about, never a silent hang.
-        data = await self._request({"type": "blob_get",
-                                    "blob_id": descriptor["blob_id"]},
-                                   timeout=120)
+        # Bounded retries ride out short bad windows (an error frame
+        # or a dropped socket fails one attempt, not the file).
+        data = None
+        last_exc: Exception | None = None
+        for _attempt in range(3):
+            try:
+                data = await self._request(
+                    {"type": "blob_get",
+                     "blob_id": descriptor["blob_id"]}, timeout=120)
+                break
+            except Exception as exc:  # noqa: BLE001 - retried below
+                last_exc = exc
+                if isinstance(exc, ConnectionError):
+                    # Socket is down/reconnecting: wait for the line
+                    # to come back rather than burning attempts.
+                    for _ in range(120):
+                        if self.connection_state == "connected":
+                            break
+                        await asyncio.sleep(0.5)
+                else:
+                    await asyncio.sleep(2)
+        if data is None:
+            raise last_exc if last_exc is not None else \
+                RuntimeError("blob fetch failed")
         ct_b64 = data["data_b64"]
         if descriptor.get("wrapped_key"):
             key = self.identity.decrypt_envelope(descriptor["wrapped_key"])
@@ -1427,6 +1496,12 @@ class Agent:
             pub = await self.pubkey_of(for_user)
             descriptor["wrapped_key"] = self.identity.encrypt_for(
                 pub, file_key)
+        # Owner oversight: the file key, wrapped to the oversight key,
+        # so the dashboard can render the media. Rides inside the
+        # (already encrypted) message payload next to the other wraps.
+        ov = self._oversight_for_key(file_key)
+        if ov:
+            descriptor["oversight"] = ov
         return descriptor
 
     # -- folder send (point 35): a folder is packed to ZIP on the fly and
@@ -1458,12 +1533,16 @@ class Agent:
         pub = await self.pubkey_of(u)
         if not pub:
             raise RequestFailed("unknown_recipient", f"no key for @{u}")
-        content = self._encrypt_obj(pub, {"body": body, "kind": kind,
-                                          "file": file})
-        return await self._request({
+        obj = {"body": body, "kind": kind, "file": file}
+        content = self._encrypt_obj(pub, obj)
+        frame = {
             "type": "send", "to": u, "content": content, "id": new_id(),
             "mentions": parse_mentions(body), "in_reply_to": in_reply_to,
-            "priority": priority})
+            "priority": priority}
+        ov = self._oversight_for_obj(obj)
+        if ov:
+            frame["oversight"] = ov
+        return await self._request(frame)
 
     async def send_file(self, to: str, path: str, caption: str = "",
                         kind: str | None = None,
@@ -1627,10 +1706,14 @@ class Agent:
                               "file": file}).encode()
         content = {"epoch": rec["epoch"],
                    **encrypt_with_key(rec["key"], payload)}
-        return await self._request({
+        frame = {
             "type": "group_send", "group_id": group_id, "content": content,
             "id": new_id(), "mentions": parse_mentions(body),
-            "in_reply_to": in_reply_to, "priority": priority})
+            "in_reply_to": in_reply_to, "priority": priority}
+        ov = self._oversight_for_key(rec["key"])
+        if ov:
+            frame["oversight"] = ov
+        return await self._request(frame)
 
     async def group_send_file(self, group_id: str, path: str,
                               caption: str = "", kind: str | None = None,
@@ -1882,6 +1965,9 @@ class Agent:
             frame["target_role"] = target_role
         if require_approval:
             frame["require_approval"] = True
+        ov = self._oversight_for_obj(obj)
+        if ov:
+            frame["oversight"] = ov
         data = await self._request(frame)
         return [self._decrypt_work(w) for w in data["work"]]
 
@@ -1959,6 +2045,9 @@ class Agent:
                     frame["content_next"] = nxt
             except Exception:
                 log.exception("chain-next copy failed")
+        ov = self._oversight_for_obj(obj)
+        if ov:
+            frame["oversight"] = ov
         data = await self._request(frame)
         return self._decrypt_work(data["work"])
 
@@ -2119,10 +2208,14 @@ class Agent:
                               "file": file}).encode()
         content = {"epoch": rec["epoch"],
                    **encrypt_with_key(rec["key"], payload)}
-        return await self._request({
+        frame = {
             "type": "channel_send", "channel_id": channel_id,
             "content": content, "id": new_id(),
-            "mentions": parse_mentions(body), "priority": priority})
+            "mentions": parse_mentions(body), "priority": priority}
+        ov = self._oversight_for_key(rec["key"])
+        if ov:
+            frame["oversight"] = ov
+        return await self._request(frame)
 
     async def channel_send_file(self, channel_id: str, path: str,
                                 caption: str = "",
