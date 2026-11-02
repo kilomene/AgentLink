@@ -374,8 +374,16 @@ def _service(rest: list[str]) -> int:
             result["error"] = str(exc)
             result["next"] = ("save the unit to your systemd directory"
                               " (needs operator privileges) and enable it")
-        # Cron safety net, installed idempotently: per-minute watchdog
-        # + daily update check. Marker-delimited, safe to re-run.
+        # Cron safety net, installed idempotently where a crontab
+        # binary exists: the per-minute hang watchdog. The */15
+        # update entry is a LEGACY belt-and-braces duplicate — since
+        # v1.1.8 the agent checks for updates inside its own daemon
+        # (see Agent._update_check_loop), so self-update NEVER
+        # depends on this file. Marker-delimited, safe to re-run.
+        result["self_update"] = (
+            "in-daemon: the agent checks for updates itself every"
+            " 15 minutes inside `agentlink agent` — no host cron,"
+            " systemd timer or supervisor required")
         try:
             import shutil
             import subprocess as _sp
@@ -425,8 +433,18 @@ def _service(rest: list[str]) -> int:
                 else:
                     result["cron"] = "already installed"
             else:
-                result["cron"] = "no crontab binary; copy deploy/" \
-                                 "agentlink.cron into your cron spool"
+                result["cron"] = (
+                    "no crontab binary on this host — the cron"
+                    " safety net was skipped, and the ONLY thing lost"
+                    " is the per-minute hang watchdog (it inherently"
+                    " needs an external ticker: cron or a supervisor"
+                    " of your own). Self-update is NOT affected: it"
+                    " runs in-daemon (see self_update)")
+                print("NOTE: no crontab binary on this host — the"
+                      " cron safety net (per-minute hang watchdog)"
+                      " was skipped. Self-update does not depend on"
+                      " it: the agent daemon checks for updates"
+                      " itself every 15 minutes.", flush=True)
         except Exception as exc:
             result["cron"] = f"skipped: {exc}"
         _print(result)
