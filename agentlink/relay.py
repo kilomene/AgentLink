@@ -985,7 +985,11 @@ class Relay:
                               "blob needs for_user or for_group")
             return
         blob_id = "b-" + _hl.sha256(data).hexdigest()
-        self.blob_store.put(blob_id, data)
+        # Blob I/O offloaded (v1.1 Phase-1 live fix): with the R2
+        # backend a put/get is a network round trip with retries;
+        # on the event loop it starved hello/message handling and
+        # blob fetches timed out on the requesting client.
+        await asyncio.to_thread(self.blob_store.put, blob_id, data)
         self.store.put_blob_meta(blob_id, owner=peer.username,
                                  for_user=for_user or "",
                                  for_group=for_group or "",
@@ -1019,7 +1023,8 @@ class Relay:
             return
         from .blobstore import BlobNotFound
         try:
-            data = self.blob_store.get(meta["id"])
+            data = await asyncio.to_thread(self.blob_store.get,
+                                           meta["id"])
         except BlobNotFound:
             await self._error(ws, "unknown_blob", req_id)
             return
@@ -1041,7 +1046,7 @@ class Relay:
             await self._error(ws, "permission_denied", req_id,
                               "only the owner or a group admin can delete")
             return
-        self.blob_store.delete(meta["id"])
+        await asyncio.to_thread(self.blob_store.delete, meta["id"])
         self.store.delete_blob_meta(meta["id"])
         await self._result(ws, req_id, True, {"blob_id": meta["id"],
                                               "deleted": True})
@@ -1925,7 +1930,8 @@ class Relay:
                               "chunk sha256 mismatch; chunk rejected")
             return
         index = int(frame.get("index"))
-        self.blob_store.put(f"{sess['session_id']}-{index}", data)
+        await asyncio.to_thread(self.blob_store.put,
+                                f"{sess['session_id']}-{index}", data)
         have = self.store.record_chunk(sess["session_id"], index)
         await self._result(ws, req_id, True, {"have": have})
 
@@ -1963,7 +1969,8 @@ class Relay:
         parts = []
         try:
             for i in range(total):
-                parts.append(self.blob_store.get(f"{sess['session_id']}-{i}"))
+                parts.append(await asyncio.to_thread(
+                    self.blob_store.get, f"{sess['session_id']}-{i}"))
         except BlobNotFound:
             await self._error(ws, "incomplete_upload", req_id,
                               "a chunk is missing from storage")
@@ -1984,13 +1991,14 @@ class Relay:
             await self._error(ws, "not_a_member", req_id)
             return
         blob_id = "b-" + sess["ct_sha"]
-        self.blob_store.put(blob_id, data)
+        await asyncio.to_thread(self.blob_store.put, blob_id, data)
         self.store.put_blob_meta(
             blob_id, owner=peer.username, for_user=sess["for_user"],
             for_group=sess["for_group"], for_channel=fin_channel,
             whole_sha=sess["whole_sha"], size=len(data))
         for i in range(total):
-            self.blob_store.delete(f"{sess['session_id']}-{i}")
+            await asyncio.to_thread(self.blob_store.delete,
+                                    f"{sess['session_id']}-{i}")
         self.store.delete_upload_session(sess["session_id"])
         self.store.audit("blob_upload_completed", peer.username,
                          sess["for_user"], sess["for_group"], blob_id, "")
