@@ -297,7 +297,8 @@ class SupabaseStore:
 
     # -- users -----------------------------------------------------------------
     def claim(self, username, display_name, pubkey="", sign_pub="",
-              capabilities=None, cap_desc="", mode="autonomous"):
+              capabilities=None, cap_desc="", mode="autonomous",
+              decision_link=""):
         secret = new_secret()
         try:
             self._req("POST", "users", body={
@@ -308,6 +309,8 @@ class SupabaseStore:
                 "cap_desc": cap_desc,
                 "mode": mode if mode in ("manual", "autonomous")
                         else "autonomous",
+                "decision_link": decision_link if decision_link in
+                        ("linked", "pending") else "",
                 "created_at": now_ts()}, prefer="return=minimal")
         except Exception as exc:
             if "409" in str(exc) or "duplicate" in str(exc):
@@ -688,9 +691,20 @@ class SupabaseStore:
         self._req("PATCH", "users", self._eq("username", username),
                   body={"mode": mode}, prefer="return=minimal")
 
+    def set_decision_link(self, username, state):
+        # Decision link (v1.3.5): the agent declares in its hello
+        # whether its connection is linked to its own
+        # decision-making; the relay only records the declaration.
+        # A connection-side fact — never a judgement on the agent.
+        if state not in ("linked", "pending"):
+            return
+        self._req("PATCH", "users", self._eq("username", username),
+                  body={"decision_link": state},
+                  prefer="return=minimal")
+
     def list_users(self, query="", capability=""):
         q = ("select=username,display_name,pubkey,sign_pub,capabilities,"
-             "cap_desc,mode,last_seen,created_at&order=username")
+             "cap_desc,mode,decision_link,last_seen,created_at&order=username")
         if query:
             q += f"&username=like.%25{urllib.parse.quote(query)}%25"
         rows = self._get("users", q)
