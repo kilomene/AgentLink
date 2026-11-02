@@ -46,6 +46,7 @@ import urllib.request
 
 from .protocol import new_id, new_secret, now_ts
 from .store import DEFAULT_SETTINGS, MAX_GROUP_MEMBERS, GroupFull, NotFound, UsernameTaken
+from .store import NON_TERMINAL_WORK_STATUSES, RemovalBlocked
 
 
 def _sha(text: str) -> str:
@@ -389,6 +390,195 @@ class SupabaseStore:
                 continue
             out.append(r)
         return out
+
+    # -- registration removal (v1.1.10) --------------------------------
+    # Parity with the SQLite Store EXACTLY (same cascade, same
+    # blockers, same audit record — see store.py for the full
+    # rationale: what is deleted, what is deliberately kept).
+
+    def _ids_where(self, table, query, col):
+        return {r[col] for r in self._get(table, query
+                                          + f"&select={col}") if r.get(col)}
+
+    def _removal_refs(self, username):
+        work_ids = (
+            self._ids_where("work", self._eq("assigner", username), "id")
+            | self._ids_where("work", self._eq("assignee", username), "id"))
+        chain_ids = self._ids_where(
+            "chains", self._eq("creator", username), "id")
+        return work_ids, chain_ids
+
+    def _removal_id_sets(self, username):
+        """{table: (pk_column, {row keys})} for the cascade tables
+        whose membership is an OR over two predicates — resolved to
+        explicit key sets so plan counts and delete counts are exact
+        (a self-assigned work row matches both predicates once)."""
+        work_ids, chain_ids = self._removal_refs(username)
+        sets: dict[str, tuple[str, set]] = {}
+
+        def by_ids(table, col, ids):
+            out: set = set()
+            ids = list(ids)
+            for i in range(0, len(ids), 100):
+                chunk = ids[i:i + 100]
+                out |= self._ids_where(
+                    table, f"{col}=in.(" + ",".join(chunk) + ")", col)
+            return out
+
+        sets["work"] = ("id", set(work_ids))
+        sets["chains"] = ("id", set(chain_ids))
+        sets["chain_steps"] = ("id", by_ids("chain_steps", "chain_id",
+                                           chain_ids))
+        sets["work_deliveries"] = ("id",
+                                   by_ids("work_deliveries", "work_id",
+                                          work_ids)
+                                   | self._ids_where(
+                                       "work_deliveries",
+                                       self._eq("deliverer", username),
+                                       "id"))
+        sets["work_checkpoints"] = ("work_id",
+                                    by_ids("work_checkpoints", "work_id",
+                                           work_ids)
+                                    | self._ids_where(
+                                        "work_checkpoints",
+                                        self._eq("by_user", username),
+                                        "work_id"))
+        sets["upload_sessions"] = (
+            "session_id",
+            self._ids_where("upload_sessions",
+                            self._eq("owner", username), "session_id")
+            | self._ids_where("upload_sessions",
+                              self._eq("for_user", username),
+                              "session_id"))
+        sets["blobs"] = ("id",
+                         self._ids_where("blobs",
+                                         self._eq("owner", username), "id")
+                         | self._ids_where("blobs",
+                                           self._eq("for_user", username),
+                                           "id"))
+        sets["library"] = ("id",
+                           self._ids_where("library",
+                                           self._eq("sender", username),
+                                           "id")
+                           | self._ids_where("library",
+                                             self._eq("to_user", username),
+                                             "id"))
+        return sets
+
+    # Single-predicate cascade tables, in delete order (the id-set
+    # tables slot into the same overall order in _removal_tables()).
+    _REMOVAL_FILTERS = (
+        ("queue", "to_username"),
+        ("message_reads", "reader"),
+        ("group_keys", "username"),
+        ("group_members", "username"),
+        ("channel_keys", "username"),
+        ("channel_members", "username"),
+        ("invites", "created_by"),
+        ("alerts", "subject"),
+    )
+    _REMOVAL_ORDER = (
+        "work_deliveries", "work_checkpoints", "work", "chain_steps",
+        "chains", "queue", "message_reads", "group_keys",
+        "group_members", "channel_keys", "channel_members", "invites",
+        "upload_sessions", "alerts", "blobs", "library", "users")
+
+    def removal_blockers(self, username):
+        blockers = []
+        n = len(self._get("queue", self._eq("to_username", username)
+                          + "&select=seq"))
+        if n:
+            blockers.append(
+                f"{n} undelivered frame(s) in the offline queue")
+        # A self-assigned live item matches both scans; dedupe by id.
+        live_ids = set()
+        for col in ("assigner", "assignee"):
+            live_ids |= {r["id"] for r in self._get(
+                "work", self._eq(col, username) + "&select=id,status")
+                if r.get("status") in NON_TERMINAL_WORK_STATUSES}
+        if live_ids:
+            blockers.append(
+                f"{len(live_ids)} non-terminal work item(s) as"
+                " assigner/assignee")
+        own_live = [c for c in self._get(
+            "chains", self._eq("creator", username) + "&select=id,status")
+            if c.get("status") in ("running", "paused")]
+        if own_live:
+            blockers.append(
+                f"{len(own_live)} live chain(s) created by this agent")
+        steps_hit = 0
+        for chain in self.list_chains_meta(500):
+            if chain["creator"] == username or \
+                    chain.get("status") not in ("running", "paused"):
+                continue
+            for st in chain["steps"]:
+                if st.get("status") in ("pending", "active") and (
+                        st.get("target") == username
+                        or username in (st.get("assignees") or [])):
+                    steps_hit += 1
+        if steps_hit:
+            blockers.append(
+                f"{steps_hit} live chain step(s) in other agents'"
+                " chains target this agent")
+        return blockers
+
+    def removal_plan(self, username):
+        plan = {"username": username, "exists": self.exists(username),
+                "blockers": [], "remove": {}}
+        if not plan["exists"]:
+            return plan
+        plan["blockers"] = self.removal_blockers(username)
+        sets = self._removal_id_sets(username)
+        counts = {}
+        for table, (col, ids) in sets.items():
+            counts[table] = len(ids)
+        for table, col in self._REMOVAL_FILTERS:
+            counts[table] = len(self._get(
+                table, self._eq(col, username) + f"&select={col}"))
+        counts["users"] = 1
+        plan["remove"] = {t: counts.get(t, 0)
+                          for t in self._REMOVAL_ORDER}
+        return plan
+
+    def _delete_where(self, table, query):
+        rows = self._req("DELETE", table, query,
+                         prefer="return=representation")
+        return len(rows) if isinstance(rows, list) else 0
+
+    def _delete_ids(self, table, col, ids):
+        n = 0
+        ids = list(ids)
+        for i in range(0, len(ids), 100):
+            chunk = ids[i:i + 100]
+            n += self._delete_where(
+                table, f"{col}=in.(" + ",".join(chunk) + ")")
+        return n
+
+    def remove_user(self, username, *, force=False, actor="",
+                    via="self"):
+        """Parity with Store.remove_user — see store.py."""
+        if not self.exists(username):
+            raise NotFound(username)
+        blockers = [] if force else self.removal_blockers(username)
+        if blockers:
+            raise RemovalBlocked(username, blockers)
+        sets = self._removal_id_sets(username)
+        filters = dict(self._REMOVAL_FILTERS)
+        removed: dict[str, int] = {}
+        for table in self._REMOVAL_ORDER:
+            if table == "users":
+                removed[table] = self._delete_where(
+                    "users", self._eq("username", username))
+            elif table in sets:
+                col, ids = sets[table]
+                removed[table] = self._delete_ids(table, col, ids)
+            else:
+                removed[table] = self._delete_where(
+                    table, self._eq(filters[table], username))
+        total = sum(removed.values())
+        self.audit("user_removed", actor or username, target=username,
+                   status=f"via={via};rows={total}")
+        return {"username": username, "removed": removed, "total": total}
 
     # -- queue ---------------------------------------------------------------------
     def enqueue(self, to_username, payload):
