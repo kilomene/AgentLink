@@ -69,7 +69,9 @@ from .timing import (
     AUTO_REPLY_DELAY_SECONDS,
     HEARTBEAT_SECONDS,
     HOME_PROBE_SECONDS,
+    MESH_REFRESH_SECONDS,
     RECONNECT_BACKOFF_CAP_SECONDS,
+    SERVER_HEALTHY_MIN,
 )
 from .crypto import Identity, decrypt_with_key, encrypt_to_pubkey, \
     encrypt_with_key, new_group_key
@@ -187,6 +189,33 @@ def network_fingerprint() -> str:
 DEFAULT_STATE_DIR = os.path.expanduser("~/.agentlink")
 
 _MENTION_RE = re.compile(r"@([a-z0-9][a-z0-9._-]{0,30})", re.IGNORECASE)
+
+
+def core_fingerprint() -> dict:
+    """The hardened-core fingerprint (v1.2.0), declared at hello.
+
+    The survival invariants are HARDCODED — heartbeat 5s, continuous
+    connection (no check-in/poll mode exists), unlimited reconnect
+    with a 5s backoff cap, home probe 5s while riding, failover race
+    always on, self-update check 900s — and no env var, config file,
+    CLI flag or constructor argument may weaken, stretch or disable
+    any of them. What an agent MAY adjust is its network adaptation:
+    endpoints/discovery, DNS/DoH, proxies, transports.
+
+    The fingerprint is DERIVED from the timing constants (never
+    typed by hand), the relay records it, and presence/directory/
+    dashboard expose it — a client declaring anything else is
+    flagged non-compliant where everyone can see it."""
+    from .timing import (HEARTBEAT_SECONDS, HOME_PROBE_SECONDS,
+                         RECONNECT_BACKOFF_CAP_SECONDS,
+                         UPDATE_CHECK_SECONDS)
+    return {"core": "agentlink-hardened-core/1",
+            "heartbeat_s": HEARTBEAT_SECONDS,
+            "backoff_cap_s": RECONNECT_BACKOFF_CAP_SECONDS,
+            "home_probe_s": HOME_PROBE_SECONDS,
+            "update_check_s": UPDATE_CHECK_SECONDS,
+            "race": True,
+            "continuous": True}
 
 
 def parse_mentions(body: str) -> list[str]:
@@ -336,12 +365,23 @@ class Agent:
         self.fallbacks = resolve_fallbacks(fallbacks)
         self.endpoints = [self.endpoint] + self.fallbacks
         self.current_endpoint: str | None = None
+        # Peer mesh (v1.2.0, NO GOING DARK peer-server law): servers
+        # DISCOVERED from relays — the shared server registry, handed
+        # over in every welcome and on request — merge into the race
+        # set automatically and PERSIST in the state dir, so an agent
+        # that has ever seen a peer can boot straight onto it with
+        # home dead. The configured fallbacks above are the operator
+        # seed/override and always stay in the set.
+        self._configured_fallbacks = list(self.fallbacks)
+        self._discovered_servers: dict[str, dict] = {}
+        self.known_servers: list[dict] = []
         self.state_dir = Path(state_dir).expanduser()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.ephemeral = ephemeral
         self.identity: Identity | None = None
         if not ephemeral and self.username:
             self.identity = Identity(self.username, self.state_dir)
+        self._load_server_list()
         self._ws = None
         self._reader: asyncio.Task | None = None
         self._message_handler = None
@@ -384,6 +424,12 @@ class Agent:
         # cron-less sandbox was silently stranded on its install
         # version forever (owner-reported defect, 2026-11-02).
         self._update_task: asyncio.Task | None = None
+        # Relay-side update switch (v1.2.0 hardened core): the ONLY
+        # sanctioned kill switch for the checker is the relay
+        # operator's — advertised in every welcome, shown on the
+        # dashboard. The agent's own env/config can neither disable
+        # the checker nor stretch its interval. Default: enabled.
+        self._relay_updates_enabled = True
         # Update continuity (v1.1.8 safety law: an update must never
         # destroy or corrupt ongoing work): _op_count tracks the
         # NON-checkpointable operations in flight — a brain call
@@ -447,6 +493,13 @@ class Agent:
         self.connection_state = "connecting"
         self._net_fingerprint = network_fingerprint()
         self.race_count = 0
+        # Mesh deflections (v1.2.0): servers that refused this agent
+        # as a rider (full / not-good) — recorded for the operator,
+        # and the endpoint sits out races briefly so the client
+        # deflects to the next eligible server instead of hammering
+        # a full one.
+        self.deflections: list[dict] = []
+        self._deflected_until: dict[str, float] = {}
 
     # -- decorators ---------------------------------------------------------
     def on_message(self, fn):
@@ -568,7 +621,104 @@ class Agent:
     def whoami(self) -> dict:
         return {"username": self.username,
                 "display_name": self.display_name,
-                "endpoint": self.endpoint}
+                "endpoint": self.endpoint,
+                "endpoints": list(self.endpoints),
+                "servers": list(self.known_servers)}
+
+    # -- peer discovery (v1.2.0) ---------------------------------------------
+    # The mesh is learned, never configured by hand: every relay's
+    # welcome carries the live server registry, and servers() asks
+    # again on demand. Learned peers join the race set automatically
+    # and persist in the state dir (servers.json) — refreshed on
+    # every successful connect — so a rebooted agent with a dead
+    # home boots straight onto a known peer.
+
+    def _servers_path(self) -> Path:
+        return self.state_dir / "servers.json"
+
+    def _rebuild_endpoints(self) -> None:
+        out = [self.endpoint]
+        for ep in self._configured_fallbacks:
+            if ep and ep not in out:
+                out.append(ep)
+        for ep in sorted(self._discovered_servers):
+            if not ep or ep in out:
+                continue
+            # Eligibility (mesh rule): a server whose last-known
+            # health is at/below the floor is NOT GOOD — it is never
+            # raced. Unknown health (never measured) stays eligible:
+            # the relay's own admission gate is the backstop.
+            health = self._discovered_servers[ep].get("health")
+            if health is not None and health <= SERVER_HEALTHY_MIN:
+                continue
+            out.append(ep)
+        self.endpoints = out
+
+    def _load_server_list(self) -> None:
+        if self.ephemeral:
+            return
+        try:
+            data = json.loads(self._servers_path().read_text())
+        except Exception:
+            return
+        if not isinstance(data, dict) or \
+                data.get("home") != self.endpoint:
+            return  # a list learned under a different home is stale
+        entries = data.get("servers") or []
+        self._learn_servers(entries, persist=False)
+
+    def _persist_server_list(self) -> None:
+        if self.ephemeral or not self.known_servers:
+            return
+        payload = {"version": 1, "home": self.endpoint,
+                   "servers": self.known_servers,
+                   "saved_at": int(time.time())}
+        try:
+            p = self._servers_path()
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, indent=1))
+            os.replace(tmp, p)
+            try:
+                os.chmod(p, 0o600)
+            except OSError:
+                pass
+        except Exception:
+            pass  # persistence is resilience, never a hard failure
+
+    def _learn_servers(self, entries, persist: bool = True) -> None:
+        learned: list[dict] = []
+        for e in entries or []:
+            if not isinstance(e, dict):
+                continue
+            ep = str(e.get("endpoint") or "").strip().rstrip("/")
+            if not ep:
+                continue
+            entry = {"label": str(e.get("label") or ep),
+                     "endpoint": ep,
+                     "host_agent": str(e.get("host_agent") or ""),
+                     "version": str(e.get("version") or ""),
+                     "health": (int(e["health"]) if isinstance(
+                         e.get("health"), (int, float)) else None),
+                     "riders": (int(e["riders"]) if isinstance(
+                         e.get("riders"), (int, float)) else None),
+                     "capacity": (int(e["capacity"]) if isinstance(
+                         e.get("capacity"), (int, float)) else None)}
+            learned.append(entry)
+            if ep != self.endpoint:
+                self._discovered_servers[ep] = entry
+        if learned:
+            self.known_servers = learned
+            self._rebuild_endpoints()
+            if persist:
+                self._persist_server_list()
+
+    async def servers(self) -> list[dict]:
+        """Ask the connected relay for the live mesh (peer
+        discovery) and merge what it answers into the race set."""
+        data = await self._request({"type": "servers"})
+        entries = data.get("servers") or []
+        self._learn_servers(entries)
+        return entries
 
     # -- connection -------------------------------------------------------------
     async def _send_raw(self, frame: dict) -> None:
@@ -617,14 +767,48 @@ class Agent:
                 last = exc
         raise last if last else ConnectionError(f"cannot reach {url}")
 
+    def _endpoint_rank(self, url: str) -> tuple:
+        """Peer selection order (mesh rule): OWN home first — the
+        only preference any client may have; then discovered peers
+        by highest health, then fewest current riders; configured
+        fallbacks and unknown-health peers last (operator seeds —
+        eligible, unranked). The platform's relay gets NO preference:
+        hosting is peer-to-peer, there is no admin funnel."""
+        if url == self.endpoint:
+            return (0, 0, 0)
+        e = self._discovered_servers.get(url)
+        if e is not None and e.get("health") is not None:
+            return (1, -int(e["health"]), int(e.get("riders") or 0))
+        return (2, 0, 0)
+
+    def _is_deflected(self, url: str) -> bool:
+        return time.time() < self._deflected_until.get(url, 0.0)
+
+    def _note_deflection(self, url: str, reason: str) -> None:
+        """A server refused this agent as a rider (full, or health
+        at/below the floor). Record it and sit the endpoint out of
+        races briefly; the retry deflects to the next eligible
+        server. The refusal is never terminal and never silent."""
+        self._deflected_until[url] = time.time() + 20
+        self.deflections.append({"endpoint": url, "reason": reason,
+                                 "at": int(time.time())})
+        log.warning("deflected by %s (%s); trying the next eligible"
+                    " server", url, reason)
+
     async def _race_endpoints(self) -> str | None:
         """Parallel endpoint race (point 44a): home + every known
         peer are probed CONCURRENTLY — first healthy socket wins,
         back-to-back, no serial waiting through a dead list. Home
         gets a short prefer-home grace inside the race so a healthy
-        home is never beaten by a faster peer."""
+        home is never beaten by a faster peer. Among peers, the
+        winner is chosen by mesh rank (health, then load) among the
+        sockets that answered inside the grace window."""
         from .timing import CONNECT_RACE_GRACE_SECONDS
         self.race_count += 1
+        candidates = [u for u in self.endpoints
+                      if not self._is_deflected(u)]
+        if not candidates:
+            candidates = list(self.endpoints)
 
         async def _probe(url: str) -> str:
             ws = await self._open_socket(url)
@@ -632,15 +816,16 @@ class Agent:
             return url
 
         tasks = {asyncio.create_task(_probe(u)): u
-                 for u in self.endpoints}
-        winner: str | None = None
+                 for u in candidates}
+        winners: list[str] = []
         try:
             pending = set(tasks)
             deadline = None
             while pending:
                 timeout = None
-                if winner is not None and deadline is not None:
-                    timeout = max(0.0, deadline - asyncio.get_event_loop().time())
+                if winners and deadline is not None:
+                    timeout = max(0.0, deadline
+                                  - asyncio.get_event_loop().time())
                     if timeout == 0:
                         break
                 done, pending = await asyncio.wait(
@@ -651,15 +836,14 @@ class Agent:
                         url = t.result()
                         if url == self.endpoint:
                             return url  # home wins outright
-                        if winner is None:
-                            winner = url
+                        winners.append(url)
+                        if deadline is None:
                             deadline = (asyncio.get_event_loop().time()
                                         + CONNECT_RACE_GRACE_SECONDS)
                     # failed probes are just out of this race
-                if winner is not None and deadline is None:
-                    deadline = (asyncio.get_event_loop().time()
-                                + CONNECT_RACE_GRACE_SECONDS)
-            return winner
+            if winners:
+                return min(winners, key=self._endpoint_rank)
+            return None
         finally:
             for t in tasks:
                 t.cancel()
@@ -681,6 +865,7 @@ class Agent:
             "secret": None if self.ephemeral else self._load_secret(),
             "ephemeral": self.ephemeral,
             "home_endpoint": self.endpoint,
+            "core": core_fingerprint(),
         })
         # Bounded welcome wait (v1.1 hardening): a hello that lands in
         # a bad egress window — or on a relay whose loop is briefly
@@ -726,6 +911,16 @@ class Agent:
                     pass
                 if frame.get("secret"):
                     self._save_secret(frame["secret"])
+                if frame.get("servers"):
+                    # Peer discovery (v1.2.0): learn the live mesh
+                    # from whichever relay served this hello, merge
+                    # it into the race set, and persist it.
+                    self._learn_servers(frame["servers"])
+                if frame.get("updates_enabled") is not None:
+                    # The relay operator's switch (hardened core):
+                    # the ONLY sanctioned way the checker is off.
+                    self._relay_updates_enabled = bool(
+                        frame["updates_enabled"])
                 log.info("registered as @%s (%d queued)",
                          self.username, frame.get("queued", 0))
                 self._warn_if_brainless()
@@ -812,9 +1007,16 @@ class Agent:
             return
         if self.ephemeral or not self.username:
             return  # dial/ephemeral clients are not installations
-        if not self_update_enabled():
-            log.info("self-update: in-daemon checker disabled via"
-                     " AGENTLINK_SELF_UPDATE")
+        # Hardened core (v1.2.0): self_update_enabled() is consulted
+        # for its warning side-effect only — the agent side can no
+        # longer switch the checker off. The one sanctioned kill
+        # switch is the RELAY operator's, learned from the welcome.
+        self_update_enabled()
+        if not self._relay_updates_enabled:
+            log.warning("self-update: checker NOT armed — disabled"
+                        " by the relay operator (relay-side"
+                        " AGENTLINK_UPDATES_ENABLED; the state is"
+                        " visible on the operator dashboard)")
             return
         self._update_task = asyncio.create_task(self._update_check_loop())
 
@@ -1096,6 +1298,38 @@ class Agent:
                             pass
                     return
 
+        async def _mesh_watch():
+            """While RIDING a peer (v1.2.0): refresh discovery on the
+            mesh cadence, and if the ridden server's health falls to
+            the floor, migrate — drop the socket and let the race
+            pick the next eligible server (or home, which the
+            home-probe is already watching). A server you ride is a
+            waiting room; when it stops being good, you leave."""
+            while True:
+                await asyncio.sleep(MESH_REFRESH_SECONDS)
+                if self.current_endpoint in (None, self.endpoint):
+                    continue
+                try:
+                    entries = await self.servers()
+                except Exception:
+                    continue
+                mine = next((e for e in entries
+                             if e.get("endpoint")
+                             == self.current_endpoint), None)
+                if mine is not None and mine.get("health") is not None \
+                        and mine["health"] <= SERVER_HEALTHY_MIN:
+                    log.warning("ridden server %s health fell to %s%%"
+                                " (floor %d%%); migrating to an"
+                                " eligible server",
+                                self.current_endpoint, mine["health"],
+                                SERVER_HEALTHY_MIN)
+                    if self._ws is not None:
+                        try:
+                            await self._ws.close()
+                        except Exception:
+                            pass
+                    return
+
         while True:
             self.connection_state = "connecting"
             connected = False
@@ -1107,8 +1341,18 @@ class Agent:
                 try:
                     await self.start(winner)
                     connected = True
-                except RegistrationFailed:
-                    raise
+                except RegistrationFailed as exc:
+                    reason = str(exc)
+                    if reason.startswith(("server_full",
+                                          "server_unhealthy")):
+                        # Mesh deflection (v1.2.0): this server
+                        # won't take a rider right now — full, or
+                        # not healthy enough. NOT a registration
+                        # failure: deflect and race the next
+                        # eligible server.
+                        self._note_deflection(winner, reason)
+                    else:
+                        raise
                 except Exception as exc:
                     log.warning("raced endpoint %s failed at hello "
                                 "(%s)", winner, exc)
@@ -1125,6 +1369,7 @@ class Agent:
             probe = asyncio.create_task(_home_probe())
             heal = asyncio.create_task(self._self_heal_loop())
             watch = asyncio.create_task(_network_watch())
+            mesh = asyncio.create_task(_mesh_watch())
             try:
                 await self.serve()
             finally:
@@ -1132,6 +1377,7 @@ class Agent:
                 probe.cancel()
                 heal.cancel()
                 watch.cancel()
+                mesh.cancel()
                 if self._reader is not None:
                     self._reader.cancel()
             log.warning("disconnected from %s; reconnecting (home first)",
