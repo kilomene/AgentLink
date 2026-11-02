@@ -174,6 +174,14 @@ class Relay:
     owner_agent: str | None = None
     home_host: str | None = None
     carrier_enabled: bool = True
+    # Immortality gate (v1.3.2): on startup the relay verifies the
+    # store's conversation census against a durable baseline before
+    # serving. The baseline lives beside the relay's state file —
+    # never in the code directory, so no update can touch it. None
+    # derives the path from db_path; census_gate_enabled=False is an
+    # operator-only escape for store-less stub relays in tests.
+    census_baseline_path: str | None = None
+    census_gate_enabled: bool = True
     dashboard_password: str | None = None
     dashboard_port: int = 8766
     public_endpoint: str | None = None
@@ -1244,8 +1252,18 @@ class Relay:
         envelope's DETAILS (id, ts, sender, kind, size, mentions,
         priority, delivery status, evidence) grouped by conversation —
         1:1 pairs and groups. Content stays sealed; this is metadata
-        the relay legitimately holds."""
-        rows = self.store.list_audit(500)
+        the relay legitimately holds.
+
+        IMMORTALITY (v1.3.2): composed from the store's FULL content
+        history (list_content_audit), never from a bounded activity
+        window. The pre-1.3.2 code read list_audit(500) — the 500
+        newest audit rows of ALL kinds — so any conversation whose
+        latest item aged past the presence/alert churn flooding the
+        tail silently vanished from the dashboard while sitting
+        intact in the store (owner-reported 2026-11-02: the beulah
+        and deploy-probe conversations "disappeared" while only the
+        freshest drill conversation rendered)."""
+        rows = self.store.list_content_audit()
         convs: dict[str, dict] = {}
         part_cache: dict[str, list] = {}
         for r in rows:
@@ -1332,7 +1350,47 @@ class Relay:
         log.warning("dashboard password generated; stored at %s", pw_file)
         return pw
 
+    def _census_gate_path(self) -> str:
+        if self.census_baseline_path:
+            return os.path.expanduser(self.census_baseline_path)
+        db = os.path.expanduser(self.db_path)
+        return os.path.join(os.path.dirname(db), "census-baseline.json")
+
+    def _run_census_gate(self) -> None:
+        """Immortality gate (v1.3.2): verify the store's conversation
+        census against the durable baseline. Runs on a worker thread
+        (the store may be network-backed). A detected loss has
+        already been written to the record by the guard (alert +
+        audit rows) before this logs it; the baseline then re-adopts
+        the current state so one loss alerts once — the open alert
+        is the standing signal until an operator resolves it."""
+        from .census import CensusGuard, CensusLossError
+        guard = CensusGuard(self.store, self._census_gate_path())
+        try:
+            result = guard.verify()
+            log.info("census gate: %s (%s conversations, %s items)",
+                     result.get("status"), result.get("conversations"),
+                     result.get("items"))
+        except CensusLossError as exc:
+            log.error("CONVERSATION CENSUS LOSS DETECTED: %s", exc)
+            try:
+                guard.accept_current()
+            except Exception:
+                log.exception("census gate: re-baseline failed")
+
     async def start(self) -> "Relay":
+        # Immortality gate BEFORE serving (v1.3.2): this process may
+        # be brand-new code (an update), a restart, or a migration —
+        # whatever changed since the last boot, the store's
+        # conversations are verified against the baseline first, and
+        # any loss is on the record before a single frame is served.
+        # The relay still starts on a detected loss: the loss is a
+        # fact to surface, and going dark would compound it.
+        if self.census_gate_enabled:
+            try:
+                await asyncio.to_thread(self._run_census_gate)
+            except Exception:
+                log.exception("census gate failed to run")
         self._server = await serve(
             self._handle, self.host, self.port, max_size=MAX_FRAME,
         )
