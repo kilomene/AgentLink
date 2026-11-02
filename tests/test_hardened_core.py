@@ -305,6 +305,14 @@ def test_stretched_daemon_params_cannot_weaken_the_core(state_root):
         try:
             assert await wait_for(
                 lambda: home.relay and "stretched" in home.relay.peers)
+            # Earned-health law (v1.3.0): a fresh peer cannot take
+            # riders until its battery rates it — wait for the
+            # rating AND for the agent to learn the peer into its
+            # race set, then kill home.
+            assert await wait_for(
+                lambda: peer.relay and peer.relay._rated, timeout=60)
+            assert await wait_for(
+                lambda: peer_url in agent.endpoints, timeout=30)
             home.kill()
             # Backoff cap: riding within seconds, not in an hour.
             assert await wait_for(
