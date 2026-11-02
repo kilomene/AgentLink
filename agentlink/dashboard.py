@@ -3285,12 +3285,12 @@ function render(d){
  keyed(document.getElementById('users'), d.users||[], u=>u.username, u=>
   `<tr><td>@${esc(u.username)}<br><small>${esc((u.capabilities||[]).join(', '))}</small></td>
    <td class="${u.online?'on':'off'}"><span class="dot ${u.online?'on':''}"></span>${u.online?'online':'offline'}<br><small>${esc(u.activity_state||'')}</small></td>
-   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}</td>
+   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state==='carried'?'carried by @'+esc(u.server_carried_by||''):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}</td>
    <td>${u.reachability?esc(u.reachability):''}${u.home&&u.riding&&u.home!==u.riding?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`);
  keyed(document.getElementById('servers'), d.servers||[], s=>s.endpoint, s=>
-  `<tr><td>${esc(s.label||s.endpoint)}<br><small>${esc(s.endpoint)}</small></td>
-   <td>${s.host_agent?'hosted by @'+esc(s.host_agent):'operator relay'}</td>
-   <td><span class="pill health${s.health<=50?' bad':''}">health ${s.health}%</span></td>
+  `<tr><td>${esc(s.label||s.endpoint)}<br><small>${esc(s.endpoint)}</small>${s.owner_agent&&s.home_endpoint&&s.home_endpoint!==s.endpoint?'<br><small>home: '+esc(s.home_endpoint)+'</small>':''}</td>
+   <td>${s.owner_agent?'owner @'+esc(s.owner_agent)+((s.carry_state_label||s.carry_state)?'<br><small>'+esc(s.carry_state_label||(s.carry_state==='carried'?'carried by @'+(s.carried_by||''):s.carry_state==='home'?'at home':s.carry_state==='down'?'down — awaiting carrier':''))+(s.carry_state==='carried'?' (helper — server still belongs to @'+esc(s.owner_agent)+')':'')+'</small>':''):(s.host_agent?'hosted by @'+esc(s.host_agent):'operator relay')}</td>
+   <td>${(s.health===-1||s.health==null)?'<span class="pill health">UNRATED — testing</span>':`<span class="pill health${s.health<=50?' bad':''}">health ${s.health}%</span>`}</td>
    <td>riding: ${s.riders} / ${s.capacity}</td></tr>`);
  keyed(document.getElementById('groups'),
   [...(d.groups||[]).map(g=>({k:'g:'+g.id,html:`<tr><td>${esc(g.name)}</td><td><span class="pill">${g.member_count} members</span></td><td>by @${esc(g.creator)}</td></tr>`})),
