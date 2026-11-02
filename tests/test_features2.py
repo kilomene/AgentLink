@@ -34,7 +34,7 @@ def relay_env():
     tmp = tempfile.mkdtemp(prefix="agentlink-f2-")
     db = str(Path(tmp) / "relay.db")
     relay = Relay(host=HOST, port=0, db_path=db,
-                  dashboard_password="test-dash-pass")
+                  dashboard_password="test-dash-pass", dashboard_port=0)
     ready = threading.Event()
     box: dict = {}
 
