@@ -53,10 +53,17 @@ class RelayHandle:
         self.dash_port = 0
 
     def start(self):
+        if not self.port:
+            import socket as _s
+            _tmp = _s.socket()
+            _tmp.bind((HOST, 0))
+            self.port = _tmp.getsockname()[1]
+            _tmp.close()
         self.relay = Relay(host=HOST, port=self.port, db_path=self.db,
                            server_name=self.name,
                            dashboard_password="test-pass",
                            dashboard_port=self.dash_port,
+                           public_endpoint=f"ws://{HOST}:{self.port}",
                            **self.relay_kw)
         ready = threading.Event()
 
