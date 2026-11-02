@@ -50,6 +50,11 @@ FAILURE_WINDOW = 300  # seconds
 # via notify() (coalesced rebuild ≤1s), so the TTL is only a backstop;
 # the SSE stream corrects any first-paint staleness live.
 SNAPSHOT_TTL = 5.0  # seconds
+# Bounded wait (v1.1.4.1): a read that arrives AFTER a notify() must
+# never be served a snapshot that predates that notify — it waits for
+# the coalesced build covering it, at most this long, then serves the
+# newest cache regardless (a request must never hang forever).
+SNAPSHOT_WAIT = 15.0  # seconds
 
 
 def _hash(token: str) -> str:
@@ -124,10 +129,19 @@ class DashboardServer:
         # a half-built snapshot can never be served. Freshness stays
         # honest: notify() rebuilds within ~1s of any real event and
         # pushes over SSE; the cache only spares duplicate builds.
+        # Read contract (v1.1.4.1): staleness is tolerated ONLY for
+        # TTL expiry — a read that arrives after a notify() is never
+        # served a snapshot that predates that notify; it waits
+        # (bounded by SNAPSHOT_WAIT) for the build covering it.
+        # _event_seq counts notify() calls; _built_event_seq is the
+        # event count the cached snapshot covers.
         self._snap_lock = threading.Lock()
+        self._snap_cond = threading.Condition(self._snap_lock)
         self._snap_json: str | None = None
         self._snap_at = 0.0  # time.monotonic() when _snap_json was built
         self._builds = 0     # completed snapshot builds (tests, doctor)
+        self._event_seq = 0
+        self._built_event_seq = 0
         self._failures: dict[str, list[float]] = {}
         self._oversight = _load_oversight_identity()
         # Oversight-unwrapped file keys, learned while opening
@@ -188,6 +202,11 @@ class DashboardServer:
                 self._builder = threading.Thread(
                     target=self._build_loop, daemon=True)
                 self._builder.start()
+        # Sequence every signalled change (separate lock, taken after
+        # _lock is released — the two are never held together): reads
+        # compare this against the sequence the cache covers.
+        with self._snap_lock:
+            self._event_seq += 1
 
     def _build_loop(self) -> None:
         while True:
@@ -195,8 +214,10 @@ class DashboardServer:
                 dirty = self._dirty
                 self._dirty = False
             if dirty:
+                with self._snap_lock:
+                    seq = self._event_seq
                 try:
-                    snapshot = self._build_snapshot()
+                    snapshot = self._build_snapshot(seq)
                 except Exception:
                     snapshot = None
                 if snapshot is not None:
@@ -210,26 +231,46 @@ class DashboardServer:
             time.sleep(1.0)
 
     # -- snapshot cache (stale-while-revalidate, v1.1.4) ------------------
-    def _build_snapshot(self) -> str:
+    def _build_snapshot(self, start_seq: int | None = None) -> str:
         """Build the dashboard payload once and atomically publish it
         as the cached snapshot. The JSON string is complete before it
-        is stored, so readers only ever see whole snapshots."""
+        is stored, so readers only ever see whole snapshots.
+        start_seq is the notify() sequence the build started under;
+        publishing records that the cache covers it and wakes any
+        reader waiting for a post-notify snapshot."""
+        if start_seq is None:
+            with self._snap_lock:
+                start_seq = self._event_seq
         snapshot = json.dumps(self._serve_data())
-        with self._snap_lock:
+        with self._snap_cond:
             self._snap_json = snapshot
             self._snap_at = time.monotonic()
             self._builds += 1
+            if start_seq > self._built_event_seq:
+                self._built_event_seq = start_seq
+            self._snap_cond.notify_all()
         return snapshot
 
     def _snapshot_json(self) -> str:
         """The payload for /api/status and the /api/stream connect
-        snapshot. Serves the cache immediately when one exists; a
-        stale cache (> SNAPSHOT_TTL) is served too and revalidated in
-        the background via the same coalesced builder notify() drives
-        (the SSE push then corrects the open page live). Only with no
-        snapshot at all — cold start, warmup still running — does the
-        caller pay a synchronous build, exactly as before the cache."""
-        with self._snap_lock:
+        snapshot. Serves the cache immediately when it covers every
+        change signalled before this read arrived; a TTL-stale cache
+        (> SNAPSHOT_TTL) is served too and revalidated in the
+        background via the same coalesced builder notify() drives
+        (the SSE push then corrects the open page live). If a change
+        WAS signalled (notify) but its build has not published yet,
+        the read waits for that build — bounded by SNAPSHOT_WAIT —
+        rather than answering with a snapshot that predates a change
+        the server already knows about. Only with no snapshot at all
+        — cold start, warmup still running — does the caller pay a
+        synchronous build, exactly as before the cache."""
+        with self._snap_cond:
+            seq = self._event_seq
+            deadline = time.monotonic() + SNAPSHOT_WAIT
+            while self._snap_json is not None \
+                    and self._built_event_seq < seq \
+                    and time.monotonic() < deadline:
+                self._snap_cond.wait(timeout=0.25)
             snap = self._snap_json
             at = self._snap_at
         if snap is not None:
