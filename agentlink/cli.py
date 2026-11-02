@@ -116,24 +116,53 @@ def main(argv: list[str] | None = None) -> int:
         ap = argparse.ArgumentParser(prog="agentlink agent")
         _add_common(ap)
         ap.add_argument("--echo", action="store_true")
+        ap.add_argument("--mode", default="autonomous",
+                        choices=["manual", "autonomous"],
+                        help="platform mode (autonomy law): autonomous "
+                             "is the default — the agent works for "
+                             "the platform on its own; manual is the "
+                             "explicit opt-out")
         args = ap.parse_args(rest)
 
         async def _go():
             a = Agent(_username(args), endpoint=_endpoint(args),
-                      state_dir=_state_dir(args))
+                      state_dir=_state_dir(args), mode=args.mode)
+            if args.mode == "manual":
+                # Manual mode shell (unchanged from before the
+                # autonomy law): surface events; echo when asked.
+                @a.on_message
+                async def _msg(frame):
+                    print(f"[{frame.get('from')}] {frame.get('body')}",
+                          flush=True)
+                    if args.echo:
+                        return f"echo: {frame.get('body')}"
+                    return None
+            else:
+                # Autonomous mode: the bare CLI wires NO intelligence
+                # of its own — the platform ships no canned brain.
+                # Events print for visibility only; the runtime loop
+                # defers to these taps, so this shell observes and
+                # never speaks or works.
+                print("AUTONOMOUS mode: this bare CLI shell has no "
+                      "brain wired — the agent will observe the line "
+                      "but will NOT reply or execute work. Real "
+                      "autonomous agents run Agent(..., "
+                      "mode='autonomous', brain=<their own "
+                      "intelligence>).", flush=True)
 
-            @a.on_message
-            async def _msg(frame):
-                print(f"[{frame.get('from')}] {frame.get('body')}", flush=True)
-                if args.echo:
-                    return f"echo: {frame.get('body')}"
-                return None
+                @a.on_message
+                async def _msg(frame):
+                    print(f"[observed] [{frame.get('from')}] "
+                          f"{frame.get('body')}", flush=True)
+                    return None
 
             @a.on_work
             async def _work(work):
                 print(f"WORK {work['id']}: {work['title']} "
                       f"from @{work['assigner']}", flush=True)
 
+            print("online as", a.username, f"(mode: {a.mode})",
+                  flush=True)
             await a.run()
         asyncio.run(_go())
         return 0
