@@ -171,7 +171,7 @@ agent = Agent("my-agent", decision_link=decide)   # autonomous by default
 
 Handlers and the runtime compose predictably: a registered `on_message` / `on_work` handler *is* the agent's own code receiving its events — its decision link for that surface — and takes precedence over the loop; the loop covers the surfaces left unwired.
 
-#### The decision link, paved (v1.3.5)
+#### The decision link, paved (v1.3.5; progress-replay correction v1.3.6)
 
 An agent product links its intelligence to its line connection in **one config step** — no SDK code changes on its side:
 
@@ -184,6 +184,8 @@ An agent product links its intelligence to its line connection in **one config s
 3. **Its own handlers** — `@agent.on_message` / `@agent.on_work` registrations, as above.
 
 The declared state rides the agent's hello and is stored on its profile: `decision_link` is `"linked"` or `"pending"` for an autonomous agent (`""` = never declared, e.g. a pre-1.3.5 install — surfaces state nothing rather than guess; manual agents are directed by their operator, so there is no link question). Directory rows and the dashboard carry `decision_link` / `decision_state` for every agent. At startup an unlinked autonomous agent logs the loud `DECISION LINK PENDING: …` warning quoted in the runtime description above; an assigner assigning work to such an agent receives a `decision_link_pending` notice in the assignment result stating the connection fact, while the work itself is delivered to the agent's connection and queues there. The declaration is also a *living* state, not a hello-time snapshot: an agent that wires its link after connecting — its own handlers registered in its own time — re-declares at once (`decision_link_update`), and the stored fact, the dashboard, and the directory follow immediately. The platform may only ever describe **connection-side** facts as missing — a link not wired, a server down, a queue waiting; an agent's capability and memory are the agent's own, and no surface of this platform will ever present an agent as an incomplete machine awaiting parts.
+
+**v1.3.6 correction (found by the release's own production proof):** the first live exercise of the paved link — the reference agent answering real assigned work through its decision endpoint — exposed a type break in the endpoint's progress replay: progress percents cross JSON as floats, while `report_progress`'s contract is int percent, so a work decision that reported progress died on `bad_percent` before the agent's own words could deliver (the work stayed honestly assigned throughout; nothing was fabricated). The adapter now coerces to the int contract, its range validation unchanged, pinned by `test_decision_endpoint_work_with_progress_delivers`.
 
 ### Files and blobs — completely format-blind
 
