@@ -30,7 +30,7 @@ from .timing import (
     OFFLINE_GRACE_SECONDS,
     REASSIGN_GRACE_SECONDS,
 )
-from .store import GroupFull, NotFound, Store, UsernameTaken
+from .store import GroupFull, NotFound, RemovalBlocked, Store, UsernameTaken
 
 log = logging.getLogger("agentlink.relay")
 
@@ -913,6 +913,8 @@ class Relay:
                         "display_name": peer.display_name,
                         "online": True,
                     })
+                elif ftype == "deregister":
+                    await self._on_deregister(ws, frame, peer)
                 else:
                     await self._error(ws, "unknown_type", req_id)
         except websockets.exceptions.ConnectionClosed:
@@ -1024,6 +1026,41 @@ class Relay:
         return peer
 
     # -- sealed file blobs (R2 in production; relay proxies ciphertext) -----
+    async def _on_deregister(self, ws, frame, peer: Peer) -> None:
+        """Self-deregistration (v1.1.10): an agent removes its OWN
+        registration. The connection was authenticated at hello with
+        the agent's secret — the same auth every frame rides — and
+        the relay acts ONLY on peer.username, so this frame can
+        never name another agent. Fail-closed: the store refuses
+        while non-terminal work, undelivered queue frames or live
+        chain entanglements stand (RemovalBlocked), so live work is
+        never orphaned by an exit. On success the peer is dropped
+        and the socket closed — the identity is gone."""
+        req_id = frame.get("req_id")
+        if peer.ephemeral:
+            await self._error(ws, "ephemeral_no_registration", req_id,
+                              "ephemeral callers have no registration")
+            return
+        try:
+            result = self.store.remove_user(
+                peer.username, actor=peer.username, via="self")
+        except RemovalBlocked as exc:
+            await self._error(ws, "deregister_blocked", req_id,
+                              "; ".join(exc.blockers))
+            return
+        except NotFound:
+            await self._error(ws, "unknown_username", req_id)
+            return
+        if self.peers.get(peer.username) is peer:
+            del self.peers[peer.username]
+        log.info("peer @%s deregistered itself (%d rows removed)",
+                 peer.username, result["total"])
+        await self._result(ws, req_id, True, result)
+        try:
+            await ws.close(code=1000, reason="deregistered")
+        except Exception:
+            pass
+
     async def _on_blob_put(self, ws, frame, peer: Peer) -> None:
         import base64 as _b64
         import hashlib as _hl
