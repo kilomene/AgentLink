@@ -991,25 +991,41 @@ class Agent:
         Updater(state_dir=self.state_dir).discard_staged(prepared)
 
     def _restart_self(self) -> None:
-        """Re-exec the same entrypoint/argv so the new code runs —
-        works with no systemd, no cron, no supervisor. On success
-        this never returns (the process image is replaced; the new
+        """Re-exec the SAME invocation so the new code runs — works
+        with no systemd, no cron, no supervisor. On success this
+        never returns (the process image is replaced; the new
         process hellos and reconnects through the normal machinery).
+
+        The invocation must be reproduced faithfully: a daemon
+        launched as ``python -m agentlink ...`` has sys.argv[0]
+        pointing at the package's ``__main__.py`` file, and
+        re-running that file as a plain script breaks its relative
+        imports (``from .cli import main`` has no package). The
+        interpreter's own record of the launch (sys.orig_argv) is
+        therefore used verbatim; the __main__.py -> ``-m`` fix-up
+        below is the fallback for interpreters without it.
         """
-        argv = list(sys.argv)
-        if not argv:
-            log.error("self-update: cannot re-exec (empty sys.argv);"
-                      " the new code is on disk — restart the daemon"
-                      " to pick it up")
-            return
-        log.warning("self-update: re-exec %s %s", sys.executable, argv)
+        orig = list(getattr(sys, "orig_argv", None) or [])
+        if len(orig) >= 2:
+            argv = [sys.executable, *orig[1:]]
+        else:
+            raw = list(sys.argv)
+            if not raw or not raw[0]:
+                log.error("self-update: cannot re-exec (empty"
+                          " sys.argv); the new code is on disk —"
+                          " restart the daemon to pick it up")
+                return
+            if Path(raw[0]).name == "__main__.py":
+                raw = ["-m", Path(raw[0]).parent.name, *raw[1:]]
+            argv = [sys.executable, *raw]
+        log.warning("self-update: re-exec %s", argv)
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.flush()
             except Exception:
                 pass
         try:
-            os.execv(sys.executable, [sys.executable, *argv])
+            os.execv(argv[0], argv)
         except Exception:
             log.exception("self-update: re-exec failed; the new code"
                           " is on disk — restart the daemon to pick"
