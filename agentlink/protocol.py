@@ -16,6 +16,10 @@ Client -> Relay (all carry an optional ``req_id`` for result correlation)
     group_join_link{group_id}
     group_join     {group_id, token}
     group_send     {group_id, body, kind, file, in_reply_to}
+    read           {ids:[message_id]}   (read receipts, v1.1.2: the
+                    recipient reports messages it has taken in; the
+                    relay validates participation from its own audit
+                    row and records the first-read time)
     assign         {assignees:[username], group_id|null, title,
                     instructions, attachments:[file], deadline}
     deliver_work   {work_id, body, files:[file]}
@@ -31,6 +35,9 @@ Relay -> Client
     error          {req_id?, reason, detail}
     message        {id, from, from_name, body, kind, file, ts,
                     in_reply_to, group_id?, queued}
+    read_receipt   {id, reader, read_at, group_id?, channel_id?}
+                    (v1.1.2: pushed live to a message's sender when
+                    a validated recipient reads it)
     group_event    {id, group_id, event, actor, target?, group_name, ts}
     work_assigned  {work: {...}}
     work_update    {work: {...}, delivery?}
