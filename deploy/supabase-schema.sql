@@ -47,10 +47,10 @@ create table if not exists group_keys (
   primary key (group_id, username)
 );
 create table if not exists invites (
-  token_hash text primary key,
+  token text primary key,
   group_id text not null,
   created_by text not null,
-  expires_at bigint not null
+  created_at bigint not null
 );
 create table if not exists work (
   id text primary key,
@@ -109,6 +109,7 @@ alter table work add column if not exists batch_id text;
 alter table work add column if not exists priority text not null default 'normal';
 alter table work add column if not exists auto_reassign integer not null default 1;
 alter table work add column if not exists assignee_role text not null default '';
+alter table work add column if not exists require_approval integer not null default 0;
 alter table work add column if not exists attempt integer not null default 1;
 alter table work add column if not exists progress_percent integer not null default 0;
 alter table work add column if not exists progress_at double precision not null default 0;
@@ -126,6 +127,9 @@ alter table audit_log add column if not exists priority text not null default ''
 alter table audit_log add column if not exists size integer not null default 0;
 alter table audit_log add column if not exists mentions text not null default '[]';
 alter table audit_log add column if not exists ref_id text not null default '';
+alter table audit_log add column if not exists sender_nickname text not null default '';
+alter table audit_log add column if not exists sender_role text not null default '';
+alter table audit_log add column if not exists sender_custom_role text not null default '';
 
 create table if not exists channels (
   id text primary key, name text not null, creator text not null,
@@ -143,7 +147,7 @@ create table if not exists upload_sessions (
   id text primary key, owner text not null, blob_id text not null,
   whole_sha text not null, chunk_size integer not null,
   total_chunks integer not null, for_user text not null default '',
-  for_group text not null default '', for_channel text not null default '',
+  for_group text not null default '',
   got text not null default '[]', created_at double precision not null);
 create table if not exists work_checkpoints (
   work_id text primary key, attempt integer not null, by_user text not null,
@@ -174,6 +178,7 @@ create table if not exists chains (
   created_at double precision not null,
   updated_at double precision not null);
 create table if not exists chain_steps (
+  require_approval integer not null default 0,
   chain_id text not null, step_index integer not null,
   work_id text, target_kind text not null default 'user',
   target text not null default '', status text not null default 'pending',
