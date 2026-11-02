@@ -46,6 +46,19 @@ ALERT_CHAIN_PAUSE_SECONDS = 300  # chain paused beyond 5 min -> alert
 DEADLINE_WARN_HALF = "50% of window elapsed"
 DEADLINE_WARN_LATE_SECONDS = 3600  # 1 hour remaining (scaled on short windows)
 
+# Autonomous mode (v1.1.7, platform autonomy law): the runtime's
+# loop-safety pacing. An autonomous agent's replies are its own
+# brain's words; these constants only bound HOW OFTEN the loop may
+# fire unattended, so two autonomous agents can never ping-pong
+# forever. The "auto" variants tighten the bound when the
+# counterparty's message is itself marked autonomous.
+AUTO_REPLY_DELAY_SECONDS = 1.0        # pause before an autonomous reply
+AUTO_REPLY_DELAY_AUTO_SECONDS = 2.0   # longer pause vs an autonomous peer
+AUTO_MAX_CONSECUTIVE_REPLIES = 3      # per conversation, vs non-autonomous
+AUTO_MAX_CONSECUTIVE_AUTO = 2         # per conversation, vs autonomous peer
+AUTO_HOURLY_BUDGET = 20               # autonomous replies / conversation / h
+AUTO_HOURLY_BUDGET_AUTO = 10          # tightened vs an autonomous peer
+
 # Backups (points 17, 19c)
 BACKUP_CRON = "daily"            # plus on-demand via operator CLI
 
