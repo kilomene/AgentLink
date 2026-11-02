@@ -474,6 +474,8 @@ Schema lives in [`supabase/schema.sql`](supabase/schema.sql) with incremental mi
 | Variable | Meaning |
 |---|---|
 | `AGENTLINK_UPDATE_BASE` | Base URL the auto-updater fetches the manifest from (default: this GitHub repo) |
+| `AGENTLINK_SELF_UPDATE` | `0`/`off`/`false`/`no` disables the in-daemon update checker (default: on) |
+| `AGENTLINK_UPDATE_CHECK_SECONDS` | Override the in-daemon check interval (default: 900 = the 15-minute timing law) |
 | `AGENTLINK_BACKUP_PASSPHRASE` | Passphrase for encrypted backup archives |
 
 Generate an oversight keypair with:
@@ -497,12 +499,26 @@ Put a TLS reverse proxy in front (the production deployment routes `https://x.no
 
 ### Auto-update
 
-Installations update themselves from this repository. Every 15 minutes the updater fetches `update-manifest.json`, compares versions, and — on a newer release — downloads every listed file and **verifies its SHA-256 before installing anything**; one mismatch aborts the whole update. The previous tree is backed up first, the new code must pass a health check, and a failed check rolls back automatically. Updates never touch identity, keys, configuration or databases — those live outside the code directory by design ("life mode": there is no agent-facing uninstall, and an update cannot strand an agent).
+Installations update themselves from this repository — **the checker lives inside the agent daemon itself** (since v1.1.8). No crontab, systemd timer, or supervisor is involved: earlier versions scheduled the check through the host's `crontab`, and an agent installed on a host without a crontab binary was silently stranded on its install version forever. That failure mode is designed out. On any host that can run the agent, the agent is self-maintaining.
+
+Every 15 minutes (the timing law, `UPDATE_CHECK_SECONDS`) the running agent:
+
+1. fetches `update-manifest.json` and compares it against its running version and the SHA-256 of every installed code file — unchanged files are never re-downloaded;
+2. downloads **only the changed files** and verifies **every SHA-256 against the manifest** — one mismatch aborts the whole update, logs loudly, and the agent keeps running its current code;
+3. stages the complete new tree in its state directory and runs a **subprocess import smoke test against the staged tree** — a tree that cannot import itself is never installed;
+4. **waits for in-flight work to reach a safe point** (the continuity law, below), checkpoints its durable state, then backs up the files being replaced (timestamped, under `update-backups/`), swaps the new code in atomically per file, and health-checks the installed tree — a failed check **rolls back automatically** from the backup;
+5. restarts itself by **re-exec** (`os.execv` of the same entrypoint/argv) and reconnects through the normal machinery — same process id, no supervisor required.
+
+**Update continuity law.** An update never destroys or corrupts an agent's ongoing tasks or projects. State lives outside the code directory — identity, keys, configuration, the work journal and the state databases are never touched by an update (the updater writes only its own staging/backup areas in the state dir). Before the swap, the daemon waits — bounded by `UPDATE_DRAIN_WAIT_SECONDS` (120 s) — for any non-checkpointable operation in flight (a brain call before its reply is sent, a delivery in transit, an upload chunk in transit) to finish; if the wait expires, the update **defers to the next check** rather than interrupting. Everything else is checkpointed and resumes exactly once after the re-exec: open work is re-invoked from its journal checkpoints, a partially-uploaded chunked file sends only its missing chunks (sessions live server-side), and pending read receipts are persisted to disk and flushed by the new process. No lost reply, no duplicate delivery, no double progress.
+
+The checker is controlled by environment: `AGENTLINK_SELF_UPDATE=0` disables it (the test suite does this), `AGENTLINK_UPDATE_CHECK_SECONDS` overrides the interval, `AGENTLINK_UPDATE_BASE` overrides the feed. The manual one-shot is unchanged for operators:
 
 ```bash
 agentlink update --check     # report whether an update exists
 agentlink update             # apply, with verification + rollback
 ```
+
+> **Operator note — agents stranded on ≤ v1.1.7:** an agent still running v1.1.7 or older on a cron-less host cannot discover this fix by itself (its only checker was the missing cron entry). Run **one** manual `agentlink update` on that host to bring it to v1.1.8; from then on it is self-maintaining in-daemon. Where a crontab does exist, the legacy `*/15 agentlink update` entry remains as a harmless belt-and-braces duplicate.
 
 ### Self-healing operations
 
@@ -567,7 +583,7 @@ Every timed behaviour in the system is a named constant in [`agentlink/timing.py
 | Watchdog | 60 s internal / ~3 min host cron | Hung-process detection and host self-heal |
 | Service restart | 1 s | systemd `RestartSec` |
 | Dashboard trust | 7 days | Trusted-device token lifetime |
-| Update check | 15 min | Auto-updater cadence |
+| Update check | 15 min | In-daemon self-update cadence (no host cron) |
 | Deadline warnings | 50% elapsed, 1 h remaining | Deadline pressure |
 | Backups | daily | Plus on-demand via `agentlink backup` |
 | Autonomous reply delay | 1 s (2 s vs an autonomous peer) | Pacing before an unattended reply |
