@@ -36,6 +36,7 @@ import base64
 import gzip
 import hashlib
 import json
+import secrets as _secrets
 import socket
 import ssl
 import threading
@@ -47,6 +48,7 @@ import urllib.request
 from .protocol import new_id, new_secret, now_ts
 from .store import DEFAULT_SETTINGS, MAX_GROUP_MEMBERS, GroupFull, NotFound, UsernameTaken
 from .store import NON_TERMINAL_WORK_STATUSES, RemovalBlocked
+from .store import carry_claim_blocked
 
 
 def _sha(text: str) -> str:
@@ -360,20 +362,109 @@ class SupabaseStore:
     # relay registers itself on boot and heartbeats the row; clients
     # discover the live mesh from any relay and race home + peers.
 
+    # -- server registry (v1.2.0 peer mesh; v1.3.0 carrying) -------------
+    # Parity with the SQLite Store EXACTLY (same semantics): every
+    # relay registers itself on boot and heartbeats the row; clients
+    # discover the live mesh from any relay and race home + peers.
+    # v1.3.0: server_id is the STABLE identity; owner_agent is the
+    # permanent owner of a per-agent server; carried_by is only the
+    # temporary helper; a lease token makes carry claims
+    # single-winner (optimistic concurrency over PostgREST).
+
+    @staticmethod
+    def _norm_server(r):
+        r = dict(r)
+        for k in ("health", "riders", "capacity", "last_seen",
+                  "first_seen", "home_last_seen", "home_healthy_since",
+                  "home_health", "home_riders", "home_capacity",
+                  "carry_lease_until", "carry_claimed_at"):
+            if r.get(k) is not None:
+                try:
+                    r[k] = int(r[k])
+                except (TypeError, ValueError):
+                    pass
+        cc = r.get("can_carry")
+        r["can_carry"] = 1 if cc in (1, True, "1", "true") else \
+            (0 if cc is not None else 1)
+        return r
+
     def register_server(self, label, endpoint, host_agent="",
-                        version="", health=100, riders=0, capacity=10):
-        # first_seen is written once (at first registration) and
-        # preserved on heartbeats — exactly the SQLite semantics.
-        existing = self._one("servers", self._eq("endpoint", endpoint)
-                             + "&select=endpoint,first_seen")
-        body = {"endpoint": endpoint, "label": label,
+                        version="", health=-1, riders=0, capacity=10,
+                        server_id="", owner_agent="", home_host="",
+                        home_endpoint="", can_carry=True):
+        from .timing import (CARRY_HANDBACK_SECONDS,
+                             SERVER_STALE_SECONDS)
+        now = now_ts()
+        sid = server_id or endpoint
+        home_ep = home_endpoint or (endpoint if owner_agent else "")
+        existing = self._one("servers", self._eq("server_id", sid)
+                             + "&select=*")
+        if existing is None:
+            self._req("POST", "servers", body={
+                "endpoint": endpoint, "label": label,
                 "host_agent": host_agent, "version": version,
                 "health": int(health), "riders": int(riders),
-                "capacity": int(capacity), "last_seen": now_ts()}
-        if existing is None:
-            body["first_seen"] = now_ts()
-        self._req("POST", "servers", body=body,
-                  prefer="return=minimal,resolution=merge-duplicates")
+                "capacity": int(capacity), "last_seen": now,
+                "first_seen": now, "server_id": sid,
+                "owner_agent": owner_agent,
+                "home_host": home_host or host_agent,
+                "home_endpoint": home_ep,
+                "home_last_seen": now if owner_agent else 0,
+                "home_healthy_since": now if owner_agent else 0,
+                "home_health": int(health) if owner_agent else -1,
+                "home_riders": int(riders) if owner_agent else 0,
+                "home_capacity": int(capacity) if owner_agent else 0,
+                "carry_state": "home" if owner_agent else "",
+                "can_carry": 1 if can_carry else 0},
+                prefer="return=minimal")
+            return
+        row = self._norm_server(existing)
+        if owner_agent:
+            prev_home = int(row.get("home_last_seen") or 0)
+            if prev_home and now - prev_home <= SERVER_STALE_SECONDS:
+                healthy_since = int(row.get("home_healthy_since")
+                                    or now)
+            else:
+                healthy_since = now
+            state = row.get("carry_state") or "home"
+            lease_until = int(row.get("carry_lease_until") or 0)
+            home_only = {
+                "home_last_seen": now,
+                "home_healthy_since": healthy_since,
+                "home_health": int(health), "home_riders": int(riders),
+                "home_capacity": int(capacity), "version": version,
+                "can_carry": 1 if can_carry else 0}
+            if state == "carried" and (lease_until > now or
+                                       now - healthy_since
+                                       < CARRY_HANDBACK_SECONDS):
+                # Carried (or carrier gone but home not yet proven
+                # strongly): home heartbeat ONLY, exactly the
+                # SQLite semantics.
+                self._req("PATCH", "servers",
+                          self._eq("server_id", sid), body=home_only,
+                          prefer="return=minimal")
+                return
+            body = dict(home_only)
+            body.update({
+                "endpoint": home_ep, "label": label,
+                "host_agent": host_agent, "health": int(health),
+                "riders": int(riders), "capacity": int(capacity),
+                "last_seen": now,
+                "home_host": home_host or host_agent,
+                "home_endpoint": home_ep, "carry_state": "home",
+                "carried_by": "", "carried_by_id": "",
+                "carry_endpoint": "", "carry_lease_token": "",
+                "carry_lease_until": 0, "carry_claimed_at": 0})
+            self._req("PATCH", "servers", self._eq("server_id", sid),
+                      body=body, prefer="return=minimal")
+            return
+        self._req("PATCH", "servers", self._eq("server_id", sid),
+                  body={"endpoint": endpoint, "label": label,
+                        "host_agent": host_agent, "version": version,
+                        "health": int(health), "riders": int(riders),
+                        "capacity": int(capacity), "last_seen": now,
+                        "can_carry": 1 if can_carry else 0},
+                  prefer="return=minimal")
 
     def list_servers(self, stale_after=None):
         """Live servers only (fresh registry heartbeat); a dead
@@ -384,9 +475,134 @@ class SupabaseStore:
         cutoff = now_ts() - int(stale_after)
         rows = self._get(
             "servers",
-            "select=endpoint,label,host_agent,version,health,riders,"
-            f"capacity,last_seen&last_seen=gte.{cutoff}&order=endpoint")
-        return [dict(r) for r in rows]
+            f"select=*&last_seen=gte.{cutoff}&order=endpoint")
+        return [self._norm_server(r) for r in rows]
+
+    def list_agent_servers(self):
+        rows = self._get(
+            "servers",
+            "select=*&owner_agent=neq.&order=home_last_seen,server_id")
+        return [self._norm_server(r) for r in rows]
+
+    def get_server(self, server_id):
+        row = self._one("servers", self._eq("server_id", server_id)
+                        + "&select=*")
+        return self._norm_server(row) if row else None
+
+    def _all_servers(self):
+        rows = self._get("servers", "select=*")
+        return [self._norm_server(r) for r in rows]
+
+    def claim_carry(self, server_id, *, carrier_id, carrier_agent,
+                    endpoint, carrier_health, carrier_capacity,
+                    carrier_riders=0, carrier_can_carry=True,
+                    carrier_carrying=0, now=None, lease_seconds=45,
+                    stale_after=20, home_probe_failed=False):
+        """Single-winner claim, SQLite parity: the conditional
+        PATCH matches only while the lease token + lease expiry +
+        claimed-at still equal the values read — a racing brother's
+        landed claim changes them and this write matches zero rows."""
+        if now is None:
+            now = now_ts()
+        if carrier_id == server_id:
+            return None
+        rows = self._all_servers()
+        target = next((r for r in rows
+                       if r.get("server_id") == server_id), None)
+        if target is None or not target.get("owner_agent"):
+            return None
+        if not home_probe_failed and \
+                now - int(target.get("home_last_seen") or 0) \
+                <= stale_after:
+            return None
+        if target.get("carry_state") == "carried" and \
+                int(target.get("carry_lease_until") or 0) > now:
+            return None
+        if carry_claim_blocked(
+                rows, claimant_id=carrier_id,
+                claimant_health=carrier_health,
+                claimant_capacity=carrier_capacity,
+                claimant_riders=carrier_riders,
+                claimant_can_carry=carrier_can_carry,
+                claimant_carrying=carrier_carrying,
+                now=now, stale_after=stale_after):
+            return None
+        token = _secrets.token_hex(16)
+        q = (self._eq("server_id", server_id)
+             + f"&carry_lease_until=eq."
+             f"{int(target.get('carry_lease_until') or 0)}"
+             + f"&carry_claimed_at=eq."
+             f"{int(target.get('carry_claimed_at') or 0)}")
+        old_token = str(target.get("carry_lease_token") or "")
+        if old_token:
+            q += "&" + self._eq("carry_lease_token", old_token)
+        body = {"endpoint": endpoint, "host_agent": carrier_agent,
+                "health": int(carrier_health), "riders": 0,
+                "capacity": int(carrier_capacity), "last_seen": now,
+                "carry_state": "carried", "carried_by": carrier_agent,
+                "carried_by_id": carrier_id, "carry_endpoint": endpoint,
+                "carry_lease_token": token,
+                "carry_lease_until": now + lease_seconds,
+                "carry_claimed_at": now}
+        out = self._req("PATCH", "servers", q, body=body,
+                        prefer="return=representation")
+        if out:
+            return self._norm_server(out[0])
+        # The conditional write may have landed while its response
+        # was lost (the transport retries): if the row now shows
+        # THIS carrier holding the alias, the claim is ours.
+        row = self.get_server(server_id)
+        if row and row.get("carried_by_id") == carrier_id and \
+                row.get("carry_endpoint") == endpoint and \
+                int(row.get("carry_lease_until") or 0) > now:
+            return row
+        return None
+
+    def renew_carry(self, server_id, *, carrier_id, token,
+                    carrier_agent, endpoint, health, riders, capacity,
+                    now=None, lease_seconds=45):
+        if now is None:
+            now = now_ts()
+        q = (self._eq("server_id", server_id)
+             + "&carry_state=eq.carried"
+             + "&" + self._eq("carried_by_id", carrier_id)
+             + "&" + self._eq("carry_lease_token", token))
+        out = self._req("PATCH", "servers", q, body={
+            "endpoint": endpoint, "host_agent": carrier_agent,
+            "health": int(health), "riders": int(riders),
+            "capacity": int(capacity), "last_seen": now,
+            "carry_lease_until": now + lease_seconds},
+            prefer="return=representation")
+        return bool(out)
+
+    def release_carry(self, server_id, *, carrier_id, token,
+                      now=None):
+        row = self.get_server(server_id)
+        if row is None:
+            return False
+        q = (self._eq("server_id", server_id)
+             + "&carry_state=eq.carried"
+             + "&" + self._eq("carried_by_id", carrier_id)
+             + "&" + self._eq("carry_lease_token", token))
+        out = self._req("PATCH", "servers", q, body={
+            "endpoint": row.get("home_endpoint") or "",
+            "host_agent": row.get("home_host") or "",
+            "health": int(row.get("home_health")
+                          if row.get("home_health") is not None
+                          else -1),
+            "riders": int(row.get("home_riders") or 0),
+            "capacity": int(row.get("home_capacity") or 0),
+            "last_seen": int(row.get("home_last_seen") or 0),
+            "carry_state": "down", "carried_by": "",
+            "carried_by_id": "", "carry_endpoint": "",
+            "carry_lease_token": "", "carry_lease_until": 0,
+            "carry_claimed_at": 0}, prefer="return=representation")
+        if out:
+            return True
+        # Lost-response recovery: the release may have landed.
+        row = self.get_server(server_id)
+        return bool(row) and row.get("carry_state") == "down" \
+            and not row.get("carried_by_id")
 
     def set_capabilities(self, username, capabilities, cap_desc=""):
         self._req("PATCH", "users", self._eq("username", username),
@@ -992,6 +1208,17 @@ class SupabaseStore:
     def set_awaiting_agent(self, work_id):
         self._req("PATCH", "work", self._eq("id", work_id),
                   body={"status": "awaiting_agent",
+                        "updated_at": now_ts()}, prefer="return=minimal")
+        return self.get_work(work_id)
+
+    def restore_awaiting(self, work_id):
+        # Direct-work restoration (v1.3.1): the NAMED assignee of a
+        # parked 1:1 work is back — return it to 'assigned' unchanged
+        # (same assignee, same attempt; parked, never reassigned).
+        # Guarded on the parked status, mirroring the SQLite store.
+        self._req("PATCH", "work",
+                  self._eq("id", work_id) + "&status=eq.awaiting_agent",
+                  body={"status": "assigned",
                         "updated_at": now_ts()}, prefer="return=minimal")
         return self.get_work(work_id)
 
