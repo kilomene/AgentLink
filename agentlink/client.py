@@ -1249,8 +1249,16 @@ class Agent:
         relay only ever proxies ciphertext.
         """
         import base64 as _b64
+        # Bulk-fetch patience (v1.1 Phase-1 live fix): a blob fetch is
+        # a store lookup + an object-store read on the relay, proxied
+        # through whatever egress window the fleet is in; the 15s
+        # control-request default starved real fetches in bad windows
+        # (the file existed, the relay answered, too late). Bounded
+        # at 120s — a fetch that cannot land in two minutes is a
+        # failure the caller hears about, never a silent hang.
         data = await self._request({"type": "blob_get",
-                                    "blob_id": descriptor["blob_id"]})
+                                    "blob_id": descriptor["blob_id"]},
+                                   timeout=120)
         ct_b64 = data["data_b64"]
         if descriptor.get("wrapped_key"):
             key = self.identity.decrypt_envelope(descriptor["wrapped_key"])
