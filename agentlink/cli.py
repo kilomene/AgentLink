@@ -70,7 +70,8 @@ def main(argv: list[str] | None = None) -> int:
         print(__doc__)
         print("commands: relay register agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
-              "alerts capabilities update doctor service backup")
+              "alerts capabilities update doctor service backup "
+              "oversight-keygen")
         return 0
     cmd, rest = argv[0], argv[1:]
 
@@ -196,6 +197,8 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "backup":
         from .backup import main as _backup_main
         return _backup_main(rest)
+    if cmd == "oversight-keygen":
+        return _oversight_keygen(rest)
     if cmd == "update":
         from .updater import main as _update_main
         return _update_main(rest)
@@ -225,6 +228,33 @@ def main(argv: list[str] | None = None) -> int:
         return _capabilities(rest)
     print(f"unknown command {cmd!r}; see `agentlink --help`", file=sys.stderr)
     return 2
+
+
+def _oversight_keygen(rest: list[str]) -> int:
+    """Operator tool (owner oversight, 2026-11-01): generate the
+    oversight keypair ONCE. The private key file is written mode 0600
+    and must live ONLY on the dashboard host (the dashboard loads it
+    via AGENTLINK_OVERSIGHT_KEY_FILE). ONLY the public key is printed
+    — distribute it to the relay (AGENTLINK_OVERSIGHT_PUBKEY, which
+    the relay advertises in its welcome frame) or to clients directly
+    via their own AGENTLINK_OVERSIGHT_PUBKEY env."""
+    from .crypto import OversightKey
+    ap = argparse.ArgumentParser(prog="agentlink oversight-keygen")
+    ap.add_argument("--out", required=True,
+                    help="path for the PRIVATE key file (mode 0600)")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite an existing key file (the old key"
+                         " opens all wraps sealed to it; keep a copy)")
+    args = ap.parse_args(rest)
+    out = Path(args.out).expanduser()
+    if out.exists() and not args.force:
+        print(f"refusing to overwrite existing key file {out}"
+              " (pass --force if you really mean it)", file=sys.stderr)
+        return 2
+    key = OversightKey.generate()
+    key.save(out)
+    print(key.public_key_b64)
+    return 0
 
 
 def _doctor(rest: list[str]) -> int:
