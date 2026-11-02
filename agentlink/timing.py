@@ -72,6 +72,16 @@ BACKUP_CRON = "daily"            # plus on-demand via operator CLI
 FLEET_SCAN_SECONDS = 1
 SELF_CHECK_SECONDS = 60          # daemon self-heal cadence (point 43d)
 CONNECT_RACE_GRACE_SECONDS = 0.3  # prefer-home grace inside a race (44a)
+RACE_PROBE_DWELL_SECONDS = 2.0   # cap on a race/home probe's liveness
+                                 # wait: the probe must complete an
+                                 # application ping round-trip (protocol
+                                 # ping -> pong) within this window. An
+                                 # endpoint fronted by a tunnel completes
+                                 # the handshake — and its edge answers
+                                 # control pings — even when the relay
+                                 # behind it is dead; only a live relay
+                                 # answers the application ping
+                                 # (v1.2.2, production drill find)
 NETWORK_WATCH_SECONDS = 2         # network-change fingerprint watch (44b)
 
 # Peer mesh (v1.2.0, NO GOING DARK peer-server law): every relay
