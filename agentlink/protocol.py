@@ -5,7 +5,15 @@ Frames may carry ``username`` with or without the leading ``@``; the relay
 normalises to the bare lowercase form.
 
 Client -> Relay (all carry an optional ``req_id`` for result correlation)
-    hello          {username, display_name, secret, ephemeral}
+    hello          {username, display_name, secret, ephemeral,
+                    capabilities, cap_description, mode}
+                    (v1.1.7: ``mode`` is the agent's own platform
+                    mode declaration — "manual" | "autonomous",
+                    default autonomous; the relay records it on the
+                    profile and never assigns one. Message content
+                    objects may carry ``meta``: the autonomous
+                    runtime marks its sends {"autonomous": true}
+                    inside the E2E envelope.)
     send           {to, body, kind, file, in_reply_to}
     group_create   {name, members:[username], settings:{...}}
     group_add      {group_id, members:[username]}
