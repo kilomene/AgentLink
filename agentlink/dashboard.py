@@ -18,16 +18,19 @@ browser notifications.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
 import logging
+import os
 import queue
 import secrets
 import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 log = logging.getLogger("agentlink.dashboard")
 
@@ -43,6 +46,55 @@ def _hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def _load_oversight_identity():
+    """Owner-oversight key: when AGENTLINK_OVERSIGHT_KEY_FILE names a
+    readable key file, the dashboard opens the oversight copy of
+    conversation content SERVER-SIDE, for the authenticated operator
+    session only. Accepted file shapes: an agent-style keys JSON
+    ({"private_key": <b64>}), a bare base64 or hex X25519 private key,
+    or the raw 32 key bytes. Returns None when unset or unreadable —
+    the chat view then degrades honestly to envelope-only."""
+    path = os.environ.get("AGENTLINK_OVERSIGHT_KEY_FILE", "").strip()
+    if not path:
+        return None
+    try:
+        raw = Path(path).read_bytes()
+        priv = None
+        try:
+            priv = base64.b64decode(json.loads(raw)["private_key"])
+        except Exception:
+            pass
+        if priv is None or len(priv) != 32:
+            s = raw.strip()
+            cands = []
+            try:
+                cands.append(base64.b64decode(s, validate=True))
+            except Exception:
+                pass
+            try:
+                cands.append(bytes.fromhex(s.decode()))
+            except Exception:
+                pass
+            if len(s) == 32:
+                cands.append(s)
+            priv = next((c for c in cands if len(c) == 32), None)
+        if priv is None:
+            raise ValueError("no 32-byte X25519 private key in file")
+        from cryptography.hazmat.primitives.asymmetric.x25519 import (
+            X25519PrivateKey)
+        from .crypto import Identity
+        ident = Identity.__new__(Identity)
+        ident.username = "oversight"
+        ident.path = None
+        ident._priv = X25519PrivateKey.from_private_bytes(priv)
+        ident._sign = None
+        log.info("oversight key loaded from %s", path)
+        return ident
+    except Exception:
+        log.warning("oversight key not loaded from %s", path, exc_info=True)
+        return None
+
+
 class DashboardServer:
     def __init__(self, relay, host: str, port: int, password: str):
         self.relay = relay
@@ -54,6 +106,7 @@ class DashboardServer:
         self._dirty = False
         self._builder: threading.Thread | None = None
         self._failures: dict[str, list[float]] = {}
+        self._oversight = _load_oversight_identity()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -98,7 +151,7 @@ class DashboardServer:
                 self._dirty = False
             if dirty:
                 try:
-                    snapshot = json.dumps(self.relay._dashboard_data())
+                    snapshot = json.dumps(self._serve_data())
                 except Exception:
                     snapshot = None
                 if snapshot is not None:
@@ -110,6 +163,87 @@ class DashboardServer:
                         except queue.Full:
                             pass
             time.sleep(1.0)
+
+    # -- owner oversight: open sealed content for the operator session --
+    def _oversight_open(self, ov) -> bytes | None:
+        """Open one item's oversight wrap. Two shapes are honoured:
+        the content-key wrap {wrapped_key, nonce, ciphertext|ct}
+        (group-key pattern: unwrap the content key with the oversight
+        private key, then ChaCha20Poly1305 the content) and a direct
+        1:1-style envelope {eph_pub, nonce, ct} sealed straight to the
+        oversight public key. Any failure returns None (item stays
+        sealed) — content is never guessed or faked."""
+        ident = self._oversight
+        if ident is None or not isinstance(ov, dict):
+            return None
+        try:
+            from .crypto import decrypt_with_key
+            if isinstance(ov.get("wrapped_key"), dict):
+                key = ident.decrypt_envelope(ov["wrapped_key"])
+                return decrypt_with_key(key, {
+                    "nonce": ov.get("nonce", ""),
+                    "ct": ov.get("ciphertext") or ov.get("ct") or ""})
+            if ov.get("eph_pub"):
+                return ident.decrypt_envelope(ov)
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _content_fields(plaintext: bytes):
+        """Content plaintexts are JSON {"body","kind","file"} (the
+        client's _encrypt_obj object and the group payload alike).
+        Returns (text, content_kind, file_name)."""
+        try:
+            obj = json.loads(plaintext)
+        except Exception:
+            return plaintext.decode("utf-8", "replace"), "text", ""
+        if isinstance(obj, dict):
+            f = obj.get("file") if isinstance(obj.get("file"), dict) else {}
+            return (obj.get("body") or "",
+                    obj.get("kind") or f.get("kind") or "text",
+                    f.get("filename") or f.get("name") or "")
+        return str(obj), "text", ""
+
+    def _serve_data(self) -> dict:
+        """The dashboard payload. Conversation items carrying an
+        `oversight` wrap (on the item itself, or on its audit row) are
+        opened HERE, server-side; plaintext rides only inside the
+        authenticated operator payload (/api/status, /api/stream) and
+        the wrap is stripped so ciphertext is never echoed onward.
+        Without a configured key, content items are marked sealed and
+        the payload stays envelope-only."""
+        data = self.relay._dashboard_data()
+        data["oversight_enabled"] = self._oversight is not None
+        audit_ov = {}
+        try:
+            rows = self.relay.store.list_audit(500)
+        except Exception:
+            rows = []
+        for r in rows:
+            if isinstance(r, dict) and isinstance(r.get("oversight"), dict):
+                audit_ov[(r.get("ref_id") or r.get("work_id") or "",
+                          r.get("ts"), r.get("from"))] = r["oversight"]
+        for c in data.get("conversations", []):
+            for item in c.get("items", []):
+                ov = item.pop("oversight", None)
+                if ov is None:
+                    ov = audit_ov.get((item.get("id", ""), item.get("ts"),
+                                       item.get("from")))
+                if item.get("kind") not in ("message", "group_message",
+                                            "channel_message"):
+                    continue
+                pt = self._oversight_open(ov) if ov else None
+                if pt is not None:
+                    text, kind, fname = self._content_fields(pt)
+                    item["text"] = text
+                    item["content_kind"] = kind
+                    if fname:
+                        item["file_name"] = fname
+                    item["sealed"] = False
+                else:
+                    item["sealed"] = True
+        return data
 
     # -- auth ------------------------------------------------------------------
     def _rate_limited(self, ip: str) -> bool:
@@ -164,7 +298,7 @@ class DashboardServer:
                         return self._send(401, '{"error":"login required"}',
                                           "application/json")
                     return self._send(
-                        200, json.dumps(dash.relay._dashboard_data()),
+                        200, json.dumps(dash._serve_data()),
                         "application/json")
                 if path == "/api/stream":
                     if not self._authed():
@@ -222,7 +356,7 @@ class DashboardServer:
                     dash._subscribers.add(q)
                 try:
                     self.wfile.write(b"data: " + json.dumps(
-                        dash.relay._dashboard_data()).encode() + b"\n\n")
+                        dash._serve_data()).encode() + b"\n\n")
                     self.wfile.flush()
                     while True:
                         try:
