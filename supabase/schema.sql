@@ -65,11 +65,10 @@ create table if not exists al_group_keys (
 );
 
 create table if not exists al_invites (
-    group_id text not null,
-    token text not null,
+    token text primary key,             -- SHA-256 of the invite token
+    group_id text not null,             -- 'ch:<id>' for channel invites
     created_by text not null default '',
-    created_at bigint not null,
-    primary key (group_id, token)
+    created_at bigint not null          -- validity: created_at + 7 days
 );
 
 create table if not exists al_channels (
@@ -120,6 +119,7 @@ create table if not exists al_work (
     attempt integer not null default 1,
     auto_reassign integer not null default 1,
     assignee_role text not null default '',
+    require_approval integer not null default 0,  -- approval gate (v1.1)
     priority text not null default 'normal',
     progress_percent integer not null default 0,
     progress_at bigint not null default 0,
@@ -176,6 +176,7 @@ create table if not exists al_chain_steps (
     content_group jsonb,
     deadline bigint,
     priority text not null default 'normal',
+    require_approval integer not null default 0,  -- approval gate (v1.1)
     status text not null default 'pending',     -- pending|active|completed|cancelled
     work_id text not null default '',
     handoff jsonb not null default '[]',
@@ -200,12 +201,11 @@ create table if not exists al_upload_sessions (
     owner text not null,
     for_user text not null default '',
     for_group text not null default '',
-    for_channel text not null default '',
     whole_sha text not null default '',
     ct_sha text not null default '',
     size integer not null default 0,
     chunk_size integer not null default 0,
-    chunks jsonb not null default '[]',
+    chunks text not null default '[]',  -- JSON array of received indexes
     created_at bigint not null
 );
 
@@ -271,7 +271,10 @@ create table if not exists al_audit_log (
     priority text not null default '',
     size integer not null default 0,
     mentions jsonb not null default '[]',
-    ref_id text not null default ''
+    ref_id text not null default '',
+    sender_nickname text not null default '',
+    sender_role text not null default '',
+    sender_custom_role text not null default ''
 );
 
 create table if not exists al_dashboard_sessions (
