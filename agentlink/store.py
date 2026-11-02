@@ -26,7 +26,13 @@ DEFAULT_SETTINGS = {
 MAX_GROUP_MEMBERS = 50
 PRIORITY_WEIGHT = {"normal": 0, "high": 1, "urgent": 2}
 MAX_CHANNEL_SUBSCRIBERS = 1000
-CHUNK_SIZE = 1024 * 1024  # 1 MiB resumable-upload chunk
+CHUNK_SIZE = 1024 * 1024
+
+# Canonical invite lifetime (v1.1.0): the Supabase al_invites shape
+# stores token + created_at only, so validity is defined as
+# created_at + INVITE_TTL_SECONDS >= now. create_invite shifts
+# created_at so a custom ttl_seconds keeps its exact meaning.
+INVITE_TTL_SECONDS = 7 * 24 * 3600  # 1 MiB resumable-upload chunk
 
 
 class UsernameTaken(Exception):
@@ -121,10 +127,10 @@ class Store:
                     PRIMARY KEY (group_id, username)
                 );
                 CREATE TABLE IF NOT EXISTS invites (
-                    token_hash TEXT PRIMARY KEY,
+                    token TEXT PRIMARY KEY,
                     group_id TEXT NOT NULL,
                     created_by TEXT NOT NULL,
-                    expires_at INTEGER NOT NULL
+                    created_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS work (
                     id TEXT PRIMARY KEY,
@@ -139,6 +145,7 @@ class Store:
                     attempt INTEGER NOT NULL DEFAULT 1,
                     auto_reassign INTEGER NOT NULL DEFAULT 1,
                     assignee_role TEXT NOT NULL DEFAULT '',
+                    require_approval INTEGER NOT NULL DEFAULT 0,
                     content_group TEXT NOT NULL DEFAULT '',
                     priority TEXT NOT NULL DEFAULT 'normal',
                     progress_percent INTEGER NOT NULL DEFAULT 0,
@@ -191,7 +198,10 @@ class Store:
                     priority TEXT NOT NULL DEFAULT '',
                     size INTEGER NOT NULL DEFAULT 0,
                     mentions TEXT NOT NULL DEFAULT '[]',
-                    ref_id TEXT NOT NULL DEFAULT ''
+                    ref_id TEXT NOT NULL DEFAULT '',
+                    sender_nickname TEXT NOT NULL DEFAULT '',
+                    sender_role TEXT NOT NULL DEFAULT '',
+                    sender_custom_role TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS alerts (
                     id TEXT PRIMARY KEY,
@@ -242,6 +252,7 @@ class Store:
                     status TEXT NOT NULL DEFAULT 'pending',
                     work_id TEXT NOT NULL DEFAULT '',
                     handoff TEXT NOT NULL DEFAULT '[]',
+                    require_approval INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS vault (
@@ -290,7 +301,6 @@ class Store:
                     owner TEXT NOT NULL,
                     for_user TEXT NOT NULL DEFAULT '',
                     for_group TEXT NOT NULL DEFAULT '',
-                    for_channel TEXT NOT NULL DEFAULT '',
                     whole_sha TEXT NOT NULL DEFAULT '',
                     ct_sha TEXT NOT NULL DEFAULT '',
                     size INTEGER NOT NULL DEFAULT 0,
@@ -301,6 +311,70 @@ class Store:
                 """
             )
             self._db.commit()
+            self._migrate_v11()
+
+    def _migrate_v11(self) -> None:
+        """v1.1.0 schema alignment (idempotent, runs on every open):
+        invites -> canonical Supabase shape (token/created_at; the
+        stored token stays the SHA-256 hash, created_at is back-derived
+        as expires_at - INVITE_TTL_SECONDS so validity is preserved
+        exactly for default-TTL invites); upload_sessions drops the
+        for_channel column (channel scope is asserted by the relay at
+        session start and carried on the finish frame); audit_log
+        gains the sender identity columns; work + chain_steps gain
+        require_approval."""
+        db = self._db
+        cols = [r[1] for r in db.execute("PRAGMA table_info(invites)")]
+        if cols and "token_hash" in cols:
+            db.execute(
+                "CREATE TABLE invites_v11 ("
+                " token TEXT PRIMARY KEY, group_id TEXT NOT NULL,"
+                " created_by TEXT NOT NULL,"
+                " created_at INTEGER NOT NULL)")
+            db.execute(
+                "INSERT INTO invites_v11 (token, group_id, created_by,"
+                " created_at) SELECT token_hash, group_id, created_by,"
+                " expires_at - ? FROM invites", (INVITE_TTL_SECONDS,))
+            db.execute("DROP TABLE invites")
+            db.execute("ALTER TABLE invites_v11 RENAME TO invites")
+        cols = [r[1] for r in
+                db.execute("PRAGMA table_info(upload_sessions)")]
+        if "for_channel" in cols:
+            db.execute(
+                "CREATE TABLE upload_sessions_v11 ("
+                " session_id TEXT PRIMARY KEY, owner TEXT NOT NULL,"
+                " for_user TEXT NOT NULL DEFAULT '',"
+                " for_group TEXT NOT NULL DEFAULT '',"
+                " whole_sha TEXT NOT NULL DEFAULT '',"
+                " ct_sha TEXT NOT NULL DEFAULT '',"
+                " size INTEGER NOT NULL DEFAULT 0,"
+                " chunk_size INTEGER NOT NULL DEFAULT 0,"
+                " chunks TEXT NOT NULL DEFAULT '[]',"
+                " created_at INTEGER NOT NULL)")
+            db.execute(
+                "INSERT INTO upload_sessions_v11 SELECT session_id,"
+                " owner, for_user, for_group, whole_sha, ct_sha, size,"
+                " chunk_size, chunks, created_at FROM upload_sessions")
+            db.execute("DROP TABLE upload_sessions")
+            db.execute("ALTER TABLE upload_sessions_v11"
+                       " RENAME TO upload_sessions")
+
+        def _add(table, column, ddl):
+            existing = [r[1] for r in
+                        db.execute(f"PRAGMA table_info({table})")]
+            if existing and column not in existing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        _add("audit_log", "sender_nickname",
+             "sender_nickname TEXT NOT NULL DEFAULT ''")
+        _add("audit_log", "sender_role",
+             "sender_role TEXT NOT NULL DEFAULT ''")
+        _add("audit_log", "sender_custom_role",
+             "sender_custom_role TEXT NOT NULL DEFAULT ''")
+        _add("work", "require_approval",
+             "require_approval INTEGER NOT NULL DEFAULT 0")
+        _add("chain_steps", "require_approval",
+             "require_approval INTEGER NOT NULL DEFAULT 0")
+        db.commit()
 
     # -- blob metadata (ciphertext lives in the blob store) ----------------
     def put_blob_meta(self, blob_id, owner, for_user="", for_group="",
@@ -487,8 +561,9 @@ class Store:
                     "INSERT INTO chain_steps (id, chain_id, position,"
                     " target_type, target, group_id, assignees, envelopes,"
                     " content_group, deadline, priority, status,"
-                    " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-                    " 'pending', ?)",
+                    " require_approval, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                    " 'pending', ?, ?)",
                     (new_id("step-")[:16], cid, i + 1,
                      st.get("target_type", "user"), st.get("target", ""),
                      st.get("group_id", "") or group_id or "",
@@ -496,7 +571,8 @@ class Store:
                      json.dumps(st.get("envelopes") or {}),
                      json.dumps(st["content_group"])
                      if st.get("content_group") else "",
-                     st.get("deadline"), st.get("priority", "normal"), ts))
+                     st.get("deadline"), st.get("priority", "normal"),
+                     1 if st.get("require_approval") else 0, ts))
             self._db.commit()
         return self.get_chain(cid)
 
@@ -745,15 +821,18 @@ class Store:
     def audit(self, kind: str, actor: str, target: str = "",
               group_id: str = "", work_id: str = "", status: str = "",
               priority: str = "", size: int = 0, mentions=None,
-              ref_id: str = "") -> None:
+              ref_id: str = "", sender_nickname: str = "",
+              sender_role: str = "", sender_custom_role: str = "") -> None:
         with self._lock:
             self._db.execute(
                 "INSERT INTO audit_log (ts, kind, actor, target, group_id,"
-                " work_id, status, priority, size, mentions, ref_id)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " work_id, status, priority, size, mentions, ref_id,"
+                " sender_nickname, sender_role, sender_custom_role)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (now_ts(), kind, actor, target, group_id, work_id, status,
                  priority, int(size or 0), json.dumps(mentions or []),
-                 ref_id))
+                 ref_id, sender_nickname or "", sender_role or "",
+                 sender_custom_role or ""))
             self._db.commit()
 
     def list_audit(self, limit: int = 300) -> list[dict]:
@@ -761,7 +840,8 @@ class Store:
             rows = self._db.execute(
                 'SELECT ts, kind, actor AS "from", target AS "to",'
                 " group_id, work_id, status, priority, size, mentions,"
-                " ref_id FROM audit_log"
+                " ref_id, sender_nickname, sender_role, sender_custom_role"
+                " FROM audit_log"
                 " ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
             out = []
             for r in rows:
@@ -1101,13 +1181,19 @@ class Store:
 
     # -- invites -------------------------------------------------------------
     def create_invite(self, group_id: str, created_by: str,
-                      ttl_seconds: int = 7 * 24 * 3600) -> str:
+                      ttl_seconds: int = INVITE_TTL_SECONDS) -> str:
+        """Canonical shape (Supabase al_invites): the row stores the
+        token's SHA-256 AS the token column plus created_at; validity
+        is created_at + INVITE_TTL_SECONDS >= now. created_at is
+        shifted by (ttl - INVITE_TTL) so a custom ttl_seconds keeps
+        its exact meaning."""
         token = secrets.token_urlsafe(24)
+        created_at = now_ts() + int(ttl_seconds) - INVITE_TTL_SECONDS
         with self._lock:
             self._db.execute(
-                "INSERT INTO invites (token_hash, group_id, created_by, expires_at)"
-                " VALUES (?, ?, ?, ?)",
-                (_hash_token(token), group_id, created_by, now_ts() + ttl_seconds),
+                "INSERT INTO invites (token, group_id, created_by,"
+                " created_at) VALUES (?, ?, ?, ?)",
+                (_hash_token(token), group_id, created_by, created_at),
             )
             self._db.commit()
         return token
@@ -1117,10 +1203,12 @@ class Store:
             return False
         with self._lock:
             row = self._db.execute(
-                "SELECT expires_at FROM invites WHERE token_hash = ? AND group_id = ?",
+                "SELECT created_at FROM invites WHERE token = ?"
+                " AND group_id = ?",
                 (_hash_token(token), group_id),
             ).fetchone()
-        return bool(row) and row["expires_at"] >= now_ts()
+        return bool(row) and \
+            row["created_at"] + INVITE_TTL_SECONDS >= now_ts()
 
     @staticmethod
     def invite_link(group_id: str, token: str) -> str:
@@ -1144,7 +1232,8 @@ class Store:
                     priority: str = "normal", auto_reassign: bool = True,
                     assignee_role: str = "",
                     content_group: dict | None = None,
-                    chain_id: str = "", chain_step: int = 0) -> dict:
+                    chain_id: str = "", chain_step: int = 0,
+                    require_approval: bool = False) -> dict:
         wid = new_id("w-")[:14]
         ts = now_ts()
         with self._lock:
@@ -1153,27 +1242,33 @@ class Store:
                 " content_enc, content_self, content_group, batch_id,"
                 " chain_id, chain_step,"
                 " priority, auto_reassign, assignee_role, deadline,"
-                " status, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                " require_approval, status, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
                 " 'assigned', ?, ?)",
                 (wid, assigner, assignee, group_id, json.dumps(content_enc),
                  json.dumps(content_self),
                  json.dumps(content_group) if content_group else "",
                  batch_id, chain_id, chain_step, priority,
                  1 if auto_reassign else 0,
-                 assignee_role, deadline, ts, ts),
+                 assignee_role, deadline, 1 if require_approval else 0,
+                 ts, ts),
             )
             self._db.commit()
         return self.get_work(wid)
 
     # -- state machine (point 32: no skipping states, fail-closed) ------------
     WORK_TRANSITIONS = {
-        "assigned": {"in_progress", "delivered", "covered",
-                     "awaiting_agent"},
-        "in_progress": {"delivered", "covered", "awaiting_agent"},
-        "changes_requested": {"in_progress", "delivered", "covered",
+        "assigned": {"in_progress", "delivered", "awaiting_approval",
+                     "covered", "awaiting_agent"},
+        "in_progress": {"delivered", "awaiting_approval", "covered",
+                        "awaiting_agent"},
+        "changes_requested": {"in_progress", "delivered",
+                              "awaiting_approval", "covered",
                               "awaiting_agent"},
         "delivered": {"completed", "changes_requested"},
+        # Approval gate (v1.1.0): a proven delivery on gated work parks
+        # here until the assigner (or a group admin) decides.
+        "awaiting_approval": {"completed", "changes_requested"},
         "awaiting_agent": {"assigned"},
         "covered": set(),
         "completed": set(),
@@ -1316,13 +1411,14 @@ class Store:
         for r in rows:
             if r["status"] in ("completed", "covered"):
                 score += 4
-            elif r["status"] == "delivered":
+            elif r["status"] in ("delivered", "awaiting_approval"):
                 score += 1
             if r["deadline"]:
                 if r["status"] == "completed" and                         r["updated_at"] > r["deadline"]:
                     score -= 6
                 elif r["status"] not in ("completed", "covered",
-                                         "delivered") and now > r["deadline"]:
+                                         "delivered", "awaiting_approval") \
+                        and now > r["deadline"]:
                     score -= 6
         score -= 6 * changes
         score -= 10 * bad_proofs
@@ -1371,7 +1467,8 @@ class Store:
             rows = self._db.execute(
                 "SELECT id, assigner, assignee, group_id, status, priority,"
                 " batch_id, progress_percent, progress_at, proof_verified,"
-                " proof_hash, created_at, updated_at FROM work"
+                " proof_hash, deadline, chain_id, chain_step, attempt,"
+                " require_approval, created_at, updated_at FROM work"
                 " ORDER BY updated_at DESC LIMIT 200").fetchall()
         return [dict(r) for r in rows]
 
@@ -1487,10 +1584,10 @@ class Store:
         with self._lock:
             self._db.execute(
                 "INSERT INTO upload_sessions (session_id, owner, for_user,"
-                " for_group, for_channel, whole_sha, ct_sha, size,"
+                " for_group, whole_sha, ct_sha, size,"
                 " chunk_size, chunks, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?)",
-                (sid, owner, for_user, for_group, for_channel, whole_sha,
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?)",
+                (sid, owner, for_user, for_group, whole_sha,
                  ct_sha, size, chunk_size, now_ts()))
             self._db.commit()
         return sid
@@ -1504,6 +1601,10 @@ class Store:
             return None
         d = dict(row)
         d["chunks"] = json.loads(d["chunks"])
+        # Canonical sessions carry no channel scope (v1.1.0); the key
+        # stays present (empty) so relay consumers keep a stable shape.
+        # The relay asserts channel scope from the finish frame.
+        d.setdefault("for_channel", "")
         return d
 
     def record_chunk(self, session_id: str, index: int) -> list[int]:
@@ -1574,7 +1675,13 @@ class Store:
                      proof.get("sig", ""),
                      1 if proof.get("verified") else 0, work_id))
             self._db.commit()
-        self.set_work_status(work_id, "delivered")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT require_approval FROM work WHERE id = ?",
+                (work_id,)).fetchone()
+        gated = bool(row and row["require_approval"])
+        self.set_work_status(
+            work_id, "awaiting_approval" if gated else "delivered")
         return self.get_work(work_id)
 
     def list_work(self, username: str, status: str | None = None,
