@@ -174,6 +174,56 @@ def test_blob_io_runs_off_event_loop_and_file_lands(state_root):
     run(_t())
 
 
+def test_blob_store_failure_is_error_frame_not_teardown(state_root):
+    """A failing object store must answer blob_get with a clean
+    blob_fetch_failed error frame and leave the connection alive
+    (an uncaught store exception used to kill the socket in the
+    live exercise, cancelling the client's request)."""
+    from agentlink.blobstore import LocalBlobStore
+    from agentlink.client import RequestFailed
+
+    class FailingGetStore(LocalBlobStore):
+        def get(self, blob_id):
+            # Fail only assembled-blob reads; chunk reads (session
+            # assembly) keep working so the upload itself succeeds.
+            if str(blob_id).startswith("b-"):
+                raise RuntimeError("simulated object-store outage")
+            return super().get(blob_id)
+
+    async def _t():
+        store = FailingGetStore(str(state_root / "blobs2"))
+        relay = Relay(host=HOST, port=0,
+                      db_path=str(state_root / "blobfail.db"),
+                      dashboard_password="test-password",
+                      dashboard_port=0, blob_store=store)
+        await relay.start()
+        url = f"ws://{HOST}:{relay.port}"
+        a = Agent("sender-a", endpoint=url,
+                  state_dir=str(state_root / "fa"))
+        b = Agent("receiver-b", endpoint=url,
+                  state_dir=str(state_root / "fb"))
+        try:
+            await a.start()
+            await b.start()
+            payload = state_root / "fail-payload.bin"
+            payload.write_bytes(b"y" * 1024)
+            blob_id = await a.upload_blob(payload.read_bytes(),
+                                          for_user="receiver-b")
+            with pytest.raises(RequestFailed) as ei:
+                await b._request({"type": "blob_get",
+                                  "blob_id": blob_id}, timeout=10)
+            assert "blob_fetch_failed" in str(ei.value), ei.value
+            # connection survived: a normal request still answers
+            users = await b.directory()
+            assert any(u["username"] == "sender-a" for u in users)
+        finally:
+            await a.close()
+            await b.close()
+            await relay.stop()
+
+    run(_t())
+
+
 def test_hello_timeout_then_retry_connects(state_root, monkeypatch):
     monkeypatch.setattr(T, "HELLO_TIMEOUT_SECONDS", 0.3)
 
