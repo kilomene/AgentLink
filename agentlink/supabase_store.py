@@ -46,7 +46,7 @@ import urllib.parse
 import urllib.request
 
 from .protocol import new_id, new_secret, now_ts
-from .store import DEFAULT_SETTINGS, MAX_GROUP_MEMBERS, GroupFull, NotFound, UsernameTaken
+from .store import CONTENT_AUDIT_KINDS, DEFAULT_SETTINGS, MAX_GROUP_MEMBERS, GroupFull, NotFound, UsernameTaken
 from .store import NON_TERMINAL_WORK_STATUSES, RemovalBlocked
 from .store import carry_claim_blocked
 
@@ -1786,13 +1786,13 @@ class SupabaseStore:
             "content_envelope": content_envelope or ""},
             prefer="return=minimal")
 
-    def list_audit(self, limit=300):
-        rows = self._get(
-            "audit_log",
-            "select=ts,kind,actor,target,group_id,work_id,status,priority,"
-            "size,mentions,ref_id,sender_nickname,sender_role,"
-            f"sender_custom_role,oversight,content_envelope"
-            f"&order=seq.desc&limit={limit}")
+    _AUDIT_SELECT = ("select=ts,kind,actor,target,group_id,work_id,"
+                     "status,priority,size,mentions,ref_id,"
+                     "sender_nickname,sender_role,sender_custom_role,"
+                     "oversight,content_envelope")
+
+    @staticmethod
+    def _shape_audit(rows):
         out = []
         for r in rows:
             try:
@@ -1822,6 +1822,60 @@ class SupabaseStore:
                         "oversight": oversight,
                         "content_envelope": content_envelope})
         return out
+
+    def list_audit(self, limit=300):
+        rows = self._get(
+            "audit_log",
+            self._AUDIT_SELECT + f"&order=seq.desc&limit={limit}")
+        return self._shape_audit(rows)
+
+    def list_content_audit(self):
+        """Parity with the SQLite Store (v1.3.2): EVERY content row
+        (CONTENT_AUDIT_KINDS), oldest first, paged to exhaustion —
+        never a bounded window. The source for conversation
+        composition and the immortality census."""
+        kinds = ",".join(CONTENT_AUDIT_KINDS)
+        out = []
+        offset = 0
+        while True:
+            rows = self._get(
+                "audit_log",
+                self._AUDIT_SELECT + f"&kind=in.({kinds})"
+                f"&order=seq.asc&limit=1000&offset={offset}")
+            out.extend(self._shape_audit(rows))
+            if len(rows) < 1000:
+                return out
+            offset += len(rows)
+
+    def audit_rows_for_ids(self, ids):
+        """Parity with the SQLite Store: audit rows (any kind) whose
+        ref_id OR work_id is in ``ids``, chunked so the filter URL
+        stays bounded however large the id set grows."""
+        ids = [str(i) for i in (ids or []) if i]
+        if not ids:
+            return []
+        out = []
+        for i in range(0, len(ids), 150):
+            chunk = ",".join(ids[i:i + 150])
+            for col in ("ref_id", "work_id"):
+                rows = self._get(
+                    "audit_log",
+                    self._AUDIT_SELECT + f"&{col}=in.({chunk})"
+                    "&order=seq.asc")
+                out.extend(self._shape_audit(rows))
+        out.sort(key=lambda r: r["ts"])
+        return out
+
+    def audit_for_work(self, work_id):
+        """Parity with the SQLite Store: every audit row recorded
+        against one work id."""
+        if not work_id:
+            return []
+        rows = self._get(
+            "audit_log",
+            self._AUDIT_SELECT + "&" + self._eq("work_id", work_id)
+            + "&order=seq.asc")
+        return self._shape_audit(rows)
 
     # -- read receipts (v1.1.2: WhatsApp-style Seen state) -------------------
     def message_meta(self, message_id):
@@ -1867,15 +1921,18 @@ class SupabaseStore:
         ids = [str(i) for i in (message_ids or []) if i]
         if not ids:
             return {}
-        rows = self._get(
-            "message_reads",
-            "message_id=in.(" + ",".join(ids) + ")"
-            "&select=message_id,reader,read_at&order=read_at.asc")
         out = {}
-        for r in rows:
-            out.setdefault(r["message_id"], []).append(
-                {"username": r["reader"],
-                 "read_at": int(r["read_at"])})
+        for i in range(0, len(ids), 150):
+            rows = self._get(
+                "message_reads",
+                "message_id=in.(" + ",".join(ids[i:i + 150]) + ")"
+                "&select=message_id,reader,read_at&order=read_at.asc")
+            for r in rows:
+                out.setdefault(r["message_id"], []).append(
+                    {"username": r["reader"],
+                     "read_at": int(r["read_at"])})
+        for v in out.values():
+            v.sort(key=lambda x: x["read_at"])
         return out
 
     def set_audit_status(self, ref_id, status):
