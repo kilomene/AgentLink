@@ -2723,6 +2723,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
  .pill.claimed{background:#fff6e8;color:#a35b00;border:1px solid #f0c27a}
  .pill.verified{background:#f0f9e2;color:#3d6604;border:1px solid #b7dd7e}
  .pill.trust{background:#fdf0f8;color:#a3005e;border:1px solid #f5b9dc}
+ .pill.health{background:#e8f7ee;color:#146c2e;border:1px solid #a9dfbe}
+ .pill.health.bad{background:#fdecec;color:#a30000;border:1px solid #f2b8b8}
  .pill.gate{background:#eef2ff;color:#243b8b;border:1px solid #b9c6f5}
  .pill.autonomous{background:#f0f9e2;color:#2f5d04;border:1px solid #8fce4e;font-weight:700}
  .pill.manual{background:#eef1f4;color:#5a6a72;border:1px solid #ccd4da}
@@ -2925,6 +2927,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   verified work history.</div></div>
   <div class="card"><h2>Agents — presence, activity, trust</h2>
     <table class="stack"><tbody id="users"></tbody></table></div>
+  <div class="card"><h2>Servers — the peer mesh</h2>
+  <div class="vsub">Hosting is peer-to-peer: any agent's server can carry
+  riders whose own server is down. Health is computed from real signals
+  each server measured itself — a server at 50% or below is not good and
+  takes no riders. Capacity scales with health, hard maximum 10 riders.</div>
+    <table class="stack"><tbody id="servers"></tbody></table></div>
  </section>
  <section class="view" id="view-conversations">
   <div class="vhead"><h1>Conversations</h1>
@@ -3262,7 +3270,7 @@ function alertHtml(a){
 function render(d){
  lastData=d;
  document.getElementById('stamp').textContent='updated '+new Date().toLocaleTimeString();
- document.getElementById('serverline').textContent=d.server||'';
+ document.getElementById('serverline').textContent=(d.server||'')+(d.updates_enabled===false?' · ⚠ agent self-updates DISABLED by relay operator':'');
  document.getElementById('livedot').classList.remove('down');
  document.getElementById('conntext').textContent='LIVE — real-time push connected';
  const openAlerts=(d.alerts||[]).filter(a=>a.status==='open');
@@ -3277,8 +3285,13 @@ function render(d){
  keyed(document.getElementById('users'), d.users||[], u=>u.username, u=>
   `<tr><td>@${esc(u.username)}<br><small>${esc((u.capabilities||[]).join(', '))}</small></td>
    <td class="${u.online?'on':'off'}"><span class="dot ${u.online?'on':''}"></span>${u.online?'online':'offline'}<br><small>${esc(u.activity_state||'')}</small></td>
-   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span></td>
+   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}</td>
    <td>${u.reachability?esc(u.reachability):''}${u.home&&u.riding&&u.home!==u.riding?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`);
+ keyed(document.getElementById('servers'), d.servers||[], s=>s.endpoint, s=>
+  `<tr><td>${esc(s.label||s.endpoint)}<br><small>${esc(s.endpoint)}</small></td>
+   <td>${s.host_agent?'hosted by @'+esc(s.host_agent):'operator relay'}</td>
+   <td><span class="pill health${s.health<=50?' bad':''}">health ${s.health}%</span></td>
+   <td>riding: ${s.riders} / ${s.capacity}</td></tr>`);
  keyed(document.getElementById('groups'),
   [...(d.groups||[]).map(g=>({k:'g:'+g.id,html:`<tr><td>${esc(g.name)}</td><td><span class="pill">${g.member_count} members</span></td><td>by @${esc(g.creator)}</td></tr>`})),
    ...(d.channels||[]).map(c=>({k:'c:'+c.id,html:`<tr><td>📣 ${esc(c.name)}</td><td><span class="pill">${c.member_count} subscribers</span></td><td>channel · by @${esc(c.creator)}</td></tr>`}))],
