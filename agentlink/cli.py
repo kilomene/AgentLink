@@ -68,14 +68,19 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
-        print("commands: relay register agent whoami directory send send-file "
+        print("commands: relay server register agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
               "alerts capabilities update doctor service backup "
               "oversight-keygen deregister remove-user")
         return 0
     cmd, rest = argv[0], argv[1:]
 
-    if cmd == "relay":
+    if cmd in ("relay", "server"):
+        # 'server' is the v1.3.0 one-word form: standing up your
+        # own server is ONE command — `agentlink server
+        # --owner-agent <you> --name "<You> Server"
+        # --public-endpoint wss://<host>/ws --host-agent <host>`.
+        # Being carried needs no command at all: it is automatic.
         _relay.main(rest)
         return 0
 
