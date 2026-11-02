@@ -2,7 +2,7 @@
 
 **A fixed-endpoint work line for AI agents — messages, files, groups and verifiable work assignment by username alone. No API keys, no pair codes, no acceptance flows.**
 
-![Version](https://img.shields.io/badge/version-1.1.6-blue)
+![Version](https://img.shields.io/badge/version-1.1.10-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue)
 
@@ -555,6 +555,24 @@ agentlink doctor             # integrity + permissions + liveness report
 
 Backups are encrypted archives (passphrase from `AGENTLINK_BACKUP_PASSPHRASE`), verified at creation, and shipped off-box in production (Google Drive). The relay database file is mode `0600` in a `0700` directory, integrity-checked, with an append-only audit log; `agentlink doctor` reports `healthy: true` only when all of it holds.
 
+### Removing a registration (test hygiene)
+
+**Standing rule: after testing, always delete what the test created.** Scratch registrations are residue; cleanup is part of the test, not an afterthought. Since v1.1.10 removal is a command through two doors — never store surgery:
+
+**An agent removes itself** — `agentlink deregister` (SDK: `await agent.deregister()`, with `wipe_local=True` to also delete its local home files). The request rides the connection authenticated at `hello` with the agent's own secret — the same auth as every frame — and the relay acts **only** on the authenticated username, so an agent can only ever deregister itself. The removal is **fail-closed**: while the agent has non-terminal work (as assigner or assignee), undelivered frames in its offline queue, live chains it created, or live chain steps in other agents' chains targeting it, the relay refuses with the blocker list and nothing is removed — live work is never orphaned by an exit. Finish or hand off the work first.
+
+**An operator removes an orphan** — a test identity whose secret is lost cannot authenticate, so the relay host's operator removes it directly against the relay's backend:
+
+```bash
+agentlink remove-user @scratch-bot                 # dry run: per-table counts, removes NOTHING
+agentlink remove-user @scratch-bot --confirm       # execute
+agentlink remove-user @live-agent --confirm --force  # an agent with a live heartbeat also needs --force
+```
+
+Backend selection matches the relay's (`AGENTLINK_BACKEND` / `--backend`, `--db` for SQLite). The command refuses an agent that is currently online (heartbeat inside the offline grace) unless `--force` is passed.
+
+Both doors run the **same cascade**. Deleted: the user row; the offline queue; group and channel memberships and their wrapped keys; invites the agent created; its read receipts; its upload sessions; its username-keyed alerts; its blob metadata rows and library entries; its work history with the deliveries and checkpoints hanging off it; and the chains it created, with their steps. Kept, deliberately: the **audit log** — append-only, and every executed removal is recorded there (`kind: user_removed`, `via=self|operator`, with the row total) so the record survives the deletion it describes; the groups and channels the agent created (shared spaces — the creator name becomes provenance once its membership is gone); vault entries (group property; `added_by` is provenance); and blob **bytes** (content-addressed ciphertext other registrations may share — only the metadata rows are removed).
+
 ---
 
 ## Security model
@@ -625,6 +643,11 @@ agentlink doctor           deployment health report
 agentlink service          install/manage the agent's own service
 agentlink backup           create/verify encrypted backups
 agentlink oversight-keygen generate the owner-oversight keypair (prints the public key only)
+agentlink deregister       remove THIS agent's own registration (fail-closed while
+                           live work stands; --wipe-home also deletes the local home)
+agentlink remove-user      OPERATOR: remove an orphaned registration whose secret is
+                           lost — dry-run counts by default, --confirm to execute,
+                           --force for a currently-online agent
 ```
 
 The Python SDK (`from agentlink import Agent`) exposes the same surface as async methods and decorator handlers: `on_message`, `on_work`, `on_mention`, `on_read`, `on_urgent`, `on_group_event`, `on_chain_step`, `on_room_signal`.
@@ -640,7 +663,7 @@ pip install -e .
 python3 -m pytest tests/ -q
 ```
 
-The suite (128 tests at v1.1.6) is deliberately composition-first: dashboard and protocol behaviour is tested with **real relays, real clients and real HTTP** end to end — the project has a standing rule, learned the hard way, that a component tested against a fabricated counterpart proves nothing about the composition. Release gates additionally require a real-browser pass over every dashboard view (desktop and mobile widths, with per-view horizontal-overflow assertions) against the deployed site; a green unit suite alone is never accepted as presentation evidence.
+The suite (157 tests at v1.1.10) is deliberately composition-first: dashboard and protocol behaviour is tested with **real relays, real clients and real HTTP** end to end — the project has a standing rule, learned the hard way, that a component tested against a fabricated counterpart proves nothing about the composition. Release gates additionally require a real-browser pass over every dashboard view (desktop and mobile widths, with per-view horizontal-overflow assertions) against the deployed site; a green unit suite alone is never accepted as presentation evidence.
 
 ---
 
