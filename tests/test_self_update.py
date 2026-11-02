@@ -190,6 +190,30 @@ class _Lines:
             f" {self.snapshot()[-25:]}")
 
 
+def _seam_dir(tmp_path: Path) -> Path:
+    """Test-harness seam for staged daemon subprocesses ONLY.
+
+    HARDENED CORE (v1.2.0): the shipped library ignores the old
+    AGENTLINK_SELF_UPDATE / AGENTLINK_UPDATE_CHECK_SECONDS env vars
+    entirely — an agent's own environment can neither disable the
+    checker nor move its 900s interval. The staged demos still need
+    a 3-second tick, so the harness plants a sitecustomize.py on the
+    child's PYTHONPATH that pins the timing CONSTANT in-process.
+    That is the test reaching into the library's internals; it is
+    not a configuration surface the product offers anyone."""
+    seam = tmp_path / "testseam"
+    seam.mkdir(exist_ok=True)
+    (seam / "sitecustomize.py").write_text(
+        "import os\n"
+        "try:\n"
+        "    import agentlink.timing as _t\n"
+        "    _t.UPDATE_CHECK_SECONDS = float(\n"
+        "        os.environ.get('TEST_UPDATE_CHECK_SECONDS', '3'))\n"
+        "except Exception:\n"
+        "    pass\n")
+    return seam
+
+
 def _child_env(tmp_path: Path, install: Path, feed: Path,
                state_dir: Path, endpoint: str, extra: dict) -> dict:
     shim = tmp_path / "shim"
@@ -203,10 +227,12 @@ def _child_env(tmp_path: Path, install: Path, feed: Path,
         # missing Python environment.)
         "PATH": str(shim),
         "HOME": os.environ.get("HOME", str(tmp_path / "home")),
-        "PYTHONPATH": str(install),
+        "PYTHONPATH": os.pathsep.join(
+            [str(_seam_dir(tmp_path)), str(install)]),
         "PYTHONUNBUFFERED": "1",
-        "AGENTLINK_SELF_UPDATE": "1",
-        "AGENTLINK_UPDATE_CHECK_SECONDS": "3",
+        # Harness seam (see _seam_dir): the tick the staged daemon
+        # runs at. The library's own env surface is dead by law.
+        "TEST_UPDATE_CHECK_SECONDS": "3",
         "AGENTLINK_UPDATE_BASE": feed.as_uri(),
         "RUN_ENDPOINT": endpoint,
         "RUN_STATE": str(state_dir),
@@ -470,10 +496,10 @@ def test_a2_cli_module_daemon_self_updates(tmp_path):
     env = {
         "PATH": str(shim),  # no crontab here either
         "HOME": str(home),  # fresh identity under the scrubbed HOME
-        "PYTHONPATH": os.pathsep.join([str(install), *deps]),
+        "PYTHONPATH": os.pathsep.join(
+            [str(_seam_dir(tmp_path)), str(install), *deps]),
         "PYTHONUNBUFFERED": "1",
-        "AGENTLINK_SELF_UPDATE": "1",
-        "AGENTLINK_UPDATE_CHECK_SECONDS": "3",
+        "TEST_UPDATE_CHECK_SECONDS": "3",
         "AGENTLINK_UPDATE_BASE": feed.as_uri(),
         "AGENTLINK_ENDPOINT": endpoint,
     }
@@ -659,7 +685,7 @@ def test_f_update_waits_for_brain_call(tmp_path):
     gate = tmp_path / "brain-gate"
     env = _child_env(tmp_path, install, feed, state, endpoint,
                      {"RUN_USER": "upd-f", "RUN_GATE": str(gate),
-                      "AGENTLINK_UPDATE_CHECK_SECONDS": "10"})
+                      "TEST_UPDATE_CHECK_SECONDS": "10"})
     proc, lines = _spawn(tmp_path, RUNNER_BRAIN, env)
     try:
         lines.wait_for("READY")
@@ -699,15 +725,17 @@ def test_f_update_waits_for_brain_call(tmp_path):
 def test_g_checker_config_pins(monkeypatch):
     assert UPDATE_CHECK_SECONDS == 15 * 60  # the timing law
     assert UPDATE_DRAIN_WAIT_SECONDS > 0
+    # HARDENED CORE (v1.2.0): the agent's own environment can neither
+    # move the interval (stretch OR shrink) nor disable the checker.
+    # The pins below prove the attempts change NOTHING.
+    for junk in ("7", "99999", "0", "junk"):
+        monkeypatch.setenv("AGENTLINK_UPDATE_CHECK_SECONDS", junk)
+        assert resolve_update_check_seconds() == UPDATE_CHECK_SECONDS
     monkeypatch.delenv("AGENTLINK_UPDATE_CHECK_SECONDS", raising=False)
-    assert resolve_update_check_seconds() == UPDATE_CHECK_SECONDS
-    monkeypatch.setenv("AGENTLINK_UPDATE_CHECK_SECONDS", "7")
-    assert resolve_update_check_seconds() == 7.0
-    monkeypatch.setenv("AGENTLINK_UPDATE_CHECK_SECONDS", "junk")
     assert resolve_update_check_seconds() == UPDATE_CHECK_SECONDS
     for off in ("0", "off", "false", "no", ""):
         monkeypatch.setenv("AGENTLINK_SELF_UPDATE", off)
-        assert self_update_enabled() is False
+        assert self_update_enabled() is True
     monkeypatch.setenv("AGENTLINK_SELF_UPDATE", "1")
     assert self_update_enabled() is True
 
