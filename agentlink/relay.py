@@ -27,14 +27,65 @@ from .timing import (
     ALERT_OFFLINE_SECONDS,
     ALERT_REMINDER_SECONDS,
     ALERT_URGENT_SECONDS,
+    CHECKIN_GAP_MIN_SECONDS,
+    CHECKIN_MIN_SESSIONS,
+    CHECKIN_SESSION_MAX_SECONDS,
+    CHECKIN_WINDOW_SECONDS,
+    HEARTBEAT_SECONDS,
+    HOME_PROBE_SECONDS,
     OFFLINE_GRACE_SECONDS,
     REASSIGN_GRACE_SECONDS,
+    RECONNECT_BACKOFF_CAP_SECONDS,
+    SERVER_HEALTHY_MIN,
+    SERVER_HEARTBEAT_SECONDS,
+    SERVER_HEALTH_WINDOW_SECONDS,
+    UPDATE_CHECK_SECONDS,
 )
 from .store import GroupFull, NotFound, RemovalBlocked, Store, UsernameTaken
 
 log = logging.getLogger("agentlink.relay")
 
 ADMIN_ROLES = ("admin", "superadmin")
+
+
+def compute_server_health(*, scan_ok: int = 0, scan_fail: int = 0,
+                          hello_ok: int = 0, hello_fail: int = 0,
+                          reg_ok: int = 0, reg_fail: int = 0,
+                          peers: int = 0) -> int:
+    """THE health percentage (v1.2.0 mesh rule) — computed ONLY from
+    signals the relay itself measured, over the trailing
+    SERVER_HEALTH_WINDOW_SECONDS (5 min). No invented numbers: every
+    point lost is a real failure or real load this server saw.
+
+        health = 100
+          - round(40 x scan_fail  / scan_events)    fleet-scan errors
+          - round(30 x hello_fail / hello_events)   admission errors
+          - round(10 x reg_fail   / reg_events)     registry writes
+          - round(20 x min(1, connected_peers / 50))  load pressure
+
+    A component with no events in the window deducts nothing (a
+    fresh, idle, error-free server is a healthy server). The result
+    is clamped to 0..100. Pure function of its inputs — the tests
+    pin it deterministically."""
+    def _deduct(weight: int, ok: int, fail: int) -> int:
+        total = ok + fail
+        if total <= 0:
+            return 0
+        return round(weight * fail / total)
+    health = 100
+    health -= _deduct(40, scan_ok, scan_fail)
+    health -= _deduct(30, hello_ok, hello_fail)
+    health -= _deduct(10, reg_ok, reg_fail)
+    health -= round(20 * min(1.0, max(0, peers) / 50))
+    return max(0, min(100, health))
+
+
+def effective_capacity(health: int) -> int:
+    """Mesh rule: capacity scales with health and never exceeds the
+    hard cap — floor(SERVER_MAX_RIDERS x health / 100). At 100% a
+    server hosts the full 10 riders; at 60% it hosts 6."""
+    from .timing import SERVER_MAX_RIDERS
+    return max(0, (SERVER_MAX_RIDERS * int(health)) // 100)
 
 
 @dataclass
@@ -48,6 +99,8 @@ class Peer:
     home_endpoint: str = ""
     activity: str = "online_idle"
     touched_at: int = 0
+    connected_at: int = 0
+    core: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -58,6 +111,11 @@ class Relay:
     backend_store: object = None
     blob_store: object = None
     server_name: str | None = None
+    # Peer mesh (v1.2.0): the username of the agent hosting this
+    # relay, when an agent host runs it (''/None for a bare operator
+    # relay). Recorded in the server registry so the mesh can say
+    # WHOSE server a rider is riding.
+    host_agent: str | None = None
     dashboard_password: str | None = None
     dashboard_port: int = 8766
     public_endpoint: str | None = None
@@ -94,6 +152,30 @@ class Relay:
     require_oversight: bool = field(default_factory=lambda:
         os.environ.get("AGENTLINK_REQUIRE_OVERSIGHT", "") == "1")
     _scan_task: object = field(default=None, repr=False)
+    _server_hb_task: object = field(default=None, repr=False)
+    # Health (v1.2.0): the operator may PIN this server's health
+    # (AGENTLINK_SERVER_HEALTH, 0-100) — the deliberate drain switch:
+    # pin 50 or below and riders migrate off and none are admitted,
+    # while the server keeps serving its own home agents. Unset =
+    # health is computed from measured signals (the normal case).
+    health_override: int | None = field(default_factory=lambda: (
+        int(os.environ["AGENTLINK_SERVER_HEALTH"])
+        if os.environ.get("AGENTLINK_SERVER_HEALTH") else None))
+    _health_events: object = field(
+        default_factory=lambda: collections.deque(maxlen=20000),
+        repr=False)
+    # Hardened core (v1.2.0): the relay operator's update switch —
+    # the ONLY sanctioned kill switch for agents' self-update
+    # checkers (AGENTLINK_UPDATES_ENABLED=0 on the RELAY). Advertised
+    # in every welcome and shown on the dashboard; agents cannot
+    # switch themselves off.
+    updates_enabled: bool = field(default_factory=lambda:
+        os.environ.get("AGENTLINK_UPDATES_ENABLED", "1") != "0")
+    # Compliance visibility: per-agent session history (for the
+    # check-in pattern flag) and last declared core fingerprint.
+    _sessions: dict = field(default_factory=dict, repr=False)
+    _last_core: dict = field(default_factory=dict, repr=False)
+    _last_mesh_publish: object = field(default=None, repr=False)
     alert_chain_completed: bool = field(default_factory=lambda:
         os.environ.get("AGENTLINK_ALERT_CHAIN_COMPLETED", "1") != "0")
     chain_pause_alert_seconds: int = field(default_factory=lambda: int(
@@ -133,11 +215,237 @@ class Relay:
             candidates.add(str(ep).strip().rstrip("/").lower())
         try:
             from .config import DEFAULT_ENDPOINT
-            candidates.add(str(DEFAULT_ENDPOINT).strip().rstrip("/")
-                           .lower())
+            default_norm = str(DEFAULT_ENDPOINT).strip().rstrip("/") \
+                .lower()
+            # The fixed product endpoint counts as MY home identity
+            # only when this relay IS the product endpoint's relay —
+            # no public endpoint of its own configured, or configured
+            # AS the default. A peer relay (own public endpoint, e.g.
+            # x2.novamail.store) must NOT claim the default endpoint
+            # as home: agents homed there are RIDING when they are
+            # here, and the dashboard must say "online (via <peer>)"
+            # (v1.2.0 — with one relay this distinction was invisible;
+            # with a live mesh it is the whole point).
+            if not ep or str(ep).strip().rstrip("/").lower() == \
+                    default_norm:
+                candidates.add(default_norm)
         except Exception:
             pass
         return norm in candidates
+
+    # -- server registry (v1.2.0 peer mesh) --------------------------------
+    # NO GOING DARK, peer-server law: an agent whose server dies
+    # rides another agent's server at full capability until home is
+    # back. That only works if the mesh is DISCOVERABLE — so every
+    # relay registers itself in the shared backend on boot and
+    # heartbeats the row; any relay hands the live list to any
+    # client that connects (welcome payload + 'servers' request).
+
+    def _registry_endpoint(self) -> str:
+        """This relay's canonical endpoint identity in the registry:
+        its configured public endpoint when it has one, else its
+        bind address (the local/test shape)."""
+        ep = self.public_endpoint or \
+            os.environ.get("AGENTLINK_PUBLIC_ENDPOINT")
+        if ep:
+            return str(ep).strip().rstrip("/")
+        return f"ws://{self.host}:{self.port}"
+
+    # -- health (v1.2.0 mesh rule) -------------------------------------------
+    # Every server carries a health percentage computed from REAL
+    # signals it measured itself (see compute_server_health). The
+    # events below are the raw material: timestamped outcomes of the
+    # relay's own fleet scans, hello admissions and registry writes
+    # over the trailing window. Published in every registry
+    # heartbeat; enforced at rider admission; shown on the
+    # dashboard and in the directory.
+
+    def _health_event(self, kind: str) -> None:
+        try:
+            self._health_events.append((now_ts(), kind))
+        except Exception:
+            pass
+
+    def _health_counts(self) -> dict:
+        cutoff = now_ts() - SERVER_HEALTH_WINDOW_SECONDS
+        counts = {"scan_ok": 0, "scan_fail": 0, "hello_ok": 0,
+                  "hello_fail": 0, "reg_ok": 0, "reg_fail": 0}
+        for ts, kind in list(self._health_events):
+            if ts >= cutoff and kind in counts:
+                counts[kind] += 1
+        return counts
+
+    def _compute_health(self) -> int:
+        if self.health_override is not None:
+            return max(0, min(100, int(self.health_override)))
+        return compute_server_health(
+            peers=len(self.peers), **self._health_counts())
+
+    def _effective_capacity(self) -> int:
+        return effective_capacity(self._compute_health())
+
+    def _riders_count(self, exclude: str = "") -> int:
+        """Agents RIDING this server right now: connected, not
+        ephemeral, and their home is somewhere else. Home agents are
+        not riders and never count against capacity."""
+        n = 0
+        for p in self.peers.values():
+            if p.ephemeral or p.username == exclude:
+                continue
+            if p.home_endpoint and \
+                    not self._is_home_endpoint(p.home_endpoint):
+                n += 1
+        return n
+
+    # -- hardened-core compliance (v1.2.0) -----------------------------------
+    # The survival invariants are hardcoded in the client; the
+    # relay's job is VISIBILITY: record what each agent declares and
+    # how it actually connects, and expose both — a weakened setup
+    # must be SEEN, never silently look compliant.
+
+    @staticmethod
+    def _sanitize_core(raw) -> dict:
+        if not isinstance(raw, dict):
+            return {}
+        out = {}
+        for k, v in list(raw.items())[:12]:
+            if isinstance(v, (str, int, float, bool)) and v is not None:
+                out[str(k)[:32]] = v
+        return out
+
+    @staticmethod
+    def _core_compliant(core: dict) -> bool:
+        """True only when the declared fingerprint matches the
+        hardcoded core EXACTLY: heartbeat 5s, backoff cap 5s, home
+        probe 5s, update check 900s, race on, continuous on."""
+        if not core:
+            return False
+        return (core.get("heartbeat_s") == HEARTBEAT_SECONDS
+                and core.get("backoff_cap_s")
+                == RECONNECT_BACKOFF_CAP_SECONDS
+                and core.get("home_probe_s") == HOME_PROBE_SECONDS
+                and core.get("update_check_s") == UPDATE_CHECK_SECONDS
+                and core.get("race") is True
+                and core.get("continuous") is True)
+
+    def _record_session(self, username: str, connected_at: int,
+                        ended_at: int) -> None:
+        dq = self._sessions.setdefault(
+            username, collections.deque(maxlen=50))
+        dq.append((int(connected_at), int(ended_at)))
+
+    def _connection_pattern(self, username: str) -> str:
+        """'check-in' when the agent's recent history is repeated
+        SHORT sessions separated by LONG dark gaps — the signature
+        of an agent configured to poll instead of staying connected.
+        Anything else is 'continuous'. Deterministic over the
+        recorded session stamps (timing.CHECKIN_*)."""
+        now = now_ts()
+        sessions = [(a, b) for a, b in
+                    self._sessions.get(username, [])
+                    if b >= now - CHECKIN_WINDOW_SECONDS]
+        recent = sessions[-CHECKIN_MIN_SESSIONS:]
+        if len(recent) < CHECKIN_MIN_SESSIONS:
+            return "continuous"
+        for (a1, b1), (a2, _b2) in zip(recent, recent[1:]):
+            if a2 - b1 <= CHECKIN_GAP_MIN_SECONDS:
+                return "continuous"
+        if all(b - a < CHECKIN_SESSION_MAX_SECONDS
+               for a, b in recent):
+            return "check-in"
+        return "continuous"
+
+    def _compliance_fields(self, username: str) -> dict:
+        peer = self.peers.get(username)
+        core = (peer.core if peer is not None and peer.core
+                else self._last_core.get(username) or {})
+        return {"core": core,
+                "core_compliant": self._core_compliant(core)
+                if core else None,
+                "connection_pattern":
+                    self._connection_pattern(username)}
+
+    def _register_server_row(self) -> None:
+        from . import __version__
+        health = self._compute_health()
+        try:
+            self.store.register_server(
+                self.server_label, self._registry_endpoint(),
+                host_agent=self.host_agent or "",
+                version=__version__, health=health,
+                riders=self._riders_count(),
+                capacity=effective_capacity(health))
+            self._health_event("reg_ok")
+        except Exception:
+            # A registry write must never take the relay down: the
+            # relay keeps serving; clients just don't learn about it
+            # until a heartbeat lands. Loud in the log, never fatal.
+            self._health_event("reg_fail")
+            log.exception("server registry registration failed")
+
+    async def _server_heartbeat_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(SERVER_HEARTBEAT_SECONDS)
+                await asyncio.to_thread(self._register_server_row)
+                # Real time (Law A): when this server's published
+                # mesh state (health / rider load) actually changes,
+                # push it to dashboard subscribers NOW — mesh state
+                # moves at heartbeat cadence at the slowest, never
+                # on a polling delay.
+                sig = (self._compute_health(), self._riders_count())
+                if sig != self._last_mesh_publish:
+                    self._last_mesh_publish = sig
+                    if getattr(self, "dashboard", None) is not None:
+                        self.dashboard.notify()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.exception("server registry heartbeat failed")
+
+    def _live_servers(self) -> list[dict]:
+        """The live mesh as this relay knows it: fresh registry rows
+        (stale rows are dead relays, never offered), with this relay
+        itself always present — a relay that cannot write its own
+        row still advertises itself to the clients it serves."""
+        out: list[dict] = []
+        try:
+            rows = self.store.list_servers()
+        except Exception:
+            rows = []
+        mine = self._registry_endpoint()
+        seen = set()
+        for r in rows:
+            ep = str(r.get("endpoint") or "").strip().rstrip("/")
+            if not ep or ep in seen:
+                continue
+            seen.add(ep)
+            health = r.get("health")
+            health = 100 if health is None else int(health)
+            cap = r.get("capacity")
+            out.append({"label": r.get("label") or ep,
+                        "endpoint": ep,
+                        "host_agent": r.get("host_agent") or "",
+                        "version": r.get("version") or "",
+                        "health": health,
+                        "riders": int(r.get("riders") or 0),
+                        "capacity": effective_capacity(health)
+                        if cap is None else int(cap)})
+        # My own row is always present and always LIVE-computed (the
+        # stored heartbeat can lag up to one cadence; the dashboard
+        # and the drill read the truth, not the echo).
+        from . import __version__
+        my_health = self._compute_health()
+        myself = {"label": self.server_label, "endpoint": mine,
+                  "host_agent": self.host_agent or "",
+                  "version": __version__, "health": my_health,
+                  "riders": self._riders_count(),
+                  "capacity": effective_capacity(my_health)}
+        out = [myself if s["endpoint"] == mine else s for s in out]
+        if mine not in seen:
+            out.append(myself)
+        out.sort(key=lambda s: s["endpoint"])
+        return out
 
     def _sender_meta(self, username: str, group_id: str = ""):
         """(nickname, role, custom_role) of a sender inside a group
@@ -226,11 +534,28 @@ class Relay:
             else:
                 u["reachability"] = "online (home)"
             u["activity_state"] = peer.activity if peer else "offline"
+            u.update(self._compliance_fields(u["username"]))
             u["trust_score"] = self.store.compute_trust(u["username"])
             u.pop("pubkey", None)
             u.pop("sign_pub", None)
+        # Mesh state (v1.2.0): the live server registry, and — for
+        # agents who HOST a server — that server's health, rider
+        # load and capacity ride on the agent's own row, because on
+        # this platform every agent carries its server's health.
+        servers = self._live_servers()
+        hosting = {s["host_agent"]: s for s in servers
+                   if s.get("host_agent")}
+        for u in users:
+            srv = hosting.get(u["username"])
+            if srv:
+                u["server_health"] = srv["health"]
+                u["server_endpoint"] = srv["endpoint"]
+                u["server_riders"] = srv["riders"]
+                u["server_capacity"] = srv["capacity"]
         return {
             "server": self.server_label,
+            "servers": servers,
+            "updates_enabled": self.updates_enabled,
             "online": sorted(u["username"] for u in users if u["online"]),
             "users": users,
             "groups": self.store.all_groups(),
@@ -362,9 +687,19 @@ class Relay:
             self.port = sockets[0].getsockname()[1]
         log.info("relay listening on %s:%s", self.host, self.port)
         self._scan_task = asyncio.create_task(self._fleet_scan_loop())
+        # Peer mesh (v1.2.0): register in the shared server registry
+        # and heartbeat the row, so any client connecting anywhere
+        # can discover this server. Off-loop: a network-backed
+        # store's round trip must not stall the accept path.
+        await asyncio.to_thread(self._register_server_row)
+        self._server_hb_task = asyncio.create_task(
+            self._server_heartbeat_loop())
         return self
 
     async def stop(self) -> None:
+        if self._server_hb_task is not None:
+            self._server_hb_task.cancel()
+            self._server_hb_task = None
         if self._scan_task is not None:
             self._scan_task.cancel()
             self._scan_task = None
@@ -411,9 +746,11 @@ class Relay:
             try:
                 await asyncio.sleep(1)
                 await self._fleet_scan_once()
+                self._health_event("scan_ok")
             except asyncio.CancelledError:
                 return
             except Exception:
+                self._health_event("scan_fail")
                 log.exception("fleet scan failed")
 
     async def _fleet_scan_once(self) -> None:
@@ -733,7 +1070,15 @@ class Relay:
                 if peer is not None:
                     peer.last_seen = now_ts()
                 if ftype == "hello":
-                    peer = await self._on_hello(ws, frame, peer)
+                    try:
+                        peer = await self._on_hello(ws, frame, peer)
+                    except Exception:
+                        # A hello that dies inside the server is a
+                        # measured admission failure (health signal);
+                        # client-fault rejections return normally
+                        # and never count against the server.
+                        self._health_event("hello_fail")
+                        raise
                 elif ftype == "ping":
                     if peer is not None:
                         peer.last_seen = now_ts()
@@ -899,10 +1244,23 @@ class Relay:
                     users = self.store.list_users(
                         str(frame.get("query") or ""),
                         capability=str(frame.get("capability") or ""))
+                    hosting = {s["host_agent"]: s
+                               for s in self._live_servers()
+                               if s.get("host_agent")}
                     for u in users:
                         u["online"] = u["username"] in self.peers
                         u["trust_score"] = self.store.compute_trust(
                             u["username"])
+                        u.update(self._compliance_fields(u["username"]))
+                        srv = hosting.get(u["username"])
+                        if srv:
+                            # Health is published in the directory:
+                            # an agent who hosts a server carries its
+                            # health % for everyone to route by.
+                            u["server_health"] = srv["health"]
+                            u["server_endpoint"] = srv["endpoint"]
+                            u["server_riders"] = srv["riders"]
+                            u["server_capacity"] = srv["capacity"]
                         u.pop("secret", None)
                     users.sort(key=lambda u: (not u["online"],
                                               u["username"]))
@@ -913,6 +1271,12 @@ class Relay:
                         "display_name": peer.display_name,
                         "online": True,
                     })
+                elif ftype == "servers":
+                    # Peer discovery (v1.2.0): the live mesh, from
+                    # the shared registry. Clients merge this into
+                    # their race set and persist it (see client).
+                    await self._result(ws, req_id, True, {
+                        "servers": self._live_servers()})
                 elif ftype == "deregister":
                     await self._on_deregister(ws, frame, peer)
                 else:
@@ -923,6 +1287,12 @@ class Relay:
             if peer is not None and self.peers.get(peer.username) is peer:
                 del self.peers[peer.username]
                 if not peer.ephemeral:
+                    if peer.connected_at:
+                        # Session history feeds the check-in pattern
+                        # flag (hardened-core compliance visibility).
+                        self._record_session(peer.username,
+                                             peer.connected_at,
+                                             now_ts())
                     self._log_activity("offline", peer.username)
                 log.info("peer @%s disconnected", peer.username)
 
@@ -937,13 +1307,17 @@ class Relay:
         if frame.get("ephemeral"):
             username = "dial-" + new_id()[:8]
             peer = Peer(ws=ws, username=username, display_name=display or "dial",
-                        pubkey=pubkey, ephemeral=True, last_seen=now_ts())
+                        pubkey=pubkey, ephemeral=True, last_seen=now_ts(),
+                        connected_at=now_ts(), core=core)
             self.peers[username] = peer
             await self._send(ws, {"type": "welcome", "req_id": req_id,
                                   "username": username, "secret": None,
                                   "ephemeral": True, "queued": 0,
+                                  "servers": self._live_servers(),
+                                  "updates_enabled": self.updates_enabled,
                                   "oversight_pubkey":
                                       self.oversight_pubkey or None})
+            self._health_event("hello_ok")
             return peer
         username = normalize_username(frame.get("username"))
         if username is None:
@@ -957,6 +1331,10 @@ class Relay:
         declared_mode = frame.get("mode")
         if declared_mode not in ("manual", "autonomous"):
             declared_mode = None
+        # Hardened core (v1.2.0): the client declares its core
+        # fingerprint; the relay records it verbatim and judges it
+        # against the hardcoded constants — never trusts it.
+        core = self._sanitize_core(frame.get("core"))
         if self.store.exists(username):
             if self.store.verify(username, secret):
                 self.store.set_display_name(username, display or username)
@@ -984,11 +1362,37 @@ class Relay:
                 await stale.ws.close(code=4000, reason="superseded")
             except Exception:
                 pass
+        # Mesh admission (v1.2.0, owner's rules): a RIDER — an agent
+        # whose home is ANOTHER server — is admitted only while this
+        # server is worth riding: health ABOVE the floor and rider
+        # capacity free (capacity = floor(10 x health/100), hard cap
+        # 10). A refusal names its reason so the client deflects to
+        # the next eligible server instead of dying. HOME agents are
+        # never gated: your own server always takes you back.
+        home_ep = str(frame.get("home_endpoint") or "")
+        if home_ep and not self._is_home_endpoint(home_ep):
+            health = self._compute_health()
+            if health <= SERVER_HEALTHY_MIN:
+                await self._error(
+                    ws, "server_unhealthy", req_id,
+                    f"health {health}% is at/below the "
+                    f"{SERVER_HEALTHY_MIN}% floor — not accepting "
+                    "riders")
+                return None
+            cap = effective_capacity(health)
+            if self._riders_count(exclude=username) >= cap:
+                await self._error(
+                    ws, "server_full", req_id,
+                    f"rider capacity {cap} reached at health "
+                    f"{health}% — try another server")
+                return None
         peer = Peer(ws=ws, username=username,
                     display_name=display or username, pubkey=pubkey,
-                    last_seen=now_ts(),
-                    home_endpoint=str(frame.get("home_endpoint") or ""))
+                    last_seen=now_ts(), connected_at=now_ts(), core=core,
+                    home_endpoint=home_ep)
         self.peers[username] = peer
+        if core:
+            self._last_core[username] = core
         try:
             self.store.touch(username)
         except Exception:
@@ -1001,6 +1405,8 @@ class Relay:
         await self._send(ws, {"type": "welcome", "req_id": req_id,
                               "username": username, "secret": owner_secret,
                               "ephemeral": False, "queued": len(queued),
+                              "servers": self._live_servers(),
+                              "updates_enabled": self.updates_enabled,
                               "oversight_pubkey":
                                   self.oversight_pubkey or None})
         for q in queued:
@@ -1023,6 +1429,7 @@ class Relay:
                     await self._attempt_reassign(work, forced=username)
         except Exception:
             log.exception("awaiting-agent pickup failed")
+        self._health_event("hello_ok")
         return peer
 
     # -- sealed file blobs (R2 in production; relay proxies ciphertext) -----
@@ -2943,6 +3350,10 @@ def main(argv: list[str] | None = None) -> None:
                     help="this relay's canonical public endpoint"
                          " (wss://...) \u2014 home agents are recognised"
                          " against it, never against the --name label")
+    ap.add_argument("--host-agent", default=None,
+                    help="username of the agent hosting this relay"
+                         " (peer mesh: recorded in the server"
+                         " registry; default $AGENTLINK_HOST_AGENT)")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -2956,7 +3367,9 @@ def main(argv: list[str] | None = None) -> None:
         relay = Relay(host=args.host, port=args.port, db_path=args.db,
                       backend_store=store, dashboard_port=args.dashboard_port,
                       server_name=args.server_name,
-                      public_endpoint=args.public_endpoint)
+                      public_endpoint=args.public_endpoint,
+                      host_agent=args.host_agent
+                      or os.environ.get("AGENTLINK_HOST_AGENT"))
         await relay.start()
         try:
             await asyncio.Future()
