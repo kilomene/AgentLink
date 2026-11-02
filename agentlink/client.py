@@ -71,6 +71,7 @@ from .timing import (
     HOME_PROBE_SECONDS,
     DISCOVERED_SERVER_TTL_SECONDS,
     MESH_REFRESH_SECONDS,
+    SERVER_HEARTBEAT_SECONDS,
     RECONNECT_BACKOFF_CAP_SECONDS,
     SERVER_HEALTHY_MIN,
 )
@@ -727,6 +728,14 @@ class Agent:
                      "endpoint": ep,
                      "host_agent": str(e.get("host_agent") or ""),
                      "version": str(e.get("version") or ""),
+                     # Carrying (v1.3.0): identity + ownership ride
+                     # along so directory/whoami views can say whose
+                     # server this is and who is carrying it. Health
+                     # -1 = UNRATED (still testing, never raced).
+                     "server_id": str(e.get("server_id") or ""),
+                     "owner_agent": str(e.get("owner_agent") or ""),
+                     "carried_by": str(e.get("carried_by") or ""),
+                     "carry_state": str(e.get("carry_state") or ""),
                      "health": (int(e["health"]) if isinstance(
                          e.get("health"), (int, float)) else None),
                      "riders": (int(e["riders"]) if isinstance(
@@ -778,7 +787,14 @@ class Agent:
         last: Exception | None = None
         for ip in ips:
             netloc = f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
-            ip_url = f"{p.scheme}://{netloc}{p.path or '/'}"
+            # Path AND query survive: a carried server's alias is
+            # the carrier's /ws endpoint + ?carry=<server_id>
+            # (v1.3.0) — dropping the query would connect to the
+            # carrier's own identity instead of the carried one.
+            target = p.path or "/"
+            if p.query:
+                target += "?" + p.query
+            ip_url = f"{p.scheme}://{netloc}{target}"
             kwargs: dict = {"max_size": MAX_FRAME}
             if ip != host:
                 kwargs["extra_headers"] = {"Host": f"{host}:{port}"}
@@ -1392,12 +1408,31 @@ class Agent:
             home-probe is already watching). A server you ride is a
             waiting room; when it stops being good, you leave."""
             while True:
-                await asyncio.sleep(MESH_REFRESH_SECONDS)
-                if self.current_endpoint in (None, self.endpoint):
+                # At home, discovery refreshes on the heartbeat
+                # cadence (real-time law: mesh state moves at
+                # heartbeat cadence at the slowest) — a peer that
+                # earns its health rating must join the race set
+                # within seconds, or a home that dies in the gap
+                # leaves its agents with nobody to ride. While
+                # riding, the slower refresh cadence stands.
+                if self.current_endpoint is not None and \
+                        self.current_endpoint == self.endpoint:
+                    await asyncio.sleep(SERVER_HEARTBEAT_SECONDS)
+                else:
+                    await asyncio.sleep(MESH_REFRESH_SECONDS)
+                if self.current_endpoint is None:
                     continue
                 try:
                     entries = await self.servers()
                 except Exception:
+                    continue
+                if self.current_endpoint == self.endpoint:
+                    # At home: discovery still refreshes (v1.3.0 —
+                    # a peer that was UNRATED at first welcome earns
+                    # its rating minutes later and must join the
+                    # race set without a reconnect), but home is
+                    # never migrated away from: your own server
+                    # always takes you back.
                     continue
                 mine = next((e for e in entries
                              if e.get("endpoint")
@@ -1430,7 +1465,8 @@ class Agent:
                 except RegistrationFailed as exc:
                     reason = str(exc)
                     if reason.startswith(("server_full",
-                                          "server_unhealthy")):
+                                          "server_unhealthy",
+                                          "server_unrated")):
                         # Mesh deflection (v1.2.0): this server
                         # won't take a rider right now — full, or
                         # not healthy enough. NOT a registration
