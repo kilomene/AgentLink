@@ -220,6 +220,56 @@ def test_dead_agent_reassignment_with_checkpoint(env1, state_root):
     run(_t())
 
 
+def test_direct_work_parked_then_restored_on_return(env1, state_root):
+    """v1.3.1 root-cause regression: a 1:1 (direct) work assigned
+    while its named assignee is unreachable falls into
+    awaiting_agent; when that SAME assignee comes back online the
+    work must be restored to 'assigned' (same attempt — parked,
+    never reassigned), delivered to it, and completable exactly
+    once. Before the fix, direct parked work had no path back at
+    all (the hello pickup only handled GROUP pool work, and the
+    sweep only looks at work whose assignee is still dead) — in
+    production, work w-66b25cf34ba7 sat in awaiting_agent forever
+    after its assignee returned."""
+    env1["relay"].reassign_grace_seconds = 3
+
+    async def _t():
+        boss = await make(env1, state_root, "boss31")
+        w = await make(env1, state_root, "worker31")
+        await w.close()  # registered, then gone: no heartbeats
+        job = (await boss.assign_work(["worker31"], "direct job"))[0]
+        store = env1["relay"].store
+        assert await wait_for(
+            lambda: store.get_work(job["id"])["status"]
+            == "awaiting_agent", 30), store.get_work(job["id"])["status"]
+        received = {}
+
+        def handler(work, ctx):
+            received["work"] = work
+
+        w2 = Agent("worker31", endpoint=env1["url"],
+                   state_dir=str(state_root / "worker31"))
+        w2.on_work(handler)
+        task = asyncio.create_task(w2.run(reconnect_delay=0.5))
+        try:
+            assert await wait_for(lambda: "work" in received, 20)
+            assert received["work"]["id"] == job["id"]
+            assert received["work"]["attempt"] == 1  # parked, not reassigned
+            await w2.deliver_work(job["id"], body="done after return")
+            raw = store.get_work(job["id"])
+            assert raw["status"] == "delivered", raw["status"]
+            assert raw["attempt"] == 1
+            assert len(raw["deliveries"]) == 1  # exactly once
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await boss.close()
+    run(_t())
+
+
 # -- points 30 + 39c: SIGKILL, relaunch via the service entry, resume --------------
 
 WORKER_SCRIPT = r'''
@@ -370,6 +420,8 @@ def test_worker_pool_concurrency_and_failover_dispatch(state_root,
         assert finished == [], "all 3 started before any finished"
         # Kill home mid-flight: the agent rides the peer; work
         # assigned through the peer still reaches it (push, no nudge).
+        # Earned-health law (v1.3.0): the peer must be rated first.
+        assert await wait_for(lambda: peer._rated, timeout=60)
         kill_relay(home, hbox)
         job4 = (await boss.assign_work(["pool-worker"],
                                        "via peer while home down"))[0]
@@ -736,6 +788,9 @@ def test_43c_home_probes_never_cap(env1, state_root, tmp_path):
         task = asyncio.create_task(
             a.run(reconnect_delay=0.5, home_probe_interval=1))
         assert await wait_for(lambda: a.current_endpoint == home_url)
+        # Earned-health law (v1.3.0): the peer must have EARNED its
+        # rating before it may take riders — wait for it, then kill.
+        assert await wait_for(lambda: peer._rated, timeout=60)
         kill_relay(home, hbox)
         assert await wait_for(lambda: a.current_endpoint == peer_url, 15)
         c1 = a.home_probe_count
@@ -870,6 +925,9 @@ def test_44_race_lands_on_second_peer(state_root, tmp_path):
                   state_dir=str(state_root / "dark-agent"))
         task = asyncio.create_task(a.run(reconnect_delay=0.5))
         assert await wait_for(lambda: a.current_endpoint == urls[0])
+        # Earned-health law (v1.3.0): peer2 must have EARNED its
+        # rating before it may take riders — wait for it, then kill.
+        assert await wait_for(lambda: peer2._rated, timeout=60)
         kill_relay(home, hbox)
         kill_relay(peer1, p1box)
         assert await wait_for(lambda: a.current_endpoint == urls[2], 15)
@@ -923,6 +981,11 @@ def test_44_dns_failure_uses_doh_fallback(env1, state_root,
         a = Agent("dns-agent",
                   endpoint=f"ws://agentlink-home.invalid:{port}",
                   state_dir=str(state_root / "dns-agent"))
+        # Earned-health law (v1.3.0): the synthetic hostname is not
+        # the relay's own endpoint identity, so the agent is a rider
+        # here and the relay must have EARNED its rating first.
+        assert await wait_for(lambda: env1["relay"]._rated,
+                              timeout=60)
         await a.start()
         assert a.username == "dns-agent"
         await a.close()
