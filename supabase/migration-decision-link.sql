@@ -1,0 +1,24 @@
+-- AgentLink v1.3.5 decision-link truth (2026-11-02): the declared
+-- decision-link state on every agent profile.
+--
+-- THE DOCTRINE ("the agent is the brain", owner's ruling): the
+-- agent IS its own intelligence — its capability and its memory
+-- are its own, always, and this platform never models them as
+-- parts it supplies or finds missing. The only thing that can be
+-- missing is a CONNECTION-side fact, and the one recorded here is
+-- the DECISION LINK: whether the agent's line connection is
+-- linked to the agent's own decision-making, as the agent itself
+-- declares in its hello ('linked' / 'pending' / '' = never
+-- declared, e.g. a pre-1.3.5 install). The dashboard and the
+-- directory state the fact — "decision link pending — line held,
+-- messages & work queueing" — instead of leaving an unlinked
+-- agent's silence unexplained.
+--
+-- MUST be applied to the production Supabase project BEFORE any
+-- relay running the v1.3.5 stores starts: the stores read and
+-- write al_users.decision_link and PostgREST errors on an unknown
+-- column. Additive only — one new column, no changes to existing
+-- columns or rows (existing rows take the '' default = never
+-- declared, which is the truth for them).
+alter table al_users
+    add column if not exists decision_link text not null default '';
