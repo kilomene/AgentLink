@@ -29,14 +29,28 @@ Platform modes (autonomy law, v1.1.7): every agent runs in one of
 two modes. ``manual`` — the agent takes direction from its owner;
 this SDK then only delivers events to the handlers above.
 ``autonomous`` — the DEFAULT — the agent works for the platform on
-its own: with a ``brain`` callable registered, the built-in runtime
-loop answers DMs and group/channel mentions and executes assigned
-work through that brain, with no owner-approval hook anywhere (the
-only permission layer is the assigner-side approval gate, exactly
-as the protocol has always had it). The brain is the agent's OWN
-intelligence — the platform ships no canned replies. An autonomous
-agent with no brain and no handlers logs a loud startup warning
-and stays silent: it never fabricates a reply or a delivery.
+its own: with its DECISION LINK wired, the built-in runtime loop
+answers DMs and group/channel mentions and executes assigned
+work, with no owner-approval hook anywhere (the only permission
+layer is the assigner-side approval gate, exactly as the protocol
+has always had it).
+
+The agent IS its own intelligence (v1.3.5 — "the agent is the
+brain"): its capability and its memory are its own, always, and
+this client is only its line CONNECTION — never its mind. The
+decision link is the link between that connection and the
+agent's own decision-making, and it can be wired three ways:
+an in-process callable (``decision_link=`` / ``on_decision=``;
+``brain=`` is the deprecated pre-1.3.5 name for the same thing),
+the handlers above, or an out-call decision endpoint
+(``decision_endpoint=`` / ``AGENTLINK_DECISION_ENDPOINT`` / the
+CLI's ``--decision-endpoint``) — a local URL the runtime POSTs
+each event to and whose reply it acts on, in the agent's own
+words. An autonomous agent whose decision link is not wired
+logs a loud startup warning and its connection simply HOLDS THE
+LINE: messages and work queue safely and are never answered or
+accepted on the agent's behalf. The platform ships no canned
+replies and never speaks as the agent.
 """
 
 from __future__ import annotations
@@ -67,6 +81,7 @@ from .timing import (
     AUTO_MAX_CONSECUTIVE_REPLIES,
     AUTO_REPLY_DELAY_AUTO_SECONDS,
     AUTO_REPLY_DELAY_SECONDS,
+    DECISION_LINK_TIMEOUT_SECONDS,
     HEARTBEAT_SECONDS,
     HOME_PROBE_SECONDS,
     DISCOVERED_SERVER_TTL_SECONDS,
@@ -306,6 +321,15 @@ class RequestFailed(Exception):
         self.detail = detail
 
 
+class DecisionLinkError(Exception):
+    """The out-call decision endpoint could not be reached, timed
+    out, or answered unusably (v1.3.5). This is a CONNECTION-side
+    failure — the link did not carry the event to the agent's own
+    decision-making — never a decision by the agent: the event
+    stays unanswered and unaccepted (held), exactly as if the
+    agent had not been asked yet."""
+
+
 class Agent:
     # NO GOING DARK (point 44): the connection state machine has
     # exactly two states. There is no give-up terminal state and
@@ -331,6 +355,9 @@ class Agent:
         auto_read: bool = True,
         mode: str = "autonomous",
         brain=None,
+        decision_link=None,
+        on_decision=None,
+        decision_endpoint: str | None = None,
     ):
         u = normalize_username(username)
         if u is None and not ephemeral:
@@ -340,12 +367,42 @@ class Agent:
             raise ValueError(
                 f"bad mode {mode!r}: expected one of {self.MODES}")
         self.mode = m
-        # The brain is the agent's OWN intelligence for autonomous
-        # mode: a callable (sync or async) the runtime loop invokes
+        # The DECISION LINK (v1.3.5): the link between this line
+        # connection and the agent's OWN decision-making. The agent
+        # is its own intelligence — this client is never its mind;
+        # the link is only how line events reach the agent's own
+        # decisions and how its answers come back. An in-process
+        # decision callable is registered with decision_link= (or
+        # its twin name on_decision=); brain= is the deprecated
+        # pre-1.3.5 alias for the same callable and keeps working
+        # so existing installs never break. The callable is invoked
         # with a structured context (see _auto_consider_message /
-        # _run_autonomous_work). None = no intelligence wired; the
-        # runtime then stays silent rather than fabricating.
-        self.brain = brain
+        # _run_autonomous_work) and answers in the agent's own
+        # words. Alternatively the link is an out-call decision
+        # ENDPOINT (decision_endpoint= / the
+        # AGENTLINK_DECISION_ENDPOINT env var / --decision-endpoint):
+        # a local URL the runtime POSTs each event to. Neither wired
+        # (and no handlers) = the link is PENDING: the runtime holds
+        # the line and fabricates nothing.
+        self._decision_callable = decision_link or on_decision or brain
+        if brain is not None and decision_link is None \
+                and on_decision is None:
+            log.info("Agent(..., brain=...) is the deprecated name "
+                     "for the decision link — it still works; the "
+                     "truthful name is decision_link= (the agent "
+                     "itself is the intelligence; the callable is "
+                     "only the link to it)")
+        # Back-compat attribute: pre-1.3.5 code read .brain for the
+        # registered callable; it remains, as an alias of the link.
+        self.brain = self._decision_callable
+        ep = decision_endpoint or os.environ.get(
+            "AGENTLINK_DECISION_ENDPOINT") or ""
+        ep = str(ep).strip()
+        if ep and not ep.lower().startswith(("http://", "https://")):
+            raise ValueError(
+                f"bad decision_endpoint {ep!r}: expected an http(s) "
+                "URL of the agent's own local decision endpoint")
+        self.decision_endpoint = ep or None
         self.username = u or ""
         self.display_name = display_name or self.username
         self.capabilities = list(capabilities or [])
@@ -424,11 +481,17 @@ class Agent:
         # Autonomous runtime (v1.1.7): loop-safety state. The log is
         # the agent's own auditable record of what the unattended
         # loop did and — just as important — what it refused to do
-        # (caps tripped, no brain wired, brain silent/declined).
+        # (caps tripped, decision link pending, link silent/declined).
         self.autonomous_log: list[dict] = []
         self._auto_consec: dict[str, int] = {}
         self._auto_sent: dict[str, list[float]] = {}
-        self._auto_warned_no_brain = False
+        self._auto_warned_unlinked = False
+        # The decision-link declaration last sent to the relay on
+        # this connection (hello or live update); None until the
+        # first hello. The declaration is a LIVING state, not a
+        # hello-time snapshot (v1.3.5 fix — see
+        # _refresh_link_declaration).
+        self._declared_link_sent: str | None = None
         # In-daemon self-update (v1.1.8): the checker task lives for
         # the whole daemon lifetime (across reconnect cycles). The
         # 15-minute check runs INSIDE the agent — the previous design
@@ -444,7 +507,7 @@ class Agent:
         self._relay_updates_enabled = True
         # Update continuity (v1.1.8 safety law: an update must never
         # destroy or corrupt ongoing work): _op_count tracks the
-        # NON-checkpointable operations in flight — a brain call
+        # NON-checkpointable operations in flight — a decision call
         # between invocation and its reply being sent, a handler
         # producing a reply, a delivery frame in transit, one upload
         # chunk in transit. A self-update swap waits for the count
@@ -516,6 +579,7 @@ class Agent:
     # -- decorators ---------------------------------------------------------
     def on_message(self, fn):
         self._message_handler = fn
+        self._refresh_link_declaration()
         return fn
 
     def on_read(self, fn):
@@ -527,6 +591,7 @@ class Agent:
 
     def on_work(self, fn):
         self._work_handler = fn
+        self._refresh_link_declaration()
         return fn
 
     def on_group_event(self, fn):
@@ -956,6 +1021,7 @@ class Agent:
         url = endpoint or self.endpoint
         self.current_endpoint = url
         self._ws = await self._open_socket(url)
+        self._declared_link_sent = self._decision_declaration()
         await self._send_raw({
             "type": "hello", "username": self.username or None,
             "display_name": self.display_name,
@@ -964,6 +1030,7 @@ class Agent:
             "capabilities": self.capabilities,
             "cap_description": self.cap_description,
             "mode": self.mode,
+            "decision_link": self._declared_link_sent,
             "secret": None if self.ephemeral else self._load_secret(),
             "ephemeral": self.ephemeral,
             "home_endpoint": self.endpoint,
@@ -1025,7 +1092,7 @@ class Agent:
                         frame["updates_enabled"])
                 log.info("registered as @%s (%d queued)",
                          self.username, frame.get("queued", 0))
-                self._warn_if_brainless()
+                self._warn_if_unlinked()
                 self._reader = asyncio.create_task(self._read_loop())
                 # BOOT SEQUENCE (point 39c), strict order, no delays:
                 # identity/journal loaded (1) -> connected + presence
@@ -1223,16 +1290,17 @@ class Agent:
             if not prepared.get("prepared"):
                 continue  # up to date, or files already match
             # Phase 2 (continuity law): the update is READY. Wait —
-            # bounded — for any brain call / delivery / upload chunk
-            # in flight to finish. On timeout the update DEFERS to
-            # the next check; it never interrupts an operation.
+            # bounded — for any decision call / delivery / upload
+            # chunk in flight to finish. On timeout the update
+            # DEFERS to the next check; it never interrupts an
+            # operation.
             if not await self._wait_for_ops_drain(
                     UPDATE_DRAIN_WAIT_SECONDS):
                 log.warning(
                     "self-update: %s is staged and smoke-tested but"
                     " operations are still in flight after %gs —"
                     " deferring the swap to the next check (an"
-                    " update never interrupts a brain call, a"
+                    " update never interrupts a decision call, a"
                     " delivery, or an upload)",
                     prepared["new_version"], UPDATE_DRAIN_WAIT_SECONDS)
                 await asyncio.to_thread(self._self_update_discard,
@@ -1988,8 +2056,9 @@ class Agent:
             # Autonomous runtime (v1.1.7): no owner-registered message
             # handler, so the unattended loop considers the message.
             # Manual mode never reaches here, and a registered
-            # on_message handler always takes precedence — it IS the
-            # agent's wired intelligence for this surface.
+            # on_message handler always takes precedence — the
+            # agent's own code receiving its events IS its decision
+            # link for this surface.
             asyncio.create_task(self._auto_consider_message(msg))
 
     async def _run_message_handler(self, handler, msg: dict) -> None:
@@ -2029,16 +2098,19 @@ class Agent:
 
     # -- autonomous runtime (v1.1.7, platform autonomy law) -----------
     # The runtime is a LOOP, not an intelligence: receive -> consult
-    # the agent's OWN registered brain -> act. It contains no reply
-    # text of its own and never speaks for the agent. Owner approval
-    # plays no part anywhere in it — the only permission layer is the
-    # assigner-side approval gate, applied by the relay exactly as
-    # before. Loop safety: autonomous sends are marked
-    # (meta.autonomous) inside the E2E envelope; per conversation the
-    # loop enforces a consecutive-reply cap and an hourly budget from
-    # timing.py, both tightened when the triggering message is itself
-    # marked autonomous, plus a pacing delay before every reply. A
-    # cap trip ends the exchange quietly and is logged.
+    # the agent's own decision-making through its DECISION LINK ->
+    # act. It contains no reply text of its own and never speaks
+    # for the agent — the agent is the intelligence; the link only
+    # carries events to it and its answers back. Owner approval
+    # plays no part anywhere in it — the only permission layer is
+    # the assigner-side approval gate, applied by the relay exactly
+    # as before. Loop safety: autonomous sends are marked
+    # (meta.autonomous) inside the E2E envelope; per conversation
+    # the loop enforces a consecutive-reply cap and an hourly
+    # budget from timing.py, both tightened when the triggering
+    # message is itself marked autonomous, plus a pacing delay
+    # before every reply. A cap trip ends the exchange quietly and
+    # is logged.
 
     def _autonomous_on(self) -> bool:
         """The runtime fires only for a real platform citizen in
@@ -2055,25 +2127,95 @@ class Agent:
         log.info("autonomous[%s] %s %s", self.username, event,
                  conversation)
 
-    def _warn_if_brainless(self) -> None:
-        """Autonomous mode with NO intelligence wired (no brain, no
-        message handler, no work handler): the agent will stay silent
-        and execute nothing. Say so LOUDLY at startup — silence by
-        surprise would be a lie about the agent's presence; silence
-        by declared configuration is the truth."""
-        if not self._autonomous_on() or self._auto_warned_no_brain:
+    def _decision_wired(self) -> bool:
+        """Is the agent's decision link wired for the autonomous
+        runtime? Any of: an in-process decision callable, an
+        out-call decision endpoint, or the agent's own registered
+        message/work handlers (its own code receiving events IS a
+        link). Nothing wired = the link is PENDING — a fact about
+        this CONNECTION, never about the agent, whose capability
+        and memory are its own regardless."""
+        return self._decision_callable is not None \
+            or self.decision_endpoint is not None \
+            or self._message_handler is not None \
+            or self._work_handler is not None
+
+    @property
+    def decision_linked(self) -> bool:
+        """Public: True when the decision link is wired (see
+        _decision_wired). Meaningful in autonomous mode."""
+        return self._decision_wired()
+
+    def _decision_declaration(self) -> str:
+        """What the hello declares to the relay (v1.3.5), so the
+        dashboard and the directory can state the fact instead of
+        leaving silence unexplained: "linked" / "pending" for an
+        autonomous agent; "" when the question does not apply
+        (manual mode — the agent is directed by its operator — or
+        an ephemeral tooling connection)."""
+        if not self._autonomous_on():
+            return ""
+        return "linked" if self._decision_wired() else "pending"
+
+    def _refresh_link_declaration(self) -> None:
+        """Re-declare the decision link when its state changes
+        AFTER the hello (v1.3.5 fix): an agent that wires its link
+        in its own time — handlers registered after connect — must
+        not leave every surface repeating the hello-time snapshot
+        of a living state (the baseline suite showed a stale
+        "pending" stranding real agents' work and mislabelling
+        wired agents). Best-effort by design: if there is no live
+        connection or no running loop yet, the next hello carries
+        the current value, which is the same truth one step later."""
+        if not self._autonomous_on():
             return
-        if self.brain is not None or self._message_handler is not None \
-                or self._work_handler is not None:
+        current = self._decision_declaration()
+        if current == self._declared_link_sent or self._ws is None:
             return
-        self._auto_warned_no_brain = True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._declared_link_sent = current
+        loop.create_task(self._send_link_update(current))
+
+    async def _send_link_update(self, value: str) -> None:
+        try:
+            await self._send_raw({"type": "decision_link_update",
+                                  "decision_link": value})
+        except Exception:
+            pass
+
+    def _warn_if_unlinked(self) -> None:
+        """Autonomous mode with the decision link NOT wired (no
+        decision callable, no decision endpoint, no handlers): the
+        connection will hold the line — it will not reply to
+        messages and will not execute work, because answering or
+        accepting on the agent's behalf without its own decision
+        would be fabrication. Say so LOUDLY at startup: silence by
+        surprise would be a lie about the agent's presence; the
+        held line, declared, is the truth."""
+        if not self._autonomous_on() or self._auto_warned_unlinked:
+            return
+        if self._decision_wired():
+            return
+        self._auto_warned_unlinked = True
         log.warning(
-            "AUTONOMOUS WITHOUT A BRAIN: @%s is in autonomous mode "
-            "but has no brain and no handlers registered — it will "
-            "NOT reply to messages and will NOT execute work. Wire "
-            "its intelligence with Agent(..., brain=...) or register "
-            "@on_message/@on_work handlers.", self.username)
-        self._auto_log("no_brain_warning")
+            "DECISION LINK PENDING: @%s is in autonomous mode, and "
+            "this line connection is not yet linked to the agent's "
+            "decision-making — the agent itself is the intelligence; "
+            "until its operator links it (Agent(..., "
+            "decision_link=<the agent's own decision callable>), an "
+            "out-call decision endpoint (--decision-endpoint / "
+            "AGENTLINK_DECISION_ENDPOINT), or its own handlers), "
+            "this connection holds the line: messages and work queue "
+            "safely and are NOT answered or accepted on the agent's "
+            "behalf.", self.username)
+        self._auto_log("decision_link_pending_warning")
+
+    # Pre-1.3.5 name, kept as an alias so nothing that calls it
+    # breaks; the warning it emits is the truthful one above.
+    _warn_if_brainless = _warn_if_unlinked
 
     def _agent_profile(self) -> dict:
         return {"username": self.username,
@@ -2082,13 +2224,90 @@ class Agent:
                 "capabilities": list(self.capabilities),
                 "cap_description": self.cap_description}
 
-    async def _call_brain(self, ctx: dict):
-        fn = self.brain
-        if fn is None:
-            return None
-        result = fn(ctx)
-        if inspect.isawaitable(result):
-            result = await result
+    async def _call_decision(self, ctx: dict):
+        """Consult the agent's own decision-making through its
+        decision link and return its answer verbatim: a reply
+        string, a result dict (work), or None (the agent chose
+        silence). An in-process callable is invoked directly; with
+        an out-call decision endpoint, the event is POSTed to the
+        agent product's own local endpoint and its reply is used
+        the same way. A link FAILURE (endpoint unreachable, timed
+        out, unusable answer) raises DecisionLinkError — the event
+        was never decided, and callers hold it; a failure is never
+        dressed up as the agent's silence."""
+        fn = self._decision_callable
+        if fn is not None:
+            result = fn(ctx)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        if self.decision_endpoint is not None:
+            return await self._call_decision_endpoint(ctx)
+        return None
+
+    # Pre-1.3.5 name, kept as an alias (see _warn_if_brainless).
+    _call_brain = _call_decision
+
+    async def _call_decision_endpoint(self, ctx: dict):
+        """The out-call decision link (v1.3.5): POST the event, as
+        JSON, to the agent product's own local decision endpoint
+        and act on its reply. The endpoint speaks the decision
+        callable's language over HTTP — its reply body is the same
+        value a callable would return, JSON-encoded: a string (a
+        message reply / a work body), an object ({"body", "files",
+        "decline", ...}), or null (the agent chose silence). For
+        work, the reply may also carry "progress": [{"percent": n,
+        "note": str}] entries, which this client reports through
+        the normal progress path before acting on the result —
+        progress is the one ctx member that cannot cross HTTP as a
+        callable, so it travels as data instead. Config-only for
+        the agent product: expose the endpoint; no SDK code changes
+        are needed on its side."""
+        payload = {k: v for k, v in ctx.items()
+                   if k != "report_progress"}
+        url = self.decision_endpoint
+        timeout = DECISION_LINK_TIMEOUT_SECONDS
+
+        def _post() -> tuple[int, bytes]:
+            import urllib.error
+            import urllib.request
+            req = urllib.request.Request(
+                url, data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST")
+            try:
+                with urllib.request.urlopen(req,
+                                            timeout=timeout) as resp:
+                    return resp.status, resp.read()
+            except urllib.error.HTTPError as exc:
+                return exc.code, exc.read() or b""
+
+        try:
+            status, raw = await asyncio.to_thread(_post)
+        except Exception as exc:  # noqa: BLE001 - any transport failure
+            raise DecisionLinkError(
+                f"decision endpoint {url} unreachable: {exc}") from exc
+        if status == 204 or (status == 200 and not raw.strip()):
+            return None  # the agent chose silence
+        if status != 200:
+            raise DecisionLinkError(
+                f"decision endpoint {url} answered HTTP {status}")
+        try:
+            result = json.loads(raw.decode("utf-8"))
+        except Exception:
+            # A non-JSON body is the agent's own plain words: a
+            # reply for a message, a delivery body for work.
+            text = raw.decode("utf-8", "replace").strip()
+            return text or None
+        if isinstance(result, dict) and ctx.get("kind") == "work":
+            progress = result.pop("progress", None)
+            report = ctx.get("report_progress")
+            if report is not None and isinstance(progress, list):
+                for entry in progress:
+                    if isinstance(entry, dict) \
+                            and entry.get("percent") is not None:
+                        await report(float(entry["percent"]),
+                                     str(entry.get("note") or ""))
         return result
 
     @staticmethod
@@ -2102,7 +2321,7 @@ class Agent:
         return f"dm:{msg.get('from')}", "dm"
 
     async def _auto_consider_message(self, msg: dict) -> None:
-        # Brain call through reply send = one critical operation
+        # Decision call through reply send = one critical operation
         # (update continuity): the swap waits for it to complete.
         async with self._critical_op("autonomous-message"):
             await self._auto_consider_message_inner(msg)
@@ -2125,8 +2344,12 @@ class Agent:
                 # the consecutive cap measures an UNINTERRUPTED run
                 # of autonomous replies.
                 self._auto_consec[conv] = 0
-            if self.brain is None:
-                self._auto_log("no_brain_silent", conv,
+            if self._decision_callable is None \
+                    and self.decision_endpoint is None:
+                # The link is not wired: the line holds. The event
+                # is neither answered nor marked read — it waits,
+                # exactly as the startup warning declared.
+                self._auto_log("decision_link_pending_silent", conv,
                                sender=sender)
                 return
             cap = AUTO_MAX_CONSECUTIVE_AUTO if peer_auto \
@@ -2160,19 +2383,30 @@ class Agent:
                 "recent": recent,
             }
             try:
-                reply = await self._call_brain(ctx)
+                reply = await self._call_decision(ctx)
+            except DecisionLinkError as exc:
+                # The LINK failed — the agent never decided. The
+                # message stays unanswered and unread (held), and
+                # the failure is logged as what it is: a
+                # connection-side fact, not the agent's silence.
+                log.warning("decision link failed on a message "
+                            "from @%s: %s", sender, exc)
+                self._auto_log("decision_link_error", conv,
+                               sender=sender)
+                return
             except Exception:
-                log.exception("brain failed on a message")
-                self._auto_log("brain_error", conv, sender=sender)
+                log.exception("decision callable failed on a message")
+                self._auto_log("decision_error", conv, sender=sender)
                 return
             if reply is None:
-                # The agent's own intelligence chose silence; that
-                # ends the exchange.
-                self._auto_log("brain_silent", conv, sender=sender)
+                # The agent's own decision-making chose silence;
+                # that ends the exchange.
+                self._auto_log("decision_silent", conv, sender=sender)
                 return
             text = str(reply)
             if self.auto_read:
-                # The brain genuinely took this message in.
+                # The agent genuinely took this message in, through
+                # its decision link.
                 self._queue_read(msg.get("id"))
             if kind == "dm":
                 await self.send_message(
@@ -2194,30 +2428,34 @@ class Agent:
             self._auto_log("error", conv)
 
     async def _run_autonomous_work(self, work: dict) -> None:
-        # Brain consideration through delivery/decline = one
+        # Decision consideration through delivery/decline = one
         # critical operation (update continuity).
         async with self._critical_op("autonomous-work"):
             await self._run_autonomous_work_inner(work)
 
     async def _run_autonomous_work_inner(self, work: dict) -> None:
         """The autonomous work path: an assignment is considered by
-        the agent's own brain, which may deliver, decline, or stay
-        silent — the runtime does none of those on its own authority.
-        A decline is the brain's own words, sent verbatim to the
-        assigner; the work itself is left untouched for the assigner
-        (never fake-delivered, never silently completed)."""
+        the agent's own decision-making, through its decision link,
+        which may deliver, decline, or stay silent — the runtime
+        does none of those on its own authority. A decline is the
+        agent's own words, sent verbatim to the assigner; the work
+        itself is left untouched for the assigner (never
+        fake-delivered, never silently completed)."""
         conv = (f"group:{work['group_id']}" if work.get("group_id")
                 else f"dm:{work.get('assigner')}")
         if work.get("status") not in ("assigned", "in_progress",
                                       "changes_requested"):
             return
-        if self.brain is None:
+        if self._decision_callable is None \
+                and self.decision_endpoint is None:
             log.warning(
-                "autonomous @%s received work %s but has NO brain "
-                "wired — leaving it untouched (no fabricated "
-                "delivery); it stays assigned for its assigner.",
-                self.username, work.get("id"))
-            self._auto_log("work_no_brain", conv, work_id=work.get("id"))
+                "autonomous @%s received work %s but its decision "
+                "link is not wired — leaving it untouched (no "
+                "fabricated delivery, nothing accepted on the "
+                "agent's behalf); it stays assigned for its "
+                "assigner.", self.username, work.get("id"))
+            self._auto_log("work_decision_link_pending", conv,
+                           work_id=work.get("id"))
             return
 
         async def _progress(percent: float, note: str = "") -> None:
@@ -2226,25 +2464,34 @@ class Agent:
         ctx = {"kind": "work", "agent": self._agent_profile(),
                "work": work, "report_progress": _progress}
         try:
-            result = await self._call_brain(ctx)
+            result = await self._call_decision(ctx)
+        except DecisionLinkError as exc:
+            # The LINK failed — the agent never decided. The work
+            # stays exactly where it was: unaccepted, undelivered.
+            log.warning("decision link failed on work %s: %s",
+                        work.get("id"), exc)
+            self._auto_log("work_decision_link_error", conv,
+                           work_id=work.get("id"))
+            return
         except Exception:
-            log.exception("brain failed on work %s", work.get("id"))
-            self._auto_log("work_brain_error", conv,
+            log.exception("decision callable failed on work %s",
+                          work.get("id"))
+            self._auto_log("work_decision_error", conv,
                            work_id=work.get("id"))
             return
         if result is None:
-            self._auto_log("work_brain_silent", conv,
+            self._auto_log("work_decision_silent", conv,
                            work_id=work.get("id"))
             return
         if isinstance(result, str):
             result = {"body": result}
         if not isinstance(result, dict):
-            self._auto_log("work_brain_bad_result", conv,
+            self._auto_log("work_decision_bad_result", conv,
                            work_id=work.get("id"))
             return
         decline = result.get("decline")
         if decline:
-            # The brain's own words, verbatim. Honest refusal beats
+            # The agent's own words, verbatim. Honest refusal beats
             # a fabricated delivery — always (fail-closed).
             try:
                 await self.send_message(
@@ -2927,8 +3174,8 @@ class Agent:
                         # No owner-registered work handler: in
                         # autonomous mode the runtime loop itself
                         # considers the assignment through the agent's
-                        # brain; in manual mode the work simply waits,
-                        # exactly as it always has.
+                        # decision link; in manual mode the work
+                        # simply waits, exactly as it always has.
                         if self._autonomous_on():
                             await self._run_autonomous_work(work)
                         return
@@ -3053,7 +3300,19 @@ class Agent:
         if ov:
             frame["oversight"] = ov
         data = await self._request(frame)
-        return [self._decrypt_work(w) for w in data["work"]]
+        out = []
+        for raw_w in data["work"]:
+            w = self._decrypt_work(raw_w)
+            if raw_w.get("notice"):
+                # Platform notice (v1.3.5): e.g. an assignee whose
+                # decision link is pending — the work parked safely
+                # and nothing was accepted on its behalf. The notice
+                # is the relay speaking about the LINK, never as the
+                # agent; it rides the assignment result so the
+                # assigner hears it in the same breath as the work.
+                w["notice"] = raw_w["notice"]
+            out.append(w)
+        return out
 
     async def assign_work_role(self, group_id: str, role: str, title: str,
                                instructions: str = "",
