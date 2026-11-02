@@ -266,9 +266,18 @@ def test_hello_timeout_then_retry_connects(state_root, monkeypatch):
                           dashboard_password="test-password",
                           dashboard_port=0)
             await relay.start()
-            ok = await wait_for(lambda: "patient" in relay.peers)
+            # Wait for BOTH sides to converge: the relay registers
+            # the peer the moment it answers the hello, but the
+            # client flips connection_state only after start()'s
+            # boot sequence (resume/resync/self-check round-trips)
+            # returns. Asserting the client flag on the server
+            # signal alone raced the boot sequence and flaked under
+            # load ('connecting' != 'connected'); the conjunction
+            # is the state this test actually means to prove.
+            ok = await wait_for(
+                lambda: "patient" in relay.peers
+                and agent.connection_state == "connected")
             assert ok, "client never connected after the window cleared"
-            assert agent.connection_state == "connected"
         finally:
             run_task.cancel()
             try:
