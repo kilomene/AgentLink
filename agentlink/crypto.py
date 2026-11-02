@@ -134,18 +134,7 @@ class Identity:
     # -- envelopes ------------------------------------------------------
     def encrypt_for(self, recipient_pub_b64: str, plaintext: bytes) -> dict:
         """Encrypt to a recipient's public key (ephemeral sender key)."""
-        eph = X25519PrivateKey.generate()
-        peer = X25519PublicKey.from_public_bytes(_unb64(recipient_pub_b64))
-        shared = eph.exchange(peer)
-        key = HKDF(algorithm=hashes.SHA256(), length=32,
-                   salt=None, info=_INFO).derive(shared)
-        nonce = secrets.token_bytes(12)
-        ct = ChaCha20Poly1305(key).encrypt(nonce, plaintext, None)
-        eph_pub = eph.public_key().public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        return {"v": 1, "alg": "x25519-chacha20poly1305",
-                "eph_pub": _b64(eph_pub), "nonce": _b64(nonce),
-                "ct": _b64(ct)}
+        return encrypt_to_pubkey(recipient_pub_b64, plaintext)
 
     def decrypt_envelope(self, envelope: dict) -> bytes:
         key = self._shared_key(envelope["eph_pub"])
@@ -156,6 +145,115 @@ class Identity:
         return self.encrypt_for(recipient_pub_b64, key_bytes)
 
     def unwrap_key(self, envelope: dict) -> bytes:
+        return self.decrypt_envelope(envelope)
+
+
+def encrypt_to_pubkey(recipient_pub_b64: str, plaintext: bytes) -> dict:
+    """Ephemeral-sender encryption to a bare X25519 public key — the
+    exact scheme of :meth:`Identity.encrypt_for`, usable without an
+    Identity (the sender needs no identity to seal TO a key)."""
+    eph = X25519PrivateKey.generate()
+    peer = X25519PublicKey.from_public_bytes(_unb64(recipient_pub_b64))
+    shared = eph.exchange(peer)
+    key = HKDF(algorithm=hashes.SHA256(), length=32,
+               salt=None, info=_INFO).derive(shared)
+    nonce = secrets.token_bytes(12)
+    ct = ChaCha20Poly1305(key).encrypt(nonce, plaintext, None)
+    eph_pub = eph.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return {"v": 1, "alg": "x25519-chacha20poly1305",
+            "eph_pub": _b64(eph_pub), "nonce": _b64(nonce),
+            "ct": _b64(ct)}
+
+
+# -- owner oversight (2026-11-01, owner's direct order) -------------------
+# The operator holds an OVERSIGHT keypair. Its PUBLIC key is public
+# config (relay-advertised in the welcome frame, or the client env
+# AGENTLINK_OVERSIGHT_PUBKEY); its PRIVATE key never leaves the
+# operator's dashboard host. Clients seal an extra copy of every
+# content payload (or of the symmetric content key) to the oversight
+# public key and attach it to the frame as ``oversight`` — the relay
+# stores/routes that wrap as ciphertext, exactly like all other
+# content, and can never open it. Only the dashboard, holding the
+# private key, can.
+#
+# Oversight key file format (written by `agentlink oversight-keygen`,
+# loaded by the dashboard via env AGENTLINK_OVERSIGHT_KEY_FILE) — a
+# single JSON object, file mode 0600:
+#   {"kind": "agentlink-oversight-key", "version": 1,
+#    "private_key": "<base64 raw 32-byte X25519 private key>",
+#    "public_key":  "<base64 raw 32-byte X25519 public key>",
+#    "created_at":  <epoch seconds>}
+
+OVERSIGHT_KEY_KIND = "agentlink-oversight-key"
+OVERSIGHT_KEY_VERSION = 1
+
+
+class OversightKey:
+    """The operator's oversight keypair (dashboard side)."""
+
+    def __init__(self, priv: X25519PrivateKey):
+        self._priv = priv
+
+    @classmethod
+    def generate(cls) -> "OversightKey":
+        return cls(X25519PrivateKey.generate())
+
+    @property
+    def public_key_b64(self) -> str:
+        raw = self._priv.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        return _b64(raw)
+
+    def _raw_private(self) -> bytes:
+        return self._priv.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption())
+
+    def save(self, path: str | Path) -> Path:
+        import time as _time
+        p = Path(path).expanduser()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "kind": OVERSIGHT_KEY_KIND,
+            "version": OVERSIGHT_KEY_VERSION,
+            "private_key": _b64(self._raw_private()),
+            "public_key": self.public_key_b64,
+            "created_at": int(_time.time())}))
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
+        return p
+
+    @classmethod
+    def load(cls, path: str | Path) -> "OversightKey":
+        data = json.loads(Path(path).expanduser().read_text())
+        if data.get("kind") != OVERSIGHT_KEY_KIND:
+            raise ValueError(f"{path}: not an oversight key file")
+        return cls(X25519PrivateKey.from_private_bytes(
+            _unb64(data["private_key"])))
+
+    def decrypt_envelope(self, envelope: dict) -> bytes:
+        """Open one oversight wrap (the encrypt_for envelope shape)."""
+        peer = X25519PublicKey.from_public_bytes(
+            _unb64(envelope["eph_pub"]))
+        shared = self._priv.exchange(peer)
+        key = HKDF(algorithm=hashes.SHA256(), length=32,
+                   salt=None, info=_INFO).derive(shared)
+        return ChaCha20Poly1305(key).decrypt(
+            _unb64(envelope["nonce"]), _unb64(envelope["ct"]), None)
+
+    def open_content(self, envelope: dict) -> dict:
+        """Wrap kind 'content': the wrapped plaintext is the content
+        payload JSON (1:1 messages, work assignments/deliveries)."""
+        return json.loads(self.decrypt_envelope(envelope))
+
+    def open_key(self, envelope: dict) -> bytes:
+        """Wrap kind 'content_key': the wrapped plaintext is the raw
+        symmetric content key (group/channel key, or a file key) that
+        decrypts the sibling content envelope via decrypt_with_key."""
         return self.decrypt_envelope(envelope)
 
 
