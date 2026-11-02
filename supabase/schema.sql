@@ -279,6 +279,13 @@ create table if not exists al_audit_log (
     content_envelope text not null default ''  -- group/channel frame content envelope {epoch, nonce, ct} (ciphertext only)
 );
 
+create table if not exists al_message_reads (
+    message_id text not null,           -- audit_log.ref_id of the message
+    reader text not null,
+    read_at bigint not null,            -- epoch seconds, FIRST read wins
+    primary key (message_id, reader)
+);
+
 create table if not exists al_dashboard_sessions (
     token_hash text primary key,        -- trusted-device token, hashed
     created_at bigint not null,
@@ -295,7 +302,7 @@ begin
         'al_queue','al_work','al_work_deliveries','al_work_checkpoints',
         'al_chains','al_chain_steps','al_blobs','al_upload_sessions',
         'al_library','al_vault','al_alerts','al_alert_dispatches',
-        'al_audit_log','al_dashboard_sessions']
+        'al_audit_log','al_message_reads','al_dashboard_sessions']
     loop
         execute format('alter table %I enable row level security', t);
         -- No policies for anon/authenticated: service role bypasses RLS
