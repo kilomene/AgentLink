@@ -37,6 +37,14 @@ CONTENT_AUDIT_KINDS = (
     "work_changes_requested", "work_progress",
     "work_awaiting_approval", "work_approved",
     "work_approval_rejected")
+# Voice-room lifecycle kinds (v1.3.4): room state is written to the
+# audit log by whichever relay hosts the room's signalling, so the
+# dashboard's Voice Rooms view can be composed from the SHARED store
+# — the full lifecycle, oldest first, no window — instead of from one
+# relay's local memory (which showed nothing for rooms hosted by a
+# brother server).
+ROOM_AUDIT_KINDS = (
+    "room_opened", "room_joined", "room_left", "room_closed")
 PRIORITY_WEIGHT = {"normal": 0, "high": 1, "urgent": 2}
 MAX_CHANNEL_SUBSCRIBERS = 1000
 CHUNK_SIZE = 1024 * 1024
@@ -450,6 +458,13 @@ class Store:
                     carry_lease_until INTEGER NOT NULL DEFAULT 0,
                     carry_claimed_at INTEGER NOT NULL DEFAULT 0,
                     can_carry INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE IF NOT EXISTS connections (
+                    username TEXT PRIMARY KEY,
+                    server_id TEXT NOT NULL DEFAULT '',
+                    endpoint TEXT NOT NULL DEFAULT '',
+                    home_endpoint TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL DEFAULT 0
                 );
                 """
             )
@@ -1270,6 +1285,75 @@ class Store:
                 "SELECT last_seen FROM users WHERE username = ?",
                 (username,)).fetchone()
         return int(row["last_seen"]) if row else 0
+
+    # -- connection registry (v1.3.4 presence truth) ---------------------
+    # Presence USED to be read off the serving relay's local peer
+    # table, so an agent connected to a BROTHER server read "offline"
+    # on this server's dashboard while it was online and working —
+    # the dashboard stated a local guess as a backend fact. The cure
+    # is recorded fact: every hello (and every heartbeat cadence
+    # thereafter) notes WHERE the agent is connected in the shared
+    # store, so every dashboard on every server composes the same
+    # backend-wide truth: online from the shared last_seen, and the
+    # current server from the freshest connection note.
+
+    def note_connection(self, username: str, server_id: str,
+                        endpoint: str, home_endpoint: str) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO connections (username, server_id,"
+                " endpoint, home_endpoint, updated_at)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(username) DO UPDATE SET"
+                " server_id = excluded.server_id,"
+                " endpoint = excluded.endpoint,"
+                " home_endpoint = excluded.home_endpoint,"
+                " updated_at = excluded.updated_at",
+                (username, server_id or "", endpoint or "",
+                 home_endpoint or "", now_ts()))
+            self._db.commit()
+
+    def connections_map(self) -> dict:
+        """username -> its freshest connection note (the server it
+        most recently said hello / heartbeat on, anywhere in the
+        backend). Callers apply the presence grace to updated_at."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT username, server_id, endpoint, home_endpoint,"
+                " updated_at FROM connections").fetchall()
+        return {r["username"]: dict(r) for r in rows}
+
+    def list_room_audit(self) -> list[dict]:
+        """EVERY voice-room lifecycle row, oldest first, no limit —
+        the shared-store source for the dashboard's Voice Rooms
+        view (parity with list_content_audit's no-window rule)."""
+        marks = ",".join("?" * len(ROOM_AUDIT_KINDS))
+        with self._lock:
+            rows = self._db.execute(
+                self._AUDIT_COLS + f" WHERE kind IN ({marks})"
+                " ORDER BY seq ASC", ROOM_AUDIT_KINDS).fetchall()
+            return self._shape_audit_rows(rows)
+
+    def dashboard_digest(self) -> str:
+        """A cheap change signal over the backend facts the
+        dashboard renders: the newest presence beat, the connection
+        registry's shape, the server registry's newest heartbeat and
+        the audit tail. The dashboard's push loop compares it once a
+        second; a change means SOMETHING happened on SOME server, so
+        the open page rebuilds and pushes — real-time reflection of
+        backend-wide state, not just of the serving relay's own
+        events."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT"
+                " (SELECT COALESCE(MAX(last_seen), 0) FROM users),"
+                " (SELECT COUNT(*) FROM connections),"
+                " (SELECT COALESCE(MAX(updated_at), 0)"
+                "   FROM connections),"
+                " (SELECT COALESCE(MAX(last_seen), 0) FROM servers),"
+                " (SELECT COALESCE(MAX(seq), 0) FROM audit_log)"
+            ).fetchone()
+        return "|".join(str(int(v or 0)) for v in row)
 
     # -- server registry (v1.2.0 peer mesh) --------------------------------
     # Every relay registers ITSELF in the shared backend on boot and
