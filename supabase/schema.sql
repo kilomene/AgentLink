@@ -297,17 +297,46 @@ create table if not exists al_dashboard_sessions (
 -- itself on boot and heartbeats the row (5s); clients discover the
 -- live mesh from any relay and race home + peers. Stale rows (no
 -- heartbeat for 20s) are never offered as peers.
+--
+-- v1.3.0 server carrying + earned health:
+--   * health is EARNED by the server's test battery (-1 = UNRATED,
+--     still in the test battery, no percentage earned) — it is
+--     never assigned.
+--   * owner_agent is PERMANENT ownership of a per-agent server
+--     ('' = shared/platform relay).
+--   * carried_by is a TEMPORARY helper agent running the server
+--     while carried — it is never the owner and carrying is never
+--     a transfer of ownership.
 create table if not exists al_servers (
     endpoint text primary key,          -- the relay's public wss endpoint
     label text not null default '',     -- friendly name ("Phoenix Home Relay")
     host_agent text not null default '',-- username of the hosting agent
     version text not null default '',   -- relay package version
-    health integer not null default 100,-- health % from real signals
+    health integer not null default -1, -- EARNED health % from the server's test battery; -1 = UNRATED (still in test battery, no percentage earned), never assigned
     riders integer not null default 0,  -- agents currently riding here
     capacity integer not null default 10,-- floor(10 x health/100), max 10
     last_seen bigint not null default 0,-- registry heartbeat, epoch seconds
-    first_seen bigint not null default 0
+    first_seen bigint not null default 0,
+    server_id text not null default '', -- stable server identity (survives endpoint changes while carried)
+    owner_agent text not null default '', -- PERMANENT owner of a per-agent server; '' = shared/platform relay
+    home_host text not null default '', -- host agent of the server's home machine
+    home_endpoint text not null default '', -- the server's permanent home endpoint
+    home_last_seen bigint not null default 0, -- last heartbeat of the HOME instance
+    home_healthy_since bigint not null default 0, -- start of the home instance's current continuous healthy streak
+    home_health integer not null default -1, -- home instance's last earned health (-1 = unrated)
+    home_riders integer not null default 0,
+    home_capacity integer not null default 0,
+    carry_state text not null default '', -- '' shared relay; 'home' | 'carried' | 'down' for per-agent servers
+    carried_by text not null default '', -- TEMPORARY helper agent running the server while carried (never the owner)
+    carried_by_id text not null default '', -- helper's server_id
+    carry_endpoint text not null default '', -- endpoint the server is currently served at while carried
+    carry_lease_token text not null default '', -- single-winner claim lease token
+    carry_lease_until bigint not null default 0, -- lease expiry (epoch seconds)
+    carry_claimed_at bigint not null default 0,
+    can_carry integer not null default 1 -- 1 if this relay instance is carry-capable
 );
+
+create unique index if not exists al_servers_server_id_key on al_servers(server_id);
 
 -- ------------------------------------------------------------ RLS lockdown
 do $$
