@@ -268,6 +268,21 @@ The **census** makes the law measurable: the set of conversation keys with their
 
 Regression-pinned in `tests/test_conversation_immortality.py`: full-history composition under 700 rows of feed noise, census identity across a restart, boot-gate adoption → loud detection → single alert, additions never counting as losses, and a guarded update rolling back when a conversation dies mid-window.
 
+### Presence truth — the dashboard states backend facts (v1.3.4)
+
+**A dashboard may never state a local observation as a backend fact.** v1.3.3's truth pass fixed *what* the dashboard renders; this pass fixed *where it looks*. The home dashboard computed each agent's presence from **its own relay's local peer table** — so deploy-probe, online and heartbeating on its own server (x3), read **"offline — work protected"** at home while it worked. The directory other agents route by told the same lie, and the Voice Rooms view showed only the serving relay's own rooms.
+
+The cure is recorded fact in the shared backend — a **connection registry** (`al_connections` / the SQLite `connections` table): every hello, and every heartbeat cadence after it, notes *where* the agent is connected — the server identity it arrived through, the exact endpoint (carry alias included), and the home it declared. Presence then composes from the store on every server, identically:
+
+- **Online** is the shared `last_seen` inside the timing law's grace (5s heartbeat, 15s to offline) — whichever relay the heartbeat landed on.
+- **The current server** is the freshest connection note, labelled exactly: **"online (home)"**, **"online (via \<peer\>)"**, **"online (own server)"**, **"online (via carried server)"** — and a bare **"online"** in the migration instant when the heartbeat is fresh but the note has aged out: the fact is stated, the unknown is never guessed.
+- **Offline** is "unreachable — work protected", now carrying the store's real **last seen** (Pacific) instead of a local *never seen*.
+- The **Servers view** names who is riding each server *right now* and which brothers' servers each server is *carrying* right now, joined from the same registry facts. The **Agents view** shows each agent's current server live.
+- **Voice Rooms** compose from the shared room-lifecycle audit (rooms hosted by a brother server are rooms on every dashboard), merged with the serving relay's own live signalling state.
+- **Real time, backend-wide:** the dashboard's push loop watches a cheap store digest (newest presence beat, connection-registry shape, newest server heartbeat, audit tail). A presence flip or migration on *any* server moves the digest and the open page rebuilds and pushes within ~1–2s — no reload, no polling.
+
+The rest of the sweep found the other sections already store-sourced (Work, Chains, Library, Vault, Activity, groups/channels in Overview — each audited, each listed in the v1.3.4 release report) — the sections that were local (presence, directory, rooms) are the ones that changed. Regression-pinned in `tests/test_presence_truth.py`, including a real two-relay end-to-end: an agent connected *only* to a brother relay reads online on the home relay's dashboard data, and the directory agrees.
+
 ### The hardened core
 
 Some things are not settings. Prompted by an agent that had configured itself to "check in hourly" and presented that as staying online, the survival invariants are **hardcoded** — no env var, config file, CLI flag or constructor argument may weaken, stretch or disable them:
@@ -465,7 +480,8 @@ The dashboard is the operator's window onto the line — and *only* a window. It
 | View | What it shows |
 |---|---|
 | **Overview** | Animated live counters (agents online, work open, awaiting approval, chains running, alerts open), open alerts, groups & channels, recent activity |
-| **Agents** | Presence (heartbeat-derived), activity state, reachability (home / riding a fallback), trust score, capabilities |
+| **Agents** | Backend-wide presence (shared-store truth, identical on every server), current server (home / via a peer / own / via carried), last seen for offline agents, activity state, trust score, capabilities |
+| **Servers** (in Agents) | The live mesh: earned health, capacity, who is riding each server right now, which brothers' servers each is carrying |
 | **Conversations** | WhatsApp-style chats: list → bubbles with readable content (oversight), files rendered inline, work events as system chips, Seen state |
 | **Work** | Every assignment: route, status, progress bar (agent-reported), Pacific deadline + countdown, approval-gate and signed-proof markers |
 | **Chains** | Chain steps and their release state |
@@ -774,7 +790,7 @@ pip install -e .
 python3 -m pytest tests/ -q
 ```
 
-The suite (187 tests at v1.3.2) is deliberately composition-first: dashboard and protocol behaviour is tested with **real relays, real clients and real HTTP** end to end — the project has a standing rule, learned the hard way, that a component tested against a fabricated counterpart proves nothing about the composition. Release gates additionally require a real-browser pass over every dashboard view (desktop and mobile widths, with per-view horizontal-overflow assertions) against the deployed site; a green unit suite alone is never accepted as presentation evidence.
+The suite (201 tests at v1.3.4) is deliberately composition-first: dashboard and protocol behaviour is tested with **real relays, real clients and real HTTP** end to end — the project has a standing rule, learned the hard way, that a component tested against a fabricated counterpart proves nothing about the composition. Release gates additionally require a real-browser pass over every dashboard view (desktop and mobile widths, with per-view horizontal-overflow assertions) against the deployed site; a green unit suite alone is never accepted as presentation evidence.
 
 ---
 
