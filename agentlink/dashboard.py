@@ -477,6 +477,60 @@ class DashboardServer:
                 return f
         return None
 
+    def _targeted_audit_rows(self, data) -> list:
+        """Audit rows for exactly the ids this payload references
+        (conversation items, activity rows, library works) — the
+        oversight fallback and library resolution fetch ONLY what
+        they need, by id (v1.3.2). The pre-1.3.2 code scanned
+        list_audit(500) — the newest 500 rows of every kind — so an
+        older item's wrap fell out of the window and older library
+        entries misreported themselves 'sealed before owner
+        oversight' while their delivery rows sat intact in the
+        store. Stub stores without the targeted fetch keep the old
+        scan (test doubles only; shipped stores all have it)."""
+        ids = []
+        for c in data.get("conversations", []):
+            for item in c.get("items", []):
+                if item.get("id"):
+                    ids.append(item["id"])
+        for row in data.get("activity", []):
+            if row.get("ref_id"):
+                ids.append(row["ref_id"])
+            if row.get("work_id"):
+                ids.append(row["work_id"])
+        for e in data.get("library", []):
+            if e.get("work_id"):
+                ids.append(e["work_id"])
+        store = self.relay.store
+        fetch = getattr(store, "audit_rows_for_ids", None)
+        if fetch is not None:
+            if not ids:
+                return []
+            try:
+                return fetch(ids)
+            except Exception:
+                return []
+        try:
+            return store.list_audit(500)
+        except Exception:
+            return []
+
+    def _audit_for_work(self, entry) -> list:
+        """Every audit row for one library entry's work id (the
+        delivery row carries the oversight wrap) — targeted, any
+        age (v1.3.2)."""
+        store = self.relay.store
+        fetch = getattr(store, "audit_for_work", None)
+        if fetch is not None:
+            try:
+                return fetch(entry.get("work_id") or "")
+            except Exception:
+                return []
+        try:
+            return store.list_audit(500)
+        except Exception:
+            return []
+
     def _library_source(self, entry, audit_rows=None):
         """Resolve a library entry to its download source, or None
         when no usable oversight chain exists. Cached per entry;
@@ -486,10 +540,7 @@ class DashboardServer:
         if lid in self._library_src:
             return self._library_src[lid]
         if audit_rows is None:
-            try:
-                audit_rows = self.relay.store.list_audit(500)
-            except Exception:
-                audit_rows = []
+            audit_rows = self._audit_for_work(entry)
         seen_delivery = False
         resolved = None
         for r in audit_rows:
@@ -623,10 +674,7 @@ class DashboardServer:
         data = self.relay._dashboard_data()
         data["oversight_enabled"] = self._oversight is not None
         audit_ov = {}
-        try:
-            rows = self.relay.store.list_audit(500)
-        except Exception:
-            rows = []
+        rows = self._targeted_audit_rows(data)
         for r in rows:
             if isinstance(r, dict) and isinstance(r.get("oversight"), dict):
                 audit_ov[(r.get("ref_id") or r.get("work_id") or "",
