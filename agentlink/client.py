@@ -43,11 +43,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import inspect
 import json
 import logging
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -55,7 +57,8 @@ import websockets.exceptions
 from websockets.client import connect
 
 from .config import resolve_endpoint, resolve_fallbacks, \
-    resolve_oversight_pubkey
+    resolve_oversight_pubkey, resolve_update_check_seconds, \
+    self_update_enabled
 from .deadlines import pacific_display
 from .timing import (
     AUTO_HOURLY_BUDGET,
@@ -255,6 +258,11 @@ class TaskJournal:
             (json.dumps(data), int(_t.time()), work_id))
         self._db.commit()
 
+    def flush(self) -> None:
+        """Force any pending journal write to disk (every journal
+        write already commits; this is the pre-update belt pin)."""
+        self._db.commit()
+
 
 class _JournalOK(Exception):
     pass
@@ -369,6 +377,26 @@ class Agent:
         self._auto_consec: dict[str, int] = {}
         self._auto_sent: dict[str, list[float]] = {}
         self._auto_warned_no_brain = False
+        # In-daemon self-update (v1.1.8): the checker task lives for
+        # the whole daemon lifetime (across reconnect cycles). The
+        # 15-minute check runs INSIDE the agent — the previous design
+        # scheduled it through the host's crontab, and an agent on a
+        # cron-less sandbox was silently stranded on its install
+        # version forever (owner-reported defect, 2026-11-02).
+        self._update_task: asyncio.Task | None = None
+        # Update continuity (v1.1.8 safety law: an update must never
+        # destroy or corrupt ongoing work): _op_count tracks the
+        # NON-checkpointable operations in flight — a brain call
+        # between invocation and its reply being sent, a handler
+        # producing a reply, a delivery frame in transit, one upload
+        # chunk in transit. A self-update swap waits for the count
+        # to drain (bounded) before it may proceed. Everything else
+        # — work execution, uploads between chunks, queued reads —
+        # is checkpointed durable state and resumes exactly-once
+        # after the re-exec, so it never blocks an update.
+        self._op_count = 0
+        self._ops_idle = asyncio.Event()
+        self._ops_idle.set()
         # Rich, decrypted views (handlers and tests read these).
         self.messages: list[dict] = []
         self.group_events: list[dict] = []
@@ -722,6 +750,7 @@ class Agent:
                         log.exception("resume/resync pass failed")
                     finally:
                         self._boot_gate.set()
+                self._load_pending_reads()
                 if self._pending_reads:
                     # Receipts that failed to flush while offline
                     # retry on every (re)connect.
@@ -741,6 +770,9 @@ class Agent:
             pass
 
     async def close(self) -> None:
+        if self._update_task is not None:
+            self._update_task.cancel()
+            self._update_task = None
         if self._read_flush_task is not None:
             self._read_flush_task.cancel()
             self._read_flush_task = None
@@ -756,6 +788,7 @@ class Agent:
 
     async def serve(self) -> None:
         assert self._ws is not None, "call start() first"
+        self._ensure_update_checker()
         if self._reader is not None:
             try:
                 await self._reader
@@ -765,6 +798,222 @@ class Agent:
                 if self._reader is not None:
                     self._reader.cancel()
                 raise
+
+    # -- in-daemon self-update (v1.1.8) --------------------------------
+    # The updater lives WITH the agent. Every UPDATE_CHECK_SECONDS
+    # (timing law: 15 min) the running daemon checks the repo itself,
+    # applies a verified update through the staged path, and restarts
+    # by re-exec — no crontab, no systemd timer, no supervisor, no
+    # host facility of any kind is required, so the agent is
+    # self-maintaining on any host that can run the agent itself.
+
+    def _ensure_update_checker(self) -> None:
+        if self._update_task is not None and not self._update_task.done():
+            return
+        if self.ephemeral or not self.username:
+            return  # dial/ephemeral clients are not installations
+        if not self_update_enabled():
+            log.info("self-update: in-daemon checker disabled via"
+                     " AGENTLINK_SELF_UPDATE")
+            return
+        self._update_task = asyncio.create_task(self._update_check_loop())
+
+    @contextlib.asynccontextmanager
+    async def _critical_op(self, label: str):
+        """Mark a non-checkpointable operation in flight (update
+        continuity law). While any critical operation runs, a
+        self-update swap waits; checkpointable work never enters
+        here, so a busy agent still updates on time."""
+        self._op_count += 1
+        self._ops_idle.clear()
+        try:
+            yield
+        finally:
+            self._op_count -= 1
+            if self._op_count <= 0:
+                self._op_count = 0
+                self._ops_idle.set()
+
+    async def _wait_for_ops_drain(self, timeout: float) -> bool:
+        """True when no critical operation is in flight (immediately,
+        or within ``timeout`` as running operations complete)."""
+        if self._op_count == 0:
+            return True
+        log.info("self-update: waiting up to %gs for %d in-flight"
+                 " operation(s) to finish before swapping", timeout,
+                 self._op_count)
+        try:
+            await asyncio.wait_for(self._ops_idle.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        return self._op_count == 0
+
+    async def _pre_update_checkpoint(self) -> None:
+        """Update safety law: before a swap/re-exec, flush every
+        durable obligation into the agent home.
+
+        * work journal — assignments + checkpoints live in SQLite,
+          committed per write; force a final commit here.
+        * work checkpoints — written journal-first + relay-mirrored
+          by checkpoint() at the moment the agent records them;
+          nothing extra is owed at update time.
+        * read cursors — attempt an immediate bounded flush of
+          pending receipts; whatever remains is already persisted
+          to disk (pending-reads-<user>.json) and is picked up by
+          the next process on connect.
+        The updater itself writes NOTHING in the state dir except
+        its own staging/backup areas — identity, config, the
+        journal and the state DBs are never touched by an update.
+        """
+        if self._pending_reads:
+            ids = sorted(self._pending_reads)
+            try:
+                await asyncio.wait_for(
+                    self._request({"type": "read", "ids": ids}),
+                    timeout=10)
+                self._pending_reads.difference_update(ids)
+                self._persist_pending_reads()
+            except Exception:
+                log.info("self-update: %d read receipt(s) could not"
+                         " flush pre-update; they are persisted and"
+                         " will flush after the restart",
+                         len(self._pending_reads))
+        if self._journal is not None:
+            try:
+                self._journal.flush()
+            except Exception:
+                log.exception("self-update: journal flush failed")
+        log.info("self-update: pre-update checkpoint complete"
+                 " (journal flushed, %d read receipt(s) pending,"
+                 " all durable state in the agent home)",
+                 len(self._pending_reads))
+
+    async def _update_check_loop(self) -> None:
+        from .timing import UPDATE_DRAIN_WAIT_SECONDS
+        from .updater import Updater
+        interval = resolve_update_check_seconds()
+        feed = Updater(state_dir=self.state_dir).base
+        log.info("self-update: in-daemon checker armed — feed %s,"
+                 " check every %gs, next check in %gs (no host cron"
+                 " required)", feed, interval, interval)
+        while True:
+            await asyncio.sleep(interval)
+            # Phase 1 (worker thread): fetch the manifest, verify
+            # every changed file's SHA-256, stage the new tree and
+            # smoke-test it — all WITHOUT touching the running code.
+            try:
+                prepared = await asyncio.to_thread(
+                    self._self_update_prepare)
+            except Exception:
+                log.exception("self-update: prepare crashed; the"
+                              " checker continues and will retry")
+                continue
+            if prepared.get("error"):
+                # Loud, and the agent keeps running its current
+                # code — a bad feed or a corrupt file never strands
+                # or breaks a running agent.
+                log.error("self-update: check failed: %s (still"
+                          " running current code; will retry next"
+                          " check)", prepared["error"])
+                continue
+            if not prepared.get("prepared"):
+                continue  # up to date, or files already match
+            # Phase 2 (continuity law): the update is READY. Wait —
+            # bounded — for any brain call / delivery / upload chunk
+            # in flight to finish. On timeout the update DEFERS to
+            # the next check; it never interrupts an operation.
+            if not await self._wait_for_ops_drain(
+                    UPDATE_DRAIN_WAIT_SECONDS):
+                log.warning(
+                    "self-update: %s is staged and smoke-tested but"
+                    " operations are still in flight after %gs —"
+                    " deferring the swap to the next check (an"
+                    " update never interrupts a brain call, a"
+                    " delivery, or an upload)",
+                    prepared["new_version"], UPDATE_DRAIN_WAIT_SECONDS)
+                await asyncio.to_thread(self._self_update_discard,
+                                        prepared)
+                continue
+            # Phase 3: checkpoint all durable state to the agent home.
+            await self._pre_update_checkpoint()
+            # Phase 4 (worker thread): rollback backup + atomic swap
+            # + health check (automatic rollback on failure).
+            try:
+                outcome = await asyncio.to_thread(
+                    self._self_update_finish, prepared)
+            except Exception:
+                log.exception("self-update: apply crashed; the"
+                              " checker continues and will retry")
+                continue
+            if outcome.get("error"):
+                log.error("self-update: apply failed: %s (still"
+                          " running current code)", outcome["error"])
+                continue
+            if outcome.get("updated"):
+                log.warning("self-update: installed %s -> %s"
+                            " (backup %s); restarting self via"
+                            " re-exec", outcome.get("from"),
+                            outcome.get("to"), outcome.get("backup"))
+                self._restart_self()
+                # _restart_self returns only when exec was impossible
+                # (e.g. empty sys.argv under an embedding host): the
+                # new code is on disk; the loop keeps running and
+                # later ticks no-op (files already match).
+
+    def _self_update_prepare(self) -> dict:
+        """Phase 1 of a check (worker thread; feed I/O never stalls
+        the connection loop). Never raises for feed problems — the
+        outcome is reported in the returned dict."""
+        from .updater import UpdateError, Updater
+        up = Updater(state_dir=self.state_dir)
+        try:
+            manifest = up.fetch_manifest()
+            return up.prepare_staged(manifest)
+        except UpdateError as exc:
+            return {"error": str(exc)}
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def _self_update_finish(self, prepared: dict) -> dict:
+        """Phase 4 (worker thread). Never raises for apply problems."""
+        from .updater import UpdateError, Updater
+        try:
+            return Updater(state_dir=self.state_dir).finish_staged(
+                prepared)
+        except UpdateError as exc:
+            return {"updated": False, "error": str(exc)}
+        except Exception as exc:
+            return {"updated": False,
+                    "error": f"{type(exc).__name__}: {exc}"}
+
+    def _self_update_discard(self, prepared: dict) -> None:
+        from .updater import Updater
+        Updater(state_dir=self.state_dir).discard_staged(prepared)
+
+    def _restart_self(self) -> None:
+        """Re-exec the same entrypoint/argv so the new code runs —
+        works with no systemd, no cron, no supervisor. On success
+        this never returns (the process image is replaced; the new
+        process hellos and reconnects through the normal machinery).
+        """
+        argv = list(sys.argv)
+        if not argv:
+            log.error("self-update: cannot re-exec (empty sys.argv);"
+                      " the new code is on disk — restart the daemon"
+                      " to pick it up")
+            return
+        log.warning("self-update: re-exec %s %s", sys.executable, argv)
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        try:
+            os.execv(sys.executable, [sys.executable, *argv])
+        except Exception:
+            log.exception("self-update: re-exec failed; the new code"
+                          " is on disk — restart the daemon to pick"
+                          " it up")
 
     async def run(self, reconnect_delay: float = 2.0,
                   home_probe_interval: float = HOME_PROBE_SECONDS) -> None:
@@ -1355,6 +1604,14 @@ class Agent:
             asyncio.create_task(self._auto_consider_message(msg))
 
     async def _run_message_handler(self, handler, msg: dict) -> None:
+        # The handler invocation + the reply send are ONE critical
+        # operation for update continuity: a self-update never
+        # re-execs between a handler finishing and its reply landing.
+        async with self._critical_op("message-reply"):
+            await self._run_message_handler_inner(handler, msg)
+
+    async def _run_message_handler_inner(self, handler,
+                                         msg: dict) -> None:
         try:
             result = handler(msg)
             if inspect.isawaitable(result):
@@ -1456,6 +1713,12 @@ class Agent:
         return f"dm:{msg.get('from')}", "dm"
 
     async def _auto_consider_message(self, msg: dict) -> None:
+        # Brain call through reply send = one critical operation
+        # (update continuity): the swap waits for it to complete.
+        async with self._critical_op("autonomous-message"):
+            await self._auto_consider_message_inner(msg)
+
+    async def _auto_consider_message_inner(self, msg: dict) -> None:
         conv = ""
         try:
             sender = msg.get("from")
@@ -1542,6 +1805,12 @@ class Agent:
             self._auto_log("error", conv)
 
     async def _run_autonomous_work(self, work: dict) -> None:
+        # Brain consideration through delivery/decline = one
+        # critical operation (update continuity).
+        async with self._critical_op("autonomous-work"):
+            await self._run_autonomous_work_inner(work)
+
+    async def _run_autonomous_work_inner(self, work: dict) -> None:
         """The autonomous work path: an assignment is considered by
         the agent's own brain, which may deliver, decline, or stay
         silent — the runtime does none of those on its own authority.
@@ -1718,11 +1987,15 @@ class Agent:
         sent = 0
         for index in status["missing"]:
             chunk = data[index * chunk_size:(index + 1) * chunk_size]
-            await self._request({
-                "type": "blob_chunk", "session_id": session_id,
-                "index": index,
-                "chunk_sha": _hl.sha256(chunk).hexdigest(),
-                "data_b64": base64.b64encode(chunk).decode()})
+            # One chunk in transit is a critical operation; BETWEEN
+            # chunks is a safe point — the session lives server-side
+            # and a restarted uploader sends only the missing chunks.
+            async with self._critical_op("blob-chunk"):
+                await self._request({
+                    "type": "blob_chunk", "session_id": session_id,
+                    "index": index,
+                    "chunk_sha": _hl.sha256(chunk).hexdigest(),
+                    "data_b64": base64.b64encode(chunk).decode()})
             sent += 1
             if interrupt_after is not None and sent >= interrupt_after:
                 raise ConnectionError(
@@ -1913,6 +2186,41 @@ class Agent:
             return {"read": [], "reads": []}
         return await self._request({"type": "read", "ids": ids})
 
+    def _pending_reads_path(self) -> Path:
+        return Path(self.state_dir) / f"pending-reads-{self.username}.json"
+
+    def _persist_pending_reads(self) -> None:
+        """Read cursors are durable state: pending receipts are
+        mirrored to the agent home on every change, so a restart —
+        including a self-update re-exec — never loses one."""
+        if not self.username:
+            return
+        path = self._pending_reads_path()
+        try:
+            if not self._pending_reads:
+                path.unlink(missing_ok=True)
+                return
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(sorted(self._pending_reads)))
+            os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        except Exception:
+            log.exception("persisting pending reads failed")
+
+    def _load_pending_reads(self) -> None:
+        if not self.username:
+            return
+        try:
+            raw = self._pending_reads_path().read_text()
+            self._pending_reads.update(str(i) for i in json.loads(raw))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            log.exception("loading pending reads failed")
+
     def _queue_read(self, message_id: str | None) -> None:
         """Auto-read plumbing: accumulate ids and flush ONE read
         frame per burst — a reconnect can deliver a whole queue of
@@ -1920,6 +2228,7 @@ class Agent:
         if not message_id:
             return
         self._pending_reads.add(str(message_id))
+        self._persist_pending_reads()
         task = self._read_flush_task
         if task is None or task.done():
             self._read_flush_task = asyncio.create_task(
@@ -1933,12 +2242,14 @@ class Agent:
                 self._pending_reads.clear()
                 try:
                     await self._request({"type": "read", "ids": ids})
+                    self._persist_pending_reads()
                 except Exception:
                     # Offline / relay error: keep the ids pending —
                     # the next queued read or the next start() (the
                     # reconnect path) retries the flush. Receipts are
                     # never silently dropped by this client.
                     self._pending_reads.update(ids)
+                    self._persist_pending_reads()
                     return
         except asyncio.CancelledError:
             raise
@@ -2390,6 +2701,14 @@ class Agent:
 
     async def deliver_work(self, work_id: str, body: str = "",
                            files: list[str] | None = None) -> dict:
+        # A delivery in transit is a critical operation: a
+        # self-update waits for the frame to land before it swaps.
+        async with self._critical_op("delivery"):
+            return await self._deliver_work_inner(work_id, body, files)
+
+    async def _deliver_work_inner(self, work_id: str, body: str = "",
+                                  files: list[str] | None = None
+                                  ) -> dict:
         inbox = await self.work_inbox()
         mine = next((w for w in inbox if w["id"] == work_id), None)
         if mine is None:
