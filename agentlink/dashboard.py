@@ -2837,6 +2837,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
  .chatpane{flex:1;display:flex;flex-direction:column;min-width:0;
    background:rgba(255,255,255,.22)}
  .chatempty{margin:auto;color:var(--muted);font-size:14px;padding:30px;text-align:center}
+ .chatempty-note{margin:auto;color:var(--muted);font-size:14px;padding:30px;text-align:center;line-height:1.6}
  .chathead{display:flex;gap:11px;align-items:center;padding:11px 16px;
    border-bottom:1px solid var(--line);background:rgba(255,255,255,.5);
    backdrop-filter:blur(12px)}
@@ -3264,7 +3265,9 @@ function renderChat(){
     return '<div class="chatrow" data-key="'+esc(c.key)+'">'+
       '<div class="avatar '+(c.group_id?'grp':'')+'">'+esc(initials(t))+'</div>'+
       '<div class="cmain"><div class="cname">'+esc(t)+'</div>'+
-      '<div class="cprev">'+esc(previewOf(li))+'</div></div>'+
+      '<div class="cprev">'+esc(li?previewOf(li):
+        (c.kind==='channel'?'Broadcast channel — no posts yet':
+         c.kind==='group'?'Group created — no messages yet':''))+'</div></div>'+
       '<div class="cside"><div class="ctime">'+(li?ptTime(li.ts):'')+'</div>'+
       '<div class="countbadge">'+c.items.length+'</div></div></div>'; },
     (node,c)=>{ node.onclick=()=>{
@@ -3298,7 +3301,17 @@ function renderChat(){
   const bb=head.querySelector('.backbtn');
   if(bb) bb.onclick=()=>{ location.hash='#/conversations'; };
   const nearBottom=msgs.scrollHeight-msgs.scrollTop-msgs.clientHeight<140;
-  keyed(msgs, c.items, i=>[i.id,i.kind,i.ts].join('|'), i=>itemHtml(c,i));
+  if(!c.items.length){
+    /* A conversation with no messages yet still OPENS as a chat —
+       an empty thread, never an absence (v1.3.3). */
+    msgs.innerHTML='<div class="chatempty-note">No messages yet.'+
+      '<br><small>This conversation starts here — everything said in '+
+      'it will live on this line.</small></div>';
+  } else {
+    const staleNote=msgs.querySelector('.chatempty-note');
+    if(staleNote) staleNote.remove();
+    keyed(msgs, c.items, i=>[i.id,i.kind,i.ts].join('|'), i=>itemHtml(c,i));
+  }
   if(chatJustOpened||nearBottom) msgs.scrollTop=msgs.scrollHeight;
   chatJustOpened=false;
 }
