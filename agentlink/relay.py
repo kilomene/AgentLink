@@ -83,6 +83,16 @@ class Relay:
                        str(ALERT_REMINDER_SECONDS))))
     alert_webhook: str = field(default_factory=lambda: os.environ.get(
         "AGENTLINK_ALERT_WEBHOOK", ""))
+    # Owner oversight (2026-11-01): the oversight PUBLIC key this
+    # relay advertises in every welcome frame (clients adopt it with
+    # zero manual config; a client-side env key overrides it). The
+    # private key never reaches the relay. REQUIRE_OVERSIGHT=1 makes
+    # the relay reject content envelopes that lack a valid-shaped
+    # oversight wrap ('oversight_required').
+    oversight_pubkey: str = field(default_factory=lambda: os.environ.get(
+        "AGENTLINK_OVERSIGHT_PUBKEY", ""))
+    require_oversight: bool = field(default_factory=lambda:
+        os.environ.get("AGENTLINK_REQUIRE_OVERSIGHT", "") == "1")
     _scan_task: object = field(default=None, repr=False)
     alert_chain_completed: bool = field(default_factory=lambda:
         os.environ.get("AGENTLINK_ALERT_CHAIN_COMPLETED", "1") != "0")
@@ -145,7 +155,8 @@ class Relay:
                       status: str = "", priority: str = "",
                       size: int = 0, mentions=None, ref_id: str = "",
                       sender_nickname: str = "", sender_role: str = "",
-                      sender_custom_role: str = "") -> None:
+                      sender_custom_role: str = "",
+                      oversight: dict | None = None) -> None:
         """Metadata only — never content. Feeds the live dashboard.
 
         Evidence labelling (point 32): agent-reported claims (progress
@@ -156,6 +167,10 @@ class Relay:
         as a fact."""
         claimed = kind in ("work_progress", "message", "group_message",
                            "channel_message")
+        # Owner oversight: the wrap rides the audit row as ciphertext
+        # JSON — the relay stores it but can never open it (it holds
+        # no oversight private key, by construction).
+        oversight = json.dumps(oversight) if oversight else ""
         self.activity.appendleft({
             "ts": now_ts(), "kind": kind, "from": actor, "to": target,
             "group_id": group_id, "work_id": work_id, "status": status,
@@ -163,6 +178,7 @@ class Relay:
             "sender_nickname": sender_nickname,
             "sender_role": sender_role,
             "sender_custom_role": sender_custom_role,
+            "oversight": oversight or None,
             "evidence": "claimed" if claimed else "verified"})
         try:
             self.store.audit(kind, actor, target, group_id, work_id, status,
@@ -170,7 +186,8 @@ class Relay:
                              ref_id=ref_id,
                              sender_nickname=sender_nickname,
                              sender_role=sender_role,
-                             sender_custom_role=sender_custom_role)
+                             sender_custom_role=sender_custom_role,
+                             oversight=oversight)
         except Exception:
             pass
         if getattr(self, "dashboard", None) is not None:
@@ -269,6 +286,7 @@ class Relay:
                 "sender_custom_role": r.get("sender_custom_role", ""),
                 "kind": r["kind"], "size": r.get("size", 0),
                 "mentions": r.get("mentions") or [],
+                "oversight": r.get("oversight"),
                 "priority": r.get("priority") or "normal",
                 "status": r.get("status", ""),
                 "work_id": r.get("work_id", ""),
@@ -894,7 +912,9 @@ class Relay:
             self.peers[username] = peer
             await self._send(ws, {"type": "welcome", "req_id": req_id,
                                   "username": username, "secret": None,
-                                  "ephemeral": True, "queued": 0})
+                                  "ephemeral": True, "queued": 0,
+                                  "oversight_pubkey":
+                                      self.oversight_pubkey or None})
             return peer
         username = normalize_username(frame.get("username"))
         if username is None:
@@ -941,7 +961,9 @@ class Relay:
         queued = self.store.dequeue_all(username)
         await self._send(ws, {"type": "welcome", "req_id": req_id,
                               "username": username, "secret": owner_secret,
-                              "ephemeral": False, "queued": len(queued)})
+                              "ephemeral": False, "queued": len(queued),
+                              "oversight_pubkey":
+                                  self.oversight_pubkey or None})
         for q in queued:
             await self._send(ws, q)
         log.info("peer @%s registered, flushed %d queued", username, len(queued))
@@ -989,7 +1011,13 @@ class Relay:
         # backend a put/get is a network round trip with retries;
         # on the event loop it starved hello/message handling and
         # blob fetches timed out on the requesting client.
-        await asyncio.to_thread(self.blob_store.put, blob_id, data)
+        try:
+            await asyncio.to_thread(self.blob_store.put, blob_id, data)
+        except Exception:
+            log.exception("blob store put failed")
+            await self._error(ws, "blob_store_failed", req_id,
+                              "object storage write failed; retry")
+            return
         self.store.put_blob_meta(blob_id, owner=peer.username,
                                  for_user=for_user or "",
                                  for_group=for_group or "",
@@ -1028,6 +1056,15 @@ class Relay:
         except BlobNotFound:
             await self._error(ws, "unknown_blob", req_id)
             return
+        except Exception:
+            # Object-store transport failure (egress window): answer
+            # with a clean error frame — never kill the connection
+            # (v1.1 Phase-1 live fix; an uncaught store exception
+            # used to tear the socket down mid-request).
+            log.exception("blob store get failed")
+            await self._error(ws, "blob_fetch_failed", req_id,
+                              "object storage read failed; retry")
+            return
         await self._result(ws, req_id, True,
                            {"blob_id": meta["id"],
                             "data_b64": _b64.b64encode(data).decode()})
@@ -1046,7 +1083,13 @@ class Relay:
             await self._error(ws, "permission_denied", req_id,
                               "only the owner or a group admin can delete")
             return
-        await asyncio.to_thread(self.blob_store.delete, meta["id"])
+        try:
+            await asyncio.to_thread(self.blob_store.delete, meta["id"])
+        except Exception:
+            log.exception("blob store delete failed")
+            await self._error(ws, "blob_store_failed", req_id,
+                              "object storage delete failed; retry")
+            return
         self.store.delete_blob_meta(meta["id"])
         await self._result(ws, req_id, True, {"blob_id": meta["id"],
                                               "deleted": True})
@@ -1055,6 +1098,30 @@ class Relay:
     @staticmethod
     def _is_envelope(content) -> bool:
         return isinstance(content, dict) and bool(content.get("ct"))
+
+    @staticmethod
+    def _valid_oversight(ov) -> bool:
+        """Shape check ONLY (the relay cannot and must not verify the
+        wrap cryptographically — it holds no oversight private key):
+        the standard envelope {alg, eph_pub, nonce, ct}."""
+        if not isinstance(ov, dict):
+            return False
+        if ov.get("alg") != "x25519-chacha20poly1305":
+            return False
+        return all(isinstance(ov.get(k), str) and ov.get(k)
+                   for k in ("eph_pub", "nonce", "ct"))
+
+    async def _oversight_gate(self, ws, frame, req_id) -> bool:
+        """AGENTLINK_REQUIRE_OVERSIGHT=1: content frames without a
+        valid-shaped oversight wrap are rejected. Default off."""
+        if not self.require_oversight:
+            return True
+        if self._valid_oversight(frame.get("oversight")):
+            return True
+        await self._error(ws, "oversight_required", req_id,
+                          "this relay requires an oversight wrap on"
+                          " content envelopes")
+        return False
 
     async def _on_send(self, ws, frame, peer: Peer) -> None:
         req_id = frame.get("req_id")
@@ -1068,6 +1135,8 @@ class Relay:
             await self._error(ws, "bad_send", req_id,
                               "missing encrypted content envelope")
             return
+        if not await self._oversight_gate(ws, frame, req_id):
+            return
         if not self.store.exists(to) and to not in self.peers:
             await self._error(ws, "unknown_recipient", req_id)
             return
@@ -1076,6 +1145,7 @@ class Relay:
                "from_pubkey": peer.pubkey or self.store.pubkey_of(peer.username),
                "sender_nickname": "", "sender_role": "",
                "sender_custom_role": "",
+               "oversight": frame.get("oversight"),
                "mentions": frame.get("mentions") or [],
                "priority": (lambda pr: pr if pr in ("normal", "high", "urgent") else "normal")(str(frame.get("priority") or "normal")),
                "content": content, "ts": now_ts(),
@@ -1085,7 +1155,8 @@ class Relay:
         self._log_activity("message", peer.username, target=to,
                            priority=msg["priority"],
                            size=len(str(content.get("ct") or "")),
-                           mentions=msg["mentions"], ref_id=msg["id"])
+                           mentions=msg["mentions"], ref_id=msg["id"],
+                           oversight=frame.get("oversight"))
         await self._result(ws, req_id, True,
                            {"id": msg["id"], "to": to, "queued": queued})
 
@@ -1430,6 +1501,8 @@ class Relay:
             await self._error(ws, "bad_send", req_id,
                               "missing encrypted content envelope")
             return
+        if not await self._oversight_gate(ws, frame, req_id):
+            return
         msg = {"type": "message", "id": frame.get("id") or new_id(),
                "from": peer.username, "from_name": peer.display_name,
                "from_pubkey": peer.pubkey or self.store.pubkey_of(peer.username),
@@ -1448,6 +1521,7 @@ class Relay:
                             ("normal", "high", "urgent") else "normal")(
                                 str(frame.get("priority") or "normal")),
                "content": content, "ts": now_ts(),
+               "oversight": frame.get("oversight"),
                "in_reply_to": frame.get("in_reply_to"), "group_id": gid,
                "group_name": group["name"]}
         delivered, queued = [], []
@@ -1462,7 +1536,8 @@ class Relay:
                            mentions=msg["mentions"], ref_id=msg["id"],
                            sender_nickname=msg["sender_nickname"],
                            sender_role=msg["sender_role"],
-                           sender_custom_role=msg["sender_custom_role"])
+                           sender_custom_role=msg["sender_custom_role"],
+                           oversight=frame.get("oversight"))
         await self._result(ws, req_id, True,
                            {"id": msg["id"], "group_id": gid,
                             "delivered": delivered, "queued": queued})
@@ -1649,12 +1724,15 @@ class Relay:
             await self._error(ws, "bad_send", req_id,
                               "missing encrypted content envelope")
             return
+        if not await self._oversight_gate(ws, frame, req_id):
+            return
         msg = {"type": "message", "id": frame.get("id") or new_id(),
                "from": peer.username, "from_name": peer.display_name,
                "from_pubkey": peer.pubkey
                or self.store.pubkey_of(peer.username),
                "sender_nickname": "", "sender_role": role,
                "sender_custom_role": "",
+               "oversight": frame.get("oversight"),
                "mentions": frame.get("mentions") or [],
                "priority": str(frame.get("priority") or "normal"),
                "content": content, "ts": now_ts(),
@@ -1670,7 +1748,8 @@ class Relay:
                            priority=msg["priority"],
                            size=len(str(content.get("ct") or "")),
                            mentions=msg["mentions"], ref_id=msg["id"],
-                           sender_role=role)
+                           sender_role=role,
+                           oversight=frame.get("oversight"))
         await self._result(ws, req_id, True,
                            {"id": msg["id"], "channel_id": cid,
                             "delivered": delivered, "queued": queued})
@@ -1930,8 +2009,14 @@ class Relay:
                               "chunk sha256 mismatch; chunk rejected")
             return
         index = int(frame.get("index"))
-        await asyncio.to_thread(self.blob_store.put,
-                                f"{sess['session_id']}-{index}", data)
+        try:
+            await asyncio.to_thread(self.blob_store.put,
+                                    f"{sess['session_id']}-{index}", data)
+        except Exception:
+            log.exception("blob store chunk put failed")
+            await self._error(ws, "blob_store_failed", req_id,
+                              "object storage write failed; retry")
+            return
         have = self.store.record_chunk(sess["session_id"], index)
         await self._result(ws, req_id, True, {"have": have})
 
@@ -1975,6 +2060,11 @@ class Relay:
             await self._error(ws, "incomplete_upload", req_id,
                               "a chunk is missing from storage")
             return
+        except Exception:
+            log.exception("blob store chunk read failed")
+            await self._error(ws, "blob_store_failed", req_id,
+                              "object storage read failed; retry")
+            return
         data = b"".join(parts)
         if _hl.sha256(data).hexdigest() != sess["ct_sha"]:
             await self._error(ws, "bad_whole_hash", req_id,
@@ -1991,14 +2081,20 @@ class Relay:
             await self._error(ws, "not_a_member", req_id)
             return
         blob_id = "b-" + sess["ct_sha"]
-        await asyncio.to_thread(self.blob_store.put, blob_id, data)
+        try:
+            await asyncio.to_thread(self.blob_store.put, blob_id, data)
+            for i in range(total):
+                await asyncio.to_thread(self.blob_store.delete,
+                                        f"{sess['session_id']}-{i}")
+        except Exception:
+            log.exception("blob store finish failed")
+            await self._error(ws, "blob_store_failed", req_id,
+                              "object storage write failed; retry")
+            return
         self.store.put_blob_meta(
             blob_id, owner=peer.username, for_user=sess["for_user"],
             for_group=sess["for_group"], for_channel=fin_channel,
             whole_sha=sess["whole_sha"], size=len(data))
-        for i in range(total):
-            await asyncio.to_thread(self.blob_store.delete,
-                                    f"{sess['session_id']}-{i}")
         self.store.delete_upload_session(sess["session_id"])
         self.store.audit("blob_upload_completed", peer.username,
                          sess["for_user"], sess["for_group"], blob_id, "")
@@ -2421,6 +2517,8 @@ class Relay:
             await self._error(ws, "plaintext_not_allowed", req_id,
                               "work content must be end-to-end encrypted")
             return
+        if not await self._oversight_gate(ws, frame, req_id):
+            return
         created = []
         for raw in frame.get("assignees") or []:
             assignee = normalize_username(raw)
@@ -2456,7 +2554,8 @@ class Relay:
             self._log_activity("work_assigned", peer.username,
                                target=assignee, group_id=gid or "",
                                work_id=work["id"], status="assigned",
-                               priority=priority)
+                               priority=priority,
+                               oversight=frame.get("oversight"))
             if require_approval:
                 self._log_activity("approval_gate_set", peer.username,
                                    target=assignee, group_id=gid or "",
@@ -2526,6 +2625,8 @@ class Relay:
             await self._error(ws, "bad_delivery", req_id,
                               "missing encrypted delivery content")
             return
+        if not await self._oversight_gate(ws, frame, req_id):
+            return
         updated = self.store.add_delivery(
             work["id"], peer.username, content_enc,
             content_self or content_enc, proof=proof,
@@ -2545,7 +2646,8 @@ class Relay:
         self._log_activity("work_delivered", peer.username,
                            target=work["assigner"], work_id=work["id"],
                            status=updated["status"],
-                           priority=work.get("priority", "normal"))
+                           priority=work.get("priority", "normal"),
+                           oversight=frame.get("oversight"))
         if updated["status"] == "awaiting_approval":
             # Approval gate: the proven delivery is parked; nothing
             # completes (and no chain advances) until the assigner
