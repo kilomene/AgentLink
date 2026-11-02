@@ -467,6 +467,9 @@ def _assign(rest: list[str]) -> int:
                     choices=["normal", "high", "urgent"])
     ap.add_argument("--role", default=None,
                     help="assign to every holder of this group role")
+    ap.add_argument("--require-approval", action="store_true",
+                    help="approval gate: a proven delivery parks in"
+                         " awaiting_approval until you approve/reject")
     ap.add_argument("assignees", help="comma-separated usernames")
     ap.add_argument("title")
     ap.add_argument("instructions", nargs="?", default="")
@@ -478,11 +481,13 @@ def _assign(rest: list[str]) -> int:
             return await a.assign_work_role(
                 args.group_id, args.role, args.title, args.instructions,
                 attachments=args.attachments, deadline=args.deadline,
-                priority=args.priority)
+                priority=args.priority,
+                require_approval=args.require_approval)
         return await a.assign_work(
             assignees, args.title, args.instructions,
             group_id=args.group_id, attachments=args.attachments,
-            deadline=args.deadline, priority=args.priority)
+            deadline=args.deadline, priority=args.priority,
+            require_approval=args.require_approval)
     _print(asyncio.run(_with_agent(args, _go)))
     return 0
 
@@ -522,15 +527,20 @@ def _work(rest: list[str]) -> int:
             args, lambda a: a.report_progress(args.work_id, args.percent,
                                               args.note))))
         return 0
-    if sub in ("complete", "request-changes"):
+    if sub in ("complete", "request-changes", "approve", "reject"):
         ap = argparse.ArgumentParser(prog=f"agentlink work {sub}")
         _add_common(ap)
         ap.add_argument("work_id")
         ap.add_argument("note", nargs="?", default="")
         args = ap.parse_args(r)
-        fn = (lambda a: a.complete_work(args.work_id, args.note)) \
-            if sub == "complete" else \
-            (lambda a: a.request_changes(args.work_id, args.note))
+        fn = {"complete": lambda a: a.complete_work(args.work_id,
+                                                   args.note),
+              "request-changes": lambda a: a.request_changes(
+                  args.work_id, args.note),
+              "approve": lambda a: a.approve_work(args.work_id,
+                                                  args.note),
+              "reject": lambda a: a.reject_work(args.work_id,
+                                                args.note)}[sub]
         _print(asyncio.run(_with_agent(args, fn)))
         return 0
     print(f"unknown work command {sub!r}", file=sys.stderr)
