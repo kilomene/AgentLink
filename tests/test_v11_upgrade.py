@@ -230,6 +230,29 @@ def test_dashboard_channel_conversation_names(relay_env):
     assert "broadcast channel · by @" in html
 
 
+def test_dashboard_mobile_responsive_stack(relay_env):
+    """Responsive law (owner's standing rule, restated 2026-11-02 with
+    screenshots of Library/Vault sprawling off a phone viewport):
+    mobile widths get a TRUE mobile layout, desktop the desktop
+    layout, and no horizontal overflow ever. The desktop list tables
+    size columns to max-content (nowrap sealed-notes, unbreakable
+    ids/hashes), which dragged the document to 576-587px at a 390px
+    viewport. Pins: every list table carries .stack, and the <=900px
+    block restacks rows into one-item blocks with
+    overflow-wrap:anywhere collapsing long-token min-content; the
+    desktop base table rule is untouched."""
+    html = dash_html(relay_env)
+    for tid in ("groups", "ovact", "users", "work", "chains",
+                "library", "vault", "rooms", "act"):
+        assert f'<table class="stack"><tbody id="{tid}">' in html, tid
+    assert "table.stack,table.stack tbody{display:block" in html
+    assert "table.stack tr{display:block" in html
+    assert "table.stack td{display:block" in html
+    assert "overflow-wrap:anywhere" in html
+    assert ".sealed-note{white-space:normal}" in html
+    assert "table{width:100%;border-collapse:collapse" in html
+
+
 # -- owner oversight: REAL composition (client -> relay -> audit ->
 #    dashboard). No fabricated wraps anywhere in this section: real
 #    clients adopt the relay-advertised oversight pubkey from the
