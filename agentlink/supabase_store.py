@@ -46,7 +46,7 @@ import urllib.parse
 import urllib.request
 
 from .protocol import new_id, new_secret, now_ts
-from .store import CONTENT_AUDIT_KINDS, DEFAULT_SETTINGS, MAX_GROUP_MEMBERS, GroupFull, NotFound, UsernameTaken
+from .store import CONTENT_AUDIT_KINDS, ROOM_AUDIT_KINDS, DEFAULT_SETTINGS, MAX_GROUP_MEMBERS, GroupFull, NotFound, UsernameTaken
 from .store import NON_TERMINAL_WORK_STATUSES, RemovalBlocked
 from .store import carry_claim_blocked
 
@@ -356,6 +356,77 @@ class SupabaseStore:
         row = self._one("users", self._eq("username", username)
                         + "&select=last_seen")
         return int(row["last_seen"]) if row else 0
+
+    # -- connection registry (v1.3.4 presence truth) -------------------
+    # Parity with the SQLite Store EXACTLY: every hello (and every
+    # heartbeat cadence thereafter) notes WHERE the agent is
+    # connected in the shared backend, so every dashboard composes
+    # the same backend-wide presence truth — online from the shared
+    # last_seen, current server from the freshest connection note —
+    # instead of the serving relay's local peer table (the pre-1.3.4
+    # home dashboard read deploy-probe "offline" while it was online
+    # on its own server).
+
+    def note_connection(self, username, server_id, endpoint,
+                        home_endpoint):
+        self._req("POST", "connections", body={
+            "username": username, "server_id": server_id or "",
+            "endpoint": endpoint or "",
+            "home_endpoint": home_endpoint or "",
+            "updated_at": now_ts()},
+            prefer="return=minimal,resolution=merge-duplicates")
+
+    def connections_map(self):
+        rows = self._get(
+            "connections",
+            "select=username,server_id,endpoint,home_endpoint,"
+            "updated_at")
+        out = {}
+        for r in rows:
+            r = dict(r)
+            try:
+                r["updated_at"] = int(r.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                r["updated_at"] = 0
+            out[r["username"]] = r
+        return out
+
+    def list_room_audit(self):
+        """Parity with the SQLite Store: EVERY voice-room lifecycle
+        row, oldest first, paged to exhaustion — never a window."""
+        kinds = ",".join(ROOM_AUDIT_KINDS)
+        out = []
+        offset = 0
+        while True:
+            rows = self._get(
+                "audit_log",
+                self._AUDIT_SELECT + f"&kind=in.({kinds})"
+                f"&order=seq.asc&limit=1000&offset={offset}")
+            out.extend(self._shape_audit(rows))
+            if len(rows) < 1000:
+                return out
+            offset += len(rows)
+
+    def dashboard_digest(self):
+        """Parity with the SQLite Store: a cheap change signal over
+        the backend facts the dashboard renders (newest presence
+        beat, connection registry shape, newest server heartbeat,
+        audit tail) — four one-row reads."""
+        def _top(table, col):
+            rows = self._get(
+                table, f"select={col}&order={col}.desc&limit=1")
+            if rows:
+                try:
+                    return int(rows[0].get(col) or 0)
+                except (TypeError, ValueError):
+                    return 0
+            return 0
+        conns = self._get("connections", "select=username")
+        return "|".join(str(v) for v in (
+            _top("users", "last_seen"), len(conns),
+            _top("connections", "updated_at"),
+            _top("servers", "last_seen"),
+            _top("audit_log", "seq")))
 
     # -- server registry (v1.2.0 peer mesh) --------------------------------
     # Parity with the SQLite Store EXACTLY (same semantics): every
