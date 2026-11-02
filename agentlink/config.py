@@ -17,6 +17,7 @@ for the operator — changing the endpoint here is never needed again.
 
 from __future__ import annotations
 
+import logging
 import os
 
 # THE fixed endpoint. This is the single place it is defined.
@@ -30,34 +31,52 @@ SELF_UPDATE_ENV_VAR = "AGENTLINK_SELF_UPDATE"
 UPDATE_CHECK_SECONDS_ENV_VAR = "AGENTLINK_UPDATE_CHECK_SECONDS"
 
 
+SELF_UPDATE_ENV_VAR = "AGENTLINK_SELF_UPDATE"
+UPDATE_CHECK_SECONDS_ENV_VAR = "AGENTLINK_UPDATE_CHECK_SECONDS"
+
+log = logging.getLogger("agentlink.config")
+
+
 def self_update_enabled() -> bool:
     """In-daemon self-update (v1.1.8): the running agent checks for
     updates ITSELF, inside its own serve loop — no host cron, systemd
     timer or any other host facility is involved, so an agent on a
-    cron-less sandbox still keeps itself current. Default ON; an
-    operator (or a test suite) disables it with
-    ``AGENTLINK_SELF_UPDATE=0`` (also off/false/no)."""
+    cron-less sandbox still keeps itself current.
+
+    HARDENED CORE (v1.2.0): there is NO agent-side off switch. An
+    agent configuring itself out of staying current is exactly how
+    an agent goes dark politely, so whatever
+    ``AGENTLINK_SELF_UPDATE`` says in the agent's own environment,
+    the answer is True (a warning is logged, so the attempt is SEEN,
+    never silently honored). The only kill switch is operator-grade
+    and relay-side — the relay's ``AGENTLINK_UPDATES_ENABLED``,
+    advertised in every welcome and shown on the dashboard."""
     v = os.environ.get(SELF_UPDATE_ENV_VAR)
-    if v is None:
-        return True
-    return v.strip().lower() not in ("0", "off", "false", "no", "")
+    if v is not None and \
+            v.strip().lower() in ("0", "off", "false", "no", ""):
+        log.warning("ignoring %s=%r: the self-update checker is part"
+                    " of the hardened core and cannot be disabled"
+                    " from the agent side (the kill switch is"
+                    " relay-side, operator-grade, and visible on the"
+                    " dashboard)", SELF_UPDATE_ENV_VAR, v)
+    return True
 
 
 def resolve_update_check_seconds() -> float:
-    """Interval between in-daemon self-update checks. The law lives
-    in ``timing.UPDATE_CHECK_SECONDS`` (15 minutes); the
-    ``AGENTLINK_UPDATE_CHECK_SECONDS`` env var is an operator/test
-    override (staged demos and hostile-environment proofs shorten
-    it) and never changes the shipped default."""
+    """Interval between in-daemon self-update checks: the hardcoded
+    law, ``timing.UPDATE_CHECK_SECONDS`` (900s). HARDENED CORE
+    (v1.2.0): ``AGENTLINK_UPDATE_CHECK_SECONDS`` in the agent's own
+    environment is IGNORED — the interval can be neither stretched
+    nor shrunk from the agent's config surface. (Test harnesses pin
+    the timing constant in-process; that is not a product surface
+    and ships nowhere.)"""
     from .timing import UPDATE_CHECK_SECONDS
     raw = os.environ.get(UPDATE_CHECK_SECONDS_ENV_VAR)
     if raw:
-        try:
-            seconds = float(raw)
-        except ValueError:
-            seconds = 0.0
-        if seconds > 0:
-            return seconds
+        log.warning("ignoring %s=%r: the update-check interval is"
+                    " hardcoded at %ss by the hardened core",
+                    UPDATE_CHECK_SECONDS_ENV_VAR, raw,
+                    UPDATE_CHECK_SECONDS)
     return float(UPDATE_CHECK_SECONDS)
 
 
