@@ -47,7 +47,8 @@ def relay_factory():
         tmp = tempfile.mkdtemp(prefix="agentlink-ov-")
         db = str(Path(tmp) / "relay.db")
         relay = Relay(host=HOST, port=0, db_path=db,
-                      dashboard_password="pw", **relay_kw)
+                      dashboard_password="pw", dashboard_port=0,
+                      **relay_kw)
         ready = threading.Event()
         box: dict = {}
 
@@ -70,23 +71,19 @@ def relay_factory():
         t.start()
         assert ready.wait(timeout=10)
         env = {"url": f"ws://{HOST}:{relay.port}", "port": relay.port,
-               "db": db, "relay": relay, "tmp": Path(tmp)}
+               "db": db, "relay": relay, "tmp": Path(tmp),
+               "loop": box["loop"]}
         started.append(env)
         return env
 
     yield make
     for env in started:
         fut = asyncio.run_coroutine_threadsafe(
-            env["relay"].stop(), env.get("loop") or _loop_of(env))
+            env["relay"].stop(), env["loop"])
         try:
             fut.result(timeout=10)
         except Exception:
             pass
-
-
-def _loop_of(env):  # pragma: no cover - teardown helper
-    return env["relay"]._scan_task.get_loop() if env["relay"]._scan_task \
-        else None
 
 
 @pytest.fixture()
@@ -139,10 +136,8 @@ def test_keygen_cli_writes_0600_and_prints_only_pubkey(tmp_path, capsys):
     assert cli.main(["oversight-keygen", "--out", str(out)]) == 2
 
 
-def test_oversight_key_content_and_key_roundtrip():
+def test_oversight_key_wraps_roundtrip():
     key = OversightKey.generate()
-    a = Agent.__new__(Agent)  # wrap helpers need no connection
-    a.oversight_pubkey = key.public_key_b64
     from agentlink.crypto import encrypt_to_pubkey
     env = encrypt_to_pubkey(key.public_key_b64,
                             json.dumps({"body": "hi"}).encode())
@@ -243,20 +238,19 @@ def test_group_oversight_is_key_wrap(relay_factory, state_root):
             await a.group_send(gid, "group secret hello")
             assert await wait_for(
                 lambda: any(m.get("group_id") == gid for m in b.messages))
-            return a, gid
         finally:
             await a.close()
             await b.close()
 
-    a_gid = run(scenario())
-    a, gid = a_gid
+    run(scenario())
     rows = audit_rows(env, "group_message")
     assert len(rows) == 1
     ov = rows[0]["oversight"]
     assert ov and ov["kind"] == "content_key"
     key = okey.open_key(ov)
-    # The wrapped key IS the group key: it decrypts group-key content.
-    probe = {"nonce": "", "ct": ""}
+    assert len(key) == 32
+    # The wrapped key is a working symmetric content key: content
+    # sealed under it opens with it (the dashboard's group read path).
     from agentlink.crypto import encrypt_with_key
     probe = encrypt_with_key(key, b"dashboard-can-read-this")
     assert decrypt_with_key(key, probe) == b"dashboard-can-read-this"
