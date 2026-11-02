@@ -148,6 +148,12 @@ class Peer:
     # through — this relay's own server_id, or the carried server's
     # id when the connection came in on a carry alias.
     server_id: str = ""
+    # v1.3.4 presence truth: the exact endpoint this connection
+    # arrived through (the carry alias for a carried identity, the
+    # relay's registry endpoint for its own) — recorded in the
+    # store's connection registry at hello and on the heartbeat
+    # cadence, so every dashboard can name the agent's real server.
+    conn_endpoint: str = ""
 
 
 @dataclass
@@ -1012,6 +1018,8 @@ class Relay:
                 "home_host": row.get("home_host") or "",
                 "home_endpoint": row.get("home_endpoint") or "",
                 "carried_by": row.get("carried_by") or "",
+                "carried_by_id": row.get("carried_by_id") or "",
+                "carry_endpoint": row.get("carry_endpoint") or "",
                 "carry_state": state,
                 "carry_state_label": label}
 
@@ -1171,31 +1179,178 @@ class Relay:
         if getattr(self, "dashboard", None) is not None:
             self.dashboard.notify()
 
+    @staticmethod
+    def _norm_endpoint(value: str) -> str:
+        """Endpoint comparison form: case/whitespace-insensitive,
+        trailing slash and the canonical /ws suffix ignored — the
+        same rule _is_home_endpoint applies to this relay's own
+        identity, generalized to any pair of endpoints."""
+        v = str(value or "").strip().rstrip("/").lower()
+        if v.endswith("/ws"):
+            v = v[:-3]
+        return v
+
     def _dashboard_data(self) -> dict:
         users = self.store.list_users()
         now = now_ts()
+        # PRESENCE TRUTH (v1.3.4): presence is composed from the
+        # SHARED STORE, never from this relay's local peer table.
+        # online = the shared last_seen (touched by whichever relay
+        # the agent is connected to) is inside the 15s grace of the
+        # 5s heartbeat law; the agent's CURRENT SERVER comes from
+        # the freshest connection note in the connection registry
+        # (a local connection is this relay's freshest knowledge of
+        # all, and wins when present). The pre-1.3.4 code read the
+        # local peer table only, so deploy-probe — online on its
+        # own server x3 — read "offline — work protected" on the
+        # home dashboard while it worked. A local guess must never
+        # be stated as a backend fact again.
+        servers = self._dashboard_servers()
+        by_id = {s["server_id"]: s for s in servers if s.get("server_id")}
+        by_home_ep = {}
+        for s in servers:
+            hep = s.get("home_endpoint") or ""
+            if hep and s.get("owner_agent"):
+                by_home_ep.setdefault(self._norm_endpoint(hep), s)
+        conns = {}
+        _cm = getattr(self.store, "connections_map", None)
+        if _cm is not None:
+            try:
+                conns = _cm() or {}
+            except Exception:
+                conns = {}
+
+        def _resolve_server(u: dict) -> tuple:
+            """(server entry, how) for a user's freshest connection
+            note — how is 'own' (its per-agent server, at home),
+            'carried' (its server, carried by a brother), 'via'
+            (riding a server that is not its home) or 'home'.
+            (None, '') when no fresh note names a known server."""
+            name = u["username"]
+            conn = conns.get(name) or {}
+            sid = conn.get("server_id") or ""
+            entry = by_id.get(sid) if sid else None
+            home_ep = conn.get("home_endpoint") or ""
+            if entry is not None and entry.get("owner_agent") == name:
+                if entry.get("carry_state") == "carried":
+                    return entry, "carried"
+                return entry, "own"
+            if entry is not None:
+                home_srv = by_home_ep.get(self._norm_endpoint(home_ep))
+                cur = entry.get("home_endpoint") \
+                    if entry.get("owner_agent") else entry.get("endpoint")
+                if home_ep:
+                    if home_srv is not None and \
+                            home_srv.get("server_id") != sid:
+                        return entry, "via"
+                    if self._norm_endpoint(home_ep) != \
+                            self._norm_endpoint(cur):
+                        return entry, "via"
+                return entry, "home"
+            return None, ""
+
+        riding_now: dict[str, list] = {}
         for u in users:
-            peer = self.peers.get(u["username"])
-            # Presence derives from the 5-second heartbeat: a peer is
-            # online only if its last sign of life is fresh.
-            u["online"] = bool(peer) and \
-                (now - peer.last_seen) <= OFFLINE_GRACE_SECONDS
-            u["last_seen"] = peer.last_seen if peer else None
-            u["riding"] = self.server_label if peer else None
-            u["home"] = peer.home_endpoint if peer else None
-            # NO GOING DARK (point 44c): the dashboard distinguishes
-            # precisely — online at home, online via a peer, or
-            # unreachable with its work protected by the backend.
+            name = u["username"]
+            peer = self.peers.get(name)
+            ls = int(u.get("last_seen") or 0)
+            if peer is not None:
+                ls = max(ls, int(peer.last_seen or 0))
+            u["last_seen"] = ls or None
+            u["online"] = bool(ls) and \
+                (now - ls) <= OFFLINE_GRACE_SECONDS
+            conn = conns.get(name) or {}
+            conn_fresh = bool(conn) and \
+                (now - int(conn.get("updated_at") or 0)) \
+                <= OFFLINE_GRACE_SECONDS
+            entry, how = (None, "")
+            if u["online"]:
+                if peer is not None:
+                    entry = by_id.get(
+                        peer.server_id or self.server_id)
+                    home_srv = by_home_ep.get(self._norm_endpoint(
+                        peer.home_endpoint or ""))
+                    if entry is not None and \
+                            entry.get("owner_agent") == name:
+                        how = "carried" if entry.get("carry_state") \
+                            == "carried" else "own"
+                    elif peer.home_endpoint and \
+                            not self._is_home_endpoint(
+                                peer.home_endpoint):
+                        how = "via"
+                    elif home_srv is not None and entry is not None \
+                            and home_srv.get("server_id") != \
+                            entry.get("server_id"):
+                        how = "via"
+                    else:
+                        how = "home"
+                    if entry is None:
+                        entry = {"server_id":
+                                 peer.server_id or self.server_id,
+                                 "label": self.server_label,
+                                 "endpoint":
+                                 peer.conn_endpoint
+                                 or self._registry_endpoint(),
+                                 "owner_agent": "",
+                                 "carried_by": ""}
+                elif conn_fresh:
+                    entry, how = _resolve_server(u)
             if not u["online"]:
+                # NO GOING DARK (point 44c): offline is stated
+                # exactly — unreachable, work protected by the
+                # backend — with the store's last-seen above.
                 u["reachability"] = "unreachable — work protected"
-            elif peer and peer.home_endpoint and \
-                    not self._is_home_endpoint(peer.home_endpoint):
-                u["reachability"] = f"online (via {self.server_label})"
+                u["current_server"] = None
+                u["current_server_label"] = ""
+                u["riding"] = None
+                u["home"] = (conn.get("home_endpoint") or None) \
+                    if conn else None
             else:
-                u["reachability"] = "online (home)"
-            u["activity_state"] = peer.activity if peer else "offline"
-            u.update(self._compliance_fields(u["username"]))
-            u["trust_score"] = self.store.compute_trust(u["username"])
+                label = entry.get("label") if entry else ""
+                if how == "own":
+                    u["reachability"] = "online (own server)"
+                elif how == "carried":
+                    u["reachability"] = "online (via carried server)"
+                elif how == "via":
+                    u["reachability"] = f"online (via {label})" \
+                        if label else "online (via peer)"
+                elif entry is not None:
+                    u["reachability"] = "online (home)"
+                else:
+                    # Online is a fact (fresh shared heartbeat);
+                    # WHICH server is momentarily unknown (its
+                    # connection note aged out mid-migration) — say
+                    # "online", never guess a server.
+                    u["reachability"] = "online"
+                u["current_server"] = {
+                    "server_id": entry.get("server_id") or "",
+                    "label": label or "",
+                    "endpoint": entry.get("endpoint") or "",
+                    "how": how,
+                    "owner_agent": entry.get("owner_agent") or "",
+                    "carried_by": entry.get("carried_by") or "",
+                } if entry else None
+                u["current_server_label"] = label or ""
+                u["riding"] = entry.get("endpoint") if entry else None
+                home_ep = (peer.home_endpoint if peer is not None
+                           else conn.get("home_endpoint")) or ""
+                u["home"] = home_ep or None
+                if how == "via" and entry is not None:
+                    riding_now.setdefault(
+                        entry.get("server_id") or "", []).append(name)
+            if peer is not None:
+                u["activity_state"] = peer.activity
+            elif u["online"]:
+                # Remote presence is a fact; its fine-grained
+                # activity state is the hosting relay's knowledge,
+                # not this dashboard's — say nothing rather than
+                # guess (pre-1.3.4 this cell claimed "offline" for
+                # remote-online agents; a claim is worse than a gap).
+                u["activity_state"] = ""
+            else:
+                u["activity_state"] = "offline"
+            u.update(self._compliance_fields(name))
+            u["trust_score"] = self.store.compute_trust(name)
             u.pop("pubkey", None)
             u.pop("sign_pub", None)
         # Mesh state (v1.2.0): the live server registry, and — for
@@ -1206,7 +1361,22 @@ class Relay:
         # in their honest state, and a per-agent server is
         # attributed to its OWNER (permanent), never to the
         # temporary carrier whose machine happens to run it.
-        servers = self._dashboard_servers()
+        # v1.3.4: each server ALSO names who is riding it right now
+        # and which brothers' servers it is carrying right now —
+        # joined from the connection registry + registry carry
+        # fields, so the answer is the same on every dashboard.
+        carrying_now: dict[str, list] = {}
+        for s in servers:
+            carrier_id = s.get("carried_by_id") or ""
+            if s.get("carry_state") == "carried" and carrier_id:
+                carrying_now.setdefault(carrier_id, []).append({
+                    "server_id": s.get("server_id") or "",
+                    "label": s.get("label") or "",
+                    "owner_agent": s.get("owner_agent") or ""})
+        for s in servers:
+            sid = s.get("server_id") or ""
+            s["riding_now"] = sorted(riding_now.get(sid, []))
+            s["carrying_now"] = carrying_now.get(sid, [])
         hosting = {}
         for s in servers:
             key = s.get("owner_agent") or s.get("host_agent")
@@ -1229,11 +1399,7 @@ class Relay:
             "users": users,
             "groups": self.store.all_groups(),
             "channels": self.store.all_channels(),
-            "rooms": [
-                {"id": rid, "group_id": r["group_id"],
-                 "participants": sorted(r["participants"]),
-                 "creator": r["creator"], "opened_at": r["opened_at"]}
-                for rid, r in getattr(self, "rooms", {}).items()],
+            "rooms": self._dashboard_rooms(now),
             "work": self.store.list_work_meta(),
             "alerts": self.store.list_alerts(limit=50),
             "chains": self.store.list_chains_meta(),
@@ -1246,6 +1412,85 @@ class Relay:
                     "channel_message") else "verified")}
                 for row in self.store.list_audit()],
         }
+
+    def _dashboard_rooms(self, now: int | None = None) -> list[dict]:
+        """Voice Rooms, backend-wide (v1.3.4): composed from the
+        SHARED store's room lifecycle audit — a room hosted by a
+        brother server is a room on this dashboard too. The
+        pre-1.3.4 view read only this relay's local room table, so
+        rooms on other servers were invisible here. This relay's
+        own live rooms (exact participant sets, this process's
+        signalling state) merge over the audit-derived view.
+        Participants of an audit-derived room are the backend's
+        last known set: joins/leaves are audit events, replayed in
+        order; a room whose participants ALL read offline in the
+        shared presence truth AND whose last event is older than
+        the room staleness bound is a husk left by a dead relay —
+        stated as closed rather than shown as live forever."""
+        if now is None:
+            now = now_ts()
+        rooms: dict[str, dict] = {}
+        _lr = getattr(self.store, "list_room_audit", None)
+        if _lr is not None:
+            try:
+                rows = _lr() or []
+            except Exception:
+                rows = []
+            for r in rows:
+                rid = r.get("status") or ""
+                if not rid:
+                    continue
+                kind = r.get("kind")
+                actor = r.get("from") or ""
+                if kind == "room_opened":
+                    rooms[rid] = {
+                        "id": rid, "group_id": r.get("group_id") or "",
+                        "participants": {actor} if actor else set(),
+                        "creator": actor,
+                        "opened_at": int(r.get("ts") or 0),
+                        "last_event": int(r.get("ts") or 0),
+                        "closed": False}
+                elif rid in rooms:
+                    room = rooms[rid]
+                    room["last_event"] = max(
+                        room["last_event"], int(r.get("ts") or 0))
+                    if kind == "room_joined" and actor:
+                        room["participants"].add(actor)
+                    elif kind == "room_left" and actor:
+                        room["participants"].discard(actor)
+                    elif kind == "room_closed":
+                        room["closed"] = True
+        for rid, r in getattr(self, "rooms", {}).items():
+            rooms[rid] = {
+                "id": rid, "group_id": r["group_id"],
+                "participants": set(r["participants"]),
+                "creator": r["creator"],
+                "opened_at": int(r["opened_at"]),
+                "last_event": now, "closed": False}
+        out = []
+        for room in rooms.values():
+            if room["closed"]:
+                continue
+            parts = sorted(room["participants"])
+            if room["id"] not in getattr(self, "rooms", {}):
+                alive = False
+                for p in parts:
+                    try:
+                        if now - self.store.last_seen_of(p) \
+                                <= OFFLINE_GRACE_SECONDS:
+                            alive = True
+                            break
+                    except Exception:
+                        pass
+                if not alive and now - room["last_event"] > 3600:
+                    continue
+            out.append({"id": room["id"],
+                        "group_id": room["group_id"],
+                        "participants": parts,
+                        "creator": room["creator"],
+                        "opened_at": room["opened_at"]})
+        out.sort(key=lambda r: r["opened_at"])
+        return out
 
     def _conversations(self) -> list[dict]:
         """Per-conversation drill-down (point 40b): every message/work
@@ -1535,6 +1780,50 @@ class Relay:
 
 
     # -- fleet operations: reassignment, deadline pressure, alerts --------------
+    # -- presence truth (v1.3.4) ------------------------------------------
+    # Presence is a BACKEND fact, not a local observation. A relay
+    # records where each of its connections lives in the shared
+    # store's connection registry (hello + heartbeat cadence), and
+    # every dashboard composes presence from the shared last_seen +
+    # the freshest connection note — so an agent online on a brother
+    # server reads online, on THAT server, on every dashboard.
+
+    def _note_connection(self, peer: Peer) -> None:
+        """Record (best-effort) where this peer is connected: the
+        server identity it arrived through, the exact endpoint, and
+        the home it declared. Rides the same cadence as the store
+        touch it accompanies."""
+        if peer.ephemeral or not peer.username:
+            return
+        try:
+            self.store.note_connection(
+                peer.username, peer.server_id or self.server_id,
+                peer.conn_endpoint or self._registry_endpoint(),
+                peer.home_endpoint or "")
+        except Exception:
+            pass
+
+    def _connection_endpoint(self, server_id: str) -> str:
+        """The endpoint a connection through ``server_id`` arrived
+        at, from THIS relay's seat: my own registry endpoint for my
+        own identity, my carry alias for a server I carry."""
+        if not server_id or server_id == self.server_id:
+            return self._registry_endpoint()
+        return self._carry_endpoint_for(server_id)
+
+    def _backend_digest(self) -> str | None:
+        """The store's dashboard change signal, or None when the
+        store offers none (test doubles) — the dashboard's push loop
+        uses it to reflect changes that happened on OTHER servers
+        (presence flips, migrations, registry moves) in real time."""
+        fn = getattr(self.store, "dashboard_digest", None)
+        if fn is None:
+            return None
+        try:
+            return str(fn())
+        except Exception:
+            return None
+
     def _is_alive(self, username: str, grace: int) -> bool:
         """Backend-wide presence (point 29): alive = a heartbeat landed
         SOMEWHERE (any relay sharing the backend) within the grace."""
@@ -1913,6 +2202,7 @@ class Relay:
                                 self.store.touch(peer.username)
                             except Exception:
                                 pass
+                            self._note_connection(peer)
                     await self._send(ws, {"type": "pong", "req_id": req_id})
                 elif peer is None:
                     await self._error(ws, "not_registered", req_id)
@@ -2074,7 +2364,15 @@ class Relay:
                         if key:
                             hosting[key] = s
                     for u in users:
-                        u["online"] = u["username"] in self.peers
+                        # Backend-wide presence (v1.3.4): the
+                        # directory told the same local lie as the
+                        # dashboard — "online" meant "connected to
+                        # THIS relay", so an agent riding a brother
+                        # server read offline to everyone asking
+                        # here. Presence is the shared heartbeat
+                        # truth (point 29), wherever it landed.
+                        u["online"] = self._is_alive(
+                            u["username"], OFFLINE_GRACE_SECONDS)
                         u["trust_score"] = self.store.compute_trust(
                             u["username"])
                         u.update(self._compliance_fields(u["username"]))
@@ -2233,7 +2531,9 @@ class Relay:
                     display_name=display or username, pubkey=pubkey,
                     last_seen=now_ts(), connected_at=now_ts(), core=core,
                     home_endpoint=home_ep,
-                    server_id=server_id or self.server_id)
+                    server_id=server_id or self.server_id,
+                    conn_endpoint=self._connection_endpoint(
+                        server_id or self.server_id))
         self.peers[username] = peer
         if core:
             self._last_core[username] = core
@@ -2241,6 +2541,7 @@ class Relay:
             self.store.touch(username)
         except Exception:
             pass
+        self._note_connection(peer)
         if self.store.resolve_alerts("agent_offline", username):
             self._log_activity("alert_resolved", "system", target=username,
                                status="agent_offline")
