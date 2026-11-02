@@ -336,6 +336,17 @@ class Store:
                     chunks TEXT NOT NULL DEFAULT '[]',
                     created_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS servers (
+                    endpoint TEXT PRIMARY KEY,
+                    label TEXT NOT NULL DEFAULT '',
+                    host_agent TEXT NOT NULL DEFAULT '',
+                    version TEXT NOT NULL DEFAULT '',
+                    health INTEGER NOT NULL DEFAULT 100,
+                    riders INTEGER NOT NULL DEFAULT 0,
+                    capacity INTEGER NOT NULL DEFAULT 10,
+                    last_seen INTEGER NOT NULL DEFAULT 0,
+                    first_seen INTEGER NOT NULL DEFAULT 0
+                );
                 """
             )
             self._db.commit()
@@ -412,6 +423,14 @@ class Store:
         # only ever an explicit opt-out recorded by the agent itself.
         _add("users", "mode",
              "mode TEXT NOT NULL DEFAULT 'autonomous'")
+        # Peer mesh (v1.2.0): the server registry carries health,
+        # rider load and effective capacity alongside identity.
+        _add("servers", "health",
+             "health INTEGER NOT NULL DEFAULT 100")
+        _add("servers", "riders",
+             "riders INTEGER NOT NULL DEFAULT 0")
+        _add("servers", "capacity",
+             "capacity INTEGER NOT NULL DEFAULT 10")
         db.commit()
 
     # -- blob metadata (ciphertext lives in the blob store) ----------------
@@ -1046,6 +1065,51 @@ class Store:
                 "SELECT last_seen FROM users WHERE username = ?",
                 (username,)).fetchone()
         return int(row["last_seen"]) if row else 0
+
+    # -- server registry (v1.2.0 peer mesh) --------------------------------
+    # Every relay registers ITSELF in the shared backend on boot and
+    # heartbeats the row; clients discover the live mesh from any
+    # relay (welcome payload / 'servers' request) and race home +
+    # every live peer. The registry is how "another agent's server"
+    # becomes a real, findable thing instead of a configured guess.
+
+    def register_server(self, label: str, endpoint: str,
+                        host_agent: str = "", version: str = "",
+                        health: int = 100, riders: int = 0,
+                        capacity: int = 10) -> None:
+        now = now_ts()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO servers (endpoint, label, host_agent,"
+                " version, health, riders, capacity, last_seen,"
+                " first_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(endpoint) DO UPDATE SET"
+                " label = excluded.label,"
+                " host_agent = excluded.host_agent,"
+                " version = excluded.version,"
+                " health = excluded.health,"
+                " riders = excluded.riders,"
+                " capacity = excluded.capacity,"
+                " last_seen = excluded.last_seen",
+                (endpoint, label, host_agent, version, int(health),
+                 int(riders), int(capacity), now, now))
+            self._db.commit()
+
+    def list_servers(self, stale_after: int | None = None) -> list[dict]:
+        """Live servers only: registry rows whose heartbeat is fresh
+        (timing.SERVER_STALE_SECONDS unless overridden). A dead
+        relay's row ages out and is never offered as a peer."""
+        from .timing import SERVER_STALE_SECONDS
+        if stale_after is None:
+            stale_after = SERVER_STALE_SECONDS
+        cutoff = now_ts() - int(stale_after)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT endpoint, label, host_agent, version, health,"
+                " riders, capacity, last_seen"
+                " FROM servers WHERE last_seen >= ? ORDER BY endpoint",
+                (cutoff,)).fetchall()
+        return [dict(r) for r in rows]
 
     def set_capabilities(self, username: str, capabilities,
                          cap_desc: str = "") -> None:
