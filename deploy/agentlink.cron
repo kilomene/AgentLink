@@ -1,5 +1,9 @@
 # AgentLink safety-net cron entries — installed idempotently by
 # `agentlink service install` (marker-delimited; safe to re-run).
+# NOTE (v1.1.8): the */15 update entry below is a LEGACY
+# belt-and-braces duplicate. The agent daemon checks for updates
+# ITSELF every 15 minutes (in-daemon self-update) — an agent on a
+# host with no crontab binary loses nothing but the watchdog.
 # agentlink-watchdog-begin
 * * * * * /bin/sh ~/.agentlink/watchdog.sh >/dev/null 2>&1
 # agentlink-watchdog-end
