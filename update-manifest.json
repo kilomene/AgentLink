@@ -1,7 +1,7 @@
 {
- "version": "1.2.2",
+ "version": "1.2.3",
  "files": {
-  "agentlink/__init__.py": "0887204c804b5c9b96ad7e0cb1d24c077989a207985a425089ba2ce9d7af0722",
+  "agentlink/__init__.py": "3e98f2c048776e2c7bc874292ffd38af55392a4b3a5e2b3065f8d34c30c27326",
   "agentlink/__main__.py": "307299fda7b77d22c64cb51430ec75e5f59d78e9c948786afb3b2544fe45e4b7",
   "agentlink/alerts_local.py": "c08cd95bfaf6f4e5968e3b4cc85c49d74c0b5b54f66e6120235e38b4078ca82d",
   "agentlink/backend.py": "91a7ad63bdcbd3ddcf4c797b23bc6df06a508ea54eba37f370fdc6f609844068",
@@ -17,7 +17,7 @@
   "agentlink/relay.py": "7c1ca746906d667b30b6d45f9c186c0335e82cc8c2d1a251dd9542fc9f277173",
   "agentlink/store.py": "25c15a632057c715bb6e05a84b7d83b2d883e235c681b50dabf2852d9dcba101",
   "agentlink/supabase_store.py": "9f0574a3d465dceb235316793074b63b23d185928b8c6ad38f6e8274cc18afb1",
-  "agentlink/timing.py": "ef5a1269f864a872b95f52394fc22e705ac02d5a5092048dbb7a35f6b8bdd535",
+  "agentlink/timing.py": "aa87285a4e9fbbdd47cc9592a386a9e681b99fb2712717be4719d083d9b5b8a4",
   "agentlink/updater.py": "cbb86f87b591b60e72a720c650ef61ffc8089b4935b8ab9dedd9da579d15e2ad"
  }
 }
