@@ -382,7 +382,17 @@ class Agent:
         self.identity: Identity | None = None
         if not ephemeral and self.username:
             self.identity = Identity(self.username, self.state_dir)
+        # Set by _load_server_list when a persisted mesh was restored:
+        # restored entries are the agent's memory of the mesh and are
+        # NOT expiry-pruned until the first LIVE learn of the session
+        # (a file older than the TTL must not strip a boot-time
+        # failover target — v1.2.2, production drill find).
+        self._mesh_restored = False
         self._load_server_list()
+        # Endpoints that won a race but failed at hello are skipped
+        # for exactly one subsequent race, so a phantom winner (a
+        # tunnel fronting a dead relay) cannot win forever.
+        self._skip_next_race: set[str] = set()
         self._ws = None
         self._reader: asyncio.Task | None = None
         self._message_handler = None
@@ -650,8 +660,10 @@ class Agent:
             # Expiry: a peer nobody has re-advertised within the
             # TTL is forgotten — dead entries (an old bind address,
             # a retired server) must not linger in the race set.
+            # Restored-from-disk entries are exempt until the first
+            # live learn of the session (see _mesh_restored).
             learned_at = entry.get("learned_at")
-            if learned_at is not None and \
+            if learned_at is not None and not self._mesh_restored and \
                     now - learned_at > DISCOVERED_SERVER_TTL_SECONDS:
                 continue
             # Eligibility (mesh rule): a server whose last-known
@@ -681,6 +693,8 @@ class Agent:
                 # The persisted stamp governs expiry; entries saved
                 # by an older build fall back to the file's saved_at.
                 e.setdefault("learned_at", saved_at)
+        if entries:
+            self._mesh_restored = True
         self._learn_servers(entries, persist=False)
 
     def _persist_server_list(self) -> None:
@@ -730,6 +744,10 @@ class Agent:
             if ep != self.endpoint:
                 self._discovered_servers[ep] = entry
         if learned:
+            if persist:
+                # A live advertisement: the restored-mesh exemption
+                # ends; every entry's stamp is now session-fresh.
+                self._mesh_restored = False
             self.known_servers = learned
             self._rebuild_endpoints()
             if persist:
@@ -818,6 +836,40 @@ class Agent:
         log.warning("deflected by %s (%s); trying the next eligible"
                     " server", url, reason)
 
+    async def _socket_survives(self, url: str) -> bool:
+        """Probe with an application ping (v1.2.2): open a socket to
+        ``url``, send the protocol's own ``{"type": "ping"}`` frame,
+        and require the relay's ``pong`` inside
+        RACE_PROBE_DWELL_SECONDS.
+
+        Neither a bare handshake nor a WebSocket control ping can
+        prove life: an endpoint fronted by a tunnel (the production
+        shape) completes the upgrade — and its edge even answers
+        control pings — while the relay behind it is dead; the
+        close arrives a beat later. Without a real round-trip the
+        dead endpoint kept "winning" every race in the v1.2.0
+        production kill-drill. Text frames are what a tunnel
+        actually bridges, and only a live relay answers the
+        application ping (it does so even before hello): live =
+        pong in milliseconds, phantom = close with no frame,
+        wedged = silence past the cap."""
+        from .timing import RACE_PROBE_DWELL_SECONDS
+        ws = None
+        try:
+            ws = await self._open_socket(url)
+            await ws.send('{"type": "ping"}')
+            await asyncio.wait_for(ws.recv(),
+                                   timeout=RACE_PROBE_DWELL_SECONDS)
+            return True
+        except Exception:
+            return False
+        finally:
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+
     async def _race_endpoints(self) -> str | None:
         """Parallel endpoint race (point 44a): home + every known
         peer are probed CONCURRENTLY — first healthy socket wins,
@@ -830,12 +882,23 @@ class Agent:
         self.race_count += 1
         candidates = [u for u in self.endpoints
                       if not self._is_deflected(u)]
+        if self._skip_next_race:
+            # One-shot skip: the endpoint(s) that won the last race
+            # but failed at hello sit this one out, so the race can
+            # reach the next candidate instead of looping on a
+            # phantom. Consumed by this race either way.
+            fresh = [u for u in candidates
+                     if u not in self._skip_next_race]
+            self._skip_next_race = set()
+            if fresh:
+                candidates = fresh
         if not candidates:
             candidates = list(self.endpoints)
 
         async def _probe(url: str) -> str:
-            ws = await self._open_socket(url)
-            await ws.close()
+            if not await self._socket_survives(url):
+                raise ConnectionError(
+                    f"endpoint {url} did not survive the probe dwell")
             return url
 
         tasks = {asyncio.create_task(_probe(u)): u
@@ -1291,10 +1354,10 @@ class Agent:
                 self.home_probe_count += 1
                 if self.current_endpoint == self.endpoint:
                     continue
-                try:
-                    probe = await connect(self.endpoint, max_size=MAX_FRAME)
-                    await probe.close()
-                except Exception:
+                # Dwell-checked (v1.2.2): a tunneled home completes
+                # the handshake even while dead; only a socket that
+                # SURVIVES the dwell means home is really back.
+                if not await self._socket_survives(self.endpoint):
                     continue
                 log.info("home endpoint %s recovered; migrating back",
                          self.endpoint)
@@ -1377,6 +1440,11 @@ class Agent:
                     else:
                         raise
                 except Exception as exc:
+                    # Won the race, failed the hello: sit this
+                    # endpoint out of the NEXT race so another
+                    # candidate gets its turn (phantom-winner loop
+                    # breaker, v1.2.2).
+                    self._skip_next_race.add(winner)
                     log.warning("raced endpoint %s failed at hello "
                                 "(%s)", winner, exc)
             if not connected:
