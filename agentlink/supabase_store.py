@@ -1302,7 +1302,7 @@ class SupabaseStore:
     def audit(self, kind, actor, target="", group_id="", work_id="",
               status="", priority="", size=0, mentions=None, ref_id="",
               sender_nickname="", sender_role="",
-              sender_custom_role=""):
+              sender_custom_role="", oversight=""):
         self._req("POST", "audit_log", body={
             "ts": now_ts(), "kind": kind, "actor": actor, "target": target,
             "group_id": group_id, "work_id": work_id, "status": status,
@@ -1310,7 +1310,8 @@ class SupabaseStore:
             "mentions": json.dumps(mentions or []), "ref_id": ref_id,
             "sender_nickname": sender_nickname or "",
             "sender_role": sender_role or "",
-            "sender_custom_role": sender_custom_role or ""},
+            "sender_custom_role": sender_custom_role or "",
+            "oversight": oversight or ""},
             prefer="return=minimal")
 
     def list_audit(self, limit=300):
@@ -1318,13 +1319,17 @@ class SupabaseStore:
             "audit_log",
             "select=ts,kind,actor,target,group_id,work_id,status,priority,"
             "size,mentions,ref_id,sender_nickname,sender_role,"
-            f"sender_custom_role&order=seq.desc&limit={limit}")
+            f"sender_custom_role,oversight&order=seq.desc&limit={limit}")
         out = []
         for r in rows:
             try:
                 mentions = json.loads(r.get("mentions") or "[]")
             except Exception:
                 mentions = []
+            try:
+                oversight = json.loads(r.get("oversight") or "null")
+            except Exception:
+                oversight = None
             out.append({"ts": r["ts"], "kind": r["kind"],
                         "from": r["actor"], "to": r["target"],
                         "group_id": r["group_id"], "work_id": r["work_id"],
@@ -1335,5 +1340,6 @@ class SupabaseStore:
                         "sender_nickname": r.get("sender_nickname", ""),
                         "sender_role": r.get("sender_role", ""),
                         "sender_custom_role":
-                            r.get("sender_custom_role", "")})
+                            r.get("sender_custom_role", ""),
+                        "oversight": oversight})
         return out
