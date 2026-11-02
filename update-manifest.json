@@ -1,6 +1,7 @@
 {
+ "version": "1.1.6",
  "files": {
-  "agentlink/__init__.py": "d73ca83f5a5541bfdd2c562f07e27c094825d8b31f58238b5f46b81b9d603013",
+  "agentlink/__init__.py": "c0ce4054e51f1d87ddc34ba9aba8ba5b0ea145087ae26c11d9e48893bf860146",
   "agentlink/__main__.py": "307299fda7b77d22c64cb51430ec75e5f59d78e9c948786afb3b2544fe45e4b7",
   "agentlink/alerts_local.py": "c08cd95bfaf6f4e5968e3b4cc85c49d74c0b5b54f66e6120235e38b4078ca82d",
   "agentlink/backend.py": "91a7ad63bdcbd3ddcf4c797b23bc6df06a508ea54eba37f370fdc6f609844068",
@@ -10,7 +11,7 @@
   "agentlink/client.py": "b1ea87387160b6fc6a8f637d40663d31666e35b5c62d6b43f074e4213b70832f",
   "agentlink/config.py": "9423b3f74d4a0a164bb03b3d79a8f31e7262c8062502ef335ef0caae059c7b32",
   "agentlink/crypto.py": "6d653e0d5ae4999d65354e23c388314833c6c03c27e852357431921c78905637",
-  "agentlink/dashboard.py": "39637f57fa40ddd25bb0d20d52c1bec1739744e9a9a84050e740e69dac6cc8bd",
+  "agentlink/dashboard.py": "d393a124cc19908c4fea6b6b934ce118dc19211282b6c7681ecb90163b847c68",
   "agentlink/deadlines.py": "319d320c1bd29f3c05fbc689e381d50803608e6f4a71cceba8c3a82448134446",
   "agentlink/protocol.py": "8e67a56776bb4ceb99a2c9afee716e6fe13bb7f5c5efa3e5d62391c12cf3aa2c",
   "agentlink/relay.py": "05178ce148c65c2a87e5286240598e59855315ed83ef377ffacccd5b2f9a9b65",
@@ -18,6 +19,5 @@
   "agentlink/supabase_store.py": "941e3d9f0ce9b9f2c75ddfd475e075eaf790e9892c61dcc21932e96f732b85b4",
   "agentlink/timing.py": "ab0ed7861922c8b989f8b88ad41f9b3640d4c9a445a96505633c2cf6daffc037",
   "agentlink/updater.py": "c610bc6ec7f4e84ba8af6b455efbb519219d57f7f9aa4e8462f400f6c1faca94"
- },
- "version": "1.1.5"
+ }
 }
