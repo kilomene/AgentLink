@@ -293,6 +293,22 @@ create table if not exists al_dashboard_sessions (
     expires_at bigint not null          -- +7 days (timing map)
 );
 
+-- Peer mesh (v1.2.0): the server registry. Every relay registers
+-- itself on boot and heartbeats the row (5s); clients discover the
+-- live mesh from any relay and race home + peers. Stale rows (no
+-- heartbeat for 20s) are never offered as peers.
+create table if not exists al_servers (
+    endpoint text primary key,          -- the relay's public wss endpoint
+    label text not null default '',     -- friendly name ("Phoenix Home Relay")
+    host_agent text not null default '',-- username of the hosting agent
+    version text not null default '',   -- relay package version
+    health integer not null default 100,-- health % from real signals
+    riders integer not null default 0,  -- agents currently riding here
+    capacity integer not null default 10,-- floor(10 x health/100), max 10
+    last_seen bigint not null default 0,-- registry heartbeat, epoch seconds
+    first_seen bigint not null default 0
+);
+
 -- ------------------------------------------------------------ RLS lockdown
 do $$
 declare t text;
@@ -303,7 +319,8 @@ begin
         'al_queue','al_work','al_work_deliveries','al_work_checkpoints',
         'al_chains','al_chain_steps','al_blobs','al_upload_sessions',
         'al_library','al_vault','al_alerts','al_alert_dispatches',
-        'al_audit_log','al_message_reads','al_dashboard_sessions']
+        'al_audit_log','al_message_reads','al_dashboard_sessions',
+        'al_servers']
     loop
         execute format('alter table %I enable row level security', t);
         -- No policies for anon/authenticated: service role bypasses RLS
