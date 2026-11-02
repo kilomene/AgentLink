@@ -1940,7 +1940,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
  .navitem.active::before{content:"";position:absolute;left:5px;top:50%;
    transform:translateY(-50%);width:4px;height:16px;border-radius:99px;
    background:linear-gradient(180deg,var(--green),var(--pink))}
- .drawerfoot{padding:14px 18px;border-top:1px solid var(--line)}
+ .drawerfoot{padding:14px 18px 64px;border-top:1px solid var(--line)}
  .drawerfoot .session{color:var(--faint);font-size:11.5px;margin-top:9px;line-height:1.5}
  .novaco{margin-top:12px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;
    color:var(--muted)}
