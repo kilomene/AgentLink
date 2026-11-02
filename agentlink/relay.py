@@ -1262,8 +1262,43 @@ class Relay:
         tail silently vanished from the dashboard while sitting
         intact in the store (owner-reported 2026-11-02: the beulah
         and deploy-probe conversations "disappeared" while only the
-        freshest drill conversation rendered)."""
+        freshest drill conversation rendered).
+
+        TRUE CHRONOLOGY (v1.3.3): items inside a conversation are in
+        ascending ts order — the head of a thread is its FIRST item,
+        and the flow reads downward through time, WhatsApp-style.
+        The pre-1.3.3 code reversed every item list at the end, so
+        each thread opened with its NEWEST item: the restored
+        beulah thread rendered Beulah's reply above Phoenix's
+        opener, reading as if she had started a conversation
+        Phoenix started (owner-reported 2026-11-02). The sort here
+        is explicit, so the composed order is ts-ascending whatever
+        order the store returned rows in.
+
+        FIRST-CLASS CONVERSATIONS (v1.3.3): a group or broadcast
+        channel IS a conversation from the moment it exists — it is
+        seeded into this list from the group/channel registry even
+        with zero messages (the pre-1.3.3 list only ever contained
+        conversations that already had content rows, so the Nova
+        family group was invisible in the chat list while it sat in
+        the store)."""
         rows = self.store.list_content_audit()
+        groups = {g["id"]: g for g in self.store.all_groups()}
+        channels = {c["id"]: c for c in self.store.all_channels()}
+
+        def _participants(gid: str) -> list:
+            if gid in channels:
+                return [{"username": m["username"],
+                         "nickname": m.get("nickname", ""),
+                         "role": m.get("role", ""),
+                         "custom_role": m.get("custom_role", "")}
+                        for m in self.store.channel_members(gid)]
+            return [{"username": m["username"],
+                     "nickname": m.get("nickname", ""),
+                     "role": m.get("role", ""),
+                     "custom_role": m.get("custom_role", "")}
+                    for m in self.store.members(gid)]
+
         convs: dict[str, dict] = {}
         part_cache: dict[str, list] = {}
         for r in rows:
@@ -1277,12 +1312,7 @@ class Relay:
             if r["group_id"]:
                 key = "group:" + r["group_id"]
                 if key not in part_cache:
-                    part_cache[key] = [
-                        {"username": m["username"],
-                         "nickname": m.get("nickname", ""),
-                         "role": m.get("role", ""),
-                         "custom_role": m.get("custom_role", "")}
-                        for m in self.store.members(r["group_id"])]
+                    part_cache[key] = _participants(r["group_id"])
                 participants = part_cache[key]
             else:
                 pair = sorted(x for x in (r["from"], r["to"]) if x)
@@ -1322,11 +1352,41 @@ class Relay:
                 rb = reads.get(item["id"])
                 if rb:
                     item["read_by"] = rb
+        # Stamp kind/name/created_at, then seed any group or channel
+        # that has no content rows yet — it exists, so it is a
+        # conversation (v1.3.3, see the docstring above).
+        for gid, g in groups.items():
+            key = "group:" + gid
+            c = convs.get(key)
+            if c is None:
+                c = convs[key] = {"key": key,
+                                  "participants": _participants(gid),
+                                  "group_id": gid, "items": []}
+            c["kind"] = "group"
+            c["name"] = g.get("name", "")
+            c["created_at"] = g.get("created_at") or 0
+        for cid, ch in channels.items():
+            key = "group:" + cid
+            c = convs.get(key)
+            if c is None:
+                c = convs[key] = {"key": key,
+                                  "participants": _participants(cid),
+                                  "group_id": cid, "items": []}
+            c["kind"] = "channel"
+            c["name"] = ch.get("name", "")
+            c["created_at"] = ch.get("created_at") or 0
+        for c in convs.values():
+            c.setdefault("kind", "dm")
+            c.setdefault("name", "")
+            c.setdefault("created_at", 0)
+            # Explicit ascending sort (stable: equal-ts items keep
+            # the store's arrival order) — never a reversal.
+            c["items"].sort(key=lambda i: i["ts"])
+        # Chat-list order: most recent activity first; a conversation
+        # with no items yet sorts by its creation time.
         out = sorted(convs.values(),
-                     key=lambda c: -(c["items"][0]["ts"] if c["items"]
-                                     else 0))
-        for c in out:
-            c["items"] = list(reversed(c["items"]))
+                     key=lambda c: -((c["items"][-1]["ts"] if c["items"]
+                                      else 0) or c["created_at"] or 0))
         return out
 
     def _resolve_dashboard_password(self) -> str:
