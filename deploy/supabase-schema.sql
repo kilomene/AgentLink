@@ -184,3 +184,10 @@ create table if not exists chain_steps (
   target text not null default '', status text not null default 'pending',
   handoff text, released_at double precision,
   primary key (chain_id, step_index));
+create table if not exists servers (
+  endpoint text primary key, label text not null default '',
+  host_agent text not null default '', version text not null default '',
+  health integer not null default 100, riders integer not null default 0,
+  capacity integer not null default 10,
+  last_seen double precision not null default 0,
+  first_seen double precision not null default 0);
