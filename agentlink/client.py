@@ -69,6 +69,7 @@ from .timing import (
     AUTO_REPLY_DELAY_SECONDS,
     HEARTBEAT_SECONDS,
     HOME_PROBE_SECONDS,
+    DISCOVERED_SERVER_TTL_SECONDS,
     MESH_REFRESH_SECONDS,
     RECONNECT_BACKOFF_CAP_SECONDS,
     SERVER_HEALTHY_MIN,
@@ -641,14 +642,23 @@ class Agent:
         for ep in self._configured_fallbacks:
             if ep and ep not in out:
                 out.append(ep)
+        now = time.time()
         for ep in sorted(self._discovered_servers):
             if not ep or ep in out:
+                continue
+            entry = self._discovered_servers[ep]
+            # Expiry: a peer nobody has re-advertised within the
+            # TTL is forgotten — dead entries (an old bind address,
+            # a retired server) must not linger in the race set.
+            learned_at = entry.get("learned_at")
+            if learned_at is not None and \
+                    now - learned_at > DISCOVERED_SERVER_TTL_SECONDS:
                 continue
             # Eligibility (mesh rule): a server whose last-known
             # health is at/below the floor is NOT GOOD — it is never
             # raced. Unknown health (never measured) stays eligible:
             # the relay's own admission gate is the backstop.
-            health = self._discovered_servers[ep].get("health")
+            health = entry.get("health")
             if health is not None and health <= SERVER_HEALTHY_MIN:
                 continue
             out.append(ep)
@@ -665,6 +675,12 @@ class Agent:
                 data.get("home") != self.endpoint:
             return  # a list learned under a different home is stale
         entries = data.get("servers") or []
+        saved_at = data.get("saved_at") or 0
+        for e in entries:
+            if isinstance(e, dict):
+                # The persisted stamp governs expiry; entries saved
+                # by an older build fall back to the file's saved_at.
+                e.setdefault("learned_at", saved_at)
         self._learn_servers(entries, persist=False)
 
     def _persist_server_list(self) -> None:
@@ -702,7 +718,14 @@ class Agent:
                      "riders": (int(e["riders"]) if isinstance(
                          e.get("riders"), (int, float)) else None),
                      "capacity": (int(e["capacity"]) if isinstance(
-                         e.get("capacity"), (int, float)) else None)}
+                         e.get("capacity"), (int, float)) else None),
+                     # Live advertisements (persist=True) stamp NOW;
+                     # a restored list keeps its persisted stamp so
+                     # expiry is honest across restarts.
+                     "learned_at": (time.time() if persist else
+                                    (float(e["learned_at"]) if isinstance(
+                                        e.get("learned_at"),
+                                        (int, float)) else 0.0))}
             learned.append(entry)
             if ep != self.endpoint:
                 self._discovered_servers[ep] = entry
