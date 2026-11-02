@@ -201,7 +201,8 @@ class Store:
                     ref_id TEXT NOT NULL DEFAULT '',
                     sender_nickname TEXT NOT NULL DEFAULT '',
                     sender_role TEXT NOT NULL DEFAULT '',
-                    sender_custom_role TEXT NOT NULL DEFAULT ''
+                    sender_custom_role TEXT NOT NULL DEFAULT '',
+                    oversight TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS alerts (
                     id TEXT PRIMARY KEY,
@@ -370,6 +371,8 @@ class Store:
              "sender_role TEXT NOT NULL DEFAULT ''")
         _add("audit_log", "sender_custom_role",
              "sender_custom_role TEXT NOT NULL DEFAULT ''")
+        _add("audit_log", "oversight",
+             "oversight TEXT NOT NULL DEFAULT ''")
         _add("work", "require_approval",
              "require_approval INTEGER NOT NULL DEFAULT 0")
         _add("chain_steps", "require_approval",
@@ -822,17 +825,19 @@ class Store:
               group_id: str = "", work_id: str = "", status: str = "",
               priority: str = "", size: int = 0, mentions=None,
               ref_id: str = "", sender_nickname: str = "",
-              sender_role: str = "", sender_custom_role: str = "") -> None:
+              sender_role: str = "", sender_custom_role: str = "",
+              oversight: str = "") -> None:
         with self._lock:
             self._db.execute(
                 "INSERT INTO audit_log (ts, kind, actor, target, group_id,"
                 " work_id, status, priority, size, mentions, ref_id,"
-                " sender_nickname, sender_role, sender_custom_role)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " sender_nickname, sender_role, sender_custom_role,"
+                " oversight)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (now_ts(), kind, actor, target, group_id, work_id, status,
                  priority, int(size or 0), json.dumps(mentions or []),
                  ref_id, sender_nickname or "", sender_role or "",
-                 sender_custom_role or ""))
+                 sender_custom_role or "", oversight or ""))
             self._db.commit()
 
     def list_audit(self, limit: int = 300) -> list[dict]:
@@ -840,7 +845,8 @@ class Store:
             rows = self._db.execute(
                 'SELECT ts, kind, actor AS "from", target AS "to",'
                 " group_id, work_id, status, priority, size, mentions,"
-                " ref_id, sender_nickname, sender_role, sender_custom_role"
+                " ref_id, sender_nickname, sender_role, sender_custom_role,"
+                " oversight"
                 " FROM audit_log"
                 " ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
             out = []
@@ -850,6 +856,10 @@ class Store:
                     d["mentions"] = json.loads(d.get("mentions") or "[]")
                 except Exception:
                     d["mentions"] = []
+                try:
+                    d["oversight"] = json.loads(d.get("oversight") or "null")
+                except Exception:
+                    d["oversight"] = None
                 out.append(d)
             return out
         return [dict(r) for r in rows]
