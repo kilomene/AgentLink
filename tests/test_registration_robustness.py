@@ -107,12 +107,17 @@ CONTRACT DETAILS DISCOVERED / GUESSED (also in the worker report):
     (15) of the cutoff is still refused ``username_taken`` and
     test 2 waits that grace out before retrying, exactly as a
     real client's reconnect pacing would. On resume the relay
-    rotates the secret ONLY when the store offers a secret setter
-    (set_secret/rotate_secret/reset_secret); the inspected store
-    offers NONE, so the resume welcome carries no secret, the
-    client stays secretless, and the resume stays window-bound —
-    test 2 therefore pins the landed evidence of a resume (the
-    'hello_resumed' audit row), not a saved secret file.
+    ROTATES the secret through the store's set_secret (both stores
+    implement it since v1.3.8; in the v1.3.7 landing neither did,
+    so the welcome carried no secret and the client stayed
+    secretless and window-bound). The rotated secret rides the
+    welcome, the client saves it, and the window closes behind
+    the identity — test 2 pins BOTH the landed evidence of a
+    resume (the 'hello_resumed' audit row) AND the saved, rotated
+    secret file; the post-window test then proves a rotated
+    client returns as an ordinary verified hello after the
+    window has closed, while a still-secretless retry past the
+    window is refused — the gate itself is unchanged.
   * ``agentlink/timing.py``: ``FIRST_HELLO_TIMEOUT_SECONDS = 30``
     (the forgiving first-contact window; a pre-hello connection
     that outlives it is closed and recorded as hello_timeout) —
@@ -408,16 +413,24 @@ def test_register_cutoff_and_resume(relay_env, state_root,
         await asyncio.wait_for(a2.start(), timeout=25)
         assert a2.username == "cutoffkid"
         # Landed evidence of a resume: the relay records it loudly
-        # (audit/activity kind 'hello_resumed'). NOTE: no secret
-        # file is asserted — the store offers no secret setter, so
-        # the resume welcome carries no rotated secret and the
-        # client remains secretless inside the resume window (see
-        # header). If a store setter lands, this is the place to
-        # start asserting the saved secret instead.
+        # (audit/activity kind 'hello_resumed').
         resumed = [r for r in store.list_audit(200)
                    if r["kind"] == "hello_resumed"
                    and r["from"] == "cutoffkid"]
         assert resumed, "no 'hello_resumed' audit row for the resume"
+
+        # v1.3.8: the resume ROTATED the secret and the rotated
+        # secret rode the welcome — the client saved it, and it
+        # verifies against the store. (In the v1.3.7 landing the
+        # stores offered no secret setter, so no file existed and
+        # the client stayed secretless inside the window.)
+        secret_path = Path(state_dir) / "secret-cutoffkid.json"
+        assert secret_path.exists(), (
+            "resume did not deliver a rotated secret — the client "
+            "is still secretless and window-bound")
+        saved = json.loads(secret_path.read_text())["secret"]
+        assert saved and store.verify("cutoffkid", saved), (
+            "the saved post-resume secret does not verify")
 
         # Exactly ONE user row for the identity.
         rows = user_rows(store, "cutoffkid")
@@ -431,6 +444,144 @@ def test_register_cutoff_and_resume(relay_env, state_root,
                    if u["username"] == "cutoffkid"]
         assert len(entries) == 1 and entries[0]["online"] is True
         await a2.close()
+    run(_go())
+
+
+# ---------------------------------------------------------------------
+# 2b. set_secret: rotation semantics + store parity (v1.3.8)
+# ---------------------------------------------------------------------
+
+def _sql(db, statement, params=()):
+    con = sqlite3.connect(db, timeout=10)
+    try:
+        con.execute(statement, params)
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_set_secret_rotation_store_parity(tmp_path):
+    """set_secret (v1.3.8): both stores rotate with claim's exact
+    storage discipline — SHA-256 hash only, never plaintext — the
+    rotated secret authenticates, the replaced one does not, an
+    empty value never clobbers, and the two stores' stored hashes
+    agree byte for byte."""
+    from agentlink.store import Store, _hash_token
+    from agentlink.supabase_store import SupabaseStore, _sha
+
+    db = str(tmp_path / "parity.db")
+    store = Store(db)
+    s1 = store.claim("paritykid", "Parity Kid")
+    assert store.verify("paritykid", s1)
+    store.set_secret("paritykid", "rotated-secret-value")
+    assert store.verify("paritykid", "rotated-secret-value")
+    assert not store.verify("paritykid", s1), (
+        "the pre-rotation secret still authenticates")
+    con = sqlite3.connect(db)
+    raw = con.execute(
+        "SELECT secret FROM users WHERE username = ?",
+        ("paritykid",)).fetchone()[0]
+    con.close()
+    assert raw == _hash_token("rotated-secret-value")
+    assert raw != "rotated-secret-value", "plaintext secret stored"
+    store.set_secret("paritykid", "")
+    assert store.verify("paritykid", "rotated-secret-value"), (
+        "an empty set_secret erased the secret")
+    store.close()
+
+    calls = []
+    sb = SupabaseStore("https://example.invalid", "k")
+
+    def _capture(method, table, query="", body=None, prefer=""):
+        calls.append((method, table, query, body, prefer))
+    sb._req = _capture
+    sb.set_secret("paritykid", "rotated-secret-value")
+    assert len(calls) == 1, calls
+    method, table, query, body, _prefer = calls[0]
+    assert method == "PATCH" and table == "users"
+    assert "username=eq.paritykid" in query
+    assert body == {"secret": _sha("rotated-secret-value")}
+    # Cross-store parity: the stored hash IS claim's hash in both.
+    assert body["secret"] == _hash_token("rotated-secret-value")
+    sb.set_secret("paritykid", "")
+    assert len(calls) == 1, "empty secret must not write"
+
+
+def test_resume_rotation_closes_the_window(relay_env, state_root):
+    """The v1.3.8 completion of the resume fix, end to end:
+    register -> lose the welcome's secret (the folk-class strand)
+    -> resume inside the window (secret ROTATED and saved; the
+    pre-rotation secret no longer authenticates) -> the window
+    closes behind the identity: a return AFTER the window WITH
+    the rotated secret is an ordinary verified hello, while a
+    still-secretless retry after the window is refused — the
+    key-match gate itself is unchanged."""
+    async def _go():
+        store = relay_env["store"]
+        db = relay_env["db"]
+        relay = relay_env["relay"]
+        state_dir = str(state_root / "windowkid")
+        secret_path = Path(state_dir) / "secret-windowkid.json"
+
+        a1 = Agent("windowkid", endpoint=relay_env["url"],
+                   state_dir=state_dir)
+        await a1.start()
+        secret1 = json.loads(secret_path.read_text())["secret"]
+        assert store.verify("windowkid", secret1)
+        await a1.close()
+        assert await wait_for(
+            lambda: "windowkid" not in relay.peers, timeout=10)
+
+        # The strand: the secret is lost; the identity keys remain.
+        secret_path.unlink()
+        # Age the claim-time heartbeat touch past the offline grace
+        # so the resume gate's not-alive condition can open — what
+        # a real client's reconnect pacing waits out.
+        _sql(db, "UPDATE users SET last_seen = ? WHERE username = ?",
+             (int(time.time()) - 60, "windowkid"))
+
+        a2 = Agent("windowkid", endpoint=relay_env["url"],
+                   state_dir=state_dir)
+        await a2.start()
+        # Rotation landed: a NEW secret is saved, it verifies, and
+        # the pre-rotation secret no longer authenticates.
+        secret2 = json.loads(secret_path.read_text())["secret"]
+        assert secret2 != secret1, "resume did not rotate the secret"
+        assert store.verify("windowkid", secret2)
+        assert not store.verify("windowkid", secret1)
+        await a2.close()
+        assert await wait_for(
+            lambda: "windowkid" not in relay.peers, timeout=10)
+
+        # Close the window: the row is now older than
+        # REGISTRATION_RESUME_WINDOW_SECONDS.
+        _sql(db, "UPDATE users SET created_at = ?, last_seen = ?"
+                 " WHERE username = ?",
+             (int(time.time())
+              - 2 * timing.REGISTRATION_RESUME_WINDOW_SECONDS,
+              int(time.time()) - 60, "windowkid"))
+
+        # Post-window return WITH the rotated secret: an ordinary
+        # verified hello — no resume needed, none refused.
+        a3 = Agent("windowkid", endpoint=relay_env["url"],
+                   state_dir=state_dir)
+        await a3.start()
+        assert await wait_for(
+            lambda: "windowkid" in relay.peers, timeout=5)
+        await a3.close()
+        assert await wait_for(
+            lambda: "windowkid" not in relay.peers, timeout=10)
+        _sql(db, "UPDATE users SET last_seen = ? WHERE username = ?",
+             (int(time.time()) - 60, "windowkid"))
+
+        # Post-window return WITHOUT any secret: the gate itself
+        # is unchanged — refused, exactly as before v1.3.8.
+        secret_path.unlink()
+        a4 = Agent("windowkid", endpoint=relay_env["url"],
+                   state_dir=state_dir)
+        with pytest.raises(RegistrationFailed):
+            await asyncio.wait_for(a4.start(), timeout=25)
+        await a4.close()
     run(_go())
 
 
