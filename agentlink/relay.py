@@ -264,6 +264,7 @@ class Relay:
     require_oversight: bool = field(default_factory=lambda:
         os.environ.get("AGENTLINK_REQUIRE_OVERSIGHT", "") == "1")
     _scan_task: object = field(default=None, repr=False)
+    _room_drain_task: object = field(default=None, repr=False)
     _blob_task: object = field(default=None, repr=False)
     _server_hb_task: object = field(default=None, repr=False)
     # Earned health (v1.3.0): a server starts UNRATED — it carries
@@ -2247,6 +2248,17 @@ class Relay:
             self.port = sockets[0].getsockname()[1]
         log.info("relay listening on %s:%s", self.host, self.port)
         self._scan_task = asyncio.create_task(self._fleet_scan_loop())
+        # Room signalling gets its OWN drain loop (v1.4.4): the
+        # fleet scan's pass latency is unbounded under load (the
+        # health battery + a network store), and perishable room
+        # signals riding it sat unclaimed for 25s+ in the
+        # post-restart battery window of the v1.4.3 production
+        # room proof — a dead call in real terms. This loop does
+        # exactly one store round trip per tick; the scan keeps
+        # its own drain as a backstop (claiming is atomic, so the
+        # two can never deliver the same frame twice).
+        self._room_drain_task = asyncio.create_task(
+            self._room_drain_loop())
         # Blob-layer truth (v1.3.8): object/meta reconciliation
         # backstop — see _reconcile_blobs.
         self._blob_task = asyncio.create_task(
@@ -2294,6 +2306,9 @@ class Relay:
         if self._scan_task is not None:
             self._scan_task.cancel()
             self._scan_task = None
+        if self._room_drain_task is not None:
+            self._room_drain_task.cancel()
+            self._room_drain_task = None
         if self._blob_task is not None:
             self._blob_task.cancel()
             self._blob_task = None
@@ -2411,6 +2426,52 @@ class Relay:
                 self._health_event("scan_fail")
                 log.exception("fleet scan failed")
 
+    async def _drain_room_frames(self) -> None:
+        """Claim store-queued room frames for THIS relay's local
+        peers and write them to their sockets — agents and
+        ephemeral dashboard clients alike; a room participant's
+        signalling must reach whichever socket hosts them
+        (v1.3.9 WS2). Claimed frames whose socket is already gone
+        are simply gone: signalling is perishable and the
+        disconnect reaper has already ended that participation on
+        the record. Claiming is atomic in the store, so the two
+        callers (the dedicated loop, the fleet scan) can never
+        deliver the same frame twice."""
+        _rf_drain = getattr(self.store, "room_frames_drain", None)
+        if _rf_drain is not None and self.peers:
+            try:
+                _by_user = await asyncio.to_thread(
+                    _rf_drain, list(self.peers.keys()))
+            except Exception:
+                _by_user = {}
+            for _uname, _frames in (_by_user or {}).items():
+                _p = self.peers.get(_uname)
+                if _p is None:
+                    continue
+                for _fr in _frames:
+                    try:
+                        await self._send(_p.ws, _fr)
+                    except Exception:
+                        break
+
+    async def _room_drain_loop(self) -> None:
+        """The dedicated room-signalling drain (v1.4.4): a 0.5s
+        tick doing one store round trip, so cross-server signals
+        land within about a second even while the fleet scan is
+        mid-battery or mid-reassignment — the v1.4.3 production
+        room proof watched an answer sit unclaimed for 25s+
+        behind a post-restart battery window. Per-tick failures
+        are swallowed: the next tick retries, and the fleet
+        scan's own drain remains as a backstop."""
+        while True:
+            try:
+                await asyncio.sleep(0.5)
+                await self._drain_room_frames()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                continue
+
     async def _fleet_scan_once(self) -> None:
         now = now_ts()
         store = self.store
@@ -2478,31 +2539,10 @@ class Relay:
                 continue
             for frame in queued:
                 await self._deliver(username, frame)
-        # Room frames (v1.3.9): room signals/events deposited in the
-        # shared store for participants whose connection lives HERE
-        # (sent by a brother relay hosting the sender) are claimed
-        # and written to the local socket — agents and ephemeral
-        # dashboard clients alike; a room participant's signalling
-        # must reach whichever socket hosts them. Claimed frames
-        # whose socket is already gone are simply gone: signalling
-        # is perishable and the disconnect reaper has already ended
-        # that participation on the record.
-        _rf_drain = getattr(store, "room_frames_drain", None)
-        if _rf_drain is not None and self.peers:
-            try:
-                _by_user = await asyncio.to_thread(
-                    _rf_drain, list(self.peers.keys()))
-            except Exception:
-                _by_user = {}
-            for _uname, _frames in (_by_user or {}).items():
-                _p = self.peers.get(_uname)
-                if _p is None:
-                    continue
-                for _fr in _frames:
-                    try:
-                        await self._send(_p.ws, _fr)
-                    except Exception:
-                        break
+        # Room frames: claimed and delivered by the shared helper —
+        # the dedicated _room_drain_loop is the primary path
+        # (v1.4.4); this pass remains as its backstop.
+        await self._drain_room_frames()
         grace = self.reassign_grace_seconds
 
         def _reassign_candidates():
