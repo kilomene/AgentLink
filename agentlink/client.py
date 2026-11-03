@@ -1119,7 +1119,9 @@ class Agent:
                 result = await self.vault.put(
                     str(spec["service"]), str(spec["username"]),
                     str(spec["password"]),
-                    notes=str(spec.get("notes") or ""))
+                    notes=str(spec.get("notes") or ""),
+                    auth_type=str(spec.get("auth_type")
+                                  or "password"))
             elif cmd == "vault_get":
                 result = await self.vault.get(
                     str(spec["service_or_id"]))
@@ -1179,7 +1181,8 @@ class Agent:
         return self._cred_vault
 
     async def vault_remember(self, service: str, username: str,
-                             password: str, notes: str = "") -> dict:
+                             password: str, notes: str = "",
+                             auth_type: str = "password") -> dict:
         """THE auto-save path (owner's order): the one call an agent
         — or its account-creation helper — makes the moment it
         creates an account, so the login (service, account email /
@@ -1187,11 +1190,13 @@ class Agent:
         No permission, no prompt. Flat alias of
         ``agent.vault.remember(...)``; returns the saved entry."""
         return await self.vault.remember(service, username, password,
-                                         notes)
+                                         notes, auth_type=auth_type)
 
     async def _vault_publish(self) -> None:
         """Upload the current vault document through the blob layer
-        and publish its pointer + oversight-sealed labels. The old
+        and publish its pointer + oversight-sealed envelopes (the
+        labels for the Agents cell, and since v1.5.0 the full
+        content for the owner's Credentials view). The old
         document blob is retired once the new pointer lands. A
         stale-revision refusal is logged loudly — the local vault
         stays authoritative locally either way."""
@@ -1210,6 +1215,7 @@ class Agent:
         result = await self._request({
             "type": "vault_publish",
             "labels": core.labels_envelope(self.oversight_pubkey),
+            "content": core.content_envelope(self.oversight_pubkey),
             "blob_id": blob_id,
             "version": core.revision,
             "entry_count": len(core)})
