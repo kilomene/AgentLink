@@ -4727,17 +4727,24 @@ class Relay:
         meta = self._vault_meta_of(username)
         if not meta:
             return {"present": False, "entries": 0, "version": 0,
-                    "labels_sealed": None}
+                    "labels_sealed": None, "content_sealed": None}
         labels_env = None
         if meta.get("labels"):
             try:
                 labels_env = json.loads(meta["labels"])
             except Exception:
                 labels_env = None
+        content_env = None
+        if meta.get("content"):
+            try:
+                content_env = json.loads(meta["content"])
+            except Exception:
+                content_env = None
         return {"present": True,
                 "entries": int(meta.get("entries") or 0),
                 "version": int(meta.get("version") or 0),
-                "labels_sealed": labels_env}
+                "labels_sealed": labels_env,
+                "content_sealed": content_env}
 
     async def _on_vault_publish(self, ws, frame, peer: Peer) -> None:
         """An agent publishes its vault pointer after uploading the
@@ -4751,18 +4758,21 @@ class Relay:
         version = frame.get("version")
         entries = frame.get("entry_count")
         labels = frame.get("labels")
+        content = frame.get("content")
         if not blob_id or len(blob_id) > 200 \
                 or not isinstance(version, int) \
                 or not (0 <= version <= 2 ** 31) \
                 or not isinstance(entries, int) \
                 or not (0 <= entries <= 100000) \
                 or (labels is not None
-                    and not self._valid_oversight(labels)):
+                    and not self._valid_oversight(labels)) \
+                or (content is not None
+                    and not self._valid_oversight(content)):
             await self._error(
                 ws, "bad_vault_publish", req_id,
                 "vault publish needs a blob id, a non-negative "
                 "integer revision and entry count, and (when "
-                "present) a well-formed oversight labels envelope")
+                "present) well-formed oversight envelopes")
             return
         setter = getattr(self.store, "set_vault_meta", None)
         if setter is None:
@@ -4773,7 +4783,9 @@ class Relay:
         accepted = bool(setter(
             peer.username,
             json.dumps(labels) if labels is not None else "",
-            blob_id, version, entries))
+            blob_id, version, entries,
+            content=json.dumps(content)
+            if content is not None else ""))
         self.store.audit(
             "vault_published" if accepted else "vault_publish_stale",
             peer.username, ref_id=blob_id,
