@@ -3,8 +3,16 @@
 Identity is a username only. Two local secrets, both mode 0600 in
 ``~/.agentlink/`` and never sent anywhere except as described:
 
-* ``secret-<username>.json`` — the relay owner-secret, presented silently
-  on reconnect to reclaim the username (stops impersonation).
+* ``secret-<username>.json`` — the relay owner-secret, issued ONCE
+  by the claiming hello's welcome and saved locally. Since v1.3.9
+  it is never presented to a relay again: returning hellos
+  authenticate by SIGNATURE (an Ed25519 challenge-response against
+  the identity key below), so nothing reusable ever crosses the
+  wire, least of all to a peer or carrier relay during failover.
+  The secret is presented only as a bounded legacy fallback to a
+  relay that provably predates key-signed hello (see
+  ``_legacy_auth_endpoints``), and a store-level copy remains for
+  operator recovery flows.
 * ``keys-<username>.json`` — the X25519 *private* key for end-to-end
   encryption. It never leaves the disk. Only the public key is
   registered with the relay; the relay routes ciphertext only.
@@ -299,6 +307,114 @@ class InstanceCollision(RegistrationFailed):
     rival on the same state."""
 
 
+class ControlForwardError(Exception):
+    """A one-shot command could not be forwarded to the running
+    instance through the owner-seat control channel (v1.3.9):
+    foreign lock holder, dead holder, a pre-control-channel
+    daemon, an unreachable socket, or a wedged holder that never
+    answers. Every message names the condition and the way out —
+    forwarding fails CLOSED, never silently and never by starting
+    a rival instance."""
+
+
+async def forward_command(state_dir, username: str, spec: dict,
+                          timeout: float = 20.0):
+    """Forward one command to the running instance that owns
+    ``username``'s state dir (v1.3.9 WS4) and return its result.
+
+    The channel is the Unix socket the lock holder advertises in
+    instance-<username>.lock. Identity is checked three ways
+    before anything is sent: the lock file must name THIS
+    username (a foreign holder is refused outright), the holder
+    pid must be alive, and the per-boot token from the lock file
+    must be presented (the daemon constant-time-compares it).
+    A dead holder raises ControlForwardError — the caller falls
+    back to the ordinary lock rules (a fresh start claims the
+    state dir through the flock, which the kernel released when
+    the holder died)."""
+    sd = Path(state_dir).expanduser()
+    lock_path = sd / f"instance-{username}.lock"
+    try:
+        holder = json.loads(lock_path.read_text())
+    except Exception:
+        raise ControlForwardError(
+            "control channel: no readable instance lock at "
+            f"{lock_path} — no running instance advertises a "
+            "channel here (a pre-v1.3.9 daemon holds the lock "
+            "without one, or the state dir is wrong). Stop the old "
+            "daemon once and restart it on the current version; "
+            "from then on one-shot commands forward through it.")
+    if holder.get("username") != username:
+        raise ControlForwardError(
+            "control channel refused: the lock at "
+            f"{lock_path} is held by @{holder.get('username')}, "
+            f"not @{username} — a command forwards only to its "
+            "OWN identity's running instance.")
+    pid = holder.get("pid")
+    if pid:
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            raise ControlForwardError(
+                f"control channel: lock holder pid {pid} is not "
+                "alive — the lock is stale and the ordinary lock "
+                "rules apply: start the agent (or re-run without "
+                "the dead daemon) and the flock claim succeeds.")
+        except PermissionError:
+            pass  # alive, owned by someone else — the token decides
+        except Exception:
+            pass
+    control = holder.get("control") or {}
+    sock_path = control.get("socket")
+    token = control.get("token")
+    if not sock_path or not token:
+        raise ControlForwardError(
+            f"control channel: the running instance (pid {pid}) "
+            "advertises no control socket — it predates v1.3.9. "
+            "Stop it once and restart on the current version; "
+            "after that, one-shot commands forward through the "
+            "running instance and the daemon never needs stopping "
+            "for an operator action again.")
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(sock_path), timeout)
+    except Exception as exc:
+        raise ControlForwardError(
+            f"control channel unreachable at {sock_path} "
+            f"({type(exc).__name__}: {exc}) — the holder may be "
+            "wedged; check the daemon before retrying.")
+    try:
+        payload = dict(spec)
+        payload["token"] = token
+        writer.write((json.dumps(payload) + "\n").encode())
+        await writer.drain()
+        try:
+            line = await asyncio.wait_for(reader.readline(),
+                                          timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            raise ControlForwardError(
+                f"control channel: the running instance (pid "
+                f"{pid}) accepted the command but did not answer "
+                f"within {timeout:.0f}s — it is wedged; fail "
+                "closed rather than guess. Restart the daemon if "
+                "it does not recover.")
+        if not line:
+            raise ControlForwardError(
+                "control channel: the running instance closed "
+                "the channel without answering.")
+        resp = json.loads(line.decode())
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    if not resp.get("ok"):
+        raise ControlForwardError(
+            "control channel: the running instance did not carry "
+            f"out the command: {resp.get('error')}")
+    return resp.get("result")
+
+
 class ResumeUnsupported(Exception):
     """A work handler raises this when it cannot resume from a
     checkpoint. The client reports resume_failed EXPLICITLY (point 30)
@@ -361,10 +477,6 @@ class TaskJournal:
         self._db.commit()
 
 
-class _JournalOK(Exception):
-    pass
-
-
 class RequestFailed(Exception):
     def __init__(self, reason: str, detail: str = ""):
         super().__init__(f"{reason}: {detail}".strip())
@@ -409,6 +521,7 @@ class Agent:
         decision_link=None,
         on_decision=None,
         decision_endpoint: str | None = None,
+        media: bool = False,
     ):
         u = normalize_username(username)
         if u is None and not ephemeral:
@@ -457,6 +570,27 @@ class Agent:
         self.username = u or ""
         self.display_name = display_name or self.username
         self.capabilities = list(capabilities or [])
+        # Voice-room media (v1.3.9, optional extra): media=True asks
+        # for a real WebRTC audio leg in voice rooms (agentlink.media).
+        # The stack is OPTIONAL — without aiortc installed the agent
+        # runs exactly as before, media entry points raise
+        # MediaUnavailable, and the capability is simply not declared:
+        # absence is a stated fact, never a crash and never a silent
+        # pretence of being audible.
+        self._media_requested = bool(media)
+        self._media_sessions: dict = {}
+        self._media_rooms: dict = {}
+        if self._media_requested:
+            from .media import media_available as _media_available
+            if _media_available():
+                if "media_audio" not in self.capabilities:
+                    self.capabilities.append("media_audio")
+            else:
+                log.warning(
+                    "media=True for @%s but the optional media stack "
+                    "(aiortc) is not installed — running WITHOUT room "
+                    "audio; install with: pip install "
+                    "'agentlink[media]'", self.username)
         self.cap_description = cap_description
         self.max_concurrency = max(1, int(max_concurrency))
         # Owner oversight (2026-11-01): when a pubkey is known, every
@@ -528,6 +662,14 @@ class Agent:
         # for exactly one subsequent race, so a phantom winner (a
         # tunnel fronting a dead relay) cannot win forever.
         self._skip_next_race: set[str] = set()
+        # Key-signed hello (v1.3.9): endpoints that refused a key
+        # hello with username_taken — the signature of a pre-1.3.9
+        # relay, which cannot answer an auth_challenge and reads a
+        # secretless hello against an existing row as a collision.
+        # For THOSE endpoints only, later hellos fall back to the
+        # legacy secret presentation (loudly logged at the refusal
+        # site); everywhere else the secret never travels.
+        self._legacy_auth_endpoints: set[str] = set()
         self._ws = None
         self._reader: asyncio.Task | None = None
         self._message_handler = None
@@ -667,6 +809,11 @@ class Agent:
         # because the identity's local state has exactly one owner.
         self._instance_lock_fd = None
         self._instance_lock_path: Path | None = None
+        # Owner-seat control channel (v1.3.9): the running lock
+        # holder serves one-shot commands (send / group add) for
+        # its own identity over a state-dir Unix socket.
+        self._control_server = None
+        self._control_token: str | None = None
         self._instance_lock_borrowed = False
         # Work assignments already taken in by THIS process, keyed
         # (work_id, attempt): delivery custody is at-least-once —
@@ -853,6 +1000,141 @@ class Agent:
                 marker.unlink()
             except OSError:
                 pass
+
+    # -- owner-seat control channel (v1.3.9, WS4) ----------------------
+    # The instance lock exists so a one-shot command can never
+    # fight a running daemon for the identity's state — but for the
+    # OWNER'S OWN SEAT that made every operator action (send, group
+    # add) require stopping the daemon first. The lock holder now
+    # serves a control channel: a Unix socket inside the state dir
+    # (same user, same directory permissions), advertised in the
+    # lock file together with a per-boot random token. A one-shot
+    # command that meets the lock forwards its command to the
+    # RUNNING instance, which executes it as itself and returns
+    # the real result (the message id, the group state). The
+    # channel refuses foreign identities (the lock file's username
+    # must be the caller's own), refuses a dead holder (stale lock
+    # -> the ordinary flock rules apply instead), and fails closed
+    # with a named error when the holder is wedged.
+    def _control_socket_path(self) -> Path:
+        return self.state_dir / f"control-{self.username}.sock"
+
+    async def _start_control_server(self) -> None:
+        if self.ephemeral or not self.username:
+            return
+        if self._instance_lock_fd is None:
+            return  # not the lock holder (borrowed or unlocked)
+        if getattr(self, "_instance_lock_borrowed", False):
+            return  # the sibling object that owns the lock serves
+        if self._control_server is not None:
+            return  # already serving (reconnect cycle)
+        import secrets as _secrets
+        self._control_token = _secrets.token_urlsafe(24)
+        path = self._control_socket_path()
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        try:
+            self._control_server = await asyncio.start_unix_server(
+                self._control_handle, path=str(path))
+            os.chmod(path, 0o600)
+        except Exception as exc:
+            log.warning("control channel unavailable for @%s: %s",
+                        self.username, exc)
+            self._control_server = None
+            self._control_token = None
+            return
+        # Advertise socket + token in the lock file (rewritten on
+        # the locked fd, so the flock is never dropped).
+        try:
+            meta = {
+                "pid": os.getpid(), "username": self.username,
+                "endpoint": self.endpoint,
+                "since": int(time.time()),
+                "control": {"socket": str(path),
+                            "token": self._control_token}}
+            os.lseek(self._instance_lock_fd, 0, os.SEEK_SET)
+            os.ftruncate(self._instance_lock_fd, 0)
+            os.write(self._instance_lock_fd,
+                     json.dumps(meta).encode())
+            os.fsync(self._instance_lock_fd)
+        except Exception:
+            pass
+        log.info("control channel for @%s listening at %s — "
+                 "one-shot commands forward to this instance",
+                 self.username, path)
+
+    async def _control_handle(self, reader, writer) -> None:
+        try:
+            line = await asyncio.wait_for(reader.readline(),
+                                          timeout=30)
+            spec = json.loads(line.decode()) if line else {}
+            import hmac as _hmac
+            if not _hmac.compare_digest(
+                    str(spec.get("token") or ""),
+                    self._control_token or ""):
+                writer.write((json.dumps({
+                    "ok": False,
+                    "error": "control channel: bad token"}) + "\n"
+                ).encode())
+                await writer.drain()
+                return
+            cmd = spec.get("cmd")
+            if cmd == "ping":
+                result = {"username": self.username,
+                          "pid": os.getpid(),
+                          "endpoint": self.current_endpoint
+                          or self.endpoint}
+            elif cmd == "send":
+                result = await self.send_message(
+                    str(spec["to"]), str(spec["body"]),
+                    priority=str(spec.get("priority") or "normal"))
+            elif cmd == "group_send":
+                result = await self.group_send(
+                    str(spec["group_id"]), str(spec["body"]))
+            elif cmd == "group_add":
+                result = await self.group_add(
+                    str(spec["group_id"]),
+                    [str(m) for m in (spec.get("members") or [])])
+            else:
+                raise ValueError(f"unknown control command {cmd!r}")
+            writer.write((json.dumps(
+                {"ok": True, "result": result}, default=str) + "\n"
+            ).encode())
+            await writer.drain()
+        except Exception as exc:
+            try:
+                writer.write((json.dumps({
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}"}) + "\n"
+                ).encode())
+                await writer.drain()
+            except Exception:
+                pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def _stop_control_server(self) -> None:
+        if self._control_server is not None:
+            try:
+                self._control_server.close()
+                # Bounded: wait_closed also waits for in-flight
+                # forwarded commands to drain; a wedged caller
+                # must never stall the daemon's own close.
+                await asyncio.wait_for(
+                    self._control_server.wait_closed(), timeout=2)
+            except Exception:
+                pass
+            self._control_server = None
+        self._control_token = None
+        try:
+            self._control_socket_path().unlink()
+        except OSError:
+            pass
 
     def _secret_path(self) -> Path:
         return self.state_dir / f"secret-{self.username}.json"
@@ -1369,6 +1651,21 @@ class Agent:
                 f" with this same state dir resumes cleanly once"
                 f" the line answers.") from exc
         self._declared_link_sent = self._decision_declaration()
+        # Key-signed hello (v1.3.9): a RETURNING identity (one with
+        # a saved bootstrap secret) authenticates by SIGNATURE —
+        # the hello announces auth="key" and carries NO secret; the
+        # relay's auth_challenge is answered in the welcome loop
+        # below with an Ed25519 signature from the identity key.
+        # The reusable secret is presented ONLY to an endpoint that
+        # has already refused a key hello (a pre-1.3.9 relay — see
+        # _legacy_auth_endpoints and the welcome loop's refusal
+        # handling): a bounded, loudly logged transition fallback,
+        # per endpoint, never the default path. A first
+        # registration has no saved secret and bootstraps exactly
+        # as before: the claim's welcome issues the secret ONCE.
+        _saved_secret = None if self.ephemeral else self._load_secret()
+        _key_auth = bool(_saved_secret) and \
+            url not in self._legacy_auth_endpoints
         await self._send_raw({
             "type": "hello", "username": self.username or None,
             "display_name": self.display_name,
@@ -1384,7 +1681,9 @@ class Agent:
             # until the ack, and marks audit delivered only then.
             "delivery_ack": 1,
             "client_version": _package_version(),
-            "secret": None if self.ephemeral else self._load_secret(),
+            "secret": None if (self.ephemeral or _key_auth)
+                      else _saved_secret,
+            "auth": "key" if _key_auth else None,
             "ephemeral": self.ephemeral,
             "home_endpoint": self.endpoint,
             "core": core_fingerprint(),
@@ -1416,7 +1715,7 @@ class Agent:
         from . import timing as _timing
         from .timing import HELLO_TIMEOUT_SECONDS
         _first_contact = not self.ephemeral and \
-            self._load_secret() is None
+            _saved_secret is None
         # The first-contact window is DERIVED from the timing
         # map's own constant — never a free-standing number: the
         # map stays the single source of truth (a test that
@@ -1482,6 +1781,21 @@ class Agent:
                     f" dir and the registration resumes; nothing"
                     f" needs to be re-created or renamed.") from exc
             frame = json.loads(raw)
+            if frame.get("type") == "auth_challenge":
+                # Key-signed hello (v1.3.9): sign the challenge
+                # (nonce | relay | username | expires, the exact
+                # canonical payload) with the identity's Ed25519
+                # key and answer. The signature is worthless to
+                # any other relay and after its expiry — nothing
+                # reusable ever leaves this machine.
+                from .protocol import auth_challenge_payload
+                _payload = auth_challenge_payload(
+                    frame.get("nonce"), frame.get("relay"),
+                    self.username, frame.get("expires"))
+                await self._send_raw({
+                    "type": "auth_response",
+                    "signature": self.identity.sign(_payload)})
+                continue
             if frame.get("type") == "welcome":
                 self.username = frame["username"]
                 if not self._oversight_configured and \
@@ -1511,6 +1825,10 @@ class Agent:
                          self.username, frame.get("queued", 0))
                 self._warn_if_unlinked()
                 self._reader = asyncio.create_task(self._read_loop())
+                # Owner-seat control channel (v1.3.9): once the
+                # reader is live, the lock holder starts serving
+                # forwarded one-shot commands (send / group add).
+                await self._start_control_server()
                 # BOOT SEQUENCE (point 39c), strict order, no delays:
                 # identity/journal loaded (1) -> connected + presence
                 # registered (2) -> fetch open assignments (3) ->
@@ -1557,6 +1875,24 @@ class Agent:
                         log.exception("mailbox replay failed")
                 return self.username
             if frame.get("type") == "error":
+                if _key_auth and _saved_secret and \
+                        frame.get("reason") == "username_taken":
+                    # A pre-1.3.9 relay cannot answer an
+                    # auth_challenge: it read the secretless key
+                    # hello against the existing row as a collision.
+                    # Mark THIS endpoint legacy — the reconnect
+                    # loop's next hello to it presents the secret,
+                    # exactly as a pre-1.3.9 client would — and say
+                    # so loudly: the fallback is a transition bridge
+                    # for old relays, never a silent downgrade.
+                    self._legacy_auth_endpoints.add(url)
+                    log.warning(
+                        "relay at %s refused the key-signed hello "
+                        "(username_taken): it predates key-signed "
+                        "hello (v1.3.9). Falling back to the legacy "
+                        "secret hello for THIS endpoint only; the "
+                        "secret never travels to a relay that "
+                        "answers challenges.", url)
                 await self._ws.close()
                 raise RegistrationFailed(
                     f"{frame.get('reason')}: {frame.get('detail', '')}")
@@ -1570,6 +1906,20 @@ class Agent:
             pass
 
     async def close(self) -> None:
+        # Owner-seat control channel (v1.3.9): stop serving
+        # forwarded commands before the socket and lock go away.
+        await self._stop_control_server()
+        # Media sessions (v1.3.9): close every live RTC session
+        # before the socket goes — a peer must never be left
+        # talking to a dead track, and recorders must finalize
+        # their files.
+        for _sess in list(self._media_sessions.values()):
+            try:
+                await _sess.close()
+            except Exception:
+                pass
+        self._media_sessions.clear()
+        self._media_rooms.clear()
         self._release_instance_lock()
         if self._update_task is not None:
             self._update_task.cancel()
@@ -2137,6 +2487,9 @@ class Agent:
             return
         if ftype == "room_signal":
             self.room_signals.append(frame)
+            if self._media_sessions or self._media_rooms:
+                from . import media as _media_mod
+                _media_mod.route_signal(self, frame)
             if self._room_signal_handler is not None:
                 asyncio.create_task(self._run_simple_handler(
                     self._room_signal_handler, frame))
@@ -4482,6 +4835,80 @@ class Agent:
         return await self._request({"type": "room_signal",
                                     "room_id": room_id, "to": to,
                                     "kind": kind, "payload": payload})
+
+    # -- voice-room media (v1.3.9, optional extra) -------------------------
+    # The agent's own WebRTC audio leg, negotiated over room_signal.
+    # The relay still routes signalling only and never carries
+    # audio; media flows peer-to-peer (see agentlink/media.py for
+    # the NAT reality, stated plainly).
+
+    @staticmethod
+    def media_available() -> bool:
+        """True when the optional media stack (aiortc) is installed."""
+        from .media import media_available as _available
+        return _available()
+
+    async def media_join(self, room_id: str, peer: str, *,
+                         initiator: bool = False,
+                         publish: str | None = None,
+                         loop: bool = False):
+        """Open a media session with one participant of a room the
+        agent has already joined (room_join). initiator=True sends
+        the offer; otherwise the session answers the peer's offer
+        when it arrives. publish=<wav path> makes that file the
+        session's outgoing audio (loop=True repeats it). Returns
+        the RoomMediaSession. Raises MediaUnavailable when the
+        optional media stack is not installed."""
+        from .media import (MediaUnavailable, RoomMediaSession,
+                            media_available as _available)
+        if not _available():
+            raise MediaUnavailable(
+                "voice-room media needs the optional media stack: "
+                "pip install 'agentlink[media]' (aiortc)")
+        peer = normalize_username(peer) or peer
+        session = RoomMediaSession(self, room_id, peer)
+        self._media_sessions[(room_id, peer)] = session
+        if publish:
+            await session.publish_wav(publish, loop=loop)
+        if initiator:
+            await session.connect(initiator=True)
+        return session
+
+    def media_enable_room(self, room_id: str, *,
+                          publish: str | None = None,
+                          loop: bool = False) -> None:
+        """Auto-answer media in this room: any participant's offer
+        gets an answerer session (created on the offer's arrival),
+        optionally publishing the same WAV to every comer — how an
+        agent audibly greets a human joining from the dashboard.
+        Requires the media stack at offer time; without it, offers
+        simply go unanswered (the declared capability fact)."""
+        self._media_rooms[room_id] = \
+            (str(publish), bool(loop)) if publish else None
+
+    async def media_disable_room(self, room_id: str) -> None:
+        """Stop auto-answering in this room AND close its live
+        media sessions — disabling a room ends its media, it does
+        not leave a stream running unanswered-to."""
+        self._media_rooms.pop(room_id, None)
+        for key in [k for k in self._media_sessions
+                    if k[0] == room_id]:
+            sess = self._media_sessions.get(key)
+            if sess is not None:
+                try:
+                    await sess.close()
+                except Exception:
+                    pass
+
+    async def media_leave(self, session) -> None:
+        """Close one media session (the peer connection ends; the
+        room membership itself is room_leave's business)."""
+        try:
+            await self.room_signal(session.room_id, session.peer,
+                                   "bye", {})
+        except Exception:
+            pass
+        await session.close()
 
     async def update_capabilities(self, capabilities: list[str],
                                   description: str = "") -> dict:
