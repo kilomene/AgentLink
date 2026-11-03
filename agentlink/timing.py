@@ -120,6 +120,18 @@ DELIVERY_STUCK_SECONDS = 300     # unacked + recipient connected
                                  # since + older than this = stuck
 DELIVERY_HISTORY_PAGE = 200      # default history frame page size
 
+# Blob-layer truth (v1.3.8): the object/meta reconciliation sweep
+# cadence. Divergence is a slow leak and the delete path itself
+# verifies synchronously, so the sweep is a backstop, not a
+# hot loop — boot + this interval is proportionate.
+BLOB_RECONCILE_SECONDS = 1800
+# A battery cycle lives for seconds; a dial-* (ephemeral battery)
+# blob pair older than this is abandoned test litter, and the
+# sweep reaps the pair (production census 2026-11-03: 113/113
+# blob metas were battery-owned, 44 of them intact pairs whose
+# cleanup delete never executed at all).
+BATTERY_LITTER_AGE_SECONDS = 3600
+
 # Backups (points 17, 19c)
 BACKUP_CRON = "daily"            # plus on-demand via operator CLI
 
