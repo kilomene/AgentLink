@@ -469,8 +469,15 @@ def test_autonomous_work_decline_is_honest(relay_env, state_root):
         row = relay_env["relay"].store.get_work(wid)
         assert row["status"] == "assigned"       # NOT delivered
         assert row["proof_verified"] == 0
-        assert any(e["event"] == "work_declined"
-                   for e in worker.autonomous_log)
+        # The decline event is the client's post-send bookkeeping —
+        # wait for the condition meant, like every sibling assert
+        # (a bare sample races it under load; v1.4.4 gate
+        # arbitration, arb_144b_vs143.out, showed the identical
+        # failure on the v1.4.3 code — a test race, not a
+        # regression).
+        assert await wait_for(lambda: any(
+            e["event"] == "work_declined"
+            for e in worker.autonomous_log))
         await boss.close()
         await worker.close()
     run(_t())
