@@ -94,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         print(__doc__)
         print("commands: relay server register agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
-              "alerts capabilities update doctor census service backup "
+              "credentials alerts capabilities update doctor census service backup "
               "oversight-keygen deregister remove-user inbox sync")
         return 0
     cmd, rest = argv[0], argv[1:]
@@ -345,6 +345,8 @@ def main(argv: list[str] | None = None) -> int:
         return _library(rest)
     if cmd == "vault":
         return _vault(rest)
+    if cmd in ("credentials", "creds"):
+        return _credentials(rest)
     if cmd == "alerts":
         return _alerts(rest)
     if cmd == "capabilities":
@@ -1137,6 +1139,68 @@ def _vault(rest: list[str]) -> int:
         _print(asyncio.run(_with_agent(args, fn)))
         return 0
     print(f"unknown vault command {sub!r}", file=sys.stderr)
+    return 2
+
+
+def _credentials(rest: list[str]) -> int:
+    """The agent's OWN credentials vault (v1.4.0) — NOT the group
+    vault above (`agentlink vault` is the group's shared shelf and
+    is untouched). Entries are sealed to the agent's identity key;
+    possession of that key IS the permission, so these commands run
+    with no prompt: against the running daemon through its control
+    channel when one is live, else through a one-shot agent (whose
+    start also syncs the vault). `get` prints the full entry —
+    password included — because this CLI runs inside the agent's
+    own trust boundary for its operator's use; `list` prints labels
+    only, forever."""
+    sub = rest[0] if rest else "list"
+    r = rest[1:] if rest else []
+    ap = argparse.ArgumentParser(prog=f"agentlink credentials {sub}")
+    _add_common(ap)
+    if sub == "put":
+        ap.add_argument("service")
+        ap.add_argument("username",
+                        help="the account email/username saved")
+        ap.add_argument("password")
+        ap.add_argument("--notes", default="")
+        args = ap.parse_args(r)
+        _print(asyncio.run(_with_agent(
+            args,
+            lambda a: a.vault.remember(args.service, args.username,
+                                       args.password,
+                                       notes=args.notes),
+            forward={"cmd": "vault_put", "service": args.service,
+                     "username": args.username,
+                     "password": args.password,
+                     "notes": args.notes})))
+        return 0
+    if sub == "list":
+        args = ap.parse_args(r)
+        _print(asyncio.run(_with_agent(
+            args,
+            lambda a: a.vault.list(),
+            forward={"cmd": "vault_list"})))
+        return 0
+    if sub == "get":
+        ap.add_argument("service_or_id")
+        args = ap.parse_args(r)
+        _print(asyncio.run(_with_agent(
+            args,
+            lambda a: a.vault.get(args.service_or_id),
+            forward={"cmd": "vault_get",
+                     "service_or_id": args.service_or_id})))
+        return 0
+    if sub == "remove":
+        ap.add_argument("entry_id")
+        args = ap.parse_args(r)
+        _print(asyncio.run(_with_agent(
+            args,
+            lambda a: a.vault.remove(args.entry_id),
+            forward={"cmd": "vault_remove",
+                     "entry_id": args.entry_id})))
+        return 0
+    print(f"unknown credentials command {sub!r} "
+          f"(put/list/get/remove)", file=sys.stderr)
     return 2
 
 
