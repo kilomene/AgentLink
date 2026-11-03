@@ -26,6 +26,28 @@ HELLO_TIMEOUT_SECONDS = 8        # bounded welcome wait per hello attempt;
                                  # kill-drill; never a wedged client,
                                  # never a service restart to recover
 HOME_PROBE_SECONDS = 5           # failover home-probe cadence
+FIRST_HELLO_TIMEOUT_SECONDS = 30  # the FIRST-contact hello window:
+                                 # a brand-new identity's first hello
+                                 # (its registration) gets a longer
+                                 # bounded wait than a reconnect hello
+                                 # (HELLO_TIMEOUT_SECONDS) — a first
+                                 # registration crosses the sick
+                                 # network exactly once, and the relay
+                                 # spends real work on it (the claim).
+                                 # The relay ALSO uses this as its
+                                 # server-side bound: a connection
+                                 # that has not completed a hello
+                                 # within this window of connecting is
+                                 # closed and counted as an incomplete
+                                 # hello (v1.3.7, registration
+                                 # visibility)
+REGISTRATION_RESUME_WINDOW_SECONDS = 3600  # a cut-off FIRST
+                                 # registration may be resumed by the
+                                 # same identity (see relay.py
+                                 # _try_resume_registration) only
+                                 # while its half-created row is
+                                 # younger than this — the window IS
+                                 # the safety bound on that path
 
 # Supervision (points 11, 17, 39)
 WATCHDOG_CRON_SECONDS = 60       # per-minute watchdog cron
@@ -80,6 +102,23 @@ AUTO_HOURLY_BUDGET_AUTO = 10          # tightened vs an autonomous peer
 # bound has not decided anything: the event stays unanswered and
 # unaccepted — held, never fabricated, never lost.
 DECISION_LINK_TIMEOUT_SECONDS = 30    # one decision-endpoint call
+
+# Delivery custody (v1.3.7): for a client that declares
+# delivery_ack in its hello, the offline queue is a CUSTODY
+# OUTBOX, not a flush-and-forget pile — the relay OFFERs queued
+# frames and only the recipient's ack (ids durably journaled on
+# ITS side) retires them. An unacked frame still in custody is
+# re-offered to a connected peer on the resend cadence; a frame
+# that stays unacked while its recipient has connected since it
+# queued is STUCK — the exact failure of 2026-11-02, where a DM
+# flushed into a check-in agent's 23-second connection was marked
+# delivered and never reached the agent. Legacy clients (no
+# delivery_ack declaration) keep the pre-1.3.7 flush semantics.
+DELIVERY_RESEND_SECONDS = 30     # re-offer cadence to a connected,
+                                 # unacked peer
+DELIVERY_STUCK_SECONDS = 300     # unacked + recipient connected
+                                 # since + older than this = stuck
+DELIVERY_HISTORY_PAGE = 200      # default history frame page size
 
 # Backups (points 17, 19c)
 BACKUP_CRON = "daily"            # plus on-demand via operator CLI
