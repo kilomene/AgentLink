@@ -1774,6 +1774,12 @@ class Relay:
             # same honesty pattern as the delivery guarantee above.
             u["auth_legacy"] = (u.get("auth_method") or "") in (
                 "secret", "resume")
+            # Credentials vault (v1.4.0): presence, entry count and
+            # the OVERSIGHT-SEALED labels envelope — still sealed
+            # here; the dashboard server opens it inside the owner's
+            # authenticated session. Passwords are never sealed to
+            # oversight and never appear in any payload.
+            u["vault"] = self._vault_fields(name)
             u["trust_score"] = self.store.compute_trust(name)
             u.pop("pubkey", None)
             u.pop("sign_pub", None)
@@ -1844,6 +1850,16 @@ class Relay:
                     "channel_message") else "verified")}
                 for row in self.store.list_audit()],
         }
+
+    def _connections_map_guarded(self) -> dict:
+        """The shared connection registry as a map, for presence
+        checks outside the dashboard composition (which builds its
+        own): a store that cannot answer yields an empty map and
+        the last_seen branch of _participant_live still decides."""
+        try:
+            return self.store.connections_map() or {}
+        except Exception:
+            return {}
 
     def _participant_live(self, username: str, now: int,
                           conn_map: dict | None) -> bool:
@@ -3139,6 +3155,20 @@ class Relay:
                     await self._result(ws, req_id, True, {"work": inbox})
                 elif ftype == "update_capabilities":
                     await self._on_update_capabilities(ws, frame, peer)
+                elif ftype == "vault_publish":
+                    await self._on_vault_publish(ws, frame, peer)
+                elif ftype == "vault_fetch_meta":
+                    # Credentials vault (v1.4.0): the agent reads
+                    # back its own vault pointer (which blob holds
+                    # the current sealed document) — never the labels
+                    # (owner-only, and sealed to oversight anyway).
+                    meta = self._vault_meta_of(peer.username) or {}
+                    await self._result(
+                        ws, req_id, True,
+                        {"present": bool(meta),
+                         "blob_id": meta.get("blob_id") or "",
+                         "version": int(meta.get("version") or 0),
+                         "entries": int(meta.get("entries") or 0)})
                 elif ftype == "chain_context":
                     step = self.store.step_by_work(
                         str(frame.get("work_id") or ""))
@@ -4632,6 +4662,88 @@ class Relay:
                            {"username": peer.username,
                             "capabilities": caps, "description": desc})
 
+    # -- credentials vault (v1.4.0): the relay holds a POINTER only --------
+
+    def _vault_meta_of(self, username: str) -> dict | None:
+        """Store-capability-guarded vault pointer read: a store
+        without the v1.4.0 accessors (older test doubles) reads as
+        'no vault', never as a crash."""
+        getter = getattr(self.store, "get_vault_meta", None)
+        if getter is None:
+            return None
+        try:
+            return getter(username)
+        except Exception:
+            log.exception("vault meta read failed for %s", username)
+            return None
+
+    def _vault_fields(self, username: str) -> dict:
+        """The dashboard vault cell for one agent: presence, entry
+        count, document revision, and the OVERSIGHT-SEALED labels
+        envelope (still sealed in this payload — the dashboard
+        server opens it inside the owner's authenticated session;
+        this relay holds no key that can). A legacy agent that has
+        never published reads present=False — a fact, not a defect."""
+        meta = self._vault_meta_of(username)
+        if not meta:
+            return {"present": False, "entries": 0, "version": 0,
+                    "labels_sealed": None}
+        labels_env = None
+        if meta.get("labels"):
+            try:
+                labels_env = json.loads(meta["labels"])
+            except Exception:
+                labels_env = None
+        return {"present": True,
+                "entries": int(meta.get("entries") or 0),
+                "version": int(meta.get("version") or 0),
+                "labels_sealed": labels_env}
+
+    async def _on_vault_publish(self, ws, frame, peer: Peer) -> None:
+        """An agent publishes its vault pointer after uploading the
+        new sealed document through the blob layer. The relay
+        validates SHAPES only — it cannot open the document (sealed
+        to the agent's identity key) or the labels (sealed to the
+        oversight key) and never tries. Stale revisions are refused
+        by the store so a zombie host cannot rewind the vault."""
+        req_id = frame.get("req_id")
+        blob_id = str(frame.get("blob_id") or "")
+        version = frame.get("version")
+        entries = frame.get("entry_count")
+        labels = frame.get("labels")
+        if not blob_id or len(blob_id) > 200 \
+                or not isinstance(version, int) \
+                or not (0 <= version <= 2 ** 31) \
+                or not isinstance(entries, int) \
+                or not (0 <= entries <= 100000) \
+                or (labels is not None
+                    and not self._valid_oversight(labels)):
+            await self._error(
+                ws, "bad_vault_publish", req_id,
+                "vault publish needs a blob id, a non-negative "
+                "integer revision and entry count, and (when "
+                "present) a well-formed oversight labels envelope")
+            return
+        setter = getattr(self.store, "set_vault_meta", None)
+        if setter is None:
+            await self._error(ws, "vault_unsupported", req_id,
+                              "this relay's store cannot record "
+                              "vault pointers")
+            return
+        accepted = bool(setter(
+            peer.username,
+            json.dumps(labels) if labels is not None else "",
+            blob_id, version, entries))
+        self.store.audit(
+            "vault_published" if accepted else "vault_publish_stale",
+            peer.username, ref_id=blob_id,
+            status=f"rev{version}")
+        current = self._vault_meta_of(peer.username) or {}
+        await self._result(
+            ws, req_id, True,
+            {"accepted": accepted,
+             "version": int(current.get("version") or 0)})
+
     # -- channels (broadcast: admins post, subscribers read-only) ------------
     CHANNEL_ADMIN_ROLES = ("admin", "superadmin")
 
@@ -5081,7 +5193,9 @@ class Relay:
         target_peer = self.peers.get(target)
         if target_peer is not None:
             await self._send(target_peer.ws, out)
-        elif self._participant_live(target, now_ts(), None):
+        elif self._participant_live(
+                target, now_ts(),
+                self._connections_map_guarded()):
             # Online, but on a brother relay: store-mediated path.
             try:
                 self.store.room_frame_put(target, out)
