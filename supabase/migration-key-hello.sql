@@ -1,0 +1,28 @@
+-- AgentLink v1.3.9 key-signed hello (2026-11-03): the reusable
+-- secret never travels again.
+--
+-- THE DEFECT (arbitrated 2026-11-03 from the v1.3.8 tree): the
+-- client hello carried the RAW reusable account secret, presented
+-- to ANY relay the client connected to — including peer/carrier
+-- relays during failover and carrying. A carrier's relay process
+-- therefore received a bearer credential that could impersonate
+-- the agent to every relay until rotation.
+--
+-- THE CURE: challenge-response hello. The hello announces the
+-- username and auth="key"; the relay returns a random nonce bound
+-- to its own server identity and a short expiry; the client signs
+-- nonce|relay|username|expires with its Ed25519 identity key; the
+-- relay verifies against the sign_pub already registered on the
+-- user row. Nothing reusable leaves the agent's machine — a
+-- carrier sees a one-time signature only. Legacy secret hellos
+-- from pre-1.3.9 clients still connect during the transition and
+-- are RECORDED as such: this column carries how the most recent
+-- hello authenticated ('key' / 'secret' / 'resume' / 'bootstrap'),
+-- and every dashboard/agents payload flags legacy connections
+-- from it; the audit trail records auth:<method> per hello too.
+--
+-- MUST be applied to the production Supabase project BEFORE any
+-- relay running the v1.3.9 SupabaseStore starts: the store's
+-- list_users selects auth_method and PostgREST errors on an
+-- unknown column. Additive only — one new column with a default.
+alter table al_users add column if not exists auth_method text not null default '';
