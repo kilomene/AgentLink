@@ -390,7 +390,12 @@ def test_boot_onto_peer_from_persisted_list(state_root):
         try:
             assert await wait_for(
                 lambda: home.relay and "booter" in home.relay.peers)
-            assert peer_url in first.endpoints  # discovered + saved
+            # Discovery lands with the welcome/refresh a beat after
+            # the server-side registration the line above waits on —
+            # wait for the condition meant (a bare sample raced it:
+            # the endpoint arrives ~0.5s after boot, measured in
+            # arb_mesh_probe.py during the v1.4.4 gate arbitration).
+            assert await wait_for(lambda: peer_url in first.endpoints)
         finally:
             task.cancel()
             try:
