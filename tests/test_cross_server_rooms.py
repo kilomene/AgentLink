@@ -367,3 +367,86 @@ def test_live_dead_mix_lists_only_live(state_root):
     run(_t())
     home.stop()
     x3.stop()
+
+
+def test_start_only_client_keeps_presence_past_grace(state_root):
+    """v1.4.3 regression pin (fast leg) — the heartbeat belongs to
+    the CONNECTION: a start()-only client (one-shot SDK embedding,
+    the CLI posture — no run()/serve loop) must keep its shared
+    last_seen advancing. Before the fix the ping loop lived only
+    in run(), so a start()-only client's last_seen froze at its
+    hello and brother relays read it offline after the 15s
+    presence grace while it was connected and active."""
+    tmp = tempfile.mkdtemp(prefix="agentlink-xr-hb-")
+    db = str(Path(tmp) / "shared.db")
+    home = RelayHandle(db, "xr-hb-home")
+    url = home.start()
+
+    async def _t():
+        a = Agent("xrheartbeat", endpoint=url,
+                  state_dir=str(state_root / "xrheartbeat"))
+        await a.start()
+        try:
+            store = home.relay.store
+            first = store.last_seen_of("xrheartbeat")
+            assert first > 0
+            await asyncio.sleep(12)
+            later = store.last_seen_of("xrheartbeat")
+            assert later >= first + 5, (first, later)
+        finally:
+            await a.close()
+
+    run(_t())
+    home.stop()
+
+
+def test_cross_server_room_signal_after_presence_grace(state_root):
+    """v1.4.3 regression pin — the exact v1.4.2 PRODUCTION room
+    proof failure: phoenix (start()-only driver) opened a room on
+    home, deploy-probe joined via x3, the offer crossed, and the
+    ANSWER died peer_offline on x3 because phoenix's last_seen
+    was 20s old — frozen at its hello, the grace being 15s. Wait
+    past the grace after both hellos, then the both-ways signal
+    cycle must complete."""
+    tmp = tempfile.mkdtemp(prefix="agentlink-xr-grace-")
+    db, home, x3, home_url, x3_url = _setup(tmp, state_root)
+
+    async def _t():
+        phx = Agent("xrgphoenix", endpoint=home_url,
+                    state_dir=str(state_root / "xrgphoenix"))
+        probe = Agent("xrgprobe", endpoint=x3_url,
+                      state_dir=str(state_root / "xrgprobe"))
+        await phx.start()
+        await probe.start()
+        try:
+            # Past OFFLINE_GRACE_SECONDS (15) from BOTH hellos —
+            # the window the production proof died in.
+            await asyncio.sleep(17)
+            g = await phx.group_create("xr-grace", ["xrgprobe"])
+            gid = g["id"] if "id" in g else g["group_id"]
+            rid = (await phx.room_open(gid))["room_id"]
+            await probe.room_join(rid)
+            got = {"probe": [], "phx": []}
+
+            @probe.on_room_signal
+            async def _ps(frame):
+                got["probe"].append(frame)
+
+            @phx.on_room_signal
+            async def _hs(frame):
+                got["phx"].append(frame)
+
+            await phx.room_signal(rid, "xrgprobe", "offer",
+                                  {"type": "offer", "sdp": "v=0 o"})
+            assert await wait_for(lambda: len(got["probe"]) == 1)
+            await probe.room_signal(rid, "xrgphoenix", "answer",
+                                    {"type": "answer", "sdp": "v=0 a"})
+            assert await wait_for(lambda: len(got["phx"]) == 1)
+            assert got["phx"][0]["kind"] == "answer"
+        finally:
+            await phx.close()
+            await probe.close()
+
+    run(_t())
+    home.stop()
+    x3.stop()
