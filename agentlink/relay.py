@@ -18,14 +18,16 @@ import os
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from http import HTTPStatus
 
 import websockets
 import websockets.exceptions
 from websockets.server import serve
 
 from .protocol import (
+    AUTH_CHALLENGE_TTL_SECONDS,
+    AUTH_CHALLENGE_WAIT_SECONDS,
     MAX_FRAME,
+    auth_challenge_payload,
     new_id,
     new_secret,
     normalize_username,
@@ -177,6 +179,13 @@ class Peer:
     delivery_ack: bool = False
     client_version: str = ""
     offered: dict = field(default_factory=dict)
+    # Key-signed hello (v1.3.9): how THIS connection authenticated —
+    # 'key' (Ed25519 challenge-response; nothing reusable was
+    # presented), 'secret' (legacy: the reusable secret crossed the
+    # wire), 'resume' (the v1.3.7 key-match resume gate) or
+    # 'bootstrap' (the claiming hello). Recorded on the user row
+    # too, so every surface can flag legacy auth honestly.
+    auth_method: str = ""
 
 
 @dataclass
@@ -630,6 +639,22 @@ class Relay:
                 setter(username, capable)
             except Exception:
                 pass
+        except Exception:
+            pass
+
+    def _record_auth_method(self, username: str, method: str) -> None:
+        """Record how a hello authenticated on the user row
+        (v1.3.9), mirroring _record_delivery_ack: the store's
+        setter (when the store carries the column) persists it;
+        a store without it keeps nothing and the live peer's
+        auth_method above remains this relay's knowledge. Every
+        dashboard reads the ROW, so the legacy flag is the same
+        backend-wide fact on every server."""
+        setter = getattr(self.store, "set_auth_method", None)
+        if setter is None or not method:
+            return
+        try:
+            setter(username, method)
         except Exception:
             pass
 
@@ -1511,17 +1536,6 @@ class Relay:
         out.sort(key=lambda s: s["endpoint"])
         return self._resolve_carry_labels(out)
 
-    def _sender_meta(self, username: str, group_id: str = ""):
-        """(nickname, role, custom_role) of a sender inside a group
-        — the identity stamped onto audit rows so dashboard
-        conversation items show who spoke, not just a username."""
-        if group_id:
-            for m in self.store.members(group_id):
-                if m["username"] == username:
-                    return (m.get("nickname", ""), m.get("role", ""),
-                            m.get("custom_role", ""))
-        return ("", "", "")
-
     def _log_activity(self, kind: str, actor: str, target: str = "",
                       group_id: str = "", work_id: str = "",
                       status: str = "", priority: str = "",
@@ -1753,6 +1767,13 @@ class Relay:
             # ack-vs-legacy guarantee the user's own declared
             # capability buys (see _delivery_fields).
             u["delivery"] = self._delivery_fields(u, now)
+            # Key-signed hello (v1.3.9): the row records how the
+            # agent's most recent hello authenticated; a connection
+            # that presented the reusable secret (or came through
+            # the legacy resume gate) is flagged legacy here, the
+            # same honesty pattern as the delivery guarantee above.
+            u["auth_legacy"] = (u.get("auth_method") or "") in (
+                "secret", "resume")
             u["trust_score"] = self.store.compute_trust(name)
             u.pop("pubkey", None)
             u.pop("sign_pub", None)
@@ -1824,7 +1845,95 @@ class Relay:
                 for row in self.store.list_audit()],
         }
 
+    def _participant_live(self, username: str, now: int,
+                          conn_map: dict | None) -> bool:
+        """Shared presence truth for one username: connected to THIS
+        relay, or fresh in the backend's presence facts (last_seen /
+        connection note inside the offline grace)."""
+        if username in self.peers:
+            return True
+        try:
+            last = self.store.last_seen_of(username)
+        except Exception:
+            last = 0
+        if last and now - last <= OFFLINE_GRACE_SECONDS:
+            return True
+        note = (conn_map or {}).get(username)
+        if note and now - int(note.get("updated_at") or 0) \
+                <= OFFLINE_GRACE_SECONDS:
+            return True
+        return False
+
     def _dashboard_rooms(self, now: int | None = None) -> list[dict]:
+        """Voice Rooms, backend-wide (v1.3.9): composed from the
+        SHARED store's live room records — the same records every
+        relay's join/signal/leave handlers write — so a room is the
+        same room on every dashboard. (Pre-1.3.9 the view replayed
+        the room lifecycle audit and merged this relay's memory;
+        that composition could not see cross-server joins and kept
+        presenting rooms whose participants had died unclosed —
+        the ghost-room defect.)
+
+        Liveness truth: a participant is listed only when live by
+        the shared presence truth (connected here, or fresh in the
+        backend's presence facts). A participant with NO presence
+        record at all (an ephemeral dashboard dial-in) is taken on
+        the room record's word — its hosting relay reaps the record
+        when its connection ends, so the record itself is the fact.
+        A room with no live participants is not a live room and is
+        not listed."""
+        if now is None:
+            now = now_ts()
+        rooms_open = getattr(self.store, "rooms_open", None)
+        if rooms_open is None:
+            return self._dashboard_rooms_legacy(now)
+        try:
+            records = rooms_open() or []
+        except Exception:
+            records = []
+        try:
+            conn_map = self.store.connections_map()
+        except Exception:
+            conn_map = {}
+        merged: dict[str, dict] = {}
+        for r in records:
+            merged[r["room_id"]] = {
+                "id": r["room_id"], "group_id": r["group_id"],
+                "participants": set(r["participants"]),
+                "creator": r["creator"],
+                "opened_at": int(r["opened_at"] or 0)}
+        for rid, r in getattr(self, "rooms", {}).items():
+            merged[rid] = {
+                "id": rid, "group_id": r["group_id"],
+                "participants": set(r["participants"]),
+                "creator": r["creator"],
+                "opened_at": int(r["opened_at"])}
+        out = []
+        for room in merged.values():
+            parts = []
+            for p in room["participants"]:
+                if self._participant_live(p, now, conn_map):
+                    parts.append(p)
+                    continue
+                try:
+                    known = bool(self.store.exists(p))
+                except Exception:
+                    known = True
+                if not known:
+                    parts.append(p)  # ephemeral: record is the fact
+            if not parts:
+                continue
+            out.append({"id": room["id"],
+                        "group_id": room["group_id"],
+                        "participants": sorted(parts),
+                        "creator": room["creator"],
+                        "opened_at": room["opened_at"]})
+        out.sort(key=lambda r: r["opened_at"])
+        return out
+
+    def _dashboard_rooms_legacy(self, now: int) -> list[dict]:
+        """Pre-1.3.9 composition (audit replay + local merge), kept
+        only for store backends without the shared room records."""
         """Voice Rooms, backend-wide (v1.3.4): composed from the
         SHARED store's room lifecycle audit — a room hosted by a
         brother server is a room on this dashboard too. The
@@ -2353,6 +2462,31 @@ class Relay:
                 continue
             for frame in queued:
                 await self._deliver(username, frame)
+        # Room frames (v1.3.9): room signals/events deposited in the
+        # shared store for participants whose connection lives HERE
+        # (sent by a brother relay hosting the sender) are claimed
+        # and written to the local socket — agents and ephemeral
+        # dashboard clients alike; a room participant's signalling
+        # must reach whichever socket hosts them. Claimed frames
+        # whose socket is already gone are simply gone: signalling
+        # is perishable and the disconnect reaper has already ended
+        # that participation on the record.
+        _rf_drain = getattr(store, "room_frames_drain", None)
+        if _rf_drain is not None and self.peers:
+            try:
+                _by_user = await asyncio.to_thread(
+                    _rf_drain, list(self.peers.keys()))
+            except Exception:
+                _by_user = {}
+            for _uname, _frames in (_by_user or {}).items():
+                _p = self.peers.get(_uname)
+                if _p is None:
+                    continue
+                for _fr in _frames:
+                    try:
+                        await self._send(_p.ws, _fr)
+                    except Exception:
+                        break
         grace = self.reassign_grace_seconds
 
         def _reassign_candidates():
@@ -3071,6 +3205,9 @@ class Relay:
                                 srv.get("carried_by") or ""
                             u["server_state_label"] = \
                                 srv.get("carry_state_label") or ""
+                        u["auth_legacy"] = (
+                            u.get("auth_method") or "") in (
+                            "secret", "resume")
                         u.pop("secret", None)
                     users.sort(key=lambda u: (not u["online"],
                                               u["username"]))
@@ -3103,9 +3240,11 @@ class Relay:
             # and delivery for that username on this relay until
             # superseded. Any peer still bound to THIS socket is
             # removed here, whatever path the connection took.
+            _reap_usernames: list[str] = []
             if peer is None:
                 for leaked in [p for p in list(self.peers.values())
                                if p.ws is ws]:
+                    _reap_usernames.append(leaked.username)
                     if self.peers.get(leaked.username) is leaked:
                         del self.peers[leaked.username]
                     if not leaked.ephemeral:
@@ -3128,6 +3267,20 @@ class Relay:
                                              now_ts())
                     self._log_activity("offline", peer.username)
                 log.info("peer @%s disconnected", peer.username)
+            # Room reaping (v1.3.9): this connection's room
+            # participation ends with it, on the shared record —
+            # a participant who vanishes without leave/close is
+            # removed by the one relay that KNOWS the connection
+            # ended, so no dashboard ever shows them sitting in a
+            # room they have left. Covers the completed-hello peer
+            # and any leaked hello-died peer bound to this socket.
+            try:
+                if peer is not None:
+                    _reap_usernames.append(peer.username)
+                for _u in _reap_usernames:
+                    await self._reap_rooms(_u)
+            except Exception:
+                log.exception("room reap on disconnect failed")
             # Registration visibility (v1.3.7): a connection that
             # showed registration intent and died before completing
             # a hello — socket closed mid-handshake, garbled first
@@ -3246,6 +3399,76 @@ class Relay:
                 rows = []
         await self._result(ws, req_id, True, {"rows": rows})
 
+    async def _key_auth_challenge(self, ws, username: str) -> bool:
+        """Key-signed hello (v1.3.9): challenge-response against the
+        identity key registered for this username.
+
+        The relay mints a random nonce bound to ITS OWN server
+        identity and a short expiry, and the client proves
+        possession of the identity's private half by signing the
+        canonical challenge payload (protocol.auth_challenge_payload)
+        with its Ed25519 key; verification is against the sign_pub
+        on the registered row. The nonce is minted fresh for this
+        one attempt and consumed by it — a captured signature names
+        this relay and this nonce, so it replays nowhere: not to a
+        brother relay (different identity, different nonce), not
+        here later (new nonce), not after the expiry (checked
+        against the relay's own clock before verification).
+
+        Runs inline in _on_hello: pre-registration the socket has
+        exactly one outstanding exchange — this one — so awaiting
+        the response here cannot interleave with other frames.
+        Any failure — no key on record, a malformed or non-response
+        frame, a timeout, a bad signature — is a plain False: the
+        caller refuses the hello; nothing falls back silently."""
+        from .crypto import Identity as _Identity
+        row = None
+        try:
+            row = self._profile_of(username)
+        except Exception:
+            row = None
+        sign_pub = str((row or {}).get("sign_pub") or "")
+        if not sign_pub:
+            log.warning("key auth refused for @%s: no signing key "
+                        "on the registered row", username)
+            return False
+        import secrets as _secrets
+        nonce = _secrets.token_urlsafe(32)
+        expires = now_ts() + AUTH_CHALLENGE_TTL_SECONDS
+        relay_id = self.server_id or self._registry_endpoint()
+        await self._send(ws, {"type": "auth_challenge",
+                              "nonce": nonce, "relay": relay_id,
+                              "expires": expires, "username": username})
+        try:
+            raw = await asyncio.wait_for(
+                ws.recv(), timeout=AUTH_CHALLENGE_WAIT_SECONDS)
+            frame = json.loads(raw)
+        except Exception:
+            log.warning("key auth failed for @%s: no usable "
+                        "auth_response within %ss", username,
+                        AUTH_CHALLENGE_WAIT_SECONDS)
+            return False
+        if not isinstance(frame, dict) or \
+                frame.get("type") != "auth_response":
+            log.warning("key auth failed for @%s: expected "
+                        "auth_response, got %r", username,
+                        (frame.get("type") if isinstance(frame, dict)
+                         else type(frame).__name__))
+            return False
+        if now_ts() > expires:
+            log.warning("key auth failed for @%s: challenge expired",
+                        username)
+            return False
+        payload = auth_challenge_payload(nonce, relay_id, username,
+                                         expires)
+        ok = _Identity.verify_signature(
+            sign_pub, payload, str(frame.get("signature") or ""))
+        if not ok:
+            log.warning("key auth failed for @%s: signature did not "
+                        "verify against the registered signing key",
+                        username)
+        return ok
+
     async def _on_hello(self, ws, frame, old, server_id: str = ""):
         if old is not None and self.peers.get(old.username) is old:
             del self.peers[old.username]
@@ -3263,6 +3486,7 @@ class Relay:
             peer = Peer(ws=ws, username=username, display_name=display or "dial",
                         pubkey=pubkey, ephemeral=True, last_seen=now_ts(),
                         connected_at=now_ts(), core=core,
+                        auth_method="ephemeral",
                         server_id=server_id or self.server_id)
             self.peers[username] = peer
             await self._send(ws, {"type": "welcome", "req_id": req_id,
@@ -3352,8 +3576,37 @@ class Relay:
                 return None
         if self.store.exists(username):
             owner_secret = secret
-            verified = bool(secret) and \
-                self.store.verify(username, secret)
+            auth_method = ""
+            verified = False
+            # Key-signed hello (v1.3.9): the client announces
+            # auth="key" and presents NO secret; authentication is
+            # the Ed25519 challenge-response against the registered
+            # identity key. A key hello that fails is refused as
+            # key_auth_failed and NEVER falls through to the secret
+            # or resume paths — a wrong key must not be able to
+            # downgrade the hello into a weaker gate.
+            want_key = frame.get("auth") == "key" and not secret
+            if want_key:
+                verified = await self._key_auth_challenge(ws, username)
+                if not verified:
+                    await self._error(
+                        ws, "key_auth_failed", req_id,
+                        "key-signed hello refused: the signature "
+                        "did not verify against the registered "
+                        "identity key")
+                    return None
+                auth_method = "key"
+                owner_secret = None  # nothing reusable to hand back
+            if not verified:
+                verified = bool(secret) and \
+                    self.store.verify(username, secret)
+                if verified:
+                    # Legacy transition: a pre-1.3.9 client (or a
+                    # fallback hello) presenting its reusable
+                    # secret. Accepted — no agent is locked out by
+                    # the upgrade — and RECORDED as legacy on the
+                    # row, so every surface flags it honestly.
+                    auth_method = "secret"
             if not verified:
                 # Registration idempotency (v1.3.7): this may be the
                 # legitimate identity retrying its own cut-off FIRST
@@ -3372,6 +3625,7 @@ class Relay:
                     await self._error(ws, "username_taken", req_id)
                     return None
                 owner_secret = rotated
+                auth_method = "resume"
                 verified = True
             if verified:
                 self.store.set_display_name(username, display or username)
@@ -3383,6 +3637,7 @@ class Relay:
                     self.store.set_decision_link(username, declared_link)
                 if declared_ack is not None:
                     self._record_delivery_ack(username, declared_ack)
+                self._record_auth_method(username, auth_method)
         else:
             try:
                 # The delivery_ack declaration rides the claim when
@@ -3420,6 +3675,12 @@ class Relay:
                 return None
             if declared_ack is not None:
                 self._record_delivery_ack(username, declared_ack)
+            # The claiming hello itself: the one unauthenticated
+            # hello an identity ever makes — its welcome carries
+            # the bootstrap secret ONCE, and every later hello from
+            # a current client authenticates by key (v1.3.9).
+            auth_method = "bootstrap"
+            self._record_auth_method(username, auth_method)
         stale = self.peers.get(username)
         if stale is not None and stale.ws is not ws:
             try:
@@ -3439,7 +3700,8 @@ class Relay:
                     conn_endpoint=self._connection_endpoint(
                         server_id or self.server_id),
                     delivery_ack=ack_capable,
-                    client_version=client_version)
+                    client_version=client_version,
+                    auth_method=auth_method)
         self.peers[username] = peer
         if core:
             self._last_core[username] = core
@@ -3451,7 +3713,9 @@ class Relay:
         if self.store.resolve_alerts("agent_offline", username):
             self._log_activity("alert_resolved", "system", target=username,
                                status="agent_offline")
-        self._log_activity("online", username)
+        self._log_activity("online", username,
+                           status=f"auth:{auth_method}"
+                           if auth_method else "")
         if peer.delivery_ack:
             # Custody flush (v1.3.7): PEEK the outbox — nothing is
             # deleted and no audit status moves. Each frame is
@@ -4640,6 +4904,15 @@ class Relay:
                            {"channel_id": cid, "key": rec})
 
     # -- voice rooms (WebRTC signalling only; media is peer-to-peer) ----------
+    # Room state is a fact in the SHARED store (v1.3.9): any relay
+    # can open/join/signal/leave/close any room, because every
+    # handler reads and writes the same room record. A signal (or
+    # room event) for a participant whose connection lives on a
+    # brother relay rides the store-mediated room_frames path and
+    # is claimed by that relay on its scan tick. When a connection
+    # ends, its hosting relay reaps the participant from every room
+    # (see _reap_rooms) — a dead connection is never left sitting
+    # in a room.
     async def _on_room_open(self, ws, frame, peer: Peer) -> None:
         req_id = frame.get("req_id")
         gid = frame.get("group_id")
@@ -4648,9 +4921,7 @@ class Relay:
                               "voice rooms are for group members only")
             return
         rid = new_id("r-")[:14]
-        self.rooms[rid] = {"group_id": gid, "creator": peer.username,
-                           "participants": {peer.username},
-                           "opened_at": now_ts()}
+        self.store.room_create(rid, gid, peer.username)
         self._log_activity("room_opened", peer.username, group_id=gid,
                            status=rid)
         await self._result(ws, req_id, True,
@@ -4659,19 +4930,33 @@ class Relay:
 
     def _room_or_error(self, frame):
         rid = frame.get("room_id")
-        return rid, self.rooms.get(rid)
+        room = None
+        if rid:
+            try:
+                room = self.store.room_get(rid)
+            except Exception:
+                room = None
+        return rid, room
 
-    async def _room_broadcast_meta(self, rid, event, actor):
-        room = self.rooms.get(rid)
-        if not room:
-            return
+    async def _room_broadcast_meta(self, rid, event, actor,
+                                   targets, participants, group_id):
         frame = {"type": "room_event", "room_id": rid, "event": event,
                  "actor": actor,
-                 "participants": sorted(room["participants"]),
-                 "group_id": room["group_id"], "ts": now_ts()}
-        for u in list(room["participants"]):
-            if u != actor:
+                 "participants": sorted(participants),
+                 "group_id": group_id, "ts": now_ts()}
+        for u in list(targets):
+            if u == actor:
+                continue
+            if u in self.peers:
                 await self._deliver(u, dict(frame))
+            else:
+                # Participant hosted by a brother relay: the frame
+                # rides the store-mediated room path and is claimed
+                # by their relay on its scan tick.
+                try:
+                    self.store.room_frame_put(u, dict(frame))
+                except Exception:
+                    pass
 
     async def _on_room_join(self, ws, frame, peer: Peer) -> None:
         req_id = frame.get("req_id")
@@ -4686,10 +4971,17 @@ class Relay:
             await self._error(ws, "not_a_member", req_id,
                               "voice rooms are for group members only")
             return
-        room["participants"].add(peer.username)
+        before = list(room["participants"])
+        room = self.store.room_add_participant(rid, peer.username)
+        if room is None:
+            await self._error(ws, "unknown_room", req_id)
+            return
         self._log_activity("room_joined", peer.username,
                            group_id=room["group_id"], status=rid)
-        await self._room_broadcast_meta(rid, "joined", peer.username)
+        await self._room_broadcast_meta(
+            rid, "joined", peer.username,
+            set(before) | set(room["participants"]),
+            room["participants"], room["group_id"])
         await self._result(ws, req_id, True,
                            {"room_id": rid,
                             "participants": sorted(room["participants"])})
@@ -4700,14 +4992,17 @@ class Relay:
         if room is None:
             await self._error(ws, "unknown_room", req_id)
             return
-        room["participants"].discard(peer.username)
+        before = list(room["participants"])
+        room = self.store.room_remove_participant(rid, peer.username)
         self._log_activity("room_left", peer.username,
                            group_id=room["group_id"], status=rid)
-        await self._room_broadcast_meta(rid, "left", peer.username)
-        if not room["participants"]:
-            del self.rooms[rid]
-            self._log_activity("room_closed", peer.username,
-                               group_id=room["group_id"], status=rid)
+        if room is not None:
+            await self._room_broadcast_meta(
+                rid, "left", peer.username, before,
+                room["participants"], room["group_id"])
+            if room["closed"]:
+                self._log_activity("room_closed", peer.username,
+                                   group_id=room["group_id"], status=rid)
         await self._result(ws, req_id, True, {"room_id": rid, "left": True})
 
     async def _on_room_close(self, ws, frame, peer: Peer) -> None:
@@ -4722,17 +5017,52 @@ class Relay:
                               "only the room creator or a group admin"
                               " can close the room")
             return
-        await self._room_broadcast_meta(rid, "closed", peer.username)
-        del self.rooms[rid]
+        await self._room_broadcast_meta(
+            rid, "closed", peer.username, room["participants"],
+            room["participants"], room["group_id"])
+        self.store.room_close(rid)
         self._log_activity("room_closed", peer.username,
                            group_id=room["group_id"], status=rid)
         await self._result(ws, req_id, True, {"room_id": rid,
                                               "closed": True})
 
+    async def _reap_rooms(self, username: str) -> None:
+        """A connection ended: its room participation ends with it,
+        on the record, whichever rooms it sat in (v1.3.9 ghost cure
+        at the source). Runs on the disconnecting relay — the one
+        place that KNOWS the connection is gone."""
+        try:
+            rooms = await asyncio.to_thread(
+                self.store.rooms_of_participant, username)
+        except Exception:
+            return
+        for room in rooms or []:
+            rid = room["room_id"]
+            before = list(room["participants"])
+            try:
+                updated = await asyncio.to_thread(
+                    self.store.room_remove_participant, rid, username)
+            except Exception:
+                continue
+            self._log_activity("room_left", username,
+                               group_id=room["group_id"], status=rid)
+            if updated is not None:
+                await self._room_broadcast_meta(
+                    rid, "left", username, before,
+                    updated["participants"], room["group_id"])
+                if updated["closed"]:
+                    self._log_activity("room_closed", username,
+                                       group_id=room["group_id"],
+                                       status=rid)
+
     async def _on_room_signal(self, ws, frame, peer: Peer) -> None:
         """Signalling (offer/answer/ICE) routed to the ADDRESSED room
-        participant only. Never stored, never queued: WebRTC media is
-        peer-to-peer (DTLS-SRTP); the relay never sees audio."""
+        participant only. Never queued in the offline queue, never
+        stored as content: WebRTC media is peer-to-peer (DTLS-SRTP);
+        the relay never sees audio. A participant on a BROTHER relay
+        is reached through the store-mediated room_frames path —
+        perishable signalling, claimed by their relay on its scan
+        tick and dropped if stale."""
         req_id = frame.get("req_id")
         rid, room = self._room_or_error(frame)
         if room is None:
@@ -4745,19 +5075,27 @@ class Relay:
         if target not in room["participants"]:
             await self._error(ws, "not_in_room", req_id, str(target))
             return
+        out = {"type": "room_signal", "room_id": rid,
+               "from": peer.username, "kind": frame.get("kind"),
+               "payload": frame.get("payload")}
         target_peer = self.peers.get(target)
-        if target_peer is None:
+        if target_peer is not None:
+            await self._send(target_peer.ws, out)
+        elif self._participant_live(target, now_ts(), None):
+            # Online, but on a brother relay: store-mediated path.
+            try:
+                self.store.room_frame_put(target, out)
+            except Exception:
+                await self._error(ws, "peer_offline", req_id)
+                return
+        else:
             await self._error(ws, "peer_offline", req_id)
             return
-        await self._send(target_peer.ws, {
-            "type": "room_signal", "room_id": rid, "from": peer.username,
-            "kind": frame.get("kind"), "payload": frame.get("payload")})
         await self._result(ws, req_id, True,
                            {"room_id": rid, "to": target, "signalled": True})
 
     # -- resumable chunked uploads (relay proxies ciphertext to R2) -----------
     async def _on_blob_session_start(self, ws, frame, peer: Peer) -> None:
-        import hashlib as _hl
         req_id = frame.get("req_id")
         whole_sha = str(frame.get("whole_sha") or "")
         ct_sha = str(frame.get("ct_sha") or "")
