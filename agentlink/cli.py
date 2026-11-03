@@ -1167,16 +1167,24 @@ def _credentials(rest: list[str]) -> int:
                         help="the account email/username saved")
         ap.add_argument("password")
         ap.add_argument("--notes", default="")
+        ap.add_argument("--auth-type", default="password",
+                        choices=["password", "api_key", "token",
+                                 "other"],
+                        help="the form of the secret (v1.5.0): a "
+                             "login password, an API key, a token, "
+                             "or other auth material")
         args = ap.parse_args(r)
         _print(asyncio.run(_with_agent(
             args,
             lambda a: a.vault.remember(args.service, args.account,
                                        args.password,
-                                       notes=args.notes),
+                                       notes=args.notes,
+                                       auth_type=args.auth_type),
             forward={"cmd": "vault_put", "service": args.service,
                      "username": args.account,
                      "password": args.password,
-                     "notes": args.notes})))
+                     "notes": args.notes,
+                     "auth_type": args.auth_type})))
         return 0
     if sub == "list":
         args = ap.parse_args(r)
