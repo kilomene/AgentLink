@@ -3574,6 +3574,19 @@ function deliveryHtml(u){
     return '<br><small>delivery: verified (ack)</small>';
   return '<br><small>delivery: legacy client — unverified</small>';
 }
+function authHtml(u){
+  // Key-signed hello (v1.3.9): how this agent's most recent hello
+  // authenticated, from the row's auth_method. A key hello means
+  // no reusable credential was ever presented to a relay; a
+  // legacy connection presented its reusable secret and is
+  // flagged as such until the agent's client updates.
+  const m=u.auth_method||'';
+  if(m==='key') return '<br><small>auth: key-signed</small>';
+  if(m==='secret'||m==='resume')
+    return '<br><span class="pill health bad">auth: legacy secret — flagged</span>';
+  if(m==='bootstrap') return '<br><small>auth: bootstrap claim</small>';
+  return '';
+}
 function alertHtml(a){
   return '<div class="alert enter">⚠ <b>'+esc(a.kind)+'</b> — '+esc(a.subject)+
     ' <small>'+esc(a.detail||'')+' · '+pt(a.created_at)+'</small></div>';
@@ -3596,7 +3609,7 @@ function render(d){
  keyed(document.getElementById('users'), d.users||[], u=>u.username, u=>
   `<tr><td>@${esc(u.username)}<br><small>${esc((u.capabilities||[]).join(', '))}</small></td>
    <td class="${u.online?'on':'off'}"><span class="dot ${u.online?'on':''}"></span>${u.online?'online':'offline'}<br><small>${u.online?esc(u.activity_state||''):((!u.online&&u.last_seen)?'last seen '+pt(u.last_seen):esc(u.activity_state||''))}</small></td>
-   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.decision_state==='pending'?`<br><span class="pill health bad">decision link pending</span><br><small>line held — messages & work queueing</small>`:u.decision_state==='linked'?`<br><small>decision link: wired</small>`:''}${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state_label?esc(u.server_state_label):u.server_state==='carried'?(u.server_carried_by?'carried by @'+esc(u.server_carried_by):'carried'):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}${deliveryHtml(u)}</td>
+   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.decision_state==='pending'?`<br><span class="pill health bad">decision link pending</span><br><small>line held — messages & work queueing</small>`:u.decision_state==='linked'?`<br><small>decision link: wired</small>`:''}${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state_label?esc(u.server_state_label):u.server_state==='carried'?(u.server_carried_by?'carried by @'+esc(u.server_carried_by):'carried'):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}${deliveryHtml(u)}${authHtml(u)}</td>
    <td>${u.reachability?esc(u.reachability):''}${u.current_server_label?'<br><small>server: '+esc(u.current_server_label)+'</small>':''}${u.home&&u.current_server&&u.current_server.endpoint&&u.home!==u.current_server.endpoint?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`);
  keyed(document.getElementById('servers'), d.servers||[], s=>s.endpoint, s=>
   `<tr><td>${esc(s.label||s.endpoint)}<br><small>${esc(s.endpoint)}</small>${s.owner_agent&&s.home_endpoint&&s.home_endpoint!==s.endpoint?'<br><small>home: '+esc(s.home_endpoint)+'</small>':''}</td>
