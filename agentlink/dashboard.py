@@ -700,7 +700,124 @@ class DashboardServer:
             item["title"] = fields["title"]
         item["sealed"] = False
         self._register_blob(item, fields["obj"])
+        self._attach_file(item, fields["obj"], fields)
         return True
+
+    def _blob_present(self, blob_id: str, fallback: bool) -> bool:
+        """Blob presence truth for the payload's verified flag:
+        the blob store's exists() decides when it can — a
+        definitive False means the object is gone. When exists()
+        is absent or raises (an R2 transport error is UNKNOWN,
+        never an absence), fall back to the registration fact
+        (fallback = a blob_url was issued while opening)."""
+        store = getattr(self.relay, "blob_store", None)
+        fn = getattr(store, "exists", None) if store is not None \
+            else None
+        if fn is None:
+            return fallback
+        try:
+            return bool(fn(blob_id))
+        except Exception:
+            return fallback
+
+    def _attach_file(self, item: dict, obj: dict, fields: dict) -> None:
+        """In-conversation file viewing (v1.3.8, owner's ruling
+        2026-11-03): when an opened content object carries a file,
+        the item gains a `file` descriptor — metadata ONLY, never
+        bytes — so the thread can render/download it in place.
+
+        inline form (the protocol file payload, data_b64 present):
+        verified is protocol.verify_file (size + sha256 over the
+        decoded bytes); only a verified payload earns the
+        /api/file/<item id> URL — fail-closed, unverified bytes
+        are never served. blob form (descriptor with blob_id):
+        verified is the descriptor's oversight wrap having yielded
+        the file key (blob_url registered by _register_blob) AND
+        the blob object actually being present in the store.
+        No file in the content object -> no `file` key at all, so
+        non-file items keep byte-identical payloads."""
+        f = obj.get("file") if isinstance(obj, dict) else None
+        if not isinstance(f, dict) or not f:
+            return
+        name = fields.get("file_name") or f.get("name") \
+            or f.get("filename") or ""
+        item_id = item.get("id") or item.get("ref_id") or ""
+        if isinstance(f.get("data_b64"), str):
+            from .protocol import verify_file
+            verified = False
+            try:
+                verified = bool(verify_file(f))
+            except Exception:
+                verified = False
+            info = {"name": name,
+                    "kind": f.get("kind") or fields.get("content_kind")
+                    or "file",
+                    "mime": f.get("mime") or "application/octet-stream",
+                    "size": f.get("size"),
+                    "sha256": f.get("sha256"),
+                    "form": "inline",
+                    "verified": verified}
+            if verified and item_id:
+                info["url"] = f"/api/file/{item_id}"
+            item["file"] = info
+            return
+        blob_id = f.get("blob_id")
+        if blob_id:
+            present = self._blob_present(
+                blob_id, bool(item.get("blob_url")))
+            verified = bool(item.get("blob_url")) and present
+            info = {"name": name,
+                    "kind": f.get("kind") or fields.get("content_kind")
+                    or "file",
+                    "mime": item.get("file_mime") or f.get("mime")
+                    or "application/octet-stream",
+                    "size": f.get("size"),
+                    "sha256": f.get("sha256"),
+                    "form": "blob",
+                    "verified": verified}
+            if verified:
+                info["url"] = item["blob_url"]
+            item["file"] = info
+
+    def _inline_file_bytes(self, item_id: str):
+        """Resolve one conversation item's INLINE file bytes for
+        /api/file/<id>, statelessly: the audit row is fetched by
+        id, its oversight wrap opened exactly as the payload
+        builder opens it, and the file payload must pass
+        protocol.verify_file (size + sha256) before a single byte
+        is returned. Returns (data, payload) or None — every
+        failure is a plain None (the route answers 404, never
+        serves unverified bytes, never 500s)."""
+        try:
+            if not item_id:
+                return None
+            rows = self.relay.store.audit_rows_for_ids([item_id])
+            row = None
+            for r in rows or []:
+                if isinstance(r, dict) \
+                        and (r.get("ref_id") or "") == item_id \
+                        and r.get("kind") in self._CONTENT_KINDS:
+                    row = r
+                    break
+            if row is None:
+                return None
+            pt = self._oversight_open(row.get("oversight"),
+                                       row.get("content_envelope"))
+            if pt is None:
+                return None
+            fields = self._content_fields(pt)
+            if fields is None:
+                return None
+            payload = fields["obj"].get("file")
+            if not isinstance(payload, dict) \
+                    or not isinstance(payload.get("data_b64"), str):
+                return None
+            from .protocol import file_bytes, verify_file
+            if not verify_file(payload):
+                return None
+            return file_bytes(payload), payload
+        except Exception:
+            return None
 
     _CONTENT_KINDS = ("message", "group_message", "channel_message")
     _WORK_KINDS = ("work_assigned", "work_delivered")
@@ -857,6 +974,45 @@ class DashboardServer:
                     return self._send(200, data, mime, extra={
                         "Content-Disposition": disp,
                         "Cache-Control": "private, no-store"})
+                if path.startswith("/api/file/"):
+                    # In-conversation inline files (v1.3.8): bytes
+                    # are re-derived statelessly from the item's
+                    # audit row and served ONLY after the payload's
+                    # size + sha256 verify — to the authenticated
+                    # operator session only. Any failure anywhere
+                    # is a clean 404; unverified bytes never serve.
+                    if not self._authed():
+                        return self._send(401, '{"error":"login required"}',
+                                          "application/json")
+                    item_id = urllib.parse.unquote(
+                        path[len("/api/file/"):]).strip("/")
+                    try:
+                        got = dash._inline_file_bytes(item_id)
+                    except Exception:
+                        got = None
+                    if got is None:
+                        return self._send(
+                            404, '{"error":"file unavailable"}',
+                            "application/json")
+                    data, payload = got
+                    mime = payload.get("mime") \
+                        or "application/octet-stream"
+                    kind = payload.get("kind") or ""
+                    inline = mime.startswith(("image/", "video/")) \
+                        or kind in ("image", "video")
+                    if inline:
+                        disp = "inline"
+                    else:
+                        fname = (payload.get("name")
+                                 or payload.get("filename")
+                                 or "file").replace(
+                                     '"', "").replace("\n", "")
+                        disp = f'attachment; filename="{fname}"'
+                    return self._send(200, data, mime, extra={
+                        "Content-Disposition": disp,
+                        "Cache-Control": "private, no-store",
+                        "X-Content-SHA256":
+                            payload.get("sha256") or ""})
                 if (path.startswith("/api/library/")
                         and path.endswith("/download")) or \
                         (path.startswith("/api/vault/")
@@ -2908,6 +3064,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
  .btext.sealed{color:var(--faint);font-style:italic}
  .chatimg{display:block;max-width:100%;border-radius:12px;margin:2px 0 4px}
  .chatvid{display:block;max-width:100%;border-radius:12px;margin:2px 0 4px}
+ .bubble audio{display:block;max-width:100%;margin:2px 0 4px}
+ .filechip.unavailable{color:var(--muted);font-style:italic}
  a.filechip{display:block;text-decoration:none;color:inherit;cursor:pointer}
  .bmeta{font-size:10.5px;color:var(--faint);text-align:right;margin-top:3px}
  .ticks{font-weight:700;letter-spacing:-2.5px;color:#8a94a6}
@@ -3265,6 +3423,14 @@ function tickBits(c,i){
     return ' · <span class="ticks">✓</span>';
   return '';
 }
+function humanSize(n){
+  if(n===null||n===undefined||isNaN(n)) return 'size unknown';
+  n=+n;
+  if(n<1024) return n+' B';
+  if(n<1024*1024) return (n/1024).toFixed(1)+' KB';
+  if(n<1024*1024*1024) return (n/(1024*1024)).toFixed(1)+' MB';
+  return (n/(1024*1024*1024)).toFixed(1)+' GB';
+}
 function itemHtml(c,i){
   if(i.kind==='message'||i.kind==='group_message'||i.kind==='channel_message'){
     const side=(!c.group_id && (c.participants||[])[1]===i.from)?'right':'left';
@@ -3272,7 +3438,33 @@ function itemHtml(c,i){
     const role=i.sender_custom_role?' · '+esc(i.sender_custom_role)
       :(i.sender_role?' · '+esc(i.sender_role):'');
     let body='';
-    if(i.blob_url && (i.content_kind==='image' || (i.file_mime||'').indexOf('image/')===0))
+    if(i.file){
+      /* In-conversation files (v1.3.8): render from the file
+         descriptor — plaintext size, verified state, in-thread
+         view/download URL. An unverified file is an honest chip:
+         no link, no image, nothing clickable that cannot deliver. */
+      const fl=i.file, fname=fl.name||i.file_name||'attachment';
+      if(fl.verified && fl.url){
+        if(fl.kind==='image' || (fl.mime||'').indexOf('image/')===0)
+          body+='<a href="'+esc(fl.url)+'" target="_blank" rel="noopener">'+
+            '<img class="chatimg" src="'+esc(fl.url)+'" alt="'+esc(fname)+'"></a>';
+        else if(fl.kind==='video' || (fl.mime||'').indexOf('video/')===0)
+          body+='<video class="chatvid" controls preload="metadata" src="'+
+            esc(fl.url)+'"></video>';
+        else if(fl.kind==='voice' || (fl.mime||'').indexOf('audio/')===0)
+          body+='<audio controls src="'+esc(fl.url)+'"></audio>';
+        else
+          body+='<a class="filechip link" href="'+esc(fl.url)+'" download>📎 <b>'+
+            esc(fname)+'</b><span>'+esc(fl.kind||'file')+' · '+
+            humanSize(fl.size)+'</span></a>';
+      } else if(!fl.verified)
+        body+='<div class="filechip unavailable">📎 <b>'+esc(fname)+
+          '</b><span>— unavailable (bytes could not be verified)</span></div>';
+      else
+        body+='<div class="filechip">📎 <b>'+esc(fname)+'</b><span>'+
+          esc(fl.kind||'file')+' · '+humanSize(fl.size)+'</span></div>';
+    }
+    else if(i.blob_url && (i.content_kind==='image' || (i.file_mime||'').indexOf('image/')===0))
       body+='<img class="chatimg" src="'+esc(i.blob_url)+'" alt="'+esc(i.file_name||'image')+'">';
     else if(i.blob_url && (i.content_kind==='video' || (i.file_mime||'').indexOf('video/')===0))
       body+='<video class="chatvid" controls preload="metadata" src="'+esc(i.blob_url)+'"></video>';
@@ -3404,11 +3596,11 @@ function render(d){
  keyed(document.getElementById('users'), d.users||[], u=>u.username, u=>
   `<tr><td>@${esc(u.username)}<br><small>${esc((u.capabilities||[]).join(', '))}</small></td>
    <td class="${u.online?'on':'off'}"><span class="dot ${u.online?'on':''}"></span>${u.online?'online':'offline'}<br><small>${u.online?esc(u.activity_state||''):((!u.online&&u.last_seen)?'last seen '+pt(u.last_seen):esc(u.activity_state||''))}</small></td>
-   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.decision_state==='pending'?`<br><span class="pill health bad">decision link pending</span><br><small>line held — messages & work queueing</small>`:u.decision_state==='linked'?`<br><small>decision link: wired</small>`:''}${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state==='carried'?'carried by @'+esc(u.server_carried_by||''):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}${deliveryHtml(u)}</td>
+   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.decision_state==='pending'?`<br><span class="pill health bad">decision link pending</span><br><small>line held — messages & work queueing</small>`:u.decision_state==='linked'?`<br><small>decision link: wired</small>`:''}${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state_label?esc(u.server_state_label):u.server_state==='carried'?(u.server_carried_by?'carried by @'+esc(u.server_carried_by):'carried'):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}${deliveryHtml(u)}</td>
    <td>${u.reachability?esc(u.reachability):''}${u.current_server_label?'<br><small>server: '+esc(u.current_server_label)+'</small>':''}${u.home&&u.current_server&&u.current_server.endpoint&&u.home!==u.current_server.endpoint?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`);
  keyed(document.getElementById('servers'), d.servers||[], s=>s.endpoint, s=>
   `<tr><td>${esc(s.label||s.endpoint)}<br><small>${esc(s.endpoint)}</small>${s.owner_agent&&s.home_endpoint&&s.home_endpoint!==s.endpoint?'<br><small>home: '+esc(s.home_endpoint)+'</small>':''}</td>
-   <td>${s.owner_agent?'owner @'+esc(s.owner_agent)+((s.carry_state_label||s.carry_state)?'<br><small>'+esc(s.carry_state_label||(s.carry_state==='carried'?'carried by @'+(s.carried_by||''):s.carry_state==='home'?'at home':s.carry_state==='down'?'down — awaiting carrier':''))+(s.carry_state==='carried'?' (helper — server still belongs to @'+esc(s.owner_agent)+')':'')+'</small>':''):(s.host_agent?'hosted by @'+esc(s.host_agent):'operator relay')}</td>
+   <td>${s.owner_agent?'owner @'+esc(s.owner_agent)+((s.carry_state_label||s.carry_state)?'<br><small>'+esc(s.carry_state_label||(s.carry_state==='carried'?(s.carried_by?'carried by @'+s.carried_by:'carried'):s.carry_state==='home'?'at home':s.carry_state==='down'?'down — awaiting carrier':''))+(s.carry_state==='carried'?' (helper — server still belongs to @'+esc(s.owner_agent)+')':'')+'</small>':''):(s.host_agent?'hosted by @'+esc(s.host_agent):'operator relay')}</td>
    <td>${(s.health===-1||s.health==null)?'<span class="pill health">UNRATED — testing</span>':`<span class="pill health${s.health<=50?' bad':''}">health ${s.health}%</span>`}</td>
    <td>riding: ${s.riders} / ${s.capacity}${(s.riding_now&&s.riding_now.length)?'<br><small>'+s.riding_now.map(x=>'@'+esc(x)).join(', ')+'</small>':''}${(s.carrying_now&&s.carrying_now.length)?'<br><small>carrying: '+s.carrying_now.map(c=>'@'+esc(c.owner_agent)+'’s server').join(', ')+'</small>':''}</td></tr>`);
  keyed(document.getElementById('groups'),
