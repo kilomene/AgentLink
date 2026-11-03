@@ -147,10 +147,6 @@ def normalize_username(raw: object) -> str | None:
     return u if USERNAME_RE.match(u) else None
 
 
-def valid_username(raw: object) -> bool:
-    return normalize_username(raw) is not None
-
-
 def new_secret() -> str:
     return secrets.token_urlsafe(24)
 
