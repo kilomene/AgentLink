@@ -91,6 +91,19 @@ NON_TERMINAL_WORK_STATUSES = ("assigned", "in_progress",
                               "awaiting_approval", "awaiting_agent")
 
 
+def _ack_id_matches(frame: dict, wanted: set) -> bool:
+    """Does an ack carrying ``wanted`` ids retire this queued frame?
+    Message frames match by top-level id; a work_assigned frame has
+    no top-level id, so it matches by its nested work id (the client
+    acks work by work id). One rule, both stores, exactly."""
+    if str(frame.get("id") or "") in wanted:
+        return True
+    if frame.get("type") == "work_assigned":
+        work = frame.get("work") or {}
+        return str(work.get("id") or "") in wanted
+    return False
+
+
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -207,6 +220,7 @@ class Store:
                     cap_desc TEXT NOT NULL DEFAULT '',
                     mode TEXT NOT NULL DEFAULT 'autonomous',
                     decision_link TEXT NOT NULL DEFAULT '',
+                    delivery_ack INTEGER NOT NULL DEFAULT 0,
                     last_seen INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL
                 );
@@ -552,6 +566,14 @@ class Store:
         # and are never modelled here as parts to be supplied.
         _add("users", "decision_link",
              "decision_link TEXT NOT NULL DEFAULT ''")
+        # Delivery custody (v1.3.7): the agent's own hello declares
+        # whether its client acks queued frames into its durable
+        # journal (1) or still takes the legacy destructive flush
+        # (0, the default for every pre-1.3.7 install). Like
+        # decision_link, a CONNECTION-side fact declared by the
+        # agent itself — the relay only records it.
+        _add("users", "delivery_ack",
+             "delivery_ack INTEGER NOT NULL DEFAULT 0")
         # Peer mesh (v1.2.0): the server registry carries health,
         # rider load and effective capacity alongside identity.
         _add("servers", "health",
@@ -1133,6 +1155,72 @@ class Store:
                 " ORDER BY seq ASC", CONTENT_AUDIT_KINDS).fetchall()
             return self._shape_audit_rows(rows)
 
+    def count_online_since(self, username: str, ts: int) -> int:
+        """How many times ``username`` has come online (audit kind
+        'online', actor = the user — written by the relay's hello
+        path via _log_activity("online", username)) with a row ts
+        STRICTLY after ``ts``. The reconnect-truth probe behind
+        delivery custody (v1.3.7): a client that reconnected since
+        a frame was queued is distinguishable from one that never
+        came back."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM audit_log"
+                " WHERE kind = 'online' AND actor = ? AND ts > ?",
+                (username, int(ts))).fetchone()
+        return int(row["n"])
+
+    # list_content_audit PLUS the row seq (the cursor column the
+    # per-user catch-up pages on) — same columns, same shaping.
+    _AUDIT_COLS_SEQ = ('SELECT seq, ts, kind, actor AS "from",'
+                       ' target AS "to", group_id, work_id, status,'
+                       " priority, size, mentions, ref_id,"
+                       " sender_nickname, sender_role,"
+                       " sender_custom_role, oversight, content_envelope"
+                       " FROM audit_log")
+
+    def content_audit_for_user(self, username: str, limit: int = 200,
+                               before_seq: int | None = None
+                               ) -> list[dict]:
+        """The content rows (CONTENT_AUDIT_KINDS) where ``username``
+        is a party: sender ("from"), recipient ("to"), a member of
+        the row's group, or a member of the row's channel (channel
+        frames carry the channel id in group_id — see the relay's
+        channel_message audit write — so both id sets are matched
+        against it, plus a channel_id key if a row ever carries
+        one). Rows carry seq plus exactly the fields
+        list_content_audit returns. With before_seq, only rows with
+        seq < before_seq. Returns the NEWEST ``limit`` matching
+        rows, presented oldest-first (seq ASC) — a catch-up page
+        that walks backwards by feeding back the oldest seq seen."""
+        group_ids = {g["group_id"]
+                     for g in self.groups_for_user(username)}
+        channel_ids = {c["channel_id"]
+                       for c in self.channels_for_user(username)}
+        marks = ",".join("?" * len(CONTENT_AUDIT_KINDS))
+        sql = (self._AUDIT_COLS_SEQ + f" WHERE kind IN ({marks})")
+        args: list = list(CONTENT_AUDIT_KINDS)
+        if before_seq is not None:
+            sql += " AND seq < ?"
+            args.append(int(before_seq))
+        sql += " ORDER BY seq ASC"
+        with self._lock:
+            rows = self._db.execute(sql, args).fetchall()
+            shaped = self._shape_audit_rows(rows)
+        scopes = group_ids | channel_ids
+        matching = []
+        for r in shaped:
+            if r.get("from") == username or r.get("to") == username:
+                matching.append(r)
+            elif r.get("group_id") and r["group_id"] in scopes:
+                matching.append(r)
+            elif r.get("channel_id") and r["channel_id"] in channel_ids:
+                matching.append(r)
+        limit = int(limit)
+        if limit <= 0:
+            return []
+        return matching[-limit:]
+
     def audit_rows_for_ids(self, ids) -> list[dict]:
         """Audit rows (any kind) whose ref_id OR work_id is in
         ``ids`` — the targeted fetch behind the dashboard's oversight
@@ -1245,23 +1333,24 @@ class Store:
     def claim(self, username: str, display_name: str, pubkey: str = "",
               sign_pub: str = "", capabilities=None,
               cap_desc: str = "", mode: str = "autonomous",
-              decision_link: str = "") -> str:
+              decision_link: str = "", delivery_ack: int = 0) -> str:
         secret = new_secret()
         mode = mode if mode in ("manual", "autonomous") else "autonomous"
         decision_link = decision_link if decision_link in (
             "linked", "pending") else ""
+        delivery_ack = 1 if delivery_ack else 0
         with self._lock:
             try:
                 self._db.execute(
                     "INSERT INTO users (username, secret, display_name, pubkey,"
                     " sign_pub, capabilities, cap_desc, mode, decision_link,"
-                    " created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " delivery_ack, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     # Only the SHA-256 hash is stored — the relay DB never
                     # holds a usable secret.
                     (username, _hash_token(secret), display_name, pubkey,
                      sign_pub, json.dumps(capabilities or []), cap_desc,
-                     mode, decision_link, now_ts()),
+                     mode, decision_link, delivery_ack, now_ts()),
                 )
                 self._db.commit()
             except sqlite3.IntegrityError:
@@ -1698,6 +1787,19 @@ class Store:
                 (state, username))
             self._db.commit()
 
+    def set_delivery_ack(self, username: str, flag) -> None:
+        """Persist the agent's declared delivery-ack capability
+        (v1.3.7). Recorded from the agent's own hello, exactly like
+        set_decision_link — the agent declares whether its client
+        acks queued frames into its durable journal; the relay
+        never assigns it. Normalised to the two lawful states
+        (1 = ack-capable, 0 = legacy flush)."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE users SET delivery_ack = ? WHERE username = ?",
+                (1 if flag else 0, username))
+            self._db.commit()
+
     def sign_pub_of(self, username: str) -> str:
         with self._lock:
             row = self._db.execute(
@@ -1744,7 +1846,7 @@ class Store:
                 rows = self._db.execute(
                     "SELECT username, display_name, pubkey, sign_pub,"
                     " capabilities, cap_desc, mode, decision_link,"
-                    " last_seen, created_at"
+                    " delivery_ack, last_seen, created_at"
                     " FROM users"
                     " WHERE username LIKE ? ORDER BY username",
                     (f"%{query}%",),
@@ -1753,7 +1855,7 @@ class Store:
                 rows = self._db.execute(
                     "SELECT username, display_name, pubkey, sign_pub,"
                     " capabilities, cap_desc, mode, decision_link,"
-                    " last_seen, created_at"
+                    " delivery_ack, last_seen, created_at"
                     " FROM users ORDER BY username"
                 ).fetchall()
             out = []
@@ -1768,6 +1870,9 @@ class Store:
                 # not an explicit 'manual' presents as autonomous.
                 d["mode"] = d.get("mode") if d.get("mode") in (
                     "manual", "autonomous") else "autonomous"
+                # Delivery-ack declaration (v1.3.7): anything not
+                # explicitly recorded as ack-capable presents as 0.
+                d["delivery_ack"] = 1 if d.get("delivery_ack") else 0
                 if capability and capability.lower() not in \
                         [c.lower() for c in d["capabilities"]]:
                     continue
@@ -1947,6 +2052,97 @@ class Store:
             frame["queued"] = True
             out.append(frame)
         return out
+
+    # -- delivery custody (v1.3.7): the queue as an acked outbox -------
+    # dequeue_all above stays the LEGACY path (flush = delivered).
+    # For ack-capable clients the queue is a custody outbox instead:
+    # the relay PEEKS with pending_frames, writes the frames to the
+    # socket, and the frames leave the store only when the receiving
+    # client acks them (ack_frames) — i.e. only once they are inside
+    # the client's durable journal. A crash anywhere before the ack
+    # leaves the frames queued for the next hello; nothing is lost
+    # by being "sent".
+
+    def pending_frames(self, to_username: str) -> list[dict]:
+        """Peek the offline queue WITHOUT deleting: the same frames
+        in the same order dequeue_all would return (priority DESC,
+        seq ASC, each stamped queued=True) — but custody stays with
+        the store until ack_frames releases it."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT payload FROM queue WHERE to_username = ?"
+                " ORDER BY priority DESC, seq ASC",
+                (to_username,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            frame = json.loads(r["payload"])
+            frame["queued"] = True
+            out.append(frame)
+        return out
+
+    def ack_frames(self, to_username: str, ids) -> list[dict]:
+        """Release custody: delete ONLY this user's queue rows whose
+        payload matches an acked id (ids the user does not hold are
+        ignored). A frame matches by its top-level "id" (message
+        frames), or — for a work_assigned frame, which carries no
+        top-level id — by its nested work id: the client acks work by
+        work id after journaling the assignment, and that ack must
+        retire the frame or custody never completes for work.
+        Returns the acked frames (parsed payloads, in queue seq
+        order). The whole match+delete runs under the store lock,
+        exactly dequeue_all's discipline, so concurrent acks can
+        never double-release a frame."""
+        wanted = {str(i) for i in (ids or []) if i}
+        if not wanted:
+            return []
+        acked: list[dict] = []
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT seq, payload FROM queue WHERE to_username = ?"
+                " ORDER BY seq ASC",
+                (to_username,),
+            ).fetchall()
+            seqs = []
+            for r in rows:
+                try:
+                    frame = json.loads(r["payload"])
+                except Exception:
+                    continue
+                if _ack_id_matches(frame, wanted):
+                    seqs.append(r["seq"])
+                    acked.append(frame)
+            for seq in seqs:
+                self._db.execute(
+                    "DELETE FROM queue WHERE seq = ?", (seq,))
+            if seqs:
+                self._db.commit()
+        return acked
+
+    def queue_stats(self, to_username: str) -> dict:
+        """Custody view for one user: how many frames the store
+        still holds for them, and the ts of the oldest (None when
+        the queue is empty)."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n, MIN(ts) AS oldest FROM queue"
+                " WHERE to_username = ?",
+                (to_username,)).fetchone()
+        return {"count": int(row["n"]),
+                "oldest_ts": int(row["oldest"])
+                if row["oldest"] is not None else None}
+
+    def queue_stats_all(self) -> dict:
+        """queue_stats for every user with a non-empty queue, keyed
+        by username (users with count 0 are absent)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT to_username, COUNT(*) AS n, MIN(ts) AS oldest"
+                " FROM queue GROUP BY to_username").fetchall()
+        return {r["to_username"]: {
+            "count": int(r["n"]),
+            "oldest_ts": int(r["oldest"])
+            if r["oldest"] is not None else None} for r in rows}
 
     # -- groups ------------------------------------------------------------
     def create_group(self, name: str, creator: str, settings: dict | None) -> str:
