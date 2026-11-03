@@ -6,7 +6,8 @@ normalises to the bare lowercase form.
 
 Client -> Relay (all carry an optional ``req_id`` for result correlation)
     hello          {username, display_name, secret, ephemeral,
-                    capabilities, cap_description, mode}
+                    capabilities, cap_description, mode,
+                    delivery_ack, client_version}
                     (v1.1.7: ``mode`` is the agent's own platform
                     mode declaration — "manual" | "autonomous",
                     default autonomous; the relay records it on the
@@ -14,6 +15,27 @@ Client -> Relay (all carry an optional ``req_id`` for result correlation)
                     objects may carry ``meta``: the autonomous
                     runtime marks its sends {"autonomous": true}
                     inside the E2E envelope.)
+                    (v1.3.7: ``delivery_ack``: 1 declares this client
+                    acknowledges delivery — the relay then holds its
+                    queued frames in a custody outbox (see ``ack``
+                    below) instead of flush-and-forget; the relay
+                    records the declaration on the profile exactly as
+                    it records ``mode``. ``client_version`` is the
+                    client's own version string, recorded verbatim.)
+                    (v1.3.7, registration robustness: a connection
+                    that dies before completing its hello is logged
+                    and counted relay-side (audit/activity kind
+                    ``hello_incomplete``, with the stage reached and
+                    the reason), and a connection that completes no
+                    hello within FIRST_HELLO_TIMEOUT_SECONDS of
+                    connecting is closed. A FIRST registration cut
+                    off after the claim but before the welcome was
+                    saved may be RESUMED by a retry presenting no
+                    secret and the SAME identity keys (``pubkey`` +
+                    ``sign_pub``) while the half-created row is
+                    inside the resume window; a hello presenting a
+                    DIFFERENT secret for an existing username is
+                    always rejected ``username_taken``.)
     send           {to, body, kind, file, in_reply_to}
     group_create   {name, members:[username], settings:{...}}
     group_add      {group_id, members:[username]}
@@ -28,6 +50,23 @@ Client -> Relay (all carry an optional ``req_id`` for result correlation)
                     recipient reports messages it has taken in; the
                     relay validates participation from its own audit
                     row and records the first-read time)
+    ack            {ids:[frame_id]}     (delivery custody, v1.3.7:
+                    sent only by a client that declared
+                    ``delivery_ack`` in its hello; the ids are frames
+                    the receiver has DURABLY JOURNALED on its side.
+                    The relay retires exactly those frames from the
+                    sender-side custody outbox and marks acked
+                    ``message`` frames delivered in its audit — an
+                    offer to a live socket is never, by itself,
+                    delivery for an ack-capable client)
+    history        {limit?, before_seq?}   (v1.3.7: the caller asks
+                    for its own content-audit history; answered via
+                    the standard result frame with data
+                    {"rows": [...]}, newest first, paged by
+                    ``before_seq`` — how an ack-capable client that
+                    journaled a frame id it cannot reconstruct, or
+                    reconciles after a crash, re-reads what the
+                    relay holds for it)
     assign         {assignees:[username], group_id|null, title,
                     instructions, attachments:[file], deadline}
     deliver_work   {work_id, body, files:[file]}
@@ -43,6 +82,14 @@ Client -> Relay (all carry an optional ``req_id`` for result correlation)
 
 Relay -> Client
     welcome        {username, secret, ephemeral, queued}
+                    (v1.3.7: for a ``delivery_ack`` client, ``queued``
+                    counts the frames held in custody for it; those
+                    frames are OFFERED after the welcome and stay in
+                    custody — re-offered on the delivery resend
+                    cadence — until the client's ``ack`` retires
+                    them. For a legacy client, ``queued`` keeps its
+                    pre-1.3.7 meaning: frames flushed with the
+                    welcome, gone from the queue.)
     result         {req_id, ok, data}         (reply to a request frame)
     error          {req_id?, reason, detail}
     message        {id, from, from_name, body, kind, file, ts,
