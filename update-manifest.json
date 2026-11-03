@@ -1,27 +1,27 @@
 {
-  "version": "1.4.4",
+  "version": "1.5.0",
   "files": {
-    "agentlink/__init__.py": "b3586ce3c0131f4c078526a2eabe7153fec82dffd801f9509499124b079c1141",
+    "agentlink/__init__.py": "5af20a0499036ced24002a36273390c741f0cf85774bcee5f24d4af459fbb643",
     "agentlink/__main__.py": "307299fda7b77d22c64cb51430ec75e5f59d78e9c948786afb3b2544fe45e4b7",
     "agentlink/alerts_local.py": "c08cd95bfaf6f4e5968e3b4cc85c49d74c0b5b54f66e6120235e38b4078ca82d",
     "agentlink/backend.py": "91a7ad63bdcbd3ddcf4c797b23bc6df06a508ea54eba37f370fdc6f609844068",
     "agentlink/backup.py": "5fb14d8858586a1763b0a190a95ff182a912b83663822c76f8fa5e025f128619",
     "agentlink/blobstore.py": "28a6b3591fc9d682524e9f7b9650e5353840b8692b6c026aca4b74ff44296988",
     "agentlink/census.py": "2cb5d77c3ff78c226d1a2c3be37de1bf889c59c61bde57f30c940299c226b78b",
-    "agentlink/cli.py": "6a53651f90ec30f989b19893638d93b38a472d3d3c3436262a44250db62f2794",
-    "agentlink/client.py": "c7712c4228ed006f3eb96802e3d2d61cea04d33a25dde7802c50b19eb531af57",
+    "agentlink/cli.py": "3069b71d848d8f71f32f194cd59fb4f9d40294e2cb142f65395a45e3279cc0ee",
+    "agentlink/client.py": "4fa899021b4f7f37bc2aa1e8eb4a9e14b2d09b44137eece385f307286ed22484",
     "agentlink/config.py": "903954c47bad67559cb7daaa828ab5ad154c80c075d34ce638ab6411e1c2e5a6",
     "agentlink/crypto.py": "6d653e0d5ae4999d65354e23c388314833c6c03c27e852357431921c78905637",
-    "agentlink/dashboard.py": "40df9561822dcd8fd76e4e8a8ba932c6ae389b2150cda6f127ad807ef2b60835",
+    "agentlink/dashboard.py": "9afcd2ba69ab37aae552888e2172a87a0d6d609b869ecf7f6d3fb29cd2ce7177",
     "agentlink/deadlines.py": "e9132f5b5e9c2d845788505c3f3464df7e80573a78fb4e1149e271f65c6d0811",
     "agentlink/mailbox.py": "5b811c0cb37b1054ac3cd567ddb14be6c9d2edd665f03e0ca4b995c758b7752c",
     "agentlink/media.py": "fdf5cef33872b824f71e33e2c9c5ad4716288b5f5e5fa8feb85bbff15fdf8ef9",
     "agentlink/protocol.py": "2531af63996a48a385cff633bc9cd2ee8cf8af8799376132f92ee3276bb1afc2",
-    "agentlink/relay.py": "8ef5b88ffd62bb78a0d6dffd8c99c3173b742495a94232b00fba126c90e74bb0",
-    "agentlink/store.py": "ae37a905160ba80a67b5df130c12570f74c6dbbf5d2db57eb6c3352d16afcc46",
-    "agentlink/supabase_store.py": "ecae6d7f0236b65fd66db2435acaf706c5d8526b80314448135b2dbb96eb7b8b",
+    "agentlink/relay.py": "624f229f9ac7098d6d61ce38c25dfb9f1d1b6b047cda0e07b64ca331555b4ac2",
+    "agentlink/store.py": "12361656666ff229a886640b138da3e823da9f9438705c1d784c405a2bd748e6",
+    "agentlink/supabase_store.py": "3d010b6535ba752db7ffe9bc889f53b160730fac4205e32c99a83898a27d2f6a",
     "agentlink/timing.py": "1cc60322136f06d708997e2c4f85499bd87b1d09c2e622d5ffce5c53d2aec142",
     "agentlink/updater.py": "ab77ba53307c6cb3489121e47df8963a84a423167f22565af8849667e8a9764a",
-    "agentlink/vault.py": "5050236e616fc05690a777c87d73b619c53ca50fe1ea7ef0384c86b4b8f8ecf0"
+    "agentlink/vault.py": "443c37502b61f2e663d5bccb64821ce7dc1ed8d0ee0124e0603fd330661a7505"
   }
 }
