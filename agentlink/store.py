@@ -222,6 +222,7 @@ class Store:
                     decision_link TEXT NOT NULL DEFAULT '',
                     delivery_ack INTEGER NOT NULL DEFAULT 0,
                     vault_labels TEXT NOT NULL DEFAULT '',
+                    vault_content TEXT NOT NULL DEFAULT '',
                     vault_blob TEXT NOT NULL DEFAULT '',
                     vault_version INTEGER NOT NULL DEFAULT 0,
                     vault_entries INTEGER NOT NULL DEFAULT 0,
@@ -612,11 +613,20 @@ class Store:
         # in the blob layer; vault_version is the document revision
         # the pointer names (stale publishes are refused so a
         # zombie host can never rewind an agent's vault);
-        # vault_entries is the published entry count. Passwords
-        # exist ONLY inside the agent-sealed document — no column
-        # here can ever hold one.
+        # vault_entries is the published entry count. No column
+        # here can ever hold a PLAINTEXT secret: entry secrets
+        # exist in plaintext only inside the agent (identity-sealed
+        # document) and, since v1.5.0, inside the oversight-sealed
+        # content envelope whose plaintext lives only in the
+        # owner's authenticated dashboard session.
         _add("users", "vault_labels",
              "vault_labels TEXT NOT NULL DEFAULT ''")
+        # v1.5.0: vault_content is the agent-published OVERSIGHT-
+        # SEALED FULL-content envelope (the owner's Credentials
+        # view) — still ciphertext to this store; it holds no key
+        # that can open it.
+        _add("users", "vault_content",
+             "vault_content TEXT NOT NULL DEFAULT ''")
         _add("users", "vault_blob",
              "vault_blob TEXT NOT NULL DEFAULT ''")
         _add("users", "vault_version",
@@ -2076,15 +2086,17 @@ class Store:
 
     def set_vault_meta(self, username: str, labels: str,
                        blob_id: str, version: int,
-                       entries: int) -> bool:
+                       entries: int, content: str = "") -> bool:
         """Publish the relay-side pointer to an agent's credentials
         vault (v1.4.0). Only a pointer is stored: the self-sealed
         document's blob id, its document revision, the entry count,
-        and the OVERSIGHT-SEALED labels envelope (ciphertext to this
-        store — it holds no key that can open it). A publish whose
-        revision is OLDER than the stored pointer is REFUSED
-        (returns False) so a stale/zombie host can never rewind an
-        agent's vault; an equal revision re-points idempotently."""
+        and the OVERSIGHT-SEALED envelopes (labels, and since
+        v1.5.0 the full content for the owner's Credentials view —
+        ciphertext to this store; it holds no key that opens
+        either). A publish whose revision is OLDER than the stored
+        pointer is REFUSED (returns False) so a stale/zombie host
+        can never rewind an agent's vault; an equal revision
+        re-points idempotently."""
         with self._lock:
             row = self._db.execute(
                 "SELECT vault_version FROM users WHERE username = ?",
@@ -2094,11 +2106,12 @@ class Store:
             if int(version) < int(row[0]):
                 return False
             self._db.execute(
-                "UPDATE users SET vault_labels = ?, vault_blob = ?, "
+                "UPDATE users SET vault_labels = ?, "
+                "vault_content = ?, vault_blob = ?, "
                 "vault_version = ?, vault_entries = ? "
                 "WHERE username = ?",
-                (labels or "", blob_id or "", int(version),
-                 int(entries), username))
+                (labels or "", content or "", blob_id or "",
+                 int(version), int(entries), username))
             self._db.commit()
             return True
 
@@ -2108,13 +2121,15 @@ class Store:
         with self._lock:
             row = self._db.execute(
                 "SELECT vault_labels, vault_blob, vault_version, "
-                "vault_entries FROM users WHERE username = ?",
+                "vault_entries, vault_content FROM users "
+                "WHERE username = ?",
                 (username,)).fetchone()
         if row is None or not (row[1] or row[0]):
             return None
         return {"labels": row[0] or "", "blob_id": row[1] or "",
                 "version": int(row[2] or 0),
-                "entries": int(row[3] or 0)}
+                "entries": int(row[3] or 0),
+                "content": row[4] or ""}
 
     def sign_pub_of(self, username: str) -> str:
         with self._lock:
