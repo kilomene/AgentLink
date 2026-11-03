@@ -1,0 +1,23 @@
+-- AgentLink v1.5.0 credentials vault — owner-visibility content
+-- envelope (2026-11-03, owner's explicit ruling, superseding the
+-- v1.4.0 labels-only dashboard design): "Since any agent can't
+-- access that dashboard it's safe, I can see whatever the agent
+-- save there — the website, the email it uses & password and
+-- other form of authentication whether api key or whatever."
+--
+-- WHAT LANDS HERE: vault_content is the agent-published envelope
+-- of the FULL entry content (service, account, auth_type, the
+-- secret itself, notes) sealed to the OWNER-OVERSIGHT key — the
+-- same sealing path as conversation content. This table still
+-- holds CIPHERTEXT ONLY: no key stored here can open it. Plaintext
+-- exists in exactly two places: inside the agent (its identity
+-- key) and inside the owner's authenticated dashboard session
+-- (the oversight key), where the Credentials view renders it.
+--
+-- APPLY NOTE: like migration-vault.sql, the code is fail-soft
+-- around this column — the Supabase store publishes labels and
+-- the pointer WITHOUT content (loud log) when the column is
+-- missing, and reads content via a separate guarded query. Apply
+-- before expecting the Credentials view to light up. Additive
+-- only — one new column with a default.
+alter table al_users add column if not exists vault_content text not null default '';
