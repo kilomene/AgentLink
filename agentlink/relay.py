@@ -24,7 +24,13 @@ import websockets
 import websockets.exceptions
 from websockets.server import serve
 
-from .protocol import MAX_FRAME, new_id, normalize_username, now_ts
+from .protocol import (
+    MAX_FRAME,
+    new_id,
+    new_secret,
+    normalize_username,
+    now_ts,
+)
 from .timing import (
     ALERT_OFFLINE_SECONDS,
     ALERT_REMINDER_SECONDS,
@@ -36,6 +42,10 @@ from .timing import (
     CHECKIN_MIN_SESSIONS,
     CHECKIN_SESSION_MAX_SECONDS,
     CHECKIN_WINDOW_SECONDS,
+    DELIVERY_HISTORY_PAGE,
+    DELIVERY_RESEND_SECONDS,
+    DELIVERY_STUCK_SECONDS,
+    FIRST_HELLO_TIMEOUT_SECONDS,
     HEALTH_FRAME_TIMEOUT_SECONDS,
     HEALTH_INITIAL_CYCLES,
     HEALTH_PROBE_ROUNDS,
@@ -46,6 +56,7 @@ from .timing import (
     OFFLINE_GRACE_SECONDS,
     REASSIGN_GRACE_SECONDS,
     RECONNECT_BACKOFF_CAP_SECONDS,
+    REGISTRATION_RESUME_WINDOW_SECONDS,
     SERVER_HEALTHY_MIN,
     SERVER_HEARTBEAT_SECONDS,
     SERVER_HEALTH_WINDOW_SECONDS,
@@ -154,6 +165,16 @@ class Peer:
     # store's connection registry at hello and on the heartbeat
     # cadence, so every dashboard can name the agent's real server.
     conn_endpoint: str = ""
+    # Delivery custody (v1.3.7): this connection's client declared
+    # delivery_ack in its hello — its queued frames are HELD in the
+    # store's custody outbox and only its ack retires them (see
+    # _deliver / _on_ack). ``offered`` is frame id -> epoch second
+    # this peer was last OFFERED that frame (the re-offer cadence
+    # reads it; an ack clears it). ``client_version`` is the
+    # client's own version string from the hello, verbatim.
+    delivery_ack: bool = False
+    client_version: str = ""
+    offered: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -272,6 +293,15 @@ class Relay:
         os.environ.get("AGENTLINK_ALERT_CHAIN_PAUSE_SECONDS", "300")))
     _pressure_fired: set = field(default_factory=set, repr=False)
     _alert_dispatched: set = field(default_factory=set, repr=False)
+    # Registration visibility (v1.3.7): incomplete-hello counters —
+    # connections that showed registration intent but died before
+    # completing a hello. The durable record is the audit/activity
+    # kind 'hello_incomplete' (see _record_hello_incomplete); these
+    # counters are this relay process's running total, surfaced on
+    # the dashboard overview alongside the persisted activity rows.
+    _hello_incomplete_total: int = field(default=0, repr=False)
+    _hello_incomplete_by_reason: dict = field(
+        default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self.store = self.backend_store or \
@@ -534,6 +564,269 @@ class Relay:
             if row.get("username") == username:
                 return row
         return None
+
+    # -- delivery custody (v1.3.7) -------------------------------------
+    # The delivery_ack declaration is plumbed exactly like
+    # decision_link: the client declares it in its hello, the relay
+    # records it on the user row, and every surface (delivery
+    # routing, dashboard, directory) reads the ROW — because any
+    # relay sharing the backend must know a recipient's capability
+    # whether or not that recipient is connected to it.
+
+    @staticmethod
+    def _ack_value(value) -> bool:
+        """Truth of a delivery_ack declaration, in any of the shapes
+        it legitimately arrives in: hello JSON (1 / true), a stored
+        row (0/1 int, possibly a string from a network store)."""
+        if value is True:
+            return True
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "ack", "yes")
+        return False
+
+    def _row_delivery_ack(self, username: str) -> bool | None:
+        """The user row's delivery_ack declaration: True/False when
+        the row carries the column, None when it does not (a store
+        that predates the column — callers may then fall back to a
+        live peer's own declaration, never to a guess)."""
+        try:
+            row = self._profile_of(username)
+        except Exception:
+            return None
+        if not row or "delivery_ack" not in row:
+            return None
+        return self._ack_value(row.get("delivery_ack"))
+
+    def _delivery_ack_recipient(self, username: str) -> bool:
+        """Is ``username`` an ack-capable recipient? Decided from
+        the USER ROW (see the section headnote); only when the row
+        cannot say (pre-custody store) does a locally connected
+        peer's own hello declaration stand in."""
+        declared = self._row_delivery_ack(username)
+        if declared is not None:
+            return declared
+        peer = self.peers.get(username)
+        return bool(peer is not None and peer.delivery_ack)
+
+    def _record_delivery_ack(self, username: str, capable: bool) -> None:
+        """Record a hello's delivery_ack declaration on the user
+        row, mirroring set_decision_link: the store's setter (when
+        the store carries the column) persists 0/1; a store without
+        it simply keeps nothing and the live peer's declaration
+        above remains this relay's knowledge."""
+        setter = getattr(self.store, "set_delivery_ack", None)
+        if setter is None:
+            return
+        value = 1 if capable else 0
+        try:
+            setter(username, value)
+        except TypeError:
+            try:
+                setter(username, capable)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _delivery_fields(self, row: dict, now: int) -> dict:
+        """Dashboard delivery state for one user (v1.3.7): how much
+        sits in custody for them, how long the oldest item has
+        waited, how many times they have connected (hello audit)
+        since it queued, and the guarantee their declared client
+        capability buys — 'ack' (custody: nothing counts delivered
+        until their ack) or 'legacy' (flush semantics, unverified).
+        Every number comes from the store; a store that cannot
+        answer yet reports an empty queue rather than a guess."""
+        name = row.get("username") or ""
+        waiting = 0
+        oldest_wait_s = None
+        hellos = 0
+        stats = None
+        stats_fn = getattr(self.store, "queue_stats", None)
+        if stats_fn is not None:
+            try:
+                stats = stats_fn(name) or {}
+            except Exception:
+                stats = {}
+        if stats:
+            try:
+                waiting = int(stats.get("count") or 0)
+            except Exception:
+                waiting = 0
+            oldest_ts = stats.get("oldest_ts")
+            if oldest_ts:
+                try:
+                    oldest_ts = int(oldest_ts)
+                except Exception:
+                    oldest_ts = 0
+                if oldest_ts:
+                    oldest_wait_s = max(0, now - oldest_ts)
+                    count_fn = getattr(
+                        self.store, "count_online_since", None)
+                    if count_fn is not None:
+                        try:
+                            hellos = int(count_fn(name, oldest_ts)
+                                         or 0)
+                        except Exception:
+                            hellos = 0
+        declared = row.get("delivery_ack")
+        if declared is None:
+            peer = self.peers.get(name)
+            declared = peer.delivery_ack if peer is not None else 0
+        return {"waiting": waiting,
+                "oldest_wait_s": oldest_wait_s,
+                "hellos_since_oldest": hellos,
+                "guarantee": "ack" if self._ack_value(declared)
+                else "legacy"}
+
+    # -- registration visibility (v1.3.7) --------------------------------
+    # A registration that dies on a sick network used to leave NO
+    # trace on the line's side: the connection handler only ever
+    # logged COMPLETED hellos ("peer @x registered") and clean
+    # disconnects of registered peers, so a foreign agent that
+    # "registers but along the line the registration even cut off"
+    # was undiagnosable from here. Every connection that shows
+    # registration intent but dies before completing a hello is now
+    # logged with its reason and counted.
+
+    @staticmethod
+    def _remote_of(ws) -> str:
+        """The peer address of a connection ('ip:port'), best
+        effort — test doubles and exotic transports may not carry
+        one; visibility degrades to '', never to an exception."""
+        try:
+            ra = getattr(ws, "remote_address", None)
+        except Exception:
+            ra = None
+        if isinstance(ra, (tuple, list)) and ra:
+            return ":".join(str(p) for p in ra[:2])
+        return str(ra or "")
+
+    def _record_hello_incomplete(self, username: str, stage: str,
+                                 reason: str, remote: str) -> None:
+        """Log + count + audit one incomplete hello. The log line
+        carries everything an operator needs (who, from where,
+        which stage the handshake reached, why it died); the
+        activity/audit row (kind 'hello_incomplete', status
+        '<stage>: <reason>') makes it durable and visible on the
+        dashboard activity feed; the counters feed the dashboard
+        overview. Never raises — visibility must not kill the
+        connection path it observes."""
+        self._hello_incomplete_total += 1
+        self._hello_incomplete_by_reason[reason] = \
+            self._hello_incomplete_by_reason.get(reason, 0) + 1
+        log.warning(
+            "hello incomplete: user=@%s stage=%s reason=%s "
+            "remote=%s (total %d)",
+            username or "unknown", stage, reason, remote or "-",
+            self._hello_incomplete_total)
+        try:
+            self._log_activity(
+                "hello_incomplete", username or "unknown",
+                target=remote, status=f"{stage}: {reason}")
+        except Exception:
+            pass
+
+    def _try_resume_registration(self, username: str, frame: dict,
+                                 secret) -> tuple:
+        """Registration idempotency (v1.3.7): resume a cut-off
+        FIRST registration against its own half-created row.
+
+        The strand this fixes: a first hello CLAIMS the row (the
+        store generates the secret), but the welcome carrying that
+        secret dies on the sick network before the client saves it.
+        Every retry then presented no secret, verify() failed, and
+        the relay answered username_taken — the legitimate identity
+        was locked out of its own name by its own half-registration,
+        forever, with no operator-free recovery.
+
+        A retry may resume ONLY when every one of these holds:
+          * NO secret was presented. A presented secret that fails
+            verify is a DIFFERENT secret and is rejected outright —
+            identity checks are not weakened by this path, ever.
+          * The hello presents the identity's pubkey AND sign_pub,
+            exactly matching the half-created row's stored keys —
+            the same identity, from the same identity file.
+          * The row is younger than
+            REGISTRATION_RESUME_WINDOW_SECONDS — a half-registration
+            is a minutes-scale accident; the window is the bound
+            that keeps this from becoming a standing back door
+            into established identities.
+          * The identity is NOT alive anywhere: not a local peer,
+            and no fresh shared heartbeat within the offline grace.
+            The claim-time touch makes a just-claimed row read
+            alive for OFFLINE_GRACE_SECONDS, so a retry inside the
+            grace is still refused and the client's own reconnect
+            pacing carries it past the grace — the gate opens for
+            the genuinely stranded retry, never for a second live
+            claimant.
+        A resume is LOUD: a warning log line and a 'hello_resumed'
+        activity row. When the store offers a secret setter the
+        secret is ROTATED on resume and the new secret rides the
+        welcome — the client saves it and the window closes
+        permanently; without one the welcome carries no secret and
+        the resume stays window-bound (the store-level completion
+        of this fix is a set_secret/rotate_secret method — see the
+        v1.3.7 workstream report). Returns (resumed?, new_secret).
+        """
+        if secret:
+            return False, None
+        pubkey = str(frame.get("pubkey") or "")
+        sign_pub = str(frame.get("sign_pub") or "")
+        if not pubkey or not sign_pub:
+            return False, None
+        try:
+            row = self._profile_of(username)
+        except Exception:
+            return False, None
+        if not row:
+            return False, None
+        if row.get("pubkey") != pubkey or \
+                row.get("sign_pub") != sign_pub:
+            return False, None
+        created = 0
+        try:
+            created = int(row.get("created_at") or 0)
+        except Exception:
+            created = 0
+        if not created or \
+                now_ts() - created > REGISTRATION_RESUME_WINDOW_SECONDS:
+            return False, None
+        if username in self.peers:
+            return False, None
+        if self._is_alive(username, OFFLINE_GRACE_SECONDS):
+            return False, None
+        log.warning(
+            "registration resumed for @%s: cut-off first "
+            "registration retried by the same identity keys within "
+            "the resume window", username)
+        try:
+            self._log_activity(
+                "hello_resumed", username,
+                status="half-registration resumed by identity keys")
+        except Exception:
+            pass
+        rotated = None
+        setter = None
+        for _name in ("set_secret", "rotate_secret", "reset_secret",
+                      "update_secret", "set_user_secret",
+                      "replace_secret"):
+            setter = getattr(self.store, _name, None)
+            if setter is not None:
+                break
+        if setter is not None:
+            try:
+                candidate = new_secret()
+                setter(username, candidate)
+                rotated = candidate
+            except Exception:
+                log.exception(
+                    "secret rotation on resume failed for @%s",
+                    username)
+                rotated = None
+        return True, rotated
 
     def _register_server_row(self) -> None:
         from . import __version__
@@ -1394,6 +1687,11 @@ class Relay:
                 u["activity_state"] = "offline"
             u.update(self._compliance_fields(name))
             u.update(self._decision_fields(u))
+            # Delivery custody (v1.3.7): waiting count / oldest
+            # wait / connections since the oldest queued, plus the
+            # ack-vs-legacy guarantee the user's own declared
+            # capability buys (see _delivery_fields).
+            u["delivery"] = self._delivery_fields(u, now)
             u["trust_score"] = self.store.compute_trust(name)
             u.pop("pubkey", None)
             u.pop("sign_pub", None)
@@ -1439,6 +1737,12 @@ class Relay:
             "server": self.server_label,
             "servers": servers,
             "updates_enabled": self.updates_enabled,
+            # Registration visibility (v1.3.7): this relay's
+            # incomplete-hello counters (durable record: the
+            # 'hello_incomplete' audit/activity rows).
+            "hello_incomplete": self._hello_incomplete_total,
+            "hello_incomplete_by_reason":
+                dict(self._hello_incomplete_by_reason),
             "online": sorted(u["username"] for u in users if u["online"]),
             "users": users,
             "groups": self.store.all_groups(),
@@ -1930,6 +2234,15 @@ class Relay:
         # within one scan tick — real-time across the fleet, not
         # just at hello. dequeue is atomic in the store, and _deliver
         # re-queues on a dead socket, so nothing is lost or doubled.
+        #
+        # Delivery custody (v1.3.7): for an ACK-CAPABLE local peer
+        # the drain PEEKS (pending_frames) and only RE-OFFERS —
+        # custody frames are never dequeued here and never routed
+        # through _deliver (which would enqueue a second custody
+        # copy); a frame is re-offered only when its last offer is
+        # older than DELIVERY_RESEND_SECONDS (or it was never
+        # offered). Legacy local peers keep dequeue_all + _deliver
+        # exactly as above. Ephemeral peers are skipped, as before.
         usernames = [u for u, p in list(self.peers.items())
                      if not getattr(p, "ephemeral", False)]
 
@@ -1937,12 +2250,37 @@ class Relay:
             out = {}
             for u in usernames:
                 try:
-                    out[u] = store.dequeue_all(u)
+                    p = self.peers.get(u)
+                    peek = getattr(store, "pending_frames", None)
+                    if p is not None and getattr(p, "delivery_ack",
+                                                 False) \
+                            and peek is not None:
+                        out[u] = ("ack", peek(u) or [])
+                    else:
+                        out[u] = ("legacy", store.dequeue_all(u))
                 except Exception:
                     continue
             return out
 
-        for username, queued in (await asyncio.to_thread(_drain)).items():
+        for username, (mode, queued) in \
+                (await asyncio.to_thread(_drain)).items():
+            if mode == "ack":
+                peer = self.peers.get(username)
+                if peer is None or peer.ephemeral:
+                    continue
+                for frame in queued:
+                    last = peer.offered.get(self._offer_key(frame))
+                    if last is not None and \
+                            now - last < DELIVERY_RESEND_SECONDS:
+                        continue
+                    try:
+                        await self._offer(peer, frame)
+                    except websockets.exceptions.ConnectionClosed:
+                        # Still in custody; the next connection (or
+                        # the next cadence window on a live one)
+                        # offers it again.
+                        break
+                continue
             for frame in queued:
                 await self._deliver(username, frame)
         grace = self.reassign_grace_seconds
@@ -2170,6 +2508,56 @@ class Relay:
                 "urgent_undelivered", name,
                 "urgent item waiting in the offline queue")
             await self._dispatch_alert(alert)
+        # Delivery stuck (v1.3.7, custody): an item that has sat
+        # UNACKNOWLEDGED in custody beyond DELIVERY_STUCK_SECONDS
+        # while its recipient has CONNECTED at least once since it
+        # queued — the recipient came, was offered, and the frame
+        # still never landed in its journal (the 2026-11-02 failure,
+        # now loud instead of silent). Same open/resolve discipline
+        # as urgent_undelivered above: open_alert dedupes an
+        # already-open alert for the kind+subject, and a user who
+        # is no longer stuck (queue empty, or nothing past the bound
+        # with a later connection) resolves below.
+        stuck: set = set()
+        stats_all = {}
+        stats_all_fn = getattr(store, "queue_stats_all", None)
+        if stats_all_fn is not None:
+            try:
+                stats_all = await asyncio.to_thread(stats_all_fn) \
+                    or {}
+            except Exception:
+                stats_all = {}
+        count_fn = getattr(store, "count_online_since", None)
+        for user, stats in stats_all.items():
+            if not isinstance(stats, dict):
+                continue
+            oldest_ts = stats.get("oldest_ts")
+            if not oldest_ts:
+                continue
+            try:
+                oldest_ts = int(oldest_ts)
+                count = int(stats.get("count") or 0)
+            except Exception:
+                continue
+            if now - oldest_ts <= DELIVERY_STUCK_SECONDS:
+                continue
+            k = 0
+            if count_fn is not None:
+                try:
+                    k = int(await asyncio.to_thread(
+                        count_fn, user, oldest_ts) or 0)
+                except Exception:
+                    k = 0
+            if k < 1:
+                continue
+            stuck.add(user)
+            alert = await asyncio.to_thread(
+                store.open_alert,
+                "delivery_stuck", user,
+                f"{count} item(s) waiting unacknowledged; "
+                f"oldest {now - oldest_ts}s; recipient connected "
+                f"{k}x since it queued")
+            await self._dispatch_alert(alert)
         for alert in await asyncio.to_thread(
                 store.list_alerts, status="open"):
             if alert["kind"] == "urgent_undelivered" and \
@@ -2178,6 +2566,11 @@ class Relay:
                                              for r in urgent}:
                 await asyncio.to_thread(
                     store.resolve_alerts, "urgent_undelivered",
+                    alert["subject"])
+            if alert["kind"] == "delivery_stuck" and \
+                    alert["subject"] not in stuck:
+                await asyncio.to_thread(
+                    store.resolve_alerts, "delivery_stuck",
                     alert["subject"])
             # Throttled reminders for still-open incidents.
             last_touch = max(alert["created_at"],
@@ -2199,8 +2592,82 @@ class Relay:
         await self._send(ws, {"type": "error", "req_id": req_id,
                               "reason": reason, "detail": detail})
 
+    @staticmethod
+    def _offer_key(frame: dict) -> str:
+        """The offered-map key for a frame: its own id when it has
+        one. A frame WITHOUT an id can never be acked (an ack names
+        ids), so it can never leave custody — the drain keys it by a
+        content hash instead, purely so the re-offer cadence still
+        bounds how often it is re-sent rather than every scan tick.
+        The prefix can never collide with a real frame id."""
+        fid = frame.get("id")
+        if fid:
+            return str(fid)
+        import hashlib as _hl
+        try:
+            blob = json.dumps(frame, sort_keys=True,
+                              default=str).encode()
+        except Exception:
+            blob = str(frame.get("type") or "").encode()
+        return "_noid:" + _hl.sha256(blob).hexdigest()
+
+    async def _offer(self, peer: Peer, frame: dict) -> None:
+        """Offer one custody frame to a connected ack peer: write it
+        to the socket and stamp the offer. The frame STAYS in the
+        store's custody outbox — only the peer's ack retires it."""
+        await self._send(peer.ws, frame)
+        peer.offered[self._offer_key(frame)] = now_ts()
+
     async def _deliver(self, username: str, frame: dict) -> bool:
-        """Live-deliver a frame, else queue it offline. Returns queued?"""
+        """Live-deliver a frame, else queue it offline. Returns queued?
+
+        Delivery custody (v1.3.7): for an ACK-CAPABLE recipient
+        (the user row's delivery_ack declaration) the model is
+        custody, not flush — the frame is ALWAYS enqueued first, so
+        no socket outcome can lose it; a connected local peer is
+        then OFFERED the frame (returns False — 'live' means
+        offered to a live socket; the final truth of delivery is
+        the recipient's ack, see _on_ack) and an absent or dead
+        socket leaves it waiting in custody (returns True). For a
+        LEGACY (or unknown) recipient this is byte-for-byte the
+        pre-1.3.7 behaviour: live send, else enqueue."""
+        if self._delivery_ack_recipient(username) and frame.get("type") in (
+                "message", "work_assigned"):
+            # Custody scope (v1.3.7): only frames the receiving client
+            # journals and acks enter ack custody — message frames
+            # (acked by message id) and work_assigned frames (acked
+            # by work id). Event/notification frames (group_event,
+            # work_progress, key frames, receipts…) are advisory
+            # pushes whose state is re-derivable from the store; the
+            # client never acks them, so enqueueing them for an
+            # ack-capable recipient would strand them in the queue
+            # forever — re-offered on every hello, counted by the
+            # stuck-delivery scan and by removal blockers, none of
+            # which is true. They take the live-write path below
+            # instead, exactly as a legacy recipient's events do.
+            self.store.enqueue(username, frame)
+            peer = self.peers.get(username)
+            if peer is not None and not peer.ephemeral:
+                try:
+                    await self._offer(peer, frame)
+                    return False
+                except websockets.exceptions.ConnectionClosed:
+                    # Already safe in custody — nothing to re-queue.
+                    return True
+            return True
+        if self._delivery_ack_recipient(username):
+            # Non-custody frame for an ack-capable recipient: live
+            # write only (never enqueued — see above). A missed
+            # advisory event is re-derivable; a stranded queue row
+            # is a false delivery alarm.
+            peer = self.peers.get(username)
+            if peer is not None:
+                try:
+                    await self._send(peer.ws, frame)
+                    return False
+                except websockets.exceptions.ConnectionClosed:
+                    return True
+            return True
         peer = self.peers.get(username)
         if peer is not None:
             try:
@@ -2229,32 +2696,104 @@ class Relay:
             except Exception:
                 pass
             return
+        # Registration visibility (v1.3.7): track HOW FAR this
+        # connection gets, so a registration that dies mid-handshake
+        # is diagnosable from the line's side alone (see the finally
+        # block and _record_hello_incomplete). A connection has
+        # registration INTENT when it sends a hello, a malformed
+        # frame, or any non-ping frame before registering — plain
+        # ping probes (the health battery, carry probes, TCP health
+        # checks) connect and close without intent and are never
+        # counted as incomplete hellos. Until a hello completes,
+        # the connection is also BOUNDED: no hello within
+        # FIRST_HELLO_TIMEOUT_SECONDS of connecting closes it as a
+        # timed-out hello instead of leaving a half-open socket
+        # sitting silent forever.
+        remote = self._remote_of(ws)
+        hello_deadline = time.monotonic() + FIRST_HELLO_TIMEOUT_SECONDS
+        stage = "pre_hello"
+        attempted = ""
+        intent = False
+        hello_refused = False
+        incomplete_recorded = False
         try:
-            async for raw in ws:
+            while True:
+                try:
+                    if peer is None:
+                        left = hello_deadline - time.monotonic()
+                        if left <= 0:
+                            raise TimeoutError("hello deadline")
+                        raw = await asyncio.wait_for(
+                            ws.recv(), timeout=left)
+                    else:
+                        raw = await ws.recv()
+                except (asyncio.TimeoutError, TimeoutError):
+                    self._record_hello_incomplete(
+                        attempted, "awaiting_hello",
+                        "hello_timeout", remote)
+                    incomplete_recorded = True
+                    try:
+                        await ws.close(code=4408,
+                                       reason="hello timeout")
+                    except Exception:
+                        pass
+                    break
                 try:
                     frame = json.loads(raw)
                 except (json.JSONDecodeError, TypeError):
+                    if peer is None:
+                        intent = True
                     await self._error(ws, "bad_frame")
                     continue
                 if not isinstance(frame, dict):
+                    if peer is None:
+                        intent = True
                     await self._error(ws, "bad_frame")
                     continue
                 ftype = frame.get("type")
                 req_id = frame.get("req_id")
                 if peer is not None:
                     peer.last_seen = now_ts()
+                elif ftype != "ping":
+                    # Any non-ping frame from an unregistered
+                    # connection is registration intent (a hello, or
+                    # a client that believes it already registered).
+                    intent = True
                 if ftype == "hello":
+                    stage = "hello_received"
+                    hello_refused = False
+                    attempted = normalize_username(
+                        frame.get("username")) or \
+                        str(frame.get("username") or "")[:32]
                     try:
                         peer = await self._on_hello(
                             ws, frame, peer,
                             server_id=conn_server_id or self.server_id)
-                    except Exception:
+                    except Exception as exc:
                         # A hello that dies inside the server is a
                         # measured admission failure (health signal);
                         # client-fault rejections return normally
-                        # and never count against the server.
+                        # and never count against the server. It is
+                        # ALSO a counted incomplete hello (v1.3.7
+                        # registration visibility): the handshake
+                        # reached the hello and died inside it —
+                        # the stage an operator needs to see.
                         self._health_event("hello_fail")
+                        self._record_hello_incomplete(
+                            attempted, "hello_processing",
+                            f"hello_error:{type(exc).__name__}",
+                            remote)
+                        incomplete_recorded = True
                         raise
+                    if peer is None:
+                        # A definitive refusal was sent (bad
+                        # username, admission gate, username_taken):
+                        # the handshake COMPLETED with an answer —
+                        # logged at the refusal site, never counted
+                        # as an incomplete hello.
+                        hello_refused = True
+                    else:
+                        stage = "registered"
                 elif ftype == "ping":
                     if peer is not None:
                         peer.last_seen = now_ts()
@@ -2280,6 +2819,10 @@ class Relay:
                     await self._on_send(ws, frame, peer)
                 elif ftype == "read":
                     await self._on_read(ws, frame, peer)
+                elif ftype == "ack":
+                    await self._on_ack(ws, frame, peer)
+                elif ftype == "history":
+                    await self._on_history(ws, frame, peer)
                 elif ftype == "decision_link_update":
                     await self._on_decision_link_update(ws, frame, peer)
                 elif ftype == "group_create":
@@ -2479,6 +3022,28 @@ class Relay:
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
+            # Leaked-peer sweep (v1.3.7): _on_hello registers the
+            # Peer in self.peers BEFORE the welcome is written; a
+            # hello that died mid-handshake (dead socket at the
+            # welcome/flush) raised before _handle's own `peer`
+            # assignment landed, so the normal cleanup below would
+            # never see it and the dead peer would wedge presence
+            # and delivery for that username on this relay until
+            # superseded. Any peer still bound to THIS socket is
+            # removed here, whatever path the connection took.
+            if peer is None:
+                for leaked in [p for p in list(self.peers.values())
+                               if p.ws is ws]:
+                    if self.peers.get(leaked.username) is leaked:
+                        del self.peers[leaked.username]
+                    if not leaked.ephemeral:
+                        self._gone_at[leaked.username] = now_ts()
+                        if leaked.connected_at:
+                            self._record_session(
+                                leaked.username, leaked.connected_at,
+                                now_ts())
+                    log.info("peer @%s disconnected (hello did not "
+                             "complete)", leaked.username)
             if peer is not None and self.peers.get(peer.username) is peer:
                 del self.peers[peer.username]
                 if not peer.ephemeral:
@@ -2491,6 +3056,23 @@ class Relay:
                                              now_ts())
                     self._log_activity("offline", peer.username)
                 log.info("peer @%s disconnected", peer.username)
+            # Registration visibility (v1.3.7): a connection that
+            # showed registration intent and died before completing
+            # a hello — socket closed mid-handshake, garbled first
+            # frame on a sick network, a client that spoke before
+            # registering and vanished — is counted here, once,
+            # with the stage it reached. (Timeouts and in-hello
+            # errors recorded themselves at their sites above; a
+            # refused hello got a definitive answer and is not an
+            # incomplete hello; a connection that never showed
+            # intent — a bare connect-and-close, or ping-only like
+            # the health battery and race probes — is
+            # indistinguishable from a health probe and is NOT
+            # counted.)
+            if peer is None and not incomplete_recorded \
+                    and not hello_refused and intent:
+                self._record_hello_incomplete(
+                    attempted, stage, "closed_before_hello", remote)
 
     async def _on_decision_link_update(self, ws, frame,
                                        peer: Peer) -> None:
@@ -2509,6 +3091,88 @@ class Relay:
                 self.store.set_decision_link(peer.username, value)
             except Exception:
                 pass
+
+    async def _on_ack(self, ws, frame, peer: Peer) -> None:
+        """Delivery ack (v1.3.7, custody): an ack-capable client
+        names the frame ids it has DURABLY JOURNALED on its side.
+        Exactly those frames retire from its custody outbox
+        (store.ack_frames deletes by payload id — an id the store
+        does not hold retires nothing), an acked ``message`` frame's
+        audit row becomes 'delivered' — this, not the socket offer,
+        is delivery for an ack-capable client — and the peer's
+        offered stamps clear. When the queue drains to empty, any
+        open delivery_stuck alert for the user resolves here too
+        (the scan would resolve it on its next tick regardless)."""
+        ids = [str(i) for i in (frame.get("ids") or []) if i]
+        acked = []
+        ack_fn = getattr(self.store, "ack_frames", None)
+        if ack_fn is not None and ids:
+            try:
+                acked = ack_fn(peer.username, ids) or []
+            except Exception:
+                log.exception("ack_frames failed for @%s",
+                              peer.username)
+                acked = []
+        for f in acked:
+            if isinstance(f, dict) and f.get("type") == "message" \
+                    and f.get("id"):
+                try:
+                    self.store.set_audit_status(str(f["id"]),
+                                                "delivered")
+                except Exception:
+                    pass
+        for i in ids:
+            peer.offered.pop(i, None)
+        for f in acked:
+            if isinstance(f, dict) and f.get("id"):
+                peer.offered.pop(str(f["id"]), None)
+        waiting = None
+        stats_fn = getattr(self.store, "queue_stats", None)
+        if stats_fn is not None:
+            try:
+                waiting = int((stats_fn(peer.username) or {})
+                              .get("count") or 0)
+            except Exception:
+                waiting = None
+        if waiting is None:
+            waiting = len(peer.offered)
+        if waiting == 0:
+            try:
+                if self.store.resolve_alerts("delivery_stuck",
+                                             peer.username):
+                    self._log_activity("alert_resolved", "system",
+                                       target=peer.username,
+                                       status="delivery_stuck")
+            except Exception:
+                pass
+        log.info("peer @%s acked %d, %d still waiting",
+                 peer.username, len(acked), waiting)
+
+    async def _on_history(self, ws, frame, peer: Peer) -> None:
+        """Content-audit history (v1.3.7): an authenticated peer
+        reads back ITS OWN content-audit rows — the relay's record
+        of what was routed for it — paged newest-first by
+        ``before_seq``. Answered through the standard result frame;
+        the page defaults to DELIVERY_HISTORY_PAGE and is capped at
+        500 whatever the caller asks for."""
+        req_id = frame.get("req_id")
+        try:
+            limit = int(frame.get("limit")
+                        or DELIVERY_HISTORY_PAGE)
+        except Exception:
+            limit = DELIVERY_HISTORY_PAGE
+        limit = min(limit, 500)
+        rows = []
+        hist_fn = getattr(self.store, "content_audit_for_user", None)
+        if hist_fn is not None:
+            try:
+                rows = hist_fn(peer.username, limit,
+                               frame.get("before_seq")) or []
+            except Exception:
+                log.exception("content_audit_for_user failed for @%s",
+                              peer.username)
+                rows = []
+        await self._result(ws, req_id, True, {"rows": rows})
 
     async def _on_hello(self, ws, frame, old, server_id: str = ""):
         if old is not None and self.peers.get(old.username) is old:
@@ -2540,6 +3204,8 @@ class Relay:
             return peer
         username = normalize_username(frame.get("username"))
         if username is None:
+            log.warning("hello refused: bad_username (raw %r)",
+                        str(frame.get("username"))[:40])
             await self._error(ws, "bad_username", req_id,
                               "usernames are 2-32 chars: a-z 0-9 . _ -")
             return None
@@ -2558,6 +3224,16 @@ class Relay:
         declared_link = frame.get("decision_link")
         if declared_link not in ("linked", "pending"):
             declared_link = None
+        # Delivery custody (v1.3.7): the client declares whether it
+        # acknowledges delivery (delivery_ack: 1) — recorded on the
+        # user row exactly like the decision link above, and kept on
+        # the Peer for this connection. Absent = no declaration (a
+        # legacy client): the stored row stands, and a row that has
+        # never declared reads legacy — flush semantics, unchanged.
+        declared_ack = None
+        if "delivery_ack" in frame:
+            declared_ack = self._ack_value(frame.get("delivery_ack"))
+        client_version = str(frame.get("client_version") or "")[:64]
         # Mesh admission (v1.2.0, owner's rules) — checked BEFORE
         # identity claim/verification (v1.3.0 root-cause fix): a
         # RIDER — an agent whose home is ANOTHER server — is
@@ -2575,12 +3251,17 @@ class Relay:
         if home_ep and not self._is_home_endpoint(home_ep):
             health = self._compute_health()
             if health == HEALTH_UNRATED:
+                log.warning("hello refused: server_unrated for @%s "
+                            "(rider, home %s)", username, home_ep)
                 await self._error(
                     ws, "server_unrated", req_id,
                     "this server has not earned a health rating yet "
                     "(still testing) — not accepting riders")
                 return None
             if health <= SERVER_HEALTHY_MIN:
+                log.warning("hello refused: server_unhealthy (%s%%) "
+                            "for @%s (rider, home %s)",
+                            health, username, home_ep)
                 await self._error(
                     ws, "server_unhealthy", req_id,
                     f"health {health}% is at/below the "
@@ -2589,13 +3270,38 @@ class Relay:
                 return None
             cap = effective_capacity(health)
             if self._riders_count(exclude=username) >= cap:
+                log.warning("hello refused: server_full (capacity "
+                            "%s) for @%s (rider, home %s)",
+                            cap, username, home_ep)
                 await self._error(
                     ws, "server_full", req_id,
                     f"rider capacity {cap} reached at health "
                     f"{health}% — try another server")
                 return None
         if self.store.exists(username):
-            if self.store.verify(username, secret):
+            owner_secret = secret
+            verified = bool(secret) and \
+                self.store.verify(username, secret)
+            if not verified:
+                # Registration idempotency (v1.3.7): this may be the
+                # legitimate identity retrying its own cut-off FIRST
+                # registration (claimed row, welcome never saved) —
+                # _try_resume_registration applies the strict gate
+                # (no presented secret, identity keys matching the
+                # half-created row, resume window, not alive). A
+                # presented-but-wrong secret never resumes.
+                resumed, rotated = self._try_resume_registration(
+                    username, frame, secret)
+                if not resumed:
+                    log.warning(
+                        "hello refused: username_taken for @%s "
+                        "(existing row, secret did not verify, "
+                        "resume gate not met)", username)
+                    await self._error(ws, "username_taken", req_id)
+                    return None
+                owner_secret = rotated
+                verified = True
+            if verified:
                 self.store.set_display_name(username, display or username)
                 self.store.set_pubkey(username, pubkey)
                 self.store.set_sign_pub(username, sign_pub)
@@ -2603,34 +3309,65 @@ class Relay:
                     self.store.set_mode(username, declared_mode)
                 if declared_link:
                     self.store.set_decision_link(username, declared_link)
-            else:
-                await self._error(ws, "username_taken", req_id)
-                return None
-            owner_secret = secret
+                if declared_ack is not None:
+                    self._record_delivery_ack(username, declared_ack)
         else:
             try:
+                # The delivery_ack declaration rides the claim when
+                # the store's claim carries the column (the
+                # decision_link pattern); when it does not, the
+                # setter below records it instead — either way the
+                # row ends up carrying the agent's own declaration.
+                claim_kwargs = {}
+                if declared_ack is not None:
+                    try:
+                        import inspect as _inspect
+                        if "delivery_ack" in _inspect.signature(
+                                self.store.claim).parameters:
+                            claim_kwargs["delivery_ack"] = \
+                                1 if declared_ack else 0
+                    except Exception:
+                        claim_kwargs = {}
                 owner_secret = self.store.claim(
                     username, display or username, pubkey, sign_pub,
                     capabilities=frame.get("capabilities") or [],
                     cap_desc=str(frame.get("cap_description") or ""),
                     mode=declared_mode or "autonomous",
-                    decision_link=declared_link or "")
+                    decision_link=declared_link or "",
+                    **claim_kwargs)
             except UsernameTaken:
+                # Lost a claim race against a concurrent hello for
+                # the same new name (often the same identity's own
+                # retry racing its first attempt): logged, because
+                # from the client's side this looks identical to a
+                # hostile collision and the distinction matters.
+                log.warning("hello refused: username_taken for @%s "
+                            "(claim race — row created concurrently)",
+                            username)
                 await self._error(ws, "username_taken", req_id)
                 return None
+            if declared_ack is not None:
+                self._record_delivery_ack(username, declared_ack)
         stale = self.peers.get(username)
         if stale is not None and stale.ws is not ws:
             try:
                 await stale.ws.close(code=4000, reason="superseded")
             except Exception:
                 pass
+        # This connection's delivery capability: its own hello
+        # declaration when it made one, else the row's recorded
+        # declaration (another relay may have recorded it).
+        ack_capable = declared_ack if declared_ack is not None \
+            else bool(self._row_delivery_ack(username))
         peer = Peer(ws=ws, username=username,
                     display_name=display or username, pubkey=pubkey,
                     last_seen=now_ts(), connected_at=now_ts(), core=core,
                     home_endpoint=home_ep,
                     server_id=server_id or self.server_id,
                     conn_endpoint=self._connection_endpoint(
-                        server_id or self.server_id))
+                        server_id or self.server_id),
+                    delivery_ack=ack_capable,
+                    client_version=client_version)
         self.peers[username] = peer
         if core:
             self._last_core[username] = core
@@ -2643,24 +3380,65 @@ class Relay:
             self._log_activity("alert_resolved", "system", target=username,
                                status="agent_offline")
         self._log_activity("online", username)
-        queued = self.store.dequeue_all(username)
-        await self._send(ws, {"type": "welcome", "req_id": req_id,
-                              "username": username, "secret": owner_secret,
-                              "ephemeral": False, "queued": len(queued),
-                              "servers": self._live_servers(),
-                              "updates_enabled": self.updates_enabled,
-                              "oversight_pubkey":
-                                  self.oversight_pubkey or None})
-        for q in queued:
-            await self._send(ws, q)
-            if q.get("type") == "message" and q.get("id"):
-                # A queued message's audit row said 'sent'/'queued'
-                # while it waited; the flush IS the delivery.
+        if peer.delivery_ack:
+            # Custody flush (v1.3.7): PEEK the outbox — nothing is
+            # deleted and no audit status moves. Each frame is
+            # OFFERED and its offer stamped; frames stay in custody
+            # until this client's ack retires them, and the fleet
+            # scan re-offers whatever stays unacked on the resend
+            # cadence. Frames without ids are sent and forgotten
+            # here (an ack can never name them — see _offer_key for
+            # how the drain still bounds their re-offer).
+            peek = getattr(self.store, "pending_frames", None)
+            if peek is not None:
+                queued = peek(username) or []
+            else:
+                # A store that cannot peek yet cannot hold custody;
+                # fall back to the flush so nothing is stranded in
+                # the gap (pre-custody store only).
+                queued = self.store.dequeue_all(username)
+            await self._send(ws, {"type": "welcome", "req_id": req_id,
+                                  "username": username,
+                                  "secret": owner_secret,
+                                  "ephemeral": False,
+                                  "queued": len(queued),
+                                  "servers": self._live_servers(),
+                                  "updates_enabled":
+                                      self.updates_enabled,
+                                  "oversight_pubkey":
+                                      self.oversight_pubkey or None})
+            for q in queued:
                 try:
-                    self.store.set_audit_status(q["id"], "delivered")
-                except Exception:
-                    pass
-        log.info("peer @%s registered, flushed %d queued", username, len(queued))
+                    await self._send(ws, q)
+                except websockets.exceptions.ConnectionClosed:
+                    break
+                if q.get("id"):
+                    peer.offered[str(q["id"])] = now_ts()
+            log.info("peer @%s registered, offered %d in custody",
+                     username, len(queued))
+        else:
+            queued = self.store.dequeue_all(username)
+            await self._send(ws, {"type": "welcome", "req_id": req_id,
+                                  "username": username,
+                                  "secret": owner_secret,
+                                  "ephemeral": False,
+                                  "queued": len(queued),
+                                  "servers": self._live_servers(),
+                                  "updates_enabled":
+                                      self.updates_enabled,
+                                  "oversight_pubkey":
+                                      self.oversight_pubkey or None})
+            for q in queued:
+                await self._send(ws, q)
+                if q.get("type") == "message" and q.get("id"):
+                    # A queued message's audit row said 'sent'/'queued'
+                    # while it waited; the flush IS the delivery.
+                    try:
+                        self.store.set_audit_status(q["id"], "delivered")
+                    except Exception:
+                        pass
+            log.info("peer @%s registered, flushed %d queued",
+                     username, len(queued))
         # Awaiting-agent work: an agent coming online picks up pooled
         # group work immediately (point 29 fallback). DIRECT work is
         # restored too (v1.3.1): a 1:1 work parked in awaiting_agent
