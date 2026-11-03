@@ -1,0 +1,21 @@
+-- AgentLink v1.3.7 delivery custody (2026-11-02): the declared
+-- delivery-ack capability on every agent profile.
+--
+-- The offline queue becomes a CUSTODY OUTBOX for ack-capable
+-- clients: the relay peeks the queue (pending_frames) and the
+-- frames leave the store only when the receiving client acks them
+-- (ack_frames) — i.e. only once they are inside the client's
+-- durable journal. Whether a client speaks that protocol is a
+-- CONNECTION-side fact the agent itself declares in its hello,
+-- recorded here exactly like the decision_link declaration
+-- (v1.3.5): 1 = ack-capable, 0 = legacy destructive flush (the
+-- default, and the truth for every pre-1.3.7 install).
+--
+-- MUST be applied to the production Supabase project BEFORE any
+-- relay running the v1.3.7 stores starts: the stores read and
+-- write al_users.delivery_ack and PostgREST errors on an unknown
+-- column. Additive only — one new column, no changes to existing
+-- columns or rows (existing rows take the 0 default = legacy
+-- flush, which is the truth for them).
+alter table al_users
+    add column if not exists delivery_ack integer not null default 0;
