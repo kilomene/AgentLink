@@ -892,12 +892,17 @@ class DashboardServer:
         # oversight-sealed LABELS here — inside the owner's
         # authenticated session — and replace the sealed envelope
         # with the plain labels, so ciphertext never echoes onward.
-        # The labels are service + account + timestamps ONLY:
-        # passwords were never sealed to oversight (deliberate —
-        # the vault is the agent's own) and never appear in this
-        # payload. Without the oversight key, or when the envelope
-        # does not open, labels stay honestly None while presence
-        # and count remain factual.
+        # v1.5.0 (owner's ruling): the FULL entry content rides a
+        # second oversight envelope, opened the same way into
+        # vault["content"] for the Credentials view — service,
+        # account, auth type, the secret itself, notes. Plaintext
+        # content exists ONLY in this authenticated payload (and
+        # in the agent itself); the relay/store hold ciphertext,
+        # and no agent can open this dashboard — the owner's
+        # stated safety basis for full visibility. Without the
+        # oversight key, or when an envelope does not open, the
+        # fields stay honestly None while presence and count
+        # remain factual.
         for u in data.get("users", []):
             vault = u.get("vault")
             if not isinstance(vault, dict):
@@ -913,6 +918,19 @@ class DashboardServer:
                 except Exception:
                     labels = None
             vault["labels"] = labels
+            sealed_content = vault.pop("content_sealed", None)
+            content = None
+            if sealed_content is not None \
+                    and self._oversight is not None:
+                try:
+                    payload = json.loads(
+                        self._oversight.decrypt_envelope(
+                            sealed_content))
+                    if payload.get("kind") == "vault_content":
+                        content = payload.get("entries") or []
+                except Exception:
+                    content = None
+            vault["content"] = content
         return data
 
     # -- auth ------------------------------------------------------------------
@@ -3162,6 +3180,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="navgroup">Files</div>
   <a class="navitem" href="#/library" data-route="library">Library</a>
   <a class="navitem" href="#/vault" data-route="vault">Vault</a>
+  <a class="navitem" href="#/credentials" data-route="credentials">Credentials</a>
   <div class="navgroup">Live</div>
   <a class="navitem" href="#/rooms" data-route="rooms">Voice Rooms</a>
   <a class="navitem" href="#/activity" data-route="activity">Alerts &amp; Activity</a>
@@ -3258,6 +3277,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="card"><h2>Group Vault</h2>
     <table class="stack"><tbody id="vault"></tbody></table></div>
  </section>
+ <section class="view" id="view-credentials">
+  <div class="vhead"><h1>Credentials</h1>
+  <div class="vsub">Each agent's own credentials vault — the accounts it
+  created and the auth it saved: service, email/username, secret and
+  auth type, shown in full. Plaintext exists only here, inside your
+  authenticated session (and inside the agent itself): entries are
+  sealed to the owner-oversight key end to end, the relay and stores
+  hold ciphertext only, and no agent can open this dashboard. This is
+  NOT the group Vault — that is shared group files, one section up.</div></div>
+  <div class="card"><h2>Agent Credentials</h2>
+    <table class="stack"><tbody id="credentials"></tbody></table></div>
+ </section>
  <section class="view" id="view-rooms">
   <div class="vhead"><h1>Voice Rooms</h1>
   <div class="vsub">Live voice rooms — the relay carries signalling only;
@@ -3338,7 +3369,7 @@ function senderBits(i){ let h='';
   return h; }
 
 /* ---- hash routing: every section is its own full view ---- */
-const ROUTES=['overview','agents','conversations','work','chains','library','vault','rooms','activity'];
+const ROUTES=['overview','agents','conversations','work','chains','library','vault','credentials','rooms','activity'];
 let curRoute='';
 function parseRoute(){
   const h=location.hash.replace(/^#[/]?/,'');
@@ -3613,13 +3644,13 @@ function authHtml(u){
   return '';
 }
 function vaultHtml(u){
-  // Credentials vault (v1.4.0): the agent's OWN vault, sealed to
-  // its identity key. The dashboard can only ever show presence,
-  // the entry count, and the oversight-opened LABELS (service +
-  // account) — passwords are never sealed to oversight and never
-  // appear in this payload. Absent = the agent has no vault (a
-  // legacy client, or it has saved nothing yet): a fact, not an
-  // alarm.
+  // Credentials vault pointer (v1.4.0, kept as the summary cell):
+  // presence, entry count, and the oversight-opened LABELS
+  // (service + account) for the agent's OWN vault. The full
+  // entries — secrets included — live in the Credentials view
+  // (Files section), per the owner's v1.5.0 ruling. Absent = the
+  // agent has no vault (a legacy client, or it has saved nothing
+  // yet): a fact, not an alarm.
   const v=u.vault||{};
   if(!v.present) return '<br><small>credentials vault: none</small>';
   let h='<br><small>🔐 credentials vault: '+(v.entries||0)+
@@ -3683,6 +3714,32 @@ function render(d){
   `<tr><td>${esc(e.filename)}<br><small>${esc(e.sha256).slice(0,12)}… · ${e.size} B</small></td><td>@${esc(e.sender)} → @${esc(e.to_user)}</td><td><small>${pt(e.ts)}</small></td><td>${e.download_url?`<a class="dllink" href="${esc(e.download_url)}" download>⬇ Download</a>`:`<span class="sealed-note">🔒 not downloadable — ${esc(e.download_note||'sealed before owner oversight')}</span>`}</td></tr>`);
  keyed(document.getElementById('vault'), d.vault||[], v=>v.id, v=>
   `<tr><td>${v.pinned?'📌 ':''}${esc(v.name)}<br><small>${esc(v.sha256).slice(0,12)}… · ${v.size} B</small></td><td>${esc(v.group_id)}</td><td><small>by @${esc(v.added_by)}</small></td><td>${v.download_url?`<a class="dllink" href="${esc(v.download_url)}" download>⬇ Download</a>`:`<span class="sealed-note">🔒 not downloadable — ${esc(v.download_note||'sealed before owner oversight')}</span>`}</td></tr>`);
+ // Credentials (v1.5.0): the per-agent credentials vaults, opened
+ // from their oversight envelopes into this authenticated payload
+ // only (see the view's own boundary note). One row per entry; an
+ // agent whose vault is present but whose content was never
+ // shared with oversight gets an honest labels-only row.
+ const credRows=[];
+ for(const u of (d.users||[])){
+   const v=u.vault||{};
+   if(!v.present) continue;
+   if(Array.isArray(v.content)&&v.content.length){
+     for(const e of v.content){
+       credRows.push({id:u.username+'|'+e.id, html:
+        `<tr><td><b>${esc(e.service||'')}</b><br><small>@${esc(u.username)} · ${esc(e.auth_type||'password')}</small></td><td>${esc(e.username||'')}<br><small>created ${pt(e.created_at)} · updated ${pt(e.updated_at)}</small></td><td><code>${esc(e.password||'')}</code>${e.notes?`<br><small>${esc(e.notes)}</small>`:''}</td></tr>`});
+     }
+   } else if(Array.isArray(v.content)){
+     credRows.push({id:u.username+'|empty', html:
+      `<tr><td colspan="3"><small>@${esc(u.username)} — credentials vault is empty</small></td></tr>`});
+   } else {
+     credRows.push({id:u.username+'|labels', html:
+      `<tr><td colspan="3"><small>@${esc(u.username)} — ${v.entries||0} entr${v.entries===1?'y':'ies'}, content not shared with oversight (labels only)</small></td></tr>`});
+   }
+ }
+ if(!credRows.length) credRows.push({id:'none', html:
+  '<tr><td colspan="3"><small>No agent has published a credentials vault yet.</small></td></tr>'});
+ keyed(document.getElementById('credentials'), credRows, r=>r.id,
+  r=>r.html);
  keyed(document.getElementById('rooms'), d.rooms||[], r=>r.id, r=>
   `<tr><td>${esc(r.id)}</td><td>${esc(r.group_id)}</td><td>${(r.participants||[]).map(p=>'@'+esc(p)).join(', ')}</td></tr>`);
  const actKey=a=>[a.ts,a.kind,a.from,a.to||'',a.work_id||'',a.status||''].join('|');
