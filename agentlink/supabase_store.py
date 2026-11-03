@@ -51,6 +51,19 @@ from .store import NON_TERMINAL_WORK_STATUSES, RemovalBlocked
 from .store import carry_claim_blocked
 
 
+def _ack_id_matches(frame, wanted) -> bool:
+    """Does an ack carrying ``wanted`` ids retire this queued frame?
+    Message frames match by top-level id; a work_assigned frame has
+    no top-level id, so it matches by its nested work id (the client
+    acks work by work id). One rule, both stores, exactly."""
+    if str(frame.get("id") or "") in wanted:
+        return True
+    if frame.get("type") == "work_assigned":
+        work = frame.get("work") or {}
+        return str(work.get("id") or "") in wanted
+    return False
+
+
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -298,7 +311,7 @@ class SupabaseStore:
     # -- users -----------------------------------------------------------------
     def claim(self, username, display_name, pubkey="", sign_pub="",
               capabilities=None, cap_desc="", mode="autonomous",
-              decision_link=""):
+              decision_link="", delivery_ack=0):
         secret = new_secret()
         try:
             self._req("POST", "users", body={
@@ -311,6 +324,7 @@ class SupabaseStore:
                         else "autonomous",
                 "decision_link": decision_link if decision_link in
                         ("linked", "pending") else "",
+                "delivery_ack": 1 if delivery_ack else 0,
                 "created_at": now_ts()}, prefer="return=minimal")
         except Exception as exc:
             if "409" in str(exc) or "duplicate" in str(exc):
@@ -702,9 +716,19 @@ class SupabaseStore:
                   body={"decision_link": state},
                   prefer="return=minimal")
 
+    def set_delivery_ack(self, username, flag):
+        # Delivery custody (v1.3.7): the agent declares in its
+        # hello whether its client acks queued frames into its
+        # durable journal; the relay only records the declaration,
+        # exactly like set_decision_link. Normalised to 1/0.
+        self._req("PATCH", "users", self._eq("username", username),
+                  body={"delivery_ack": 1 if flag else 0},
+                  prefer="return=minimal")
+
     def list_users(self, query="", capability=""):
         q = ("select=username,display_name,pubkey,sign_pub,capabilities,"
-             "cap_desc,mode,decision_link,last_seen,created_at&order=username")
+             "cap_desc,mode,decision_link,delivery_ack,last_seen,"
+             "created_at&order=username")
         if query:
             q += f"&username=like.%25{urllib.parse.quote(query)}%25"
         rows = self._get("users", q)
@@ -719,6 +743,9 @@ class SupabaseStore:
             # an explicit 'manual' presents as autonomous.
             r["mode"] = r.get("mode") if r.get("mode") in (
                 "manual", "autonomous") else "autonomous"
+            # Delivery-ack declaration (v1.3.7): anything not
+            # explicitly recorded as ack-capable presents as 0.
+            r["delivery_ack"] = 1 if r.get("delivery_ack") else 0
             if capability and capability.lower() not in \
                     [c.lower() for c in r["capabilities"]]:
                 continue
@@ -942,6 +969,77 @@ class SupabaseStore:
             frame = json.loads(r["payload"])
             frame["queued"] = True
             out.append(frame)
+        return out
+
+    # -- delivery custody (v1.3.7): the queue as an acked outbox -------
+    # Parity with the SQLite Store EXACTLY (see store.py): dequeue_all
+    # stays the legacy flush; ack-capable clients are peeked with
+    # pending_frames and their frames leave only on ack_frames.
+
+    def pending_frames(self, to_username):
+        """Peek WITHOUT deleting — same frames, same order
+        (priority DESC, seq ASC), same queued=True stamp as
+        dequeue_all, but custody stays in the store until acked."""
+        rows = self._get("queue", self._eq("to_username", to_username)
+                         + "&select=payload"
+                         + "&order=priority.desc,seq.asc")
+        out = []
+        for r in rows:
+            frame = json.loads(r["payload"])
+            frame["queued"] = True
+            out.append(frame)
+        return out
+
+    def ack_frames(self, to_username, ids):
+        """Delete ONLY this user's queue rows whose payload matches
+        an acked id; unknown ids are ignored. A frame matches by its
+        top-level "id" (message frames), or — for a work_assigned
+        frame, which carries no top-level id — by its nested work
+        id: the client acks work by work id after journaling the
+        assignment, and that ack must retire the frame or custody
+        never completes for work. Returns the acked frames (parsed
+        payloads, seq order). Match in Python over seq+payload,
+        delete by seq — the same shape as the SQLite store."""
+        wanted = {str(i) for i in (ids or []) if i}
+        if not wanted:
+            return []
+        rows = self._get("queue", self._eq("to_username", to_username)
+                         + "&select=seq,payload&order=seq.asc")
+        seqs = []
+        acked = []
+        for r in rows:
+            try:
+                frame = json.loads(r["payload"])
+            except Exception:
+                continue
+            if _ack_id_matches(frame, wanted):
+                seqs.append(r["seq"])
+                acked.append(frame)
+        if seqs:
+            self._delete_ids("queue", "seq", seqs)
+        return acked
+
+    def queue_stats(self, to_username):
+        """{"count", "oldest_ts"} for one user's queue; oldest_ts
+        is MIN(ts), None when the queue is empty."""
+        rows = self._get("queue", self._eq("to_username", to_username)
+                         + "&select=ts")
+        if not rows:
+            return {"count": 0, "oldest_ts": None}
+        return {"count": len(rows),
+                "oldest_ts": min(int(r["ts"]) for r in rows)}
+
+    def queue_stats_all(self):
+        """queue_stats keyed by username, only users with count>0."""
+        rows = self._get("queue", "select=to_username,ts")
+        out = {}
+        for r in rows:
+            st = out.setdefault(r["to_username"],
+                                {"count": 0, "oldest_ts": None})
+            st["count"] += 1
+            ts = int(r["ts"])
+            if st["oldest_ts"] is None or ts < st["oldest_ts"]:
+                st["oldest_ts"] = ts
         return out
 
     # -- groups ----------------------------------------------------------------------
@@ -1931,6 +2029,82 @@ class SupabaseStore:
             if len(rows) < 1000:
                 return out
             offset += len(rows)
+
+    def count_online_since(self, username, ts):
+        """Parity with the SQLite Store: audit rows with
+        kind='online' AND actor=username AND ts strictly after the
+        given ts (the relay writes one per hello via
+        _log_activity("online", username)). Paged to exhaustion so
+        the count is exact however many reconnects are on record."""
+        n = 0
+        offset = 0
+        while True:
+            rows = self._get(
+                "audit_log",
+                "select=seq&kind=eq.online"
+                f"&actor=eq.{urllib.parse.quote(str(username), safe='')}"
+                f"&ts=gt.{int(ts)}&order=seq.asc"
+                f"&limit=1000&offset={offset}")
+            n += len(rows)
+            if len(rows) < 1000:
+                return n
+            offset += len(rows)
+
+    # _AUDIT_SELECT plus seq, the cursor column (list_content_audit's
+    # select deliberately carries no seq; the per-user catch-up does).
+    _AUDIT_SELECT_SEQ = ("select=seq,ts,kind,actor,target,group_id,"
+                         "work_id,status,priority,size,mentions,ref_id,"
+                         "sender_nickname,sender_role,sender_custom_role,"
+                         "oversight,content_envelope")
+
+    def content_audit_for_user(self, username, limit=200,
+                               before_seq=None):
+        """Parity with the SQLite Store EXACTLY (see store.py):
+        content rows (CONTENT_AUDIT_KINDS) where the user is a
+        party — "from"/"to" match, or the row's group_id is one of
+        the user's groups or channels (channel frames carry the
+        channel id in group_id). Only seq < before_seq when given.
+        Returns the NEWEST ``limit`` matches, oldest-first, each row
+        carrying seq plus exactly the fields list_content_audit
+        returns."""
+        group_ids = {g["group_id"]
+                     for g in self.groups_for_user(username)}
+        channel_ids = {c["channel_id"]
+                       for c in self.channels_for_user(username)}
+        kinds = ",".join(CONTENT_AUDIT_KINDS)
+        q = (self._AUDIT_SELECT_SEQ + f"&kind=in.({kinds})")
+        if before_seq is not None:
+            q += f"&seq=lt.{int(before_seq)}"
+        q += "&order=seq.asc"
+        raw = []
+        offset = 0
+        while True:
+            rows = self._get("audit_log",
+                             q + f"&limit=1000&offset={offset}")
+            raw.extend(rows)
+            if len(rows) < 1000:
+                break
+            offset += len(rows)
+        shaped = self._shape_audit(raw)
+        for row, s in zip(raw, shaped):
+            try:
+                s["seq"] = int(row.get("seq"))
+            except (TypeError, ValueError):
+                s["seq"] = row.get("seq")
+        scopes = group_ids | channel_ids
+        matching = []
+        for r in shaped:
+            if r.get("from") == username or r.get("to") == username:
+                matching.append(r)
+            elif r.get("group_id") and r["group_id"] in scopes:
+                matching.append(r)
+            elif r.get("channel_id") and \
+                    r["channel_id"] in channel_ids:
+                matching.append(r)
+        limit = int(limit)
+        if limit <= 0:
+            return []
+        return matching[-limit:]
 
     def audit_rows_for_ids(self, ids):
         """Parity with the SQLite Store: audit rows (any kind) whose
