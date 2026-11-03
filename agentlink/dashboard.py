@@ -888,6 +888,31 @@ class DashboardServer:
                 v["not_downloadable"] = True
                 v["download_note"] = \
                     "sealed before owner oversight"
+        # Credentials vault (v1.4.0): open each agent's
+        # oversight-sealed LABELS here — inside the owner's
+        # authenticated session — and replace the sealed envelope
+        # with the plain labels, so ciphertext never echoes onward.
+        # The labels are service + account + timestamps ONLY:
+        # passwords were never sealed to oversight (deliberate —
+        # the vault is the agent's own) and never appear in this
+        # payload. Without the oversight key, or when the envelope
+        # does not open, labels stay honestly None while presence
+        # and count remain factual.
+        for u in data.get("users", []):
+            vault = u.get("vault")
+            if not isinstance(vault, dict):
+                continue
+            sealed = vault.pop("labels_sealed", None)
+            labels = None
+            if sealed is not None and self._oversight is not None:
+                try:
+                    payload = json.loads(
+                        self._oversight.decrypt_envelope(sealed))
+                    if payload.get("kind") == "vault_labels":
+                        labels = payload.get("labels") or []
+                except Exception:
+                    labels = None
+            vault["labels"] = labels
         return data
 
     # -- auth ------------------------------------------------------------------
@@ -3587,6 +3612,26 @@ function authHtml(u){
   if(m==='bootstrap') return '<br><small>auth: bootstrap claim</small>';
   return '';
 }
+function vaultHtml(u){
+  // Credentials vault (v1.4.0): the agent's OWN vault, sealed to
+  // its identity key. The dashboard can only ever show presence,
+  // the entry count, and the oversight-opened LABELS (service +
+  // account) — passwords are never sealed to oversight and never
+  // appear in this payload. Absent = the agent has no vault (a
+  // legacy client, or it has saved nothing yet): a fact, not an
+  // alarm.
+  const v=u.vault||{};
+  if(!v.present) return '<br><small>credentials vault: none</small>';
+  let h='<br><small>🔐 credentials vault: '+(v.entries||0)+
+    ' entr'+((v.entries===1)?'y':'ies')+'</small>';
+  if(Array.isArray(v.labels)){
+    for(const l of v.labels){
+      h+='<br><small>· '+esc(l.service||'')+' — '+
+        esc(l.username||'')+'</small>';
+    }
+  }
+  return h;
+}
 function alertHtml(a){
   return '<div class="alert enter">⚠ <b>'+esc(a.kind)+'</b> — '+esc(a.subject)+
     ' <small>'+esc(a.detail||'')+' · '+pt(a.created_at)+'</small></div>';
@@ -3609,7 +3654,7 @@ function render(d){
  keyed(document.getElementById('users'), d.users||[], u=>u.username, u=>
   `<tr><td>@${esc(u.username)}<br><small>${esc((u.capabilities||[]).join(', '))}</small></td>
    <td class="${u.online?'on':'off'}"><span class="dot ${u.online?'on':''}"></span>${u.online?'online':'offline'}<br><small>${u.online?esc(u.activity_state||''):((!u.online&&u.last_seen)?'last seen '+pt(u.last_seen):esc(u.activity_state||''))}</small></td>
-   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.decision_state==='pending'?`<br><span class="pill health bad">decision link pending</span><br><small>line held — messages & work queueing</small>`:u.decision_state==='linked'?`<br><small>decision link: wired</small>`:''}${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state_label?esc(u.server_state_label):u.server_state==='carried'?(u.server_carried_by?'carried by @'+esc(u.server_carried_by):'carried'):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}${deliveryHtml(u)}${authHtml(u)}</td>
+   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.decision_state==='pending'?`<br><span class="pill health bad">decision link pending</span><br><small>line held — messages & work queueing</small>`:u.decision_state==='linked'?`<br><small>decision link: wired</small>`:''}${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state_label?esc(u.server_state_label):u.server_state==='carried'?(u.server_carried_by?'carried by @'+esc(u.server_carried_by):'carried'):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}${deliveryHtml(u)}${authHtml(u)}${vaultHtml(u)}</td>
    <td>${u.reachability?esc(u.reachability):''}${u.current_server_label?'<br><small>server: '+esc(u.current_server_label)+'</small>':''}${u.home&&u.current_server&&u.current_server.endpoint&&u.home!==u.current_server.endpoint?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`);
  keyed(document.getElementById('servers'), d.servers||[], s=>s.endpoint, s=>
   `<tr><td>${esc(s.label||s.endpoint)}<br><small>${esc(s.endpoint)}</small>${s.owner_agent&&s.home_endpoint&&s.home_endpoint!==s.endpoint?'<br><small>home: '+esc(s.home_endpoint)+'</small>':''}</td>
