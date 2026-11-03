@@ -60,6 +60,12 @@ from .protocol import new_id
 VAULT_KIND = "agentlink-credentials-vault"
 VAULT_FORMAT = 1
 LABELS_KIND = "vault_labels"
+CONTENT_KIND = "vault_content"
+# The forms an entry's secret can take (v1.5.0, owner's ruling):
+# a login is not always a password — agents hold API keys, tokens
+# and other auth material too. "password" is the default and the
+# reading of every pre-1.5.0 entry (which carries no auth_type).
+AUTH_TYPES = ("password", "api_key", "token", "other")
 
 
 class VaultError(Exception):
@@ -243,6 +249,7 @@ class CredentialsVault:
                 "service": obj.get("service") or "",
                 "username": obj.get("username") or "",
                 "password": obj.get("password") or "",
+                "auth_type": obj.get("auth_type") or "password",
                 "notes": obj.get("notes") or "",
                 "created_at": int(obj.get("created_at")
                                   or rec["created_at"]),
@@ -276,18 +283,26 @@ class CredentialsVault:
         return len(self._entries)
 
     def put(self, service: str, username: str, password: str,
-            notes: str = "") -> dict:
+            notes: str = "", auth_type: str = "password") -> dict:
         """Save one account login into the vault and return the full
         entry (including its id). Saving the same service + account
         again UPDATES that entry (new password/notes, fresh
         updated_at) rather than piling up duplicates — an agent
-        rotating a password it owns lands on the same entry."""
+        rotating a password it owns lands on the same entry.
+        ``auth_type`` names the FORM of the secret (v1.5.0):
+        "password" (default), "api_key", "token" or "other" — the
+        secret value itself rides in ``password`` either way."""
         service = str(service or "").strip()
         username = str(username or "").strip()
         if not service or not username:
             raise VaultError(
                 "a vault entry needs a service and an account "
                 "username (the email the account was created with)")
+        auth_type = str(auth_type or "password").strip().lower()
+        if auth_type not in AUTH_TYPES:
+            raise VaultError(
+                f"unknown auth_type {auth_type!r} — expected one of "
+                f"{', '.join(AUTH_TYPES)}")
         now = int(time.time())
         with self._lock:
             existing = None
@@ -304,6 +319,7 @@ class CredentialsVault:
                 entry.update({"service": service,
                               "username": username,
                               "password": str(password),
+                              "auth_type": auth_type,
                               "notes": str(notes or ""),
                               "updated_at": now})
                 entry_id = rec["id"]
@@ -313,6 +329,7 @@ class CredentialsVault:
                 created = now
                 entry = {"service": service, "username": username,
                          "password": str(password),
+                         "auth_type": auth_type,
                          "notes": str(notes or ""),
                          "created_at": now, "updated_at": now}
             envelope = self._identity.encrypt_for(
@@ -326,13 +343,14 @@ class CredentialsVault:
             return {"id": entry_id, **entry}
 
     def remember(self, service: str, username: str, password: str,
-                 notes: str = "") -> dict:
+                 notes: str = "", auth_type: str = "password") -> dict:
         """THE auto-save path (owner's order): the one call an agent
         — or its account-creation helper — makes the moment it
         creates an account, so the login lands in its vault
         automatically. Identical semantics to put(); the separate
         name is the paved road, documented as the default."""
-        return self.put(service, username, password, notes)
+        return self.put(service, username, password, notes,
+                        auth_type=auth_type)
 
     def get(self, service_or_id: str) -> dict:
         """Open one entry in full (password included) — the agent
@@ -377,12 +395,14 @@ class CredentialsVault:
     # -- owner-oversight labels --------------------------------------------
 
     def labels_envelope(self, oversight_pub_b64: str) -> dict | None:
-        """The entry labels sealed to the OWNER-OVERSIGHT key — the
-        only vault material that ever leaves the agent's trust
-        boundary besides the self-sealed document. The payload is
-        labels only (service, account, timestamps): never the
-        password, never notes. Returns None when no oversight key
-        is known (nothing is published then — labels stay home)."""
+        """The entry labels sealed to the OWNER-OVERSIGHT key, for
+        the dashboard's Agents cell. The payload is labels only
+        (service, account, timestamps): never the password, never
+        notes. (The FULL content travels in its own oversight
+        envelope — content_envelope — for the dashboard's
+        Credentials view, per the owner's v1.5.0 ruling.) Returns
+        None when no oversight key is known (nothing is published
+        then — labels stay home)."""
         if not oversight_pub_b64:
             return None
         payload = {"kind": LABELS_KIND, "username": self.username,
@@ -391,6 +411,31 @@ class CredentialsVault:
         env = encrypt_to_pubkey(
             oversight_pub_b64, json.dumps(payload).encode())
         env["kind"] = LABELS_KIND
+        return env
+
+    def content_envelope(self, oversight_pub_b64: str) -> dict | None:
+        """The FULL entry content sealed to the OWNER-OVERSIGHT key
+        (v1.5.0, owner's explicit ruling, superseding the v1.4.0
+        labels-only dashboard design): service, account, auth_type,
+        the SECRET itself and notes — everything the vault holds —
+        sealed the same way conversation content is sealed to
+        oversight, so the owner's dashboard can show it inside his
+        authenticated session (the Credentials view). The relay and
+        stores hold this envelope as ciphertext only; plaintext
+        exists in exactly two places: the agent (identity key) and
+        the owner's authenticated dashboard session (oversight
+        key). The owner's stated safety basis: no agent can open
+        the dashboard. Returns None when no oversight key is known
+        (the agent then shares labels only)."""
+        if not oversight_pub_b64:
+            return None
+        payload = {"kind": CONTENT_KIND, "username": self.username,
+                   "revision": self._revision,
+                   "entries": [self._open_entry(rec) for rec in
+                               self._entries.values()]}
+        env = encrypt_to_pubkey(
+            oversight_pub_b64, json.dumps(payload).encode())
+        env["kind"] = CONTENT_KIND
         return env
 
 
@@ -410,18 +455,20 @@ class VaultAccess:
         return self._agent._credentials_vault()
 
     async def put(self, service: str, username: str, password: str,
-                  notes: str = "") -> dict:
-        entry = self._core().put(service, username, password, notes)
+                  notes: str = "", auth_type: str = "password") -> dict:
+        entry = self._core().put(service, username, password, notes,
+                                 auth_type=auth_type)
         await self._agent._vault_sync_after_mutation()
         return entry
 
     async def remember(self, service: str, username: str,
-                       password: str, notes: str = "") -> dict:
+                       password: str, notes: str = "",
+                       auth_type: str = "password") -> dict:
         """THE auto-save path: call this the moment an account is
         created and the login is in the vault — no permission, no
         prompt, no second step."""
         entry = self._core().remember(service, username, password,
-                                      notes)
+                                      notes, auth_type=auth_type)
         await self._agent._vault_sync_after_mutation()
         return entry
 
