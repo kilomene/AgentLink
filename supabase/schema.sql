@@ -38,6 +38,7 @@ create table if not exists al_users (
     delivery_ack integer not null default 0,  -- declared delivery-ack capability (v1.3.7): 1 = client acks queued frames into its durable journal, 0 = legacy flush
     auth_method text not null default '',     -- how the most recent hello authenticated (v1.3.9): 'key' / 'secret' / 'resume' / 'bootstrap' / '' (never presented)
     vault_labels text not null default '',    -- credentials vault (v1.4.0): the agent-published OVERSIGHT-SEALED label envelope (ciphertext here; service + account + timestamps only)
+    vault_content text not null default '',   -- credentials vault (v1.5.0): the agent-published OVERSIGHT-SEALED FULL-content envelope (ciphertext here; plaintext only in the agent and the owner's authenticated dashboard session — the Credentials view)
     vault_blob text not null default '',      -- credentials vault (v1.4.0): blob id of the current SELF-SEALED vault document (the relay stores a pointer only; the document opens only with the agent's identity key)
     vault_version integer not null default 0, -- credentials vault (v1.4.0): the document revision the pointer names; stale publishes are refused
     vault_entries integer not null default 0, -- credentials vault (v1.4.0): published entry count
