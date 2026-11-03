@@ -1373,6 +1373,23 @@ class Store:
                 (pubkey, username))
             self._db.commit()
 
+    def set_secret(self, username: str, secret: str) -> None:
+        """Replace a user's owner-secret (v1.3.8). Only the SHA-256
+        hash is stored, exactly as claim() stores it — the relay DB
+        never holds a usable secret. This is the store-level half
+        of registration-resume rotation: when a cut-off FIRST
+        registration is resumed by its identity keys, the relay
+        rotates the secret through here and the new secret rides
+        the welcome, so the client persists it and the resume
+        window closes behind the identity for good."""
+        if not secret:
+            return
+        with self._lock:
+            self._db.execute(
+                "UPDATE users SET secret = ? WHERE username = ?",
+                (_hash_token(secret), username))
+            self._db.commit()
+
     def touch(self, username: str) -> None:
         """Heartbeat-derived presence, backend-wide (point 29: 'dead'
         means no heartbeat ANYWHERE, on any relay sharing the backend)."""
