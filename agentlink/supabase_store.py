@@ -355,6 +355,15 @@ class SupabaseStore:
             self._req("PATCH", "users", self._eq("username", username),
                       body={"pubkey": pubkey}, prefer="return=minimal")
 
+    def set_secret(self, username, secret):
+        # Registration-resume rotation (v1.3.8), SQLite parity:
+        # only the SHA-256 hash is stored, exactly as claim()
+        # stores it — the backend never holds a usable secret.
+        if secret:
+            self._req("PATCH", "users", self._eq("username", username),
+                      body={"secret": _sha(secret)},
+                      prefer="return=minimal")
+
     def sign_pub_of(self, username):
         row = self._one("users", self._eq("username", username)
                         + "&select=sign_pub")
