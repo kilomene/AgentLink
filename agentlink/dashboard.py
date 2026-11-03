@@ -3188,9 +3188,11 @@ function renderStats(d){
     work:(d.work||[]).filter(w=>!['completed','covered'].includes(w.status)).length,
     awaiting:(d.work||[]).filter(w=>w.status==='awaiting_approval').length,
     chains:(d.chains||[]).filter(c=>c.status==='running').length,
-    alerts:(d.alerts||[]).filter(a=>a.status==='open').length};
+    alerts:(d.alerts||[]).filter(a=>a.status==='open').length,
+    incomplete:d.hello_incomplete||0};
   const labels={online:'agents online',work:'work open',awaiting:'awaiting approval',
-    chains:'chains running',alerts:'alerts open'};
+    chains:'chains running',alerts:'alerts open',
+    incomplete:'incomplete hellos'};
   const box=document.getElementById('ovstats');
   if(!box.dataset.built){
     box.innerHTML=Object.keys(vals).map(k=>
@@ -3369,6 +3371,17 @@ function actRow(a){
     (a.title?' · “'+esc(a.title)+'”':'')+(a.text?' — '+esc(a.text):'')+
     '</td></tr>';
 }
+function deliveryHtml(u){
+  const dl=u.delivery||{};
+  if((dl.waiting||0)>0){
+    return '<br><small>delivery: '+dl.waiting+' waiting · oldest '+
+      Math.floor((dl.oldest_wait_s||0)/60)+'m · connected '+
+      (dl.hellos_since_oldest||0)+'x since</small>';
+  }
+  if(dl.guarantee==='ack')
+    return '<br><small>delivery: verified (ack)</small>';
+  return '<br><small>delivery: legacy client — unverified</small>';
+}
 function alertHtml(a){
   return '<div class="alert enter">⚠ <b>'+esc(a.kind)+'</b> — '+esc(a.subject)+
     ' <small>'+esc(a.detail||'')+' · '+pt(a.created_at)+'</small></div>';
@@ -3391,7 +3404,7 @@ function render(d){
  keyed(document.getElementById('users'), d.users||[], u=>u.username, u=>
   `<tr><td>@${esc(u.username)}<br><small>${esc((u.capabilities||[]).join(', '))}</small></td>
    <td class="${u.online?'on':'off'}"><span class="dot ${u.online?'on':''}"></span>${u.online?'online':'offline'}<br><small>${u.online?esc(u.activity_state||''):((!u.online&&u.last_seen)?'last seen '+pt(u.last_seen):esc(u.activity_state||''))}</small></td>
-   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.decision_state==='pending'?`<br><span class="pill health bad">decision link pending</span><br><small>line held — messages & work queueing</small>`:u.decision_state==='linked'?`<br><small>decision link: wired</small>`:''}${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state==='carried'?'carried by @'+esc(u.server_carried_by||''):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}</td>
+   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.decision_state==='pending'?`<br><span class="pill health bad">decision link pending</span><br><small>line held — messages & work queueing</small>`:u.decision_state==='linked'?`<br><small>decision link: wired</small>`:''}${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state==='carried'?'carried by @'+esc(u.server_carried_by||''):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}${deliveryHtml(u)}</td>
    <td>${u.reachability?esc(u.reachability):''}${u.current_server_label?'<br><small>server: '+esc(u.current_server_label)+'</small>':''}${u.home&&u.current_server&&u.current_server.endpoint&&u.home!==u.current_server.endpoint?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`);
  keyed(document.getElementById('servers'), d.servers||[], s=>s.endpoint, s=>
   `<tr><td>${esc(s.label||s.endpoint)}<br><small>${esc(s.endpoint)}</small>${s.owner_agent&&s.home_endpoint&&s.home_endpoint!==s.endpoint?'<br><small>home: '+esc(s.home_endpoint)+'</small>':''}</td>
