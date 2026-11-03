@@ -881,19 +881,24 @@ class SupabaseStore:
                   prefer="return=minimal")
 
     def set_vault_meta(self, username, labels, blob_id, version,
-                       entries):
+                       entries, content=""):
         # Credentials vault pointer (v1.4.0), parity with the SQLite
         # Store: only a pointer is stored — the self-sealed
         # document's blob id, its revision, the entry count, and the
-        # OVERSIGHT-SEALED labels envelope (ciphertext here; this
-        # store holds no key that opens it). A stale revision is
-        # REFUSED (returns False) so a zombie host cannot rewind an
-        # agent's vault. FAIL-SOFT BY DESIGN: vault meta is an
-        # auxiliary pointer, never the vault itself (the agent's
-        # state dir + the blob layer hold the real document), so a
-        # backend error — including the vault columns not yet
-        # migrated — logs loudly and reports unaccepted instead of
-        # raising into the connection loop.
+        # OVERSIGHT-SEALED envelopes (labels; since v1.5.0 also the
+        # full content for the owner's Credentials view — ciphertext
+        # here; this store holds no key that opens either). A stale
+        # revision is REFUSED (returns False) so a zombie host
+        # cannot rewind an agent's vault. FAIL-SOFT BY DESIGN: vault
+        # meta is an auxiliary pointer, never the vault itself (the
+        # agent's state dir + the blob layer hold the real
+        # document), so a backend error — including the vault
+        # columns not yet migrated — logs loudly and reports
+        # unaccepted instead of raising into the connection loop.
+        # The content column degrades SEPARATELY (v1.5.0): if the
+        # vault_content migration has not landed yet, the publish
+        # retries without it — labels and the pointer must not go
+        # dark because the newest column is missing.
         try:
             rows = self._get(
                 "users",
@@ -903,13 +908,27 @@ class SupabaseStore:
                 return False
             if int(version) < int(rows[0].get("vault_version") or 0):
                 return False
-            self._req("PATCH", "users",
-                      self._eq("username", username),
-                      body={"vault_labels": labels or "",
-                            "vault_blob": blob_id or "",
-                            "vault_version": int(version),
-                            "vault_entries": int(entries)},
-                      prefer="return=minimal")
+            body = {"vault_labels": labels or "",
+                    "vault_blob": blob_id or "",
+                    "vault_version": int(version),
+                    "vault_entries": int(entries)}
+            if content:
+                body["vault_content"] = content
+            try:
+                self._req("PATCH", "users",
+                          self._eq("username", username),
+                          body=body, prefer="return=minimal")
+            except Exception:
+                if "vault_content" not in body:
+                    raise
+                log.warning("set_vault_meta for %s: vault_content "
+                            "rejected (migration-vault-content.sql "
+                            "not applied yet?) — publishing labels "
+                            "and pointer without it", username)
+                body.pop("vault_content")
+                self._req("PATCH", "users",
+                          self._eq("username", username),
+                          body=body, prefer="return=minimal")
             return True
         except Exception:
             log.warning("set_vault_meta failed for %s (backend "
@@ -936,10 +955,25 @@ class SupabaseStore:
         r = rows[0]
         if not (r.get("vault_blob") or r.get("vault_labels")):
             return None
+        # vault_content rides a SEPARATE guarded read (v1.5.0): a
+        # backend without the column must still serve the pointer
+        # and labels — the content simply reads as unshared.
+        content = ""
+        try:
+            crows = self._get(
+                "users",
+                "select=vault_content&"
+                + self._eq("username", username))
+            if crows:
+                content = crows[0].get("vault_content") or ""
+        except Exception:
+            log.warning("get_vault_meta content read failed for %s "
+                        "(vault_content unmigrated?)", username)
         return {"labels": r.get("vault_labels") or "",
                 "blob_id": r.get("vault_blob") or "",
                 "version": int(r.get("vault_version") or 0),
-                "entries": int(r.get("vault_entries") or 0)}
+                "entries": int(r.get("vault_entries") or 0),
+                "content": content}
 
     def list_users(self, query="", capability=""):
         q = ("select=username,display_name,pubkey,sign_pub,capabilities,"
