@@ -92,6 +92,7 @@ from .timing import (
 )
 from .crypto import Identity, decrypt_with_key, encrypt_to_pubkey, \
     encrypt_with_key, new_group_key
+from .mailbox import Mailbox
 from .protocol import (
     MAX_FRAME,
     make_file_payload,
@@ -103,6 +104,18 @@ from .protocol import (
 log = logging.getLogger("agentlink.client")
 
 
+def _package_version() -> str:
+    """The SDK package version, declared at hello (v1.3.7) beside
+    the delivery-ack capability. Read lazily: this module is what
+    ``agentlink/__init__`` imports to define ``__version__``, so the
+    name only exists once the package has finished loading."""
+    try:
+        from . import __version__
+        return str(__version__)
+    except Exception:
+        return ""
+
+
 async def resolve_host(host: str, port: int) -> list[str]:
     """Resolve a hostname FRESH (point 44b): called on every connect
     attempt, never cached — a changed DNS answer is followed on the
@@ -110,8 +123,8 @@ async def resolve_host(host: str, port: int) -> list[str]:
     resolution itself fails (carrier/captive DNS breakage), fall
     back to DNS-over-HTTPS lookups for the same hostname."""
     import socket as _socket
-    if host.replace(".", "").isdigit():  # already an IPv4 literal
-        return [host]
+    if host.replace(".", "").isdigit() or ":" in host:
+        return [host]  # already an IP literal (IPv4 or IPv6)
     loop = asyncio.get_running_loop()
     try:
         infos = await loop.getaddrinfo(host, port,
@@ -158,28 +171,55 @@ def _env_proxy_applies(host: str, scheme: str) -> bool:
 
 async def doh_lookup(host: str) -> list[str]:
     """DNS-over-HTTPS fallback (point 44b): dns.google, then
-    Cloudflare. Returns A-record IPs or [] — used ONLY when the
+    Cloudflare. Returns A AND AAAA IPs (record types 1 and 28 —
+    both address families, v1.3.7) or [] — used ONLY when the
     system resolver fails, so a broken local DNS cannot dark an
     agent that still has any working network path."""
     import urllib.request as _u
-    urls = [f"https://dns.google/resolve?name={host}&type=A",
-            f"https://cloudflare-dns.com/dns-query?name={host}&type=A"]
+    bases = ["https://dns.google/resolve?name={}&type={}",
+             "https://cloudflare-dns.com/dns-query?name={}&type={}"]
 
-    def _fetch(url: str) -> list[str]:
+    def _fetch(url: str, rtype: int) -> list[str]:
         req = _u.Request(url, headers={"Accept": "application/dns-json"})
         with _u.urlopen(req, timeout=4) as resp:
             data = json.loads(resp.read())
         return [a["data"] for a in data.get("Answer", [])
-                if a.get("type") == 1]
+                if a.get("type") == rtype]
 
-    for url in urls:
+    for base in bases:
         try:
-            ips = await asyncio.to_thread(_fetch, url)
-            if ips:
-                return ips
+            out: list[str] = []
+            for rtype in (1, 28):
+                for ip in await asyncio.to_thread(
+                        _fetch, base.format(host, rtype), rtype):
+                    if ip not in out:
+                        out.append(ip)
+            if out:
+                return out
         except Exception:
             continue
     return []
+
+
+def _interleave_families(ips: list[str]) -> list[str]:
+    """Alternate IPv4/IPv6 addresses (happy eyeballs, v1.3.7): the
+    resolver's preferred family still leads, but the other family
+    is never more than one stagger behind — a broken family (an
+    IPv6 route that blackholes, a v4 NAT that drops) can never
+    starve or poison the working one, and the operator never has
+    to be told 'use IPv4'."""
+    v6 = [ip for ip in ips if ":" in ip]
+    v4 = [ip for ip in ips if ":" not in ip]
+    if not v6 or not v4:
+        return list(ips)
+    first, second = (v6, v4) if ips[0] in v6 else (v4, v6)
+    out: list[str] = []
+    for i in range(max(len(first), len(second))):
+        if i < len(first):
+            out.append(first[i])
+        if i < len(second):
+            out.append(second[i])
+    return out
 
 
 def network_fingerprint() -> str:
@@ -246,6 +286,17 @@ def parse_mentions(body: str) -> list[str]:
 
 class RegistrationFailed(Exception):
     pass
+
+
+class InstanceCollision(RegistrationFailed):
+    """Another live agentlink instance already owns this identity
+    on this state dir (v1.3.7): two processes sharing one agent's
+    journal/mailbox/secret files corrupt each other's view (the
+    SQLite-locking and duplicate-endpoint errors a second process
+    otherwise discovers the hard way). Raised FAST by start(),
+    before any socket opens — a second process joins the running
+    instance's world by talking to the line, never by starting a
+    rival on the same state."""
 
 
 class ResumeUnsupported(Exception):
@@ -439,7 +490,33 @@ class Agent:
         self.ephemeral = ephemeral
         self.identity: Identity | None = None
         if not ephemeral and self.username:
-            self.identity = Identity(self.username, self.state_dir)
+            try:
+                self.identity = Identity(self.username, self.state_dir)
+            except Exception:
+                # Registration resume (v1.3.7): a first attempt cut
+                # off mid-flight can leave a TORN keys file (the
+                # identity write is not atomic in crypto.py) — and
+                # an unreadable keys file otherwise bricks every
+                # retry of the SAME identity in its own state dir,
+                # stranding the half-registration forever.
+                # Quarantine the torn file and mint a fresh keypair,
+                # exactly the journal/mailbox corruption pattern:
+                # if the relay already holds this username, the
+                # saved secret (a separate file) still reclaims it
+                # and the hello re-registers the new pubkey; if it
+                # does not, the fresh keypair is simply what the
+                # first completed registration claims.
+                kpath = self.state_dir / f"keys-{self.username}.json"
+                try:
+                    kpath.rename(kpath.with_suffix(".corrupt"))
+                except Exception:
+                    pass
+                self.identity = Identity(self.username, self.state_dir)
+                # _pending_repairs is formally initialised later in
+                # this constructor (and no longer clobbers this).
+                self._pending_repairs: list[str] = []
+                self._pending_repairs.append(
+                    "identity_keys_corrupt_rebuilt")
         # Set by _load_server_list when a persisted mesh was restored:
         # restored entries are the agent's memory of the mesh and are
         # NOT expiry-pruned until the first LIVE learn of the session
@@ -535,7 +612,10 @@ class Agent:
         # Workforce (points 30/31/39): durable journal, concurrent pool,
         # strict boot order. The journal loads FIRST (boot step 1).
         self.self_repairs: list[dict] = []
-        self._pending_repairs: list[str] = []
+        # May already hold entries from the identity recovery above
+        # (it runs earlier in this constructor) — never clobber it.
+        if not hasattr(self, "_pending_repairs"):
+            self._pending_repairs: list[str] = []
         self._journal: TaskJournal | None = None
         if not ephemeral and self.username:
             jpath = self.state_dir / f"tasks-{self.username}.db"
@@ -551,6 +631,55 @@ class Agent:
                     pass
                 self._journal = TaskJournal(jpath)
                 self._pending_repairs.append("journal_corrupt_rebuilt")
+        # Canonical mailbox (v1.3.7): the durable local journal for
+        # MESSAGES, twin of the TaskJournal above. Every inbound item
+        # is journaled here BEFORE it is processed and acked to the
+        # relay; take-in is marked here at the same points read
+        # receipts have always fired; journaled-but-not-taken items
+        # replay on start; the relay's history backfills the same
+        # store. A corrupt mailbox is quarantined and rebuilt empty —
+        # the relay history sync then backfills what the line holds.
+        self.mailbox: Mailbox | None = None
+        self._mailbox = self.mailbox
+        if not ephemeral and self.username:
+            mpath = self.state_dir / "mailbox.db"
+            try:
+                self.mailbox = Mailbox(mpath, owner=self.username)
+                self.mailbox.count()  # header sanity check
+            except Exception:
+                try:
+                    mpath.rename(mpath.with_suffix(".corrupt"))
+                except Exception:
+                    pass
+                try:
+                    self.mailbox = Mailbox(mpath, owner=self.username)
+                except Exception:
+                    self.mailbox = None
+            self._mailbox = self.mailbox
+        # Ids claimed by a live dispatch (or a replay) in this
+        # process: the guard that makes journal-then-dispatch
+        # exactly-once when a queued flush, a history sync and the
+        # start-of-session replay all race over the same item.
+        self._takein_inflight: set[str] = set()
+        # Instance lock (v1.3.7): the OS-level lock fd this process
+        # holds on instance-<username>.lock, or None. Held from the
+        # first start() until close() — across every reconnect —
+        # because the identity's local state has exactly one owner.
+        self._instance_lock_fd = None
+        self._instance_lock_path: Path | None = None
+        self._instance_lock_borrowed = False
+        # Work assignments already taken in by THIS process, keyed
+        # (work_id, attempt): delivery custody is at-least-once —
+        # a work_assigned frame carries no ack-able id, so the
+        # relay re-offers it until the work itself moves — and the
+        # client must never journal/append/run the same attempt
+        # twice. Across restarts the boot resume pass claims the
+        # attempt first (see _resume_open_work), so the frame path
+        # meets the seen mark there too.
+        self._seen_work: set = set()
+        # The start() history-sync result ({"fetched", "inserted",
+        # "pages"}), for the CLI and for operators.
+        self.mailbox_sync: dict | None = None
         self._work_sem: asyncio.Semaphore | None = None
         self._running_work: set = set()
         self._active_work = 0
@@ -621,6 +750,110 @@ class Agent:
         return fn
 
     # -- local persistence ----------------------------------------------------
+    def _instance_lock_path_fn(self) -> Path:
+        return self.state_dir / f"instance-{self.username}.lock"
+
+    def _acquire_instance_lock(self) -> None:
+        """Claim this identity's state dir for THIS process
+        (v1.3.7 instance-collision detection). The lock is an
+        flock held on instance-<username>.lock for the Agent's
+        whole connected lifetime: the kernel releases it if the
+        process dies, so a stale pid file alone can never block a
+        legitimate restart — the flock is the truth, the pid
+        written inside is for the collision message. A second
+        live claimant fails FAST with the owner's pid instead of
+        fighting the running instance's SQLite DBs."""
+        if self.ephemeral or not self.username:
+            return
+        if self._instance_lock_fd is not None:
+            return  # already held by this object (reconnect cycle)
+        path = self._instance_lock_path_fn()
+        holder_pid = None
+        try:
+            holder = json.loads(path.read_text())
+            holder_pid = holder.get("pid")
+        except Exception:
+            holder_pid = None
+        pid_txt = str(holder_pid) if holder_pid else "unknown"
+        collision_msg = (
+            "another agentlink instance is already running on this"
+            f" state dir (pid {pid_txt}); registration joins that"
+            " instance, it does not start a rival — talk to the"
+            " line through the running instance, or stop it"
+            f" (pid {pid_txt}) first")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            import fcntl
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                if holder_pid == os.getpid():
+                    # The live holder is THIS process (a sibling
+                    # Agent object — e.g. a supervisor holding the
+                    # identity while a replacement object starts).
+                    # A pid is unique among live processes, so this
+                    # is provably not a rival PROCESS: borrow the
+                    # claim (close() must not release what it did
+                    # not take) and let the relay's own supersede
+                    # rules govern the duplicate hello.
+                    self._instance_lock_borrowed = True
+                    return
+                raise InstanceCollision(
+                    f"instance_collision: {collision_msg}")
+        except ImportError:
+            # No fcntl (non-POSIX): fall back to exclusive-create
+            # semantics on a companion marker.
+            os.close(fd)
+            marker = path.with_suffix(".held")
+            try:
+                mfd = os.open(marker, os.O_CREAT | os.O_EXCL
+                              | os.O_WRONLY, 0o600)
+                os.write(mfd, str(os.getpid()).encode())
+                os.close(mfd)
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            except FileExistsError:
+                raise InstanceCollision(
+                    f"instance_collision: {collision_msg}")
+            self._instance_marker = marker
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, json.dumps({
+                "pid": os.getpid(), "username": self.username,
+                "endpoint": self.endpoint,
+                "since": int(time.time())}).encode())
+            os.fsync(fd)
+        except Exception:
+            pass
+        self._instance_lock_fd = fd
+        self._instance_lock_path = path
+
+    def _release_instance_lock(self) -> None:
+        if getattr(self, "_instance_lock_borrowed", False):
+            # Borrowed claim: the sibling object that took the
+            # lock releases it on ITS close, not this one.
+            self._instance_lock_borrowed = False
+            return
+        fd = self._instance_lock_fd
+        self._instance_lock_fd = None
+        if fd is not None:
+            try:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        marker = getattr(self, "_instance_marker", None)
+        if marker is not None:
+            self._instance_marker = None
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+
     def _secret_path(self) -> Path:
         return self.state_dir / f"secret-{self.username}.json"
 
@@ -634,14 +867,30 @@ class Agent:
         return None
 
     def _save_secret(self, secret: str) -> None:
+        # ATOMIC (v1.3.7, registration resume): the secret is the
+        # identity's claim on its username — a process killed
+        # mid-write must never leave a torn secret file behind,
+        # because the retry would then load garbage, present no
+        # secret, and collide with its OWN half-registration
+        # (username_taken). Write to a temp file and os.replace,
+        # for the secret and for the current.json pointer alike:
+        # on disk there is always either the whole old state or
+        # the whole new state, never a splice.
         p = self._secret_path()
-        p.write_text(json.dumps({"username": self.username, "secret": secret}))
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"username": self.username,
+                                   "secret": secret}))
+        os.replace(tmp, p)
         try:
             os.chmod(p, 0o600)
         except OSError:
             pass
-        (self.state_dir / "current.json").write_text(json.dumps(
-            {"username": self.username, "display_name": self.display_name}))
+        cur = self.state_dir / "current.json"
+        ctmp = cur.with_suffix(".json.tmp")
+        ctmp.write_text(json.dumps(
+            {"username": self.username,
+             "display_name": self.display_name}))
+        os.replace(ctmp, cur)
 
     def _group_keys_path(self) -> Path:
         return self.state_dir / f"groupkeys-{self.username}.json"
@@ -843,14 +1092,34 @@ class Agent:
         """Open one websocket through the anti-dark path (point 44):
         resolve FRESH via resolve_host (system -> DoH fallback),
         then connect to a resolved address — never a pinned stale
-        IP. For wss the TLS server name stays the endpoint host."""
+        IP. For wss the TLS server name stays the endpoint host.
+
+        ADDRESS-FAMILY RACING (v1.3.7, happy eyeballs): the
+        resolved addresses are interleaved IPv4/IPv6 and the
+        connection attempts are RACED with a bounded stagger —
+        the first attempt starts at once, the next family/address
+        joins a stagger later if the first has not landed, and the
+        FIRST success wins. The pre-1.3.7 sequential walk could
+        park the whole connect on one blackholed family (a v6
+        route that silently drops costs a full TCP timeout before
+        v4 is even tried — the foreign-sandbox failure where the
+        operator had to be told 'use IPv4'); now a broken family
+        never hangs or kills the attempt, and one family's
+        failures never poison the other's: losers are cancelled,
+        and only when EVERY attempt has failed does the last
+        error surface (the caller's unlimited reconnect then
+        retries the whole race, backoff cap unchanged)."""
         from urllib.parse import urlparse
+        from . import timing as _timing
+        stagger = float(getattr(
+            _timing, "CONNECT_FAMILY_STAGGER_SECONDS", 0.25) or 0.25)
         p = urlparse(url)
         host = p.hostname or ""
         port = p.port or (443 if p.scheme == "wss" else 80)
-        ips = await resolve_host(host, port)
+        ips = _interleave_families(await resolve_host(host, port))
         last: Exception | None = None
-        for ip in ips:
+
+        def _attempt_kwargs(ip: str):
             netloc = f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
             # Path AND query survive: a carried server's alias is
             # the carrier's /ws endpoint + ?carry=<server_id>
@@ -859,7 +1128,6 @@ class Agent:
             target = p.path or "/"
             if p.query:
                 target += "?" + p.query
-            ip_url = f"{p.scheme}://{netloc}{target}"
             kwargs: dict = {"max_size": MAX_FRAME}
             if ip != host:
                 kwargs["extra_headers"] = {"Host": f"{host}:{port}"}
@@ -867,11 +1135,66 @@ class Agent:
                     import ssl as _ssl
                     kwargs["ssl"] = _ssl.create_default_context()
                     kwargs["server_hostname"] = host
-            try:
-                return await connect(ip_url, **kwargs)
-            except Exception as exc:  # try the next resolved address
-                last = exc
-                continue
+            return f"{p.scheme}://{netloc}{target}", kwargs
+
+        async def _attempt(ip: str):
+            ip_url, kwargs = _attempt_kwargs(ip)
+            return await connect(ip_url, **kwargs)
+
+        pending: set = set()
+        winner = None
+        idx = 0
+        loop = asyncio.get_running_loop()
+        next_launch = loop.time()
+        try:
+            while winner is None and (idx < len(ips) or pending):
+                now = loop.time()
+                if idx < len(ips) and now >= next_launch:
+                    pending.add(asyncio.create_task(
+                        _attempt(ips[idx])))
+                    idx += 1
+                    next_launch = now + stagger
+                    continue
+                timeout = None
+                if idx < len(ips):
+                    timeout = max(0.0, next_launch - now)
+                if not pending:
+                    # Every launched attempt already failed; wait
+                    # out the stagger before launching the next
+                    # (never a busy spin).
+                    await asyncio.sleep(timeout or 0.0)
+                    continue
+                done, pending = await asyncio.wait(
+                    pending, timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    if t.exception() is not None:
+                        last = t.exception()
+                    elif winner is None:
+                        winner = t.result()
+                    else:
+                        # A second success in the same batch: the
+                        # race has its winner; close the spare.
+                        try:
+                            await t.result().close()
+                        except Exception:
+                            pass
+            if winner is not None:
+                return winner
+        finally:
+            # Cancel the losers WITHOUT awaiting their settle: a
+            # blackholed attempt's cancellation can itself take
+            # until its handshake timeout (the debug trace: winner
+            # found at 0.25s, return stalled to 10s by the gather)
+            # — the winner must never wait on a loser's corpse.
+            # The done callback just reaps the exception so the
+            # loop never logs it as unretrieved.
+            def _reap(t):
+                if not t.cancelled():
+                    t.exception()
+            for t in pending:
+                t.cancel()
+                t.add_done_callback(_reap)
         # Network auto-adjust, proxied-egress case (point 44b): some
         # networks only allow egress through an HTTP proxy named in
         # the environment. If every direct address failed and a proxy
@@ -1020,7 +1343,31 @@ class Agent:
             self.identity = Identity.ephemeral()
         url = endpoint or self.endpoint
         self.current_endpoint = url
-        self._ws = await self._open_socket(url)
+        # Instance collision (v1.3.7): claim this identity's state
+        # dir BEFORE any socket opens. Raises InstanceCollision
+        # immediately when another live process owns it — a
+        # registration failure that names its step and its owner,
+        # never a SQLite fight discovered three layers down. The
+        # lock is held until close(): a start() that fails keeps
+        # the claim, because this object IS the instance retrying.
+        self._acquire_instance_lock()
+        try:
+            self._ws = await self._open_socket(url)
+        except Exception as exc:
+            # Registration failure reporting (v1.3.7): name the
+            # step, the endpoint, and the way forward — a bare OS
+            # error ("Network is unreachable") is never the final
+            # word on a registration.
+            raise ConnectionError(
+                f"registration failed at step 'connect': endpoint"
+                f" {url} did not answer for @{self.username or '?'}"
+                f" ({type(exc).__name__}: {exc}). Nothing was"
+                f" registered. Retry: check that the endpoint is"
+                f" the right one and reachable from this machine —"
+                f" the production default is"
+                f" wss://x.novamail.store/ws; a first registration"
+                f" with this same state dir resumes cleanly once"
+                f" the line answers.") from exc
         self._declared_link_sent = self._decision_declaration()
         await self._send_raw({
             "type": "hello", "username": self.username or None,
@@ -1031,6 +1378,12 @@ class Agent:
             "cap_description": self.cap_description,
             "mode": self.mode,
             "decision_link": self._declared_link_sent,
+            # Delivery custody (v1.3.7): this client journals every
+            # inbound item into its canonical local mailbox and acks
+            # items back — the relay keeps custody of queued frames
+            # until the ack, and marks audit delivered only then.
+            "delivery_ack": 1,
+            "client_version": _package_version(),
             "secret": None if self.ephemeral else self._load_secret(),
             "ephemeral": self.ephemeral,
             "home_endpoint": self.endpoint,
@@ -1042,9 +1395,47 @@ class Agent:
         # On timeout the socket closes and the run() loop retries
         # (unlimited attempts, 5s pacing cap) until a hello lands in a
         # good window; no service restart is ever needed to recover.
+        #
+        # FIRST-CONTACT WINDOW (v1.3.7): the steady-state 8s bound is
+        # race hygiene for an ALREADY-registered agent — the
+        # v1.2.3 kill-drill showed two stalled 30s hellos serially
+        # costing ~60s of flip time, and a healthy relay answers a
+        # reclaim hello in well under a second even through a
+        # tunnel. A FIRST registration is a different animal: the
+        # relay must claim a brand-new identity (a store write,
+        # possibly on a shared backend reached from a slow foreign
+        # network), and the cost asymmetry is total — a generous
+        # window is paid once in an agent's life, while a first
+        # hello cut at 8s can strand the registration entirely
+        # (the welcome carries the only copy of the owner-secret).
+        # So: while NO completed registration is on record locally
+        # (no saved secret — the same fact that makes the retry a
+        # fresh claim rather than a reclaim), the welcome wait is
+        # FIRST_HELLO_TIMEOUT_SECONDS; the moment a secret exists,
+        # every later hello is a reclaim and the 8s bound stands.
+        from . import timing as _timing
         from .timing import HELLO_TIMEOUT_SECONDS
+        _first_contact = not self.ephemeral and \
+            self._load_secret() is None
+        # The first-contact window is DERIVED from the timing
+        # map's own constant — never a free-standing number: the
+        # map stays the single source of truth (a test that
+        # patches HELLO_TIMEOUT_SECONDS down must see every
+        # hello wait shrink with it), while in production
+        # (8s shipped) a first registration gets up to the
+        # FIRST_HELLO_TIMEOUT_SECONDS target (30s default when
+        # the map does not name one) — bounded at 4x the steady
+        # window so the two can never drift apart.
+        _hello_window = HELLO_TIMEOUT_SECONDS
+        if _first_contact:
+            _first_target = float(getattr(
+                _timing, "FIRST_HELLO_TIMEOUT_SECONDS", 30) or 30)
+            _hello_window = max(
+                float(HELLO_TIMEOUT_SECONDS),
+                min(_first_target,
+                    float(HELLO_TIMEOUT_SECONDS) * 4))
         _hello_deadline = (asyncio.get_event_loop().time()
-                           + HELLO_TIMEOUT_SECONDS)
+                           + _hello_window)
         while True:
             _left = _hello_deadline - asyncio.get_event_loop().time()
             if _left <= 0:
@@ -1053,7 +1444,14 @@ class Agent:
                 except Exception:
                     pass
                 raise ConnectionError(
-                    "hello timed out waiting for welcome")
+                    f"registration failed at step 'welcome':"
+                    f" endpoint {url} accepted the connection but"
+                    f" no welcome arrived within {_hello_window:g}s"
+                    f" for @{self.username or '?'} (the hello was"
+                    f" sent). The relay may already have claimed"
+                    f" the identity — retry with this same state"
+                    f" dir and the registration resumes; nothing"
+                    f" needs to be re-created or renamed.")
             try:
                 raw = await asyncio.wait_for(self._ws.recv(),
                                              timeout=_left)
@@ -1063,7 +1461,26 @@ class Agent:
                 except Exception:
                     pass
                 raise ConnectionError(
-                    "hello timed out waiting for welcome")
+                    f"registration failed at step 'welcome':"
+                    f" endpoint {url} accepted the connection but"
+                    f" no welcome arrived within {_hello_window:g}s"
+                    f" for @{self.username or '?'} (the hello was"
+                    f" sent). The relay may already have claimed"
+                    f" the identity — retry with this same state"
+                    f" dir and the registration resumes; nothing"
+                    f" needs to be re-created or renamed.")
+            except websockets.exceptions.ConnectionClosed as exc:
+                # The folk failure (v1.3.7): registration cut off
+                # mid-flight. Name it as what it is — and say the
+                # part that matters: the same state dir resumes.
+                raise ConnectionError(
+                    f"registration failed at step 'welcome': the"
+                    f" connection to {url} dropped while waiting"
+                    f" for the welcome for @{self.username or '?'}"
+                    f" ({exc}). The relay may already have claimed"
+                    f" the identity — retry with this same state"
+                    f" dir and the registration resumes; nothing"
+                    f" needs to be re-created or renamed.") from exc
             frame = json.loads(raw)
             if frame.get("type") == "welcome":
                 self.username = frame["username"]
@@ -1119,6 +1536,25 @@ class Agent:
                     # Receipts that failed to flush while offline
                     # retry on every (re)connect.
                     self._queue_read(next(iter(self._pending_reads)))
+                # MAILBOX (v1.3.7), on every (re)connect — start()
+                # completing auth is the one place live start and
+                # the run() reconnect loop share: backfill the
+                # canonical mailbox from the relay's history, then
+                # replay whatever was journaled but never taken in
+                # (a previous process may have journaled and died
+                # before the intelligence ever saw the item). Both
+                # are best-effort: a failure here must never dark
+                # the line — the items stay journaled / queued and
+                # the next start tries again.
+                if self.mailbox is not None:
+                    try:
+                        self.mailbox_sync = await self.sync_history()
+                    except Exception:
+                        log.exception("mailbox history sync failed")
+                    try:
+                        await self._replay_mailbox()
+                    except Exception:
+                        log.exception("mailbox replay failed")
                 return self.username
             if frame.get("type") == "error":
                 await self._ws.close()
@@ -1134,6 +1570,7 @@ class Agent:
             pass
 
     async def close(self) -> None:
+        self._release_instance_lock()
         if self._update_task is not None:
             self._update_task.cancel()
             self._update_task = None
@@ -1940,6 +2377,320 @@ class Agent:
         self._store_channel_key(cid, int(key_rec["epoch"]), key)
         return self._channel_keys[cid]
 
+    # -- canonical mailbox (v1.3.7) ------------------------------------
+    # Delivery completes only when an item is durably journaled in
+    # the local mailbox AND acked back to the relay; take-in is a
+    # durable fact in the same store, not just a read frame; what
+    # was journaled but never taken in replays on start; the relay's
+    # history backfills the store. See mailbox.py for the contract.
+
+    async def _send_ack(self, ids) -> None:
+        """Tell the relay these ids are durably journaled in my
+        mailbox: {"type": "ack", "ids": [...]}. Only on ack does the
+        relay delete its queued copy and mark the audit row
+        delivered. Best-effort on a dying socket — an unacked item
+        simply stays in the relay's custody and is redelivered."""
+        ids = [str(i) for i in (ids or []) if i]
+        if not ids or self._ws is None:
+            return
+        try:
+            await self._send_raw({"type": "ack", "ids": ids})
+        except Exception:
+            pass
+
+    def _mailbox_mark_taken(self, message_id) -> None:
+        if self.mailbox is not None and message_id:
+            try:
+                self.mailbox.mark_taken([str(message_id)])
+            except Exception:
+                log.exception("mailbox mark_taken failed")
+
+    def _local_mailbox(self) -> Mailbox | None:
+        """The mailbox for pure-local reads: the live instance when
+        there is one, else the state dir's mailbox.db opened read-
+        write on demand — inbox()/history() must work with NO
+        connection whenever the file exists."""
+        if self.mailbox is not None:
+            return self.mailbox
+        try:
+            path = self.state_dir / "mailbox.db"
+            if path.exists():
+                self.mailbox = Mailbox(path, owner=self.username)
+                self._mailbox = self.mailbox
+        except Exception:
+            return None
+        return self.mailbox
+
+    def inbox(self, limit: int = 50, unread_only: bool = False,
+              conversation: str | None = None,
+              before_ts: int | None = None) -> list[dict]:
+        """This agent's local mailbox, newest first — the msg dicts
+        exactly as handlers see them. Pure local read: no connection
+        needed, only the state dir's mailbox.db. ``conversation`` is
+        a peer username (DM), "group:<id>" or "channel:<id>";
+        ``unread_only`` keeps only items never taken in."""
+        mb = self._local_mailbox()
+        if mb is None:
+            return []
+        return mb.inbox(limit=limit, before_ts=before_ts,
+                        conversation=conversation,
+                        unread_only=unread_only)
+
+    def history(self, limit: int = 50, unread_only: bool = False,
+                conversation: str | None = None,
+                before_ts: int | None = None) -> list[dict]:
+        """The agent's conversation history — the same canonical
+        mailbox inbox() reads (the line backfills it via
+        sync_history, live delivery journals into it), under the
+        name an agent naturally asks for."""
+        return self.inbox(limit=limit, unread_only=unread_only,
+                          conversation=conversation,
+                          before_ts=before_ts)
+
+    async def _replay_mailbox(self) -> None:
+        """Replay journaled-but-not-taken-in items to the
+        intelligence, oldest first, through the SAME take-in tail
+        live messages use. An item whose take-in fails through the
+        decision link stays taken=0 and replays again next start.
+        Sealed stubs (history rows that could not be decrypted) are
+        journal records, not deliverable content — they stay
+        journaled for a future start that holds the key, and are
+        upgraded in place if the real item ever arrives live."""
+        mb = self.mailbox
+        if mb is None:
+            return
+        for msg in mb.pending_takein():
+            mid = msg.get("id")
+            if not mid or mid in self._takein_inflight:
+                continue
+            if msg.get("sealed"):
+                continue
+            self._takein_inflight.add(str(mid))
+            try:
+                if not any(m.get("id") == mid for m in self.messages):
+                    self.messages.append(msg)
+                await self._dispatch_message_tail(msg)
+            except Exception:
+                log.exception("mailbox replay of %s failed", mid)
+                self._takein_inflight.discard(str(mid))
+
+    async def _dispatch_message_tail(self, msg: dict) -> None:
+        """The take-in tail of message processing, shared verbatim
+        by the live path (_process_message) and the mailbox replay:
+        reply waiters, mention/urgent side handlers, then the ONE
+        take-in decision — the registered message handler, or the
+        autonomous runtime when no handler is registered.
+
+        Take-in marking (mailbox + read receipt) happens at exactly
+        the points it always has: handler invocation here, and —
+        for the autonomous path — inside _auto_consider_message at
+        its existing _queue_read point, so a DecisionLinkError
+        (which returns before that point) never marks an item
+        taken. The caller owns the _takein_inflight claim for
+        ``msg``; the tail releases it unless the autonomous task
+        inherits it."""
+        mid = msg.get("id")
+        waiter = self._reply_waiters.pop(msg["in_reply_to"], None) \
+            if msg.get("in_reply_to") else None
+        if waiter is not None and not waiter.done():
+            waiter.set_result(msg)
+        mentions = msg["mentions"]
+        if self.username in mentions or \
+                ("all" in mentions and msg["group_id"]):
+            self.mention_inbox_items.append(msg)
+            if self._mention_handler is not None:
+                asyncio.create_task(self._run_simple_handler(
+                    self._mention_handler, msg))
+        if msg["priority"] == "urgent" and self._urgent_handler is not None:
+            asyncio.create_task(self._run_simple_handler(
+                self._urgent_handler, msg))
+        if self._message_handler is not None:
+            asyncio.create_task(self._run_message_handler(
+                self._message_handler, msg))
+            if msg.get("from") != self.username:
+                # The message has been taken in by the registered
+                # handler: mark it taken in the durable mailbox at
+                # the same point the read receipt has always been
+                # queued — the receipt is now backed by the journal.
+                self._mailbox_mark_taken(mid)
+                if self.auto_read:
+                    self._queue_read(mid)
+            if mid:
+                self._takein_inflight.discard(str(mid))
+        elif self._autonomous_on():
+            # Autonomous runtime (v1.1.7): no owner-registered message
+            # handler, so the unattended loop considers the message.
+            # Manual mode never reaches here, and a registered
+            # on_message handler always takes precedence — the
+            # agent's own code receiving its events IS its decision
+            # link for this surface. The take-in claim rides the
+            # consideration task: it is released only when the
+            # consideration ends (taken marked inside, at the
+            # decision-backed read point).
+            asyncio.create_task(self._auto_consider_claimed(msg))
+        else:
+            # No handler, not autonomous: nothing took the item in.
+            # It stays journaled taken=0 and replays on a later
+            # start that does have a taker.
+            if mid:
+                self._takein_inflight.discard(str(mid))
+
+    async def _auto_consider_claimed(self, msg: dict) -> None:
+        try:
+            await self._auto_consider_message(msg)
+        finally:
+            if msg.get("id"):
+                self._takein_inflight.discard(str(msg["id"]))
+
+    # -- history sync (v1.3.7): the line backfills the mailbox --------
+    async def sync_history(self) -> dict:
+        """Page the relay's history for everything the line holds
+        for me (audit content rows, newest page first, walking
+        backwards by seq) and journal it into the local mailbox.
+        Rows I sent enter taken=1; rows addressed to me enter
+        taken=0 and replay into the intelligence. A row whose
+        envelope cannot be opened here is journaled as a sealed
+        stub — a row is never dropped silently. Returns
+        {"fetched", "inserted", "pages"} (plus "error" when the
+        relay could not be asked — the sync is resumable by simply
+        calling it again, and start() calls it on every connect)."""
+        out = {"fetched": 0, "inserted": 0, "pages": 0}
+        mb = self.mailbox
+        if mb is None or self._ws is None:
+            return out
+        from . import timing as _timing
+        page_size = int(getattr(_timing, "DELIVERY_HISTORY_PAGE", 200)
+                        or 200)
+        before: int | None = None
+        smallest: int | None = None
+        while True:
+            frame: dict = {"type": "history", "limit": page_size}
+            if before is not None:
+                frame["before_seq"] = before
+            try:
+                data = await self._request(frame, timeout=30)
+            except Exception as exc:
+                log.warning("history sync stopped: %s", exc)
+                out["error"] = str(exc)
+                return out
+            rows = data.get("rows") or []
+            out["pages"] += 1
+            out["fetched"] += len(rows)
+            for row in rows:
+                seq = row.get("seq")
+                if isinstance(seq, (int, float)):
+                    smallest = int(seq) if smallest is None else min(
+                        smallest, int(seq))
+                msg = self._history_row_to_msg(row)
+                if msg is None or not msg.get("id"):
+                    continue
+                if mb.put_if_absent(msg):
+                    out["inserted"] += 1
+            if len(rows) < page_size or smallest is None:
+                break  # short page = the beginning of history
+            if before is not None and smallest >= before:
+                break  # no progress — never spin
+            before = smallest
+        return out
+
+    def _history_row_to_msg(self, row: dict) -> dict | None:
+        """Convert one relay history (audit) row into the msg dict
+        handlers see, opening its content envelope with the same
+        keys the live path uses: the identity for DMs, the stored
+        group/channel key for group/channel rows. Any failure — no
+        envelope persisted, no key held, undecryptable — yields a
+        sealed stub carrying the row's metadata, never silence."""
+        kind = str(row.get("kind") or "")
+        ref = row.get("ref_id") or row.get("work_id") or ""
+        if not ref:
+            return None
+        group_id = row.get("group_id") or None
+        channel_id = row.get("channel_id") or None
+        if kind == "channel_message":
+            # Channel audit rows carry the channel id in group_id
+            # (the store's shape) unless the row spells it out.
+            channel_id = channel_id or group_id
+            group_id = None
+        elif kind != "group_message":
+            group_id = None
+        sender = row.get("from")
+        target = row.get("to")
+        if channel_id:
+            to = channel_id
+        elif group_id:
+            to = group_id
+        else:
+            to = target or self.username
+        msg = {
+            "id": ref,
+            "from": sender,
+            "from_name": row.get("from_name") or sender,
+            "sender_nickname": row.get("sender_nickname") or "",
+            "sender_role": row.get("sender_role") or "",
+            "sender_custom_role": row.get("sender_custom_role") or "",
+            "to": to,
+            "group_id": group_id,
+            "group_name": row.get("group_name"),
+            "channel_id": channel_id,
+            "channel_name": row.get("channel_name"),
+            "priority": row.get("priority") or "normal",
+            "ts": row.get("ts"),
+            "time": row.get("ts"),
+            "kind": "text",
+            "body": "",
+            "meta": {},
+            "file": None,
+            "size": row.get("size") or 0,
+            "mentions": row.get("mentions") or [],
+            "in_reply_to": row.get("in_reply_to"),
+            "delivery_status": "history",
+            "queued": False,
+            "encrypted": True,
+        }
+        if kind.startswith("work"):
+            # Work rows are history records in the mailbox, never
+            # message replays (pending_takein excludes kind "work";
+            # the TaskJournal remains the work system of record).
+            msg["kind"] = "work"
+            msg["work_id"] = row.get("work_id") or ref
+            msg["sealed"] = True
+            return msg
+        envelope = None
+        for key in ("content", "content_envelope", "content_enc",
+                    "envelope"):
+            val = row.get(key)
+            if isinstance(val, dict) and val.get("ct"):
+                envelope = val
+                break
+        payload = None
+        if envelope is not None and self.identity is not None:
+            try:
+                if channel_id:
+                    rec = self._channel_keys.get(channel_id)
+                    if rec:
+                        payload = json.loads(decrypt_with_key(
+                            rec["key"], envelope))
+                elif group_id:
+                    rec = self._group_keys.get(group_id)
+                    if rec:
+                        payload = json.loads(decrypt_with_key(
+                            rec["key"], envelope))
+                else:
+                    payload = self._decrypt_obj(envelope)
+            except Exception:
+                payload = None
+        if payload is None:
+            msg["sealed"] = True
+            return msg
+        msg["body"] = payload.get("body", "")
+        msg["kind"] = payload.get("kind") or \
+            (payload.get("file") or {}).get("kind") or "text"
+        msg["meta"] = payload.get("meta") or {}
+        msg["file"] = payload.get("file")
+        msg["size"] = (payload.get("file") or {}).get(
+            "size", len(msg["body"]))
+        return msg
+
     # -- messages ---------------------------------------------------------------------------
     async def _ensure_group_key(self, gid: str) -> dict | None:
         rec = self._group_keys.get(gid)
@@ -2029,37 +2780,39 @@ class Agent:
             "queued": bool(frame.get("queued")),
             "encrypted": True,
         }
+        # CANONICAL MAILBOX (v1.3.7): journal BEFORE processing,
+        # ack only once the item is durable, and never reprocess a
+        # duplicate. The claim is taken synchronously — before the
+        # ack's await can yield — so a start-of-session replay
+        # racing this live delivery can never dispatch it twice.
+        mid = msg.get("id")
+        if mid and self.mailbox is not None:
+            if self.mailbox.put_if_absent(msg):
+                self._takein_inflight.add(str(mid))
+                await self._send_ack([mid])
+            else:
+                existing = self.mailbox.get(str(mid))
+                if existing and existing.get("sealed") \
+                        and not msg.get("sealed") \
+                        and not self.mailbox.taken_of(str(mid)):
+                    # A sealed history stub stood in for this item;
+                    # the real content has now arrived live and was
+                    # never taken in — upgrade the journal in place
+                    # and process the real item.
+                    self.mailbox.replace_msg(msg)
+                    self._takein_inflight.add(str(mid))
+                    await self._send_ack([mid])
+                else:
+                    # Duplicate delivery: already journaled. Re-ack
+                    # (the first ack may have been lost with the
+                    # socket that carried it) and stop — never
+                    # reprocess, never list twice.
+                    await self._send_ack([mid])
+                    return
+        elif mid:
+            self._takein_inflight.add(str(mid))
         self.messages.append(msg)
-        waiter = self._reply_waiters.pop(msg["in_reply_to"], None) \
-            if msg["in_reply_to"] else None
-        if waiter is not None and not waiter.done():
-            waiter.set_result(msg)
-        mentions = msg["mentions"]
-        if self.username in mentions or \
-                ("all" in mentions and msg["group_id"]):
-            self.mention_inbox_items.append(msg)
-            if self._mention_handler is not None:
-                asyncio.create_task(self._run_simple_handler(
-                    self._mention_handler, msg))
-        if msg["priority"] == "urgent" and self._urgent_handler is not None:
-            asyncio.create_task(self._run_simple_handler(
-                self._urgent_handler, msg))
-        if self._message_handler is not None:
-            asyncio.create_task(self._run_message_handler(
-                self._message_handler, msg))
-            if self.auto_read and msg.get("from") != self.username:
-                # The message has been taken in by the registered
-                # handler: report it read (batched with any burst
-                # siblings) — the operator's WhatsApp Seen state.
-                self._queue_read(msg.get("id"))
-        elif self._autonomous_on():
-            # Autonomous runtime (v1.1.7): no owner-registered message
-            # handler, so the unattended loop considers the message.
-            # Manual mode never reaches here, and a registered
-            # on_message handler always takes precedence — the
-            # agent's own code receiving its events IS its decision
-            # link for this surface.
-            asyncio.create_task(self._auto_consider_message(msg))
+        await self._dispatch_message_tail(msg)
 
     async def _run_message_handler(self, handler, msg: dict) -> None:
         # The handler invocation + the reply send are ONE critical
@@ -2409,9 +3162,16 @@ class Agent:
                 self._auto_log("decision_silent", conv, sender=sender)
                 return
             text = str(reply)
+            # The agent genuinely took this message in, through its
+            # decision link: mark it taken in the durable mailbox at
+            # the same point the read receipt has always fired.
+            # Every earlier exit — decision-link pending, loop caps,
+            # the agent's chosen silence, and above all a
+            # DecisionLinkError (the link failed; the agent never
+            # decided) — returns BEFORE this point, so none of them
+            # ever marks the item taken or read.
+            self._mailbox_mark_taken(msg.get("id"))
             if self.auto_read:
-                # The agent genuinely took this message in, through
-                # its decision link.
                 self._queue_read(msg.get("id"))
             if kind == "dm":
                 await self.send_message(
@@ -2780,7 +3540,27 @@ class Agent:
         ov = self._oversight_for_obj(obj)
         if ov:
             frame["oversight"] = ov
-        return await self._request(frame)
+        result = await self._request(frame)
+        self._mailbox_record_sent({
+            "id": result.get("id") or frame["id"], "from": self.username,
+            "to": u, "group_id": None, "channel_id": None,
+            "kind": kind, "body": body, "file": file,
+            "meta": dict(meta) if meta else {},
+            "mentions": frame["mentions"],
+            "in_reply_to": in_reply_to, "priority": priority,
+            "ts": int(time.time())})
+        return result
+
+    def _mailbox_record_sent(self, item: dict) -> None:
+        """Journal one of my OWN sent items (taken=1 at birth) so
+        the local mailbox is the complete history of the
+        conversation, not just its inbound half."""
+        if self.mailbox is None or not item.get("id"):
+            return
+        try:
+            self.mailbox.put_if_absent(item, taken=True)
+        except Exception:
+            log.exception("mailbox record of sent item failed")
 
     async def send_file(self, to: str, path: str, caption: str = "",
                         kind: str | None = None,
@@ -2825,7 +3605,16 @@ class Agent:
             ids = [str(m) for m in (message_ids or []) if m]
         if not ids:
             return {"read": [], "reads": []}
-        return await self._request({"type": "read", "ids": ids})
+        result = await self._request({"type": "read", "ids": ids})
+        # An explicit mark_read IS a take-in (the deferred runtime's
+        # own word for it): record it in the durable mailbox too, so
+        # the item does not replay on the next start.
+        if self.mailbox is not None:
+            try:
+                self.mailbox.mark_taken(ids)
+            except Exception:
+                log.exception("mailbox mark_taken failed")
+        return result
 
     def _pending_reads_path(self) -> Path:
         return Path(self.state_dir) / f"pending-reads-{self.username}.json"
@@ -3042,7 +3831,16 @@ class Agent:
         ov = self._oversight_for_key(rec["key"])
         if ov:
             frame["oversight"] = ov
-        return await self._request(frame)
+        result = await self._request(frame)
+        self._mailbox_record_sent({
+            "id": result.get("id") or frame["id"], "from": self.username,
+            "to": group_id, "group_id": group_id, "channel_id": None,
+            "kind": kind, "body": body, "file": file,
+            "meta": dict(meta) if meta else {},
+            "mentions": frame["mentions"],
+            "in_reply_to": in_reply_to, "priority": priority,
+            "ts": int(time.time())})
+        return result
 
     async def group_send_file(self, group_id: str, path: str,
                               caption: str = "", kind: str | None = None,
@@ -3131,11 +3929,64 @@ class Agent:
             log.exception("failed to decrypt work")
             return
         if assigned:
+            # AT-LEAST-ONCE CUSTODY (v1.3.7): a work_assigned frame
+            # has no ack-able id, so the relay re-offers it while it
+            # sits in custody — the same (id, attempt) may arrive
+            # more than once, live and across restarts. First sight
+            # wins; a re-offer is acknowledged by ignoring it.
+            wkey = (work.get("id"), int(work.get("attempt") or 1))
+            # BOOT DEFERRAL: while start() is still running (boot
+            # gate closed) and the journal already holds this work,
+            # the frame is a re-offer of a RESUMPTION candidate —
+            # journal/record it below, but do NOT claim the attempt
+            # or spawn a runner: the start() resume pass owns it and
+            # is the only path that runs the handler resumed=True
+            # with its checkpoint. (Live assignment while running —
+            # gate open — always takes the normal path.)
+            _boot_defer = bool(
+                work.get("id") and not self._boot_gate.is_set()
+                and self._journal is not None
+                and self._journal.get(work["id"]) is not None)
+            if work.get("id") and not _boot_defer:
+                if wkey in self._seen_work:
+                    return
+                self._seen_work.add(wkey)
             # JOURNAL FIRST (point 30): the assignment is durable on
             # this agent's disk before any handler acts on it.
             if self._journal is not None and work.get("id"):
                 self._journal.put(work)
+            # Mailbox first-sight record (v1.3.7): the assignment
+            # also lands in the canonical mailbox as kind="work", so
+            # the agent's one local history shows it arrived. The
+            # TaskJournal remains the work system of record — this
+            # record never replays as a message.
+            if self.mailbox is not None and work.get("id"):
+                try:
+                    self.mailbox.put_if_absent({
+                        "id": work["id"], "kind": "work",
+                        "from": work.get("assigner"),
+                        "to": self.username,
+                        "group_id": work.get("group_id"),
+                        "channel_id": None,
+                        "attempt": wkey[1],
+                        "ts": work.get("created_at")
+                        or int(time.time()),
+                        "title": work.get("title", ""),
+                        "status": work.get("status")})
+                except Exception:
+                    log.exception("mailbox work record failed")
+            # ACK BY WORK ID (v1.3.7): the assignment is now
+            # durably journaled — tell the relay, so custody can
+            # retire the frame instead of re-offering it forever
+            # (an unretirable frame would also count as an
+            # undelivered blocker, e.g. at deregister). The relay
+            # matches acked ids against the frames it holds for
+            # this agent, including work frames by their work id.
+            if work.get("id"):
+                await self._send_ack([work["id"]])
             self.assigned_work.append(work)
+            if _boot_defer:
+                return
             if self._work_handler is not None or self._autonomous_on():
                 asyncio.create_task(self._run_work(work, resumed=False))
         else:
@@ -3230,6 +4081,18 @@ class Agent:
             work["checkpoint"] = entry.get("checkpoint") if entry else None
             if work not in self.assigned_work:
                 self.assigned_work.append(work)
+            # Mark the attempt seen (a custody re-offer of the
+            # same work_assigned frame later in the session is a
+            # duplicate — see _process_work) but NEVER skip the
+            # resume spawn on that account: the resume pass is the
+            # only path that runs the handler with resumed=True
+            # and its checkpoint, and a frame that arrived during
+            # boot defers to it (see _process_work). If both paths
+            # do spawn, _run_work's own (id, attempt) guard admits
+            # exactly one runner.
+            if work.get("id"):
+                self._seen_work.add(
+                    (work["id"], int(work.get("attempt") or 1)))
             if self._work_handler is not None or self._autonomous_on():
                 asyncio.create_task(self._run_work(
                     work, resumed=work["checkpoint"] is not None))
@@ -3574,7 +4437,15 @@ class Agent:
         ov = self._oversight_for_key(rec["key"])
         if ov:
             frame["oversight"] = ov
-        return await self._request(frame)
+        result = await self._request(frame)
+        self._mailbox_record_sent({
+            "id": result.get("id") or frame["id"], "from": self.username,
+            "to": channel_id, "group_id": None, "channel_id": channel_id,
+            "kind": kind, "body": body, "file": file,
+            "meta": dict(meta) if meta else {},
+            "mentions": frame["mentions"], "in_reply_to": None,
+            "priority": priority, "ts": int(time.time())})
+        return result
 
     async def channel_send_file(self, channel_id: str, path: str,
                                 caption: str = "",
@@ -3809,6 +4680,7 @@ class Agent:
                  f"heartbeat-{self.username}.txt"]
         for suffix in ("", "-wal", "-shm"):
             names.append(f"tasks-{self.username}.db{suffix}")
+            names.append(f"mailbox.db{suffix}")
         for name in names:
             try:
                 (self.state_dir / name).unlink()
