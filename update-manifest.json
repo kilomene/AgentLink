@@ -1,7 +1,7 @@
 {
-  "version": "1.4.3",
+  "version": "1.4.4",
   "files": {
-    "agentlink/__init__.py": "ce057be8d680d4fe4d0e1a7dc1ca75af4f35b8e08a5d76c7d8f5a0968a13eb96",
+    "agentlink/__init__.py": "b3586ce3c0131f4c078526a2eabe7153fec82dffd801f9509499124b079c1141",
     "agentlink/__main__.py": "307299fda7b77d22c64cb51430ec75e5f59d78e9c948786afb3b2544fe45e4b7",
     "agentlink/alerts_local.py": "c08cd95bfaf6f4e5968e3b4cc85c49d74c0b5b54f66e6120235e38b4078ca82d",
     "agentlink/backend.py": "91a7ad63bdcbd3ddcf4c797b23bc6df06a508ea54eba37f370fdc6f609844068",
@@ -17,7 +17,7 @@
     "agentlink/mailbox.py": "5b811c0cb37b1054ac3cd567ddb14be6c9d2edd665f03e0ca4b995c758b7752c",
     "agentlink/media.py": "fdf5cef33872b824f71e33e2c9c5ad4716288b5f5e5fa8feb85bbff15fdf8ef9",
     "agentlink/protocol.py": "2531af63996a48a385cff633bc9cd2ee8cf8af8799376132f92ee3276bb1afc2",
-    "agentlink/relay.py": "3257ed902ab5d9639b26d713d2854465aebed89aca50265732724fc261c35a69",
+    "agentlink/relay.py": "8ef5b88ffd62bb78a0d6dffd8c99c3173b742495a94232b00fba126c90e74bb0",
     "agentlink/store.py": "ae37a905160ba80a67b5df130c12570f74c6dbbf5d2db57eb6c3352d16afcc46",
     "agentlink/supabase_store.py": "ecae6d7f0236b65fd66db2435acaf706c5d8526b80314448135b2dbb96eb7b8b",
     "agentlink/timing.py": "1cc60322136f06d708997e2c4f85499bd87b1d09c2e622d5ffce5c53d2aec142",
