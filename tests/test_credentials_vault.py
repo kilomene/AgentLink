@@ -305,7 +305,8 @@ def test_supabase_store_vault_meta_parity_and_failsoft():
     assert store.set_vault_meta("valice", "LBL", "b-1", 3, 2)
     meta = store.get_vault_meta("valice")
     assert meta == {"labels": "LBL", "blob_id": "b-1",
-                    "version": 3, "entries": 2}
+                    "version": 3, "entries": 2,
+                    "content": ""}  # v1.5.0: the content envelope key
     assert not store.set_vault_meta("valice", "LBL", "b-old", 2, 9)
     assert store.get_vault_meta("valice")["blob_id"] == "b-1"
 
@@ -326,8 +327,20 @@ def _oversight_env(tmp_path, monkeypatch):
     return okey
 
 
-def test_sync_dashboard_labels_and_no_password(tmp_path, state_root,
-                                               monkeypatch):
+def test_sync_dashboard_labels_and_owner_content(tmp_path,
+                                                 state_root,
+                                                 monkeypatch):
+    """REDESIGNED in v1.5.0 (owner's ruling superseded the v1.4.0
+    labels-only design — this test was
+    test_sync_dashboard_labels_and_no_password): the owner's
+    dashboard now shows FULL entry content, sealed to oversight
+    and opened only inside his authenticated session. The pin's
+    shape inverts accordingly: the secret is present BYTE-EXACT
+    inside THIS agent's vault.content in the owner payload, and
+    absent everywhere else — the labels, every other user's
+    payload section, the payload composed without the oversight
+    key, the store rows, the synced blob, and the relay DB file
+    (which holds only the sealed envelopes)."""
     okey = _oversight_env(tmp_path, monkeypatch)
     db = str(tmp_path / "relay.db")
     h = RelayHandle(db, "vault-home",
@@ -338,12 +351,19 @@ def test_sync_dashboard_labels_and_no_password(tmp_path, state_root,
         a = Agent("valice", endpoint=url,
                   state_dir=str(state_root / "valice"),
                   oversight_pubkey=okey.public_key_b64)
+        b = Agent("vmallory", endpoint=url,
+                  state_dir=str(state_root / "vmallory"),
+                  oversight_pubkey=okey.public_key_b64)
         await a.start()
+        await b.start()
         try:
             entry = await a.vault.remember(
                 "Example Mail", "valice@example.com", PASSWORD,
-                notes=NOTES)
-            assert entry["id"]
+                notes=NOTES, auth_type="api_key")
+            assert entry["id"] and entry["auth_type"] == "api_key"
+            await b.vault.remember(
+                "Other Service", "vmallory@example.com",
+                "mallory-secret-999")
             # The pointer landed in the store.
             meta = h.relay.store.get_vault_meta("valice")
             assert meta and meta["blob_id"]
@@ -353,6 +373,12 @@ def test_sync_dashboard_labels_and_no_password(tmp_path, state_root,
             assert "Example Mail" not in meta["labels"]
             assert "valice@example.com" not in meta["labels"]
             assert PASSWORD not in meta["labels"]
+            # The stored CONTENT envelope is sealed too: no
+            # plaintext secret or notes in the store's copy.
+            assert meta["content"]
+            assert PASSWORD not in meta["content"]
+            assert NOTES not in meta["content"]
+            assert "api_key" not in meta["content"]
             # The synced blob itself is sealed end to end.
             import base64 as _b64
             resp = await a._request(
@@ -366,11 +392,11 @@ def test_sync_dashboard_labels_and_no_password(tmp_path, state_root,
             return meta
         finally:
             await a.close()
+            await b.close()
 
     run(_t())
     # Dashboard payload (owner session, oversight key loaded):
-    # presence + count + opened labels; password byte-absent from
-    # the ENTIRE payload.
+    # presence + count + opened labels + opened FULL content.
     dash = DashboardServer(h.relay, "127.0.0.1", 0, "test")
     data = dash._serve_data()
     users = {u["username"]: u for u in data["users"]}
@@ -378,12 +404,31 @@ def test_sync_dashboard_labels_and_no_password(tmp_path, state_root,
     assert v["present"] is True and v["entries"] == 1
     assert v["labels"] and v["labels"][0]["service"] == "Example Mail"
     assert v["labels"][0]["username"] == "valice@example.com"
-    assert "labels_sealed" not in v
-    assert PASSWORD not in json.dumps(data)
-    assert NOTES not in json.dumps(data)
+    assert "labels_sealed" not in v and "content_sealed" not in v
+    content = v["content"]
+    assert content and len(content) == 1
+    e = content[0]
+    assert e["service"] == "Example Mail"
+    assert e["username"] == "valice@example.com"
+    assert e["auth_type"] == "api_key"
+    assert e["password"] == PASSWORD  # byte-exact, owner session only
+    assert e["notes"] == NOTES
+    # The secret lives ONLY in valice's content: not in her labels,
+    # not anywhere in any other user's payload section.
+    assert PASSWORD not in json.dumps(v["labels"])
+    for name, u in users.items():
+        if name != "valice":
+            assert PASSWORD not in json.dumps(u), name
+            assert NOTES not in json.dumps(u), name
+    # And mallory's secret lives only in mallory's content.
+    mv = users["vmallory"]["vault"]
+    assert mv["content"][0]["password"] == "mallory-secret-999"
+    assert "mallory-secret-999" not in json.dumps(
+        {k: val for k, val in users.items() if k != "vmallory"})
     h.stop()
-    # Without the oversight key the labels stay sealed (None) but
-    # presence/count remain factual.
+    # Without the oversight key the content AND labels stay sealed
+    # (None) — and the secret is absent from the ENTIRE payload —
+    # while presence/count remain factual.
     monkeypatch.delenv("AGENTLINK_OVERSIGHT_KEY_FILE")
     h2 = RelayHandle(db, "vault-nokey")
     h2.start()
@@ -391,8 +436,9 @@ def test_sync_dashboard_labels_and_no_password(tmp_path, state_root,
     data2 = dash2._serve_data()
     v2 = {u["username"]: u for u in data2["users"]}["valice"]["vault"]
     assert v2["present"] is True and v2["entries"] == 1
-    assert v2["labels"] is None
+    assert v2["labels"] is None and v2["content"] is None
     assert PASSWORD not in json.dumps(data2)
+    assert "mallory-secret-999" not in json.dumps(data2)
     h2.stop()
 
 
@@ -555,6 +601,25 @@ def test_cli_credentials_roundtrip(tmp_path, state_root):
     got = json.loads(out)
     assert got["password"] == PASSWORD
     assert got["username"] == "vcli@example.com"
+    assert got["auth_type"] == "password"  # the default (v1.5.0)
+    # auth_type rides the CLI too (v1.5.0): an API-key entry.
+    out = cli("credentials", "put", "Key Service",
+              "vcli@example.com", "sk-test-key-123",
+              "--auth-type", "api_key",
+              "--username", "vcli", "--state-dir", sd,
+              "--endpoint", url)
+    key_entry = json.loads(out)
+    assert key_entry["auth_type"] == "api_key"
+    out = cli("credentials", "get", "Key Service",
+              "--username", "vcli", "--state-dir", sd,
+              "--endpoint", url)
+    got = json.loads(out)
+    assert got["auth_type"] == "api_key"
+    assert got["password"] == "sk-test-key-123"
+    out = cli("credentials", "remove", key_entry["id"],
+              "--username", "vcli", "--state-dir", sd,
+              "--endpoint", url)
+    assert json.loads(out)["id"] == key_entry["id"]
     out = cli("credentials", "remove", entry["id"],
               "--username", "vcli", "--state-dir", sd,
               "--endpoint", url)
@@ -650,6 +715,85 @@ def test_vault_remove_all_not_resurrected_by_stale_sync(tmp_path,
             await agent.close()
 
     run(_t())
+    h.stop()
+
+
+def test_auth_type_roundtrip_and_legacy_default(tmp_path,
+                                                state_root):
+    """v1.5.0: entries carry an auth_type (password | api_key |
+    token | other). It round-trips byte-exact through put/get and
+    the restart persistence path; the default is "password"; an
+    unknown type is refused; and a PRE-1.5.0 entry (its sealed
+    plaintext has no auth_type field at all) reads as "password" —
+    backwards compatibility for every vault already saved."""
+    from agentlink.vault import VaultError
+    sd = state_root / "vtypes"
+    core = _core(sd, "vtypes")
+    for t in ("password", "api_key", "token", "other"):
+        e = core.put(f"svc-{t}", "a@x.io", f"secret-{t}",
+                     auth_type=t)
+        assert e["auth_type"] == t
+        assert core.get(e["id"])["auth_type"] == t
+    e = core.put("svc-default", "a@x.io", "secret-default")
+    assert e["auth_type"] == "password"
+    with pytest.raises(VaultError):
+        core.put("svc-bad", "a@x.io", "x", auth_type="fingerprint")
+    # Restart persistence keeps the types.
+    core2 = _core(sd, "vtypes")
+    assert core2.get("svc-api_key")["auth_type"] == "api_key"
+    # Legacy plaintext (no auth_type field) reads as "password".
+    legacy_plain = {"service": "Legacy", "username": "old@x.io",
+                    "password": "legacy-secret", "notes": "",
+                    "created_at": 111, "updated_at": 222}
+    rec = {"id": "cred-legacy1", "created_at": 111,
+           "updated_at": 222,
+           "content": core._identity.encrypt_for(
+               core._identity.public_key_b64,
+               json.dumps(legacy_plain).encode())}
+    opened = core._open_entry(rec)
+    assert opened["auth_type"] == "password"
+    assert opened["password"] == "legacy-secret"
+
+
+def test_content_envelope_removal_converges(tmp_path, state_root,
+                                            monkeypatch):
+    """v1.5.0: removing an entry cleans the owner-visible content
+    too — after the remove publishes, the store's content envelope
+    opens (under the test oversight key) to an EMPTY entry list,
+    and the dashboard composes content == [] for the agent."""
+    okey = _oversight_env(tmp_path, monkeypatch)
+    db = str(tmp_path / "relay.db")
+    h = RelayHandle(db, "vault-conv",
+                    oversight_pubkey=okey.public_key_b64)
+    url = h.start()
+
+    async def _t():
+        a = Agent("vconv", endpoint=url,
+                  state_dir=str(state_root / "vconv"),
+                  oversight_pubkey=okey.public_key_b64)
+        await a.start()
+        try:
+            e = await a.vault.put("svc", "a@x.io", "pw-conv")
+            meta = h.relay.store.get_vault_meta("vconv")
+            payload = json.loads(okey.decrypt_envelope(
+                json.loads(meta["content"])))
+            assert payload["kind"] == "vault_content"
+            assert payload["entries"][0]["password"] == "pw-conv"
+            await a.vault.remove(e["id"])
+            meta = h.relay.store.get_vault_meta("vconv")
+            assert meta["entries"] == 0
+            payload = json.loads(okey.decrypt_envelope(
+                json.loads(meta["content"])))
+            assert payload["entries"] == []
+        finally:
+            await a.close()
+
+    run(_t())
+    dash = DashboardServer(h.relay, "127.0.0.1", 0, "test")
+    data = dash._serve_data()
+    v = {u["username"]: u for u in data["users"]}["vconv"]["vault"]
+    assert v["present"] is True and v["entries"] == 0
+    assert v["content"] == []
     h.stop()
 
 
