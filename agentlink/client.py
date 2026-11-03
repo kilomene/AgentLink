@@ -683,6 +683,7 @@ class Agent:
         self._legacy_auth_endpoints: set[str] = set()
         self._ws = None
         self._reader: asyncio.Task | None = None
+        self._ping_task: asyncio.Task | None = None
         self._message_handler = None
         self._read_handler = None
         self._work_handler = None
@@ -2056,6 +2057,18 @@ class Agent:
                          self.username, frame.get("queued", 0))
                 self._warn_if_unlinked()
                 self._reader = asyncio.create_task(self._read_loop())
+                # The heartbeat belongs to the CONNECTION, not to
+                # run()'s supervision bundle (v1.4.3): a start()-only
+                # client (one-shot SDK embeddings, the CLI, tools)
+                # previously never pinged, so its shared last_seen
+                # froze at the hello and every brother relay read
+                # it OFFLINE after the 15s grace while it was
+                # connected and active — cross-server room signals
+                # addressed to it failed peer_offline (the v1.4.2
+                # production room proof caught exactly this).
+                if self._ping_task is None or self._ping_task.done():
+                    self._ping_task = asyncio.create_task(
+                        self._ping_loop())
                 # Owner-seat control channel (v1.3.9): once the
                 # reader is live, the lock holder starts serving
                 # forwarded one-shot commands (send / group add).
@@ -2152,6 +2165,27 @@ class Agent:
         except websockets.exceptions.ConnectionClosed:
             pass
 
+    async def _ping_loop(self) -> None:
+        """The connection's heartbeat (v1.4.3 — owned by start(),
+        not by run()): a ping every HEARTBEAT_SECONDS for as long
+        as the connection lives, plus the last-alive stamp the
+        watchdog reads (a stale stamp = a hung process = death).
+        Presence derives from these pings on every relay, so they
+        must flow for EVERY connected client — daemon or one-shot
+        embedding alike. A send failure ends the loop; the reader
+        owns disconnect handling and a reconnect re-spawns it."""
+        stamp = self.state_dir / f"heartbeat-{self.username}.txt"
+        while True:
+            await asyncio.sleep(HEARTBEAT_SECONDS)
+            try:
+                if self._ws is not None:
+                    await self._send_raw({
+                        "type": "ping",
+                        "activity": self._activity_state()})
+                stamp.write_text(str(int(time.time())))
+            except Exception:
+                return
+
     async def close(self) -> None:
         # Owner-seat control channel (v1.3.9): stop serving
         # forwarded commands before the socket and lock go away.
@@ -2177,6 +2211,9 @@ class Agent:
         if self._reader is not None:
             self._reader.cancel()
             self._reader = None
+        if self._ping_task is not None:
+            self._ping_task.cancel()
+            self._ping_task = None
         if self._ws is not None:
             try:
                 await self._ws.close()
@@ -2439,9 +2476,11 @@ class Agent:
 
     async def run(self, reconnect_delay: float = 2.0,
                   home_probe_interval: float = HOME_PROBE_SECONDS) -> None:
-        """Always online. Heartbeat: a ping every 5 seconds, on its own
-        task, independent of the message/work loop — it never stops
-        while the daemon lives, and presence derives from it.
+        """Always online. Heartbeat: a ping every 5 seconds, owned
+        by the CONNECTION (start() spawns it — see _ping_loop,
+        v1.4.3), independent of the message/work loop — it never
+        stops while the client is connected, and presence derives
+        from it.
 
         Failover: home is tried first on every cycle. Fallbacks are
         ridden only while home is unavailable; a home-probe task checks
@@ -2450,21 +2489,6 @@ class Agent:
         answers. Because relays share one backend, queued messages and
         work follow the agent — nothing is lost or duplicated.
         """
-        async def _heartbeat():
-            stamp = self.state_dir / f"heartbeat-{self.username}.txt"
-            while True:
-                await asyncio.sleep(HEARTBEAT_SECONDS)
-                try:
-                    if self._ws is not None:
-                        await self._send_raw({
-                            "type": "ping",
-                            "activity": self._activity_state()})
-                    # Last-alive stamp (point 39d): the watchdog treats
-                    # a stale stamp exactly like a crash — hang = death.
-                    stamp.write_text(str(int(__import__("time").time())))
-                except Exception:
-                    return
-
         async def _home_probe():
             while True:
                 await asyncio.sleep(min(home_probe_interval,
@@ -2594,7 +2618,6 @@ class Agent:
                 continue
             self.connection_state = "connected"
             self._net_fingerprint = network_fingerprint()
-            beats = asyncio.create_task(_heartbeat())
             probe = asyncio.create_task(_home_probe())
             heal = asyncio.create_task(self._self_heal_loop())
             watch = asyncio.create_task(_network_watch())
@@ -2602,7 +2625,6 @@ class Agent:
             try:
                 await self.serve()
             finally:
-                beats.cancel()
                 probe.cancel()
                 heal.cancel()
                 watch.cancel()
