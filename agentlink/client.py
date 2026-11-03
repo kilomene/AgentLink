@@ -108,6 +108,7 @@ from .protocol import (
     normalize_username,
     verify_file,
 )
+from .vault import CredentialsVault, VaultAccess, VaultError
 
 log = logging.getLogger("agentlink.client")
 
@@ -602,6 +603,16 @@ class Agent:
         self._oversight_configured = resolve_oversight_pubkey(
             oversight_pubkey)
         self.oversight_pubkey = self._oversight_configured
+        # Credentials vault (v1.4.0): the agent's OWN vault, sealed
+        # to its identity key — see agentlink/vault.py. Opened
+        # lazily on first use (an ephemeral dial client raises a
+        # clear VaultError instead); the facade itself is inert.
+        # `agent.vault` was free (the shipped group vault is the
+        # vault_put/vault_list/vault_pin/vault_remove METHODS —
+        # untouched by this namespace).
+        self._cred_vault: CredentialsVault | None = None
+        self._vault_blob_id: str | None = None
+        self.vault = VaultAccess(self)
         self.endpoint = resolve_endpoint(endpoint)
         # Failover, own server first: home (self.endpoint) is always
         # tried first; fallbacks are only ridden while home is down,
@@ -1097,6 +1108,25 @@ class Agent:
                 result = await self.group_add(
                     str(spec["group_id"]),
                     [str(m) for m in (spec.get("members") or [])])
+            elif cmd == "vault_put":
+                # Credentials vault (v1.4.0): the operator-side CLI
+                # reaches the RUNNING daemon's own vault through
+                # this channel — same user, socket 0600, per-boot
+                # token. The password crosses only inside the
+                # agent's own trust boundary, exactly like a send
+                # crosses with its body.
+                result = await self.vault.put(
+                    str(spec["service"]), str(spec["username"]),
+                    str(spec["password"]),
+                    notes=str(spec.get("notes") or ""))
+            elif cmd == "vault_get":
+                result = await self.vault.get(
+                    str(spec["service_or_id"]))
+            elif cmd == "vault_list":
+                result = {"entries": await self.vault.list()}
+            elif cmd == "vault_remove":
+                result = await self.vault.remove(
+                    str(spec["entry_id"]))
             else:
                 raise ValueError(f"unknown control command {cmd!r}")
             writer.write((json.dumps(
@@ -1117,6 +1147,176 @@ class Agent:
                 writer.close()
             except Exception:
                 pass
+
+    # -- credentials vault (v1.4.0) -----------------------------------------
+    #
+    # The agent's OWN vault (agentlink/vault.py): entries sealed to
+    # the identity key, the signed document in the state dir, synced
+    # as a sealed blob so the vault follows the agent when its
+    # server is carried. Possession of the identity key IS the
+    # permission — nothing in this section asks anyone anything.
+
+    def _credentials_vault(self) -> CredentialsVault:
+        """The lazily-opened local vault core. Raises VaultError for
+        an ephemeral identity (no state dir, no vault — a loud,
+        honest refusal rather than an in-memory pretend vault)."""
+        if self._cred_vault is None:
+            if self.identity is None or self.username is None:
+                raise VaultError(
+                    "no identity loaded — the vault opens only "
+                    "with the agent's own identity")
+            vault = CredentialsVault(self.identity, self.state_dir,
+                                    self.username)
+            if vault.load_error:
+                log.warning("credentials vault: %s", vault.load_error)
+                try:
+                    self._pending_repairs.append(
+                        f"credentials-vault: {vault.load_error}")
+                except Exception:
+                    pass
+            self._cred_vault = vault
+        return self._cred_vault
+
+    async def vault_remember(self, service: str, username: str,
+                             password: str, notes: str = "") -> dict:
+        """THE auto-save path (owner's order): the one call an agent
+        — or its account-creation helper — makes the moment it
+        creates an account, so the login (service, account email /
+        username, password) lands in its own vault automatically.
+        No permission, no prompt. Flat alias of
+        ``agent.vault.remember(...)``; returns the saved entry."""
+        return await self.vault.remember(service, username, password,
+                                         notes)
+
+    async def _vault_publish(self) -> None:
+        """Upload the current vault document through the blob layer
+        and publish its pointer + oversight-sealed labels. The old
+        document blob is retired once the new pointer lands. A
+        stale-revision refusal is logged loudly — the local vault
+        stays authoritative locally either way."""
+        core = self._credentials_vault()
+        data = core.document_bytes()
+        if len(data) <= self.blob_chunk_threshold:
+            resp = await self._request({
+                "type": "blob_put",
+                "data_b64": base64.b64encode(data).decode(),
+                "for_user": self.username})
+            blob_id = resp["blob_id"]
+        else:
+            blob_id = await self.upload_blob(data,
+                                             for_user=self.username)
+        old_blob = self._vault_blob_id
+        result = await self._request({
+            "type": "vault_publish",
+            "labels": core.labels_envelope(self.oversight_pubkey),
+            "blob_id": blob_id,
+            "version": core.revision,
+            "entry_count": len(core)})
+        self._vault_blob_id = blob_id
+        if not result.get("accepted", True):
+            log.warning(
+                "credentials vault publish refused as stale "
+                "(local rev %s, relay rev %s) — another live writer "
+                "holds a newer vault; local copy untouched",
+                core.revision, result.get("version"))
+        if old_blob and old_blob != blob_id:
+            try:
+                await self.blob_delete(old_blob)
+            except Exception:
+                log.debug("retiring superseded vault blob failed",
+                          exc_info=True)
+
+    async def _vault_sync_after_mutation(self) -> None:
+        """Publish after a put/remove when connected. The local save
+        already happened — sync is replication, never a gate — so a
+        failure here is logged and retried on the next connect,
+        never raised into the caller's operation."""
+        if self._ws is None:
+            return
+        try:
+            await self._vault_publish()
+        except Exception:
+            log.exception(
+                "credentials vault publish failed; the local vault "
+                "is saved and sync retries on the next connect")
+
+    async def _vault_restore_from_sync(self) -> bool:
+        """Fetch the synced vault document through the blob layer
+        and adopt it (signature-verified under THIS identity — a
+        foreign or tampered document is refused by construction).
+        Returns True when a document was adopted."""
+        meta = await self._request({"type": "vault_fetch_meta"})
+        if not meta.get("present") or not meta.get("blob_id"):
+            return False
+        resp = await self._request(
+            {"type": "blob_get", "blob_id": meta["blob_id"]},
+            timeout=120)
+        core = self._credentials_vault()
+        count = core.adopt_document(
+            base64.b64decode(resp["data_b64"]))
+        self._vault_blob_id = meta["blob_id"]
+        log.info("credentials vault restored from sync: %d entries "
+                 "(revision %s)", count, core.revision)
+        return True
+
+    async def _vault_sync_guarded(self) -> None:
+        """The connect-time vault sync as a post-boot task (see the
+        scheduling note in start()): failures are caught and logged
+        here at warning level — the expected case is a relay dying
+        mid-drill under the task (the same event the mailbox sync
+        logs as 'history sync stopped'), and the sync retries on
+        the next connect; the local vault is never at risk."""
+        try:
+            await self._vault_sync_on_connect()
+        except Exception as exc:
+            log.warning("credentials vault sync stopped: %s", exc)
+
+    async def _vault_sync_on_connect(self) -> None:
+        """Connect-time vault reconciliation (start() calls this
+        guarded — a failure can never dark the line):
+        * a local vault (or a quarantined local document) publishes,
+          so the pointer follows the agent onto any server it rides;
+        * no local vault but a synced pointer exists → restore
+          (the carried path: same identity, new machine, vault
+          opens);
+        * nothing anywhere → nothing (a fresh agent's vault is
+          simply absent until its first save)."""
+        core = self._credentials_vault()
+        if len(core) > 0 or core.load_error:
+            if len(core) > 0:
+                await self._vault_publish()
+            else:
+                # Quarantined local file: never publish emptiness
+                # over a synced vault — restore instead.
+                await self._vault_restore_from_sync()
+            return
+        await self._vault_restore_from_sync()
+
+    def _vault_decision_get(self, service_or_id):
+        """The synchronous vault accessor handed to the agent's own
+        decision-making in the serve-loop context: the full entry
+        (password included) or None. Local reads only — the agent
+        opening its own vault needs no line and no permission."""
+        try:
+            return self._credentials_vault().get(str(service_or_id))
+        except Exception:
+            return None
+
+    def _vault_ctx_fields(self) -> dict:
+        """The decision-context vault fields: a JSON-safe summary
+        (availability + entry count — never entry content) plus the
+        callable accessor (stripped before the endpoint payload,
+        like report_progress)."""
+        available = False
+        entries = 0
+        try:
+            core = self._credentials_vault()
+            available = True
+            entries = len(core)
+        except Exception:
+            pass
+        return {"vault": {"available": available, "entries": entries},
+                "vault_get": self._vault_decision_get}
 
     async def _stop_control_server(self) -> None:
         if self._control_server is not None:
@@ -1873,6 +2073,22 @@ class Agent:
                         await self._replay_mailbox()
                     except Exception:
                         log.exception("mailbox replay failed")
+                # CREDENTIALS VAULT (v1.4.0), on every (re)connect:
+                # scheduled, NOT awaited inline. Vault sync is
+                # replication, never a gate — the local vault is
+                # authoritative — and the boot sequence above keeps
+                # its exact shape: an inline round-trip here
+                # measurably perturbs the live-flush / mailbox
+                # replay interleave the delivery guarantee is
+                # tuned around (a queued urgent message's handler
+                # fired twice inside one poll window when the sync
+                # sat inline; the sync as a post-boot task leaves
+                # the boot interleave untouched). The task is
+                # guarded like the passes above: a sync failure can
+                # never dark the line and retries on the next
+                # connect.
+                if not self.ephemeral:
+                    asyncio.create_task(self._vault_sync_guarded())
                 return self.username
             if frame.get("type") == "error":
                 if _key_auth and _saved_secret and \
@@ -3365,12 +3581,15 @@ class Agent:
         work, the reply may also carry "progress": [{"percent": n,
         "note": str}] entries, which this client reports through
         the normal progress path before acting on the result —
-        progress is the one ctx member that cannot cross HTTP as a
-        callable, so it travels as data instead. Config-only for
-        the agent product: expose the endpoint; no SDK code changes
-        are needed on its side."""
+        progress is one ctx member that cannot cross HTTP as a
+        callable, so it travels as data instead; the vault_get
+        accessor is the other (the JSON-safe vault SUMMARY crosses;
+        an endpoint-flavour agent opens the same state-dir vault
+        through the SDK's CredentialsVault class directly).
+        Config-only for the agent product: expose the endpoint; no
+        SDK code changes are needed on its side."""
         payload = {k: v for k, v in ctx.items()
-                   if k != "report_progress"}
+                   if k not in ("report_progress", "vault_get")}
         url = self.decision_endpoint
         timeout = DECISION_LINK_TIMEOUT_SECONDS
 
@@ -3492,6 +3711,11 @@ class Agent:
                            "display_name": msg.get("from_name")},
                 "conversation": {"type": kind, "key": conv},
                 "recent": recent,
+                # Credentials vault (v1.4.0): the agent's own
+                # decision-making can fetch its login for a service
+                # mid-task via ctx["vault_get"](service) — its own
+                # vault, its own key, no permission step.
+                **self._vault_ctx_fields(),
             }
             try:
                 reply = await self._call_decision(ctx)
@@ -3580,7 +3804,12 @@ class Agent:
             await self.report_progress(work["id"], percent, note)
 
         ctx = {"kind": "work", "agent": self._agent_profile(),
-               "work": work, "report_progress": _progress}
+               "work": work, "report_progress": _progress,
+               # Credentials vault (v1.4.0): as on the message path,
+               # the agent's decision-making gets its own vault —
+               # ctx["vault_get"](service) returns the full entry
+               # (password included) or None; no permission step.
+               **self._vault_ctx_fields()}
         try:
             result = await self._call_decision(ctx)
         except DecisionLinkError as exc:
