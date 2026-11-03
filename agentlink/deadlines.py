@@ -13,7 +13,7 @@ a deadline in a viewer's local zone is forbidden.
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
@@ -60,12 +60,6 @@ def pacific_display(epoch: int | None) -> str:
     hours, minutes = divmod(total_minutes, 60)
     off = f"UTC{sign}{hours}" + (f":{minutes:02d}" if minutes else "")
     return f"{dt:%Y-%m-%d %H:%M} PT ({off})"
-
-
-def deadline_fields(epoch: int | None) -> dict:
-    if not epoch:
-        return {"deadline": None, "deadline_pt": ""}
-    return {"deadline": int(epoch), "deadline_pt": pacific_display(epoch)}
 
 
 def pressure_thresholds(created_at: int, deadline: int) -> dict:
