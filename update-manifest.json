@@ -17,7 +17,7 @@
     "agentlink/protocol.py": "299d1af7ee32e0af5937bfef70a2efde4b905d2b136de3ba8b5607b12675095d",
     "agentlink/relay.py": "40e2e46e725f7a8ca352e03725762ee433d5b0e1378ffef1d73aea4be072f341",
     "agentlink/store.py": "847e42693271d147a3802daad356ba70721b3e1bd273de18599c2ab27caed63d",
-    "agentlink/supabase_store.py": "68fc0c6c4e9eb5d044d42fac25e597d218f2a71dd99a9fef832256675e8861eb",
+    "agentlink/supabase_store.py": "8d4612e9ee2e9c0750a6242cce22b7ff082a58255a8b5fc85a30cdcd9377c10b",
     "agentlink/timing.py": "6cb0827430ed42f720b8ebc3df353c082dfe61736d92efe7ca7d26f7a8f223f5",
     "agentlink/updater.py": "ab77ba53307c6cb3489121e47df8963a84a423167f22565af8849667e8a9764a"
   },
