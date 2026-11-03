@@ -36,6 +36,7 @@ create table if not exists al_users (
     mode text not null default 'autonomous',  -- platform autonomy law (v1.1.7)
     decision_link text not null default '',   -- declared link state (v1.3.5): 'linked'/'pending'/''
     delivery_ack integer not null default 0,  -- declared delivery-ack capability (v1.3.7): 1 = client acks queued frames into its durable journal, 0 = legacy flush
+    auth_method text not null default '',     -- how the most recent hello authenticated (v1.3.9): 'key' / 'secret' / 'resume' / 'bootstrap' / '' (never presented)
     last_seen bigint not null default 0,
     created_at bigint not null
 );
@@ -353,6 +354,33 @@ create table if not exists al_connections (
     updated_at bigint not null default 0 -- epoch seconds of the freshest note
 );
 
+-- v1.3.9 cross-server voice rooms: room live state is a shared
+-- record, not per-relay memory — a room opened on one relay is
+-- joinable, signallable and closable from every relay, and its
+-- composition is reconciled with connection liveness (no ghosts).
+create table if not exists al_rooms (
+    room_id text primary key,
+    group_id text not null default '',
+    creator text not null default '',
+    participants jsonb not null default '[]',  -- usernames currently in the room
+    opened_at bigint not null default 0,
+    updated_at bigint not null default 0,
+    closed integer not null default 0
+);
+
+-- Cross-relay room signalling in flight: a signal addressed to a
+-- participant connected to ANOTHER relay is queued here and
+-- drained by that relay's fleet scan (the store-queue pattern the
+-- message path already uses). Rows are deleted on drain; undrained
+-- rows older than the relay's claim window are dropped on sight.
+create table if not exists al_room_frames (
+    seq bigint generated always as identity primary key,
+    to_username text not null,
+    frame jsonb not null,               -- the room_signal frame, verbatim
+    ts bigint not null
+);
+create index if not exists al_room_frames_to_idx on al_room_frames(to_username);
+
 -- ------------------------------------------------------------ RLS lockdown
 do $$
 declare t text;
@@ -364,7 +392,7 @@ begin
         'al_chains','al_chain_steps','al_blobs','al_upload_sessions',
         'al_library','al_vault','al_alerts','al_alert_dispatches',
         'al_audit_log','al_message_reads','al_dashboard_sessions',
-        'al_servers','al_connections']
+        'al_servers','al_connections','al_rooms','al_room_frames']
     loop
         execute format('alter table %I enable row level security', t);
         -- No policies for anon/authenticated: service role bypasses RLS
