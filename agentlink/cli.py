@@ -44,7 +44,7 @@ def _endpoint(args) -> str:
     return resolve_endpoint(getattr(args, "endpoint", None))
 
 
-async def _with_agent(args, fn):
+async def _with_agent(args, fn, forward=None):
     from .client import InstanceCollision
     agent = Agent(_username(args), endpoint=_endpoint(args),
                   state_dir=_state_dir(args))
@@ -54,6 +54,22 @@ async def _with_agent(args, fn):
         # One-shot commands never fight a running daemon for its
         # own state (v1.3.7): the refusal IS the plain message —
         # no traceback, no SQLite fight, no rival registration.
+        # Owner-seat control channel (v1.3.9): commands that carry
+        # a forward spec (send, group add) are FORWARDED to the
+        # running instance instead — it executes the command as
+        # itself and returns the real result; the daemon is never
+        # stopped for an operator action again. Forwarding fails
+        # closed with the channel's named error.
+        if forward is not None:
+            from .client import forward_command, ControlForwardError
+            try:
+                result = await forward_command(
+                    _state_dir(args), _username(args), forward)
+            except ControlForwardError as fexc:
+                print(str(fexc), file=sys.stderr)
+                raise SystemExit(1)
+            return {"forwarded_via": "running instance",
+                    "result": result}
         print(str(exc), file=sys.stderr)
         raise SystemExit(1)
     try:
@@ -158,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
                 saved = json.loads(cur.read_text())
             except Exception:
                 saved = {}
-        _print({"username": _username(args) if True else None,
+        _print({"username": _username(args),
                 "endpoint": _endpoint(args), "saved": saved})
         return 0
 
@@ -261,7 +277,10 @@ def main(argv: list[str] | None = None) -> int:
         args = ap.parse_args(rest)
         _print(asyncio.run(_with_agent(
             args, lambda a: a.send_message(args.to, args.body,
-                                           priority=args.priority))))
+                                           priority=args.priority),
+            forward={"cmd": "send", "to": args.to,
+                     "body": args.body,
+                     "priority": args.priority})))
         return 0
 
     if cmd == "send-file":
@@ -888,7 +907,11 @@ def _group(rest: list[str]) -> int:
     else:
         print(f"unknown group command {sub!r}", file=sys.stderr)
         return 2
-    _print(asyncio.run(_with_agent(args, fn)))
+    # Owner-seat control channel (v1.3.9): group add forwards to
+    # the running instance when the daemon holds the lock.
+    _fwd = {"cmd": "group_add", "group_id": args.group_id,
+            "members": list(args.members)} if sub == "add" else None
+    _print(asyncio.run(_with_agent(args, fn, forward=_fwd)))
     return 0
 
 
