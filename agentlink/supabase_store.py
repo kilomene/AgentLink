@@ -36,6 +36,7 @@ import base64
 import gzip
 import hashlib
 import json
+import logging
 import secrets as _secrets
 import socket
 import ssl
@@ -49,6 +50,8 @@ from .protocol import new_id, new_secret, now_ts
 from .store import CONTENT_AUDIT_KINDS, ROOM_AUDIT_KINDS, DEFAULT_SETTINGS, MAX_GROUP_MEMBERS, GroupFull, NotFound, UsernameTaken
 from .store import NON_TERMINAL_WORK_STATUSES, RemovalBlocked
 from .store import carry_claim_blocked
+
+log = logging.getLogger("agentlink.supabase_store")
 
 
 def _ack_id_matches(frame, wanted) -> bool:
@@ -876,6 +879,67 @@ class SupabaseStore:
         self._req("PATCH", "users", self._eq("username", username),
                   body={"auth_method": method},
                   prefer="return=minimal")
+
+    def set_vault_meta(self, username, labels, blob_id, version,
+                       entries):
+        # Credentials vault pointer (v1.4.0), parity with the SQLite
+        # Store: only a pointer is stored — the self-sealed
+        # document's blob id, its revision, the entry count, and the
+        # OVERSIGHT-SEALED labels envelope (ciphertext here; this
+        # store holds no key that opens it). A stale revision is
+        # REFUSED (returns False) so a zombie host cannot rewind an
+        # agent's vault. FAIL-SOFT BY DESIGN: vault meta is an
+        # auxiliary pointer, never the vault itself (the agent's
+        # state dir + the blob layer hold the real document), so a
+        # backend error — including the vault columns not yet
+        # migrated — logs loudly and reports unaccepted instead of
+        # raising into the connection loop.
+        try:
+            rows = self._get(
+                "users",
+                "select=vault_version&"
+                + self._eq("username", username))
+            if not rows:
+                return False
+            if int(version) < int(rows[0].get("vault_version") or 0):
+                return False
+            self._req("PATCH", "users",
+                      self._eq("username", username),
+                      body={"vault_labels": labels or "",
+                            "vault_blob": blob_id or "",
+                            "vault_version": int(version),
+                            "vault_entries": int(entries)},
+                      prefer="return=minimal")
+            return True
+        except Exception:
+            log.warning("set_vault_meta failed for %s (backend "
+                        "unavailable or vault columns unmigrated?)",
+                        username, exc_info=True)
+            return False
+
+    def get_vault_meta(self, username):
+        # The vault pointer for one agent, or None. Fail-soft like
+        # set_vault_meta: an unmigrated backend reads as "no vault
+        # published yet", never as a crash in dashboard composition.
+        try:
+            rows = self._get(
+                "users",
+                "select=vault_labels,vault_blob,vault_version,"
+                "vault_entries&" + self._eq("username", username))
+        except Exception:
+            log.warning("get_vault_meta failed for %s (backend "
+                        "unavailable or vault columns unmigrated?)",
+                        username, exc_info=True)
+            return None
+        if not rows:
+            return None
+        r = rows[0]
+        if not (r.get("vault_blob") or r.get("vault_labels")):
+            return None
+        return {"labels": r.get("vault_labels") or "",
+                "blob_id": r.get("vault_blob") or "",
+                "version": int(r.get("vault_version") or 0),
+                "entries": int(r.get("vault_entries") or 0)}
 
     def list_users(self, query="", capability=""):
         q = ("select=username,display_name,pubkey,sign_pub,capabilities,"
