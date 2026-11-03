@@ -56,6 +56,8 @@ from .timing import (
     OFFLINE_GRACE_SECONDS,
     REASSIGN_GRACE_SECONDS,
     RECONNECT_BACKOFF_CAP_SECONDS,
+    BATTERY_LITTER_AGE_SECONDS,
+    BLOB_RECONCILE_SECONDS,
     REGISTRATION_RESUME_WINDOW_SECONDS,
     SERVER_HEALTHY_MIN,
     SERVER_HEARTBEAT_SECONDS,
@@ -253,6 +255,7 @@ class Relay:
     require_oversight: bool = field(default_factory=lambda:
         os.environ.get("AGENTLINK_REQUIRE_OVERSIGHT", "") == "1")
     _scan_task: object = field(default=None, repr=False)
+    _blob_task: object = field(default=None, repr=False)
     _server_hb_task: object = field(default=None, repr=False)
     # Earned health (v1.3.0): a server starts UNRATED — it carries
     # NO percentage and is eligible neither to be ridden nor to
@@ -763,13 +766,13 @@ class Relay:
             the genuinely stranded retry, never for a second live
             claimant.
         A resume is LOUD: a warning log line and a 'hello_resumed'
-        activity row. When the store offers a secret setter the
-        secret is ROTATED on resume and the new secret rides the
-        welcome — the client saves it and the window closes
-        permanently; without one the welcome carries no secret and
-        the resume stays window-bound (the store-level completion
-        of this fix is a set_secret/rotate_secret method — see the
-        v1.3.7 workstream report). Returns (resumed?, new_secret).
+        activity row. The secret is ROTATED on resume — both
+        stores implement set_secret (v1.3.8) — and the new secret
+        rides the welcome: the client saves it and the window
+        closes permanently. The getattr ladder in the body stays
+        as a defensive path for foreign store implementations;
+        only a store with NO setter leaves the welcome secretless
+        and the resume window-bound. Returns (resumed?, new_secret).
         """
         if secret:
             return False, None
@@ -1327,6 +1330,59 @@ class Relay:
             return "home"
         return "down"
 
+    @staticmethod
+    def _carry_label(entry: dict, by_id: dict | None = None) -> str:
+        """The honest carry label for a composed server entry.
+
+        v1.3.8 root cause of the 'carried by @' wart: a carry claim
+        records the carrier's AGENT name from the claiming relay's
+        host_agent — and operator relays (the Phoenix Home/Peer
+        relays) run agent-less, so claim_carry stores carried_by=''
+        next to a populated carried_by_id and carry_state='carried'.
+        Composition used to print 'carried by @' + the empty name
+        verbatim. The carrier's identity WAS recorded — as a server
+        id — so resolve it: recorded agent name first, then the
+        carrier server's host agent, then the carrier server's
+        label (no '@' — a server is not an agent), and when nothing
+        resolves, the bare state 'carried'. A name is never
+        fabricated and a dangling 'carried by @' is never emitted.
+        """
+        state = entry.get("carry_state") or ""
+        if state == "home":
+            return "at home"
+        if state == "down":
+            return "down — awaiting carrier"
+        if state != "carried":
+            return ""
+        name = str(entry.get("carried_by") or "").strip()
+        if name:
+            return "carried by @%s" % name
+        carrier = (by_id or {}).get(
+            str(entry.get("carried_by_id") or ""))
+        if carrier:
+            host = str(carrier.get("host_agent") or "").strip()
+            if host:
+                return "carried by @%s" % host
+            label = str(carrier.get("label") or "").strip()
+            if label:
+                return "carried by %s" % label
+        return "carried"
+
+    @classmethod
+    def _resolve_carry_labels(cls, entries: list) -> list:
+        """Second composition pass: with the full entry set known,
+        every carried entry's label is resolved against its carrier
+        (see _carry_label). Idempotent; called at the end of
+        _live_servers() and _dashboard_servers() so no surface can
+        render a carried entry whose label was composed before its
+        carrier was in view."""
+        by_id = {str(e.get("server_id") or ""): e for e in entries
+                 if e.get("server_id")}
+        for e in entries:
+            if e.get("carry_state") == "carried":
+                e["carry_state_label"] = cls._carry_label(e, by_id)
+        return entries
+
     def _server_entry(self, row: dict,
                       now: int | None = None) -> dict:
         if now is None:
@@ -1335,9 +1391,14 @@ class Relay:
         health = HEALTH_UNRATED if health is None else int(health)
         cap = row.get("capacity")
         state = self._carry_state_of(row, now)
-        label = {"home": "at home",
-                 "carried": "carried by @%s" % row.get("carried_by"),
-                 "down": "down — awaiting carrier"}.get(state, "")
+        # Row-local label: correct when the row itself carries the
+        # carrier's name; a name the row does NOT carry is resolved
+        # by _resolve_carry_labels once the full set is composed —
+        # never printed as a dangling 'carried by @' (v1.3.8).
+        label = self._carry_label(
+            {"carry_state": state,
+             "carried_by": row.get("carried_by") or "",
+             "carried_by_id": row.get("carried_by_id") or ""})
         return {"label": row.get("label") or row.get("endpoint")
                 or "",
                 "endpoint": str(row.get("endpoint") or "")
@@ -1385,7 +1446,7 @@ class Relay:
             entry["capacity"] = int(row.get("home_capacity") or 0)
             out.append(entry)
         out.sort(key=lambda s: s["endpoint"])
-        return out
+        return self._resolve_carry_labels(out)
 
     def _live_servers(self) -> list[dict]:
         """The live mesh as this relay knows it: fresh registry rows
@@ -1448,7 +1509,7 @@ class Relay:
                     s["capacity"] = effective_capacity(s["health"]) \
                         if s["health"] > SERVER_HEALTHY_MIN else 0
         out.sort(key=lambda s: s["endpoint"])
-        return out
+        return self._resolve_carry_labels(out)
 
     def _sender_meta(self, username: str, group_id: str = ""):
         """(nickname, role, custom_role) of a sender inside a group
@@ -1733,6 +1794,8 @@ class Relay:
                 u["server_capacity"] = srv["capacity"]
                 u["server_state"] = srv.get("carry_state") or ""
                 u["server_carried_by"] = srv.get("carried_by") or ""
+                u["server_state_label"] = \
+                    srv.get("carry_state_label") or ""
         return {
             "server": self.server_label,
             "servers": servers,
@@ -2059,6 +2122,10 @@ class Relay:
             self.port = sockets[0].getsockname()[1]
         log.info("relay listening on %s:%s", self.host, self.port)
         self._scan_task = asyncio.create_task(self._fleet_scan_loop())
+        # Blob-layer truth (v1.3.8): object/meta reconciliation
+        # backstop — see _reconcile_blobs.
+        self._blob_task = asyncio.create_task(
+            self._blob_reconcile_loop())
         # Peer mesh (v1.2.0): register in the shared server registry
         # and heartbeat the row, so any client connecting anywhere
         # can discover this server. Off-loop: a network-backed
@@ -2102,6 +2169,9 @@ class Relay:
         if self._scan_task is not None:
             self._scan_task.cancel()
             self._scan_task = None
+        if self._blob_task is not None:
+            self._blob_task.cancel()
+            self._blob_task = None
         if getattr(self, "dashboard", None) is not None:
             self.dashboard.stop()
             self.dashboard = None
@@ -2999,6 +3069,8 @@ class Relay:
                                 srv.get("carry_state") or ""
                             u["server_carried_by"] = \
                                 srv.get("carried_by") or ""
+                            u["server_state_label"] = \
+                                srv.get("carry_state_label") or ""
                         u.pop("secret", None)
                     users.sort(key=lambda u: (not u["online"],
                                               u["username"]))
@@ -3625,8 +3697,136 @@ class Relay:
                               "object storage delete failed; retry")
             return
         self.store.delete_blob_meta(meta["id"])
+        if self.store.get_blob_meta(meta["id"]) is not None:
+            # Blob-layer truth (v1.3.8): the object is gone but its
+            # meta survived — the pair has diverged and that must
+            # NEVER be silent. Audit it, raise the fleet alert, and
+            # let the reconciliation sweep keep surfacing it. (The
+            # pre-1.3.8 failure shape was the mirror image of this
+            # branch never being reached: a lost DELETE response
+            # aborted the handler BEFORE the meta delete, orphaning
+            # the meta with no trace at all.)
+            log.error("blob divergence: object %s deleted but its "
+                      "meta persists", meta["id"])
+            try:
+                self.store.audit(
+                    "blob_divergence", peer.username,
+                    meta.get("owner") or "", "", meta["id"],
+                    "object deleted; meta survived the delete")
+            except Exception:
+                pass
+            try:
+                self.store.open_alert(
+                    "blob_divergence", meta["id"],
+                    "blob object was deleted but its metadata row "
+                    "survived; reconciliation will keep surfacing "
+                    "it until the pair is consistent")
+            except Exception:
+                pass
         await self._result(ws, req_id, True, {"blob_id": meta["id"],
                                               "deleted": True})
+
+    # -- blob-layer truth: object/meta reconciliation (v1.3.8) ------
+
+    async def _blob_reconcile_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.to_thread(self._reconcile_blobs)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.exception("blob reconciliation failed")
+            await asyncio.sleep(BLOB_RECONCILE_SECONDS)
+
+    def _reconcile_blobs(self) -> None:
+        """A finished blob's object and its meta must never
+        SILENTLY diverge. Proven production mechanism (2026-11-03
+        forensics): the health battery's routine cleanup deletes
+        its test blob through _on_blob_delete; through the lossy
+        egress the R2 DELETE executed while its response died in
+        transit, the handler aborted as 'blob_store_failed', and
+        the meta delete never ran — 100+ orphaned metas, all
+        battery-owned, objects verifiably gone, no trace anywhere.
+        The delete path is now presence-truthful (blobstore) and
+        read-back-verified (above); this sweep is the backstop for
+        every other path (crashes between the steps, out-of-band
+        object removal): a meta whose object is ABSENT is reaped
+        when its owner is an ephemeral battery identity (dial-* —
+        relay-minted test peers whose uploads are self-test
+        traffic by design), and for a REAL owner it is surfaced as
+        a fleet alert + audit row, never auto-deleted and never
+        quiet. An INTACT battery pair older than
+        BATTERY_LITTER_AGE_SECONDS is abandoned cleanup litter
+        (its cycle's delete never executed at all) and is reaped
+        as a pair — object first, meta only once the object is
+        verifiably gone, so the sweep itself can never create the
+        divergence it exists to cure. A presence check that
+        ERRORS is unknown, not absent — the meta is left for the
+        next pass."""
+        try:
+            metas = self.store.list_blob_meta()
+        except Exception:
+            return
+        exists = getattr(self.blob_store, "exists", None)
+        if exists is None:
+            return
+        for m in metas:
+            bid = m.get("id") or ""
+            if not bid:
+                continue
+            try:
+                present = exists(bid)
+            except Exception:
+                continue
+            owner = m.get("owner") or ""
+            if present:
+                if owner.startswith("dial-") and \
+                        now_ts() - int(m.get("created_at") or 0) \
+                        > BATTERY_LITTER_AGE_SECONDS:
+                    try:
+                        self.blob_store.delete(bid)
+                    except Exception:
+                        continue  # pair stays consistent; retry
+                    if exists(bid):
+                        continue  # object survived; keep the pair
+                    try:
+                        self.store.delete_blob_meta(bid)
+                        self.store.audit(
+                            "blob_meta_reaped", owner, "", "", bid,
+                            "stale battery pair reaped (object + "
+                            "meta) at reconciliation")
+                        log.info("blob reconciliation: reaped "
+                                 "stale battery pair %s", bid)
+                    except Exception:
+                        pass
+                continue
+            if owner.startswith("dial-"):
+                try:
+                    self.store.delete_blob_meta(bid)
+                    self.store.audit(
+                        "blob_meta_reaped", owner, "", "", bid,
+                        "object absent at reconciliation; ephemeral "
+                        "battery meta reaped")
+                    log.info("blob reconciliation: reaped orphaned "
+                             "battery meta %s", bid)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.store.open_alert(
+                        "blob_divergence", bid,
+                        f"blob object owned by @{owner or '?'} is "
+                        "absent from storage while its metadata "
+                        "persists — the file cannot be served; "
+                        "operator attention required")
+                    self.store.audit(
+                        "blob_divergence", owner, "", "", bid,
+                        "object absent at reconciliation")
+                    log.error("blob divergence: meta %s (owner "
+                              "@%s) has no object in storage",
+                              bid, owner)
+                except Exception:
+                    pass
 
     # -- 1:1 messages (E2EE: relay routes ciphertext only) -------------------
     @staticmethod
