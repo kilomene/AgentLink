@@ -539,14 +539,22 @@ def test_cli_credentials_roundtrip(tmp_path, state_root):
               "--endpoint", url)
     entry = json.loads(out)
     assert entry["service"] == "Example Mail"
+    # The ACCOUNT positional must survive the --username AGENT flag
+    # (argparse dest collision — the v1.4.0 production proof caught
+    # an entry whose account had been overwritten by the agent
+    # name; pinned here so it can never regress silently).
+    assert entry["username"] == "vcli@example.com", entry
     out = cli("credentials", "list", "--username", "vcli",
               "--state-dir", sd, "--endpoint", url)
     assert "Example Mail" in out
+    assert "vcli@example.com" in out
     assert PASSWORD not in out and NOTES not in out
     out = cli("credentials", "get", "Example Mail",
               "--username", "vcli", "--state-dir", sd,
               "--endpoint", url)
-    assert json.loads(out)["password"] == PASSWORD
+    got = json.loads(out)
+    assert got["password"] == PASSWORD
+    assert got["username"] == "vcli@example.com"
     out = cli("credentials", "remove", entry["id"],
               "--username", "vcli", "--state-dir", sd,
               "--endpoint", url)
