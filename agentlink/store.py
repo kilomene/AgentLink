@@ -221,6 +221,10 @@ class Store:
                     mode TEXT NOT NULL DEFAULT 'autonomous',
                     decision_link TEXT NOT NULL DEFAULT '',
                     delivery_ack INTEGER NOT NULL DEFAULT 0,
+                    vault_labels TEXT NOT NULL DEFAULT '',
+                    vault_blob TEXT NOT NULL DEFAULT '',
+                    vault_version INTEGER NOT NULL DEFAULT 0,
+                    vault_entries INTEGER NOT NULL DEFAULT 0,
                     last_seen INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL
                 );
@@ -599,6 +603,26 @@ class Store:
         # honestly instead of letting them pass as current.
         _add("users", "auth_method",
              "auth_method TEXT NOT NULL DEFAULT ''")
+        # Credentials vault (v1.4.0): the relay-side POINTER to an
+        # agent's vault — never vault content. vault_labels is the
+        # agent-published OVERSIGHT-SEALED label envelope (service +
+        # account + timestamps; the relay stores ciphertext and
+        # cannot open it — only the owner's dashboard can);
+        # vault_blob names the current self-sealed vault document
+        # in the blob layer; vault_version is the document revision
+        # the pointer names (stale publishes are refused so a
+        # zombie host can never rewind an agent's vault);
+        # vault_entries is the published entry count. Passwords
+        # exist ONLY inside the agent-sealed document — no column
+        # here can ever hold one.
+        _add("users", "vault_labels",
+             "vault_labels TEXT NOT NULL DEFAULT ''")
+        _add("users", "vault_blob",
+             "vault_blob TEXT NOT NULL DEFAULT ''")
+        _add("users", "vault_version",
+             "vault_version INTEGER NOT NULL DEFAULT 0")
+        _add("users", "vault_entries",
+             "vault_entries INTEGER NOT NULL DEFAULT 0")
         # Peer mesh (v1.2.0): the server registry carries health,
         # rider load and effective capacity alongside identity.
         _add("servers", "health",
@@ -2049,6 +2073,48 @@ class Store:
                 "UPDATE users SET auth_method = ? WHERE username = ?",
                 (method, username))
             self._db.commit()
+
+    def set_vault_meta(self, username: str, labels: str,
+                       blob_id: str, version: int,
+                       entries: int) -> bool:
+        """Publish the relay-side pointer to an agent's credentials
+        vault (v1.4.0). Only a pointer is stored: the self-sealed
+        document's blob id, its document revision, the entry count,
+        and the OVERSIGHT-SEALED labels envelope (ciphertext to this
+        store — it holds no key that can open it). A publish whose
+        revision is OLDER than the stored pointer is REFUSED
+        (returns False) so a stale/zombie host can never rewind an
+        agent's vault; an equal revision re-points idempotently."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT vault_version FROM users WHERE username = ?",
+                (username,)).fetchone()
+            if row is None:
+                return False
+            if int(version) < int(row[0]):
+                return False
+            self._db.execute(
+                "UPDATE users SET vault_labels = ?, vault_blob = ?, "
+                "vault_version = ?, vault_entries = ? "
+                "WHERE username = ?",
+                (labels or "", blob_id or "", int(version),
+                 int(entries), username))
+            self._db.commit()
+            return True
+
+    def get_vault_meta(self, username: str) -> dict | None:
+        """The vault pointer for one agent, or None when the agent
+        is unknown or has never published a vault."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT vault_labels, vault_blob, vault_version, "
+                "vault_entries FROM users WHERE username = ?",
+                (username,)).fetchone()
+        if row is None or not (row[1] or row[0]):
+            return None
+        return {"labels": row[0] or "", "blob_id": row[1] or "",
+                "version": int(row[2] or 0),
+                "entries": int(row[3] or 0)}
 
     def sign_pub_of(self, username: str) -> str:
         with self._lock:
