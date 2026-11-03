@@ -266,7 +266,8 @@ class SupabaseStore:
         if method == "GET":
             attempts = 5
         elif method == "POST" and (table.endswith("queue")
-                                   or table.endswith("audit_log")):
+                                   or table.endswith("audit_log")
+                                   or table.endswith("room_frames")):
             attempts = 1
         else:
             attempts = 4
@@ -417,6 +418,135 @@ class SupabaseStore:
             out[r["username"]] = r
         return out
 
+    # -- voice-room live state (v1.3.9, shared backend) -----------------
+    # Parity with the SQLite Store EXACTLY (see store.py): room state
+    # is a fact in the shared backend (al_rooms), never one relay's
+    # memory — a room opened on any server is joinable and signallable
+    # from every server, and a closed room is closed everywhere.
+    # Participants ride a jsonb list; membership changes are
+    # read-modify-write, matching the SQLite store's contract.
+    # Room frames for participants on brother relays ride al_room_frames
+    # and are claimed (select + delete by seq) by the relay that hosts
+    # the participant's connection, on its scan tick.
+
+    @staticmethod
+    def _shape_room(r):
+        if r is None:
+            return None
+        parts = _loads(r.get("participants"), [])
+        return {"room_id": r["room_id"],
+                "group_id": r.get("group_id") or "",
+                "creator": r.get("creator") or "",
+                "participants": [str(p) for p in parts],
+                "opened_at": int(r.get("opened_at") or 0),
+                "updated_at": int(r.get("updated_at") or 0),
+                "closed": bool(r.get("closed"))}
+
+    def room_create(self, room_id, group_id, creator):
+        now = now_ts()
+        self._req("POST", "rooms", body={
+            "room_id": room_id, "group_id": group_id or "",
+            "creator": creator,
+            "participants": json.dumps([creator]),
+            "opened_at": now, "updated_at": now, "closed": 0},
+            prefer="return=minimal")
+        return self.room_get(room_id) or {
+            "room_id": room_id, "group_id": group_id or "",
+            "creator": creator, "participants": [creator],
+            "opened_at": now, "updated_at": now, "closed": False}
+
+    def room_get(self, room_id):
+        row = self._one("rooms", self._eq("room_id", room_id)
+                        + "&closed=eq.0")
+        return self._shape_room(row)
+
+    def rooms_open(self):
+        rows = self._get("rooms", "closed=eq.0"
+                                  "&order=opened_at.asc")
+        return [self._shape_room(r) for r in rows]
+
+    def room_add_participant(self, room_id, username):
+        room = self.room_get(room_id)
+        if room is None:
+            return None
+        if username not in room["participants"]:
+            room["participants"].append(username)
+            self._req("PATCH", "rooms", self._eq("room_id", room_id),
+                      body={"participants": json.dumps(
+                          room["participants"]),
+                            "updated_at": now_ts()},
+                      prefer="return=minimal")
+        return room
+
+    def room_remove_participant(self, room_id, username):
+        room = self.room_get(room_id)
+        if room is None:
+            return None
+        if username in room["participants"]:
+            room["participants"] = [
+                p for p in room["participants"] if p != username]
+            closed = 0 if room["participants"] else 1
+            room["closed"] = bool(closed)
+            self._req("PATCH", "rooms", self._eq("room_id", room_id),
+                      body={"participants": json.dumps(
+                          room["participants"]),
+                            "updated_at": now_ts(), "closed": closed},
+                      prefer="return=minimal")
+        return room
+
+    def room_close(self, room_id):
+        room = self.room_get(room_id)
+        if room is None:
+            return None
+        self._req("PATCH", "rooms", self._eq("room_id", room_id),
+                  body={"closed": 1, "updated_at": now_ts()},
+                  prefer="return=minimal")
+        room["closed"] = True
+        return room
+
+    def rooms_of_participant(self, username):
+        return [r for r in self.rooms_open()
+                if username in r["participants"]]
+
+    def room_frame_put(self, to_username, frame):
+        # room_frames is an identity-sequenced append table like the
+        # queue: POST attempts=1 semantics come from the _req table
+        # rule only for queue/audit_log names, so pass the frame via
+        # a plain POST — a lost signal is perishable by design and
+        # the sender's result does not depend on it landing twice.
+        self._req("POST", "room_frames", body={
+            "to_username": to_username, "frame": json.dumps(frame),
+            "ts": now_ts()}, prefer="return=minimal")
+
+    def room_frames_drain(self, usernames, max_age=120):
+        """Claim pending room frames for the given usernames
+        (select + delete by seq, the ack_frames discipline). Stale
+        frames are claimed and dropped, never delivered late."""
+        wanted = [u for u in (usernames or []) if u]
+        if not wanted:
+            return {}
+        in_list = ",".join(f'"{u}"' for u in wanted)
+        rows = self._get(
+            "room_frames",
+            f"to_username=in.({urllib.parse.quote(in_list, safe='(),\"')})"
+            "&select=seq,to_username,frame,ts&order=seq.asc")
+        if rows:
+            seqs = [r["seq"] for r in rows]
+            self._req("DELETE", "room_frames",
+                      "seq=in.(" + ",".join(str(s) for s in seqs) + ")",
+                      prefer="return=minimal")
+        now = now_ts()
+        out = {}
+        for r in rows:
+            if now - int(r.get("ts") or 0) > max_age:
+                continue
+            frame = _loads(r.get("frame"), None)
+            if not isinstance(frame, dict):
+                continue
+            frame["queued"] = True
+            out.setdefault(r["to_username"], []).append(frame)
+        return out
+
     def list_room_audit(self):
         """Parity with the SQLite Store: EVERY voice-room lifecycle
         row, oldest first, paged to exhaustion — never a window."""
@@ -452,7 +582,9 @@ class SupabaseStore:
             _top("users", "last_seen"), len(conns),
             _top("connections", "updated_at"),
             _top("servers", "last_seen"),
-            _top("audit_log", "seq")))
+            _top("audit_log", "seq"),
+            _top("rooms", "updated_at"),
+            _top("room_frames", "seq")))
 
     # -- server registry (v1.2.0 peer mesh) --------------------------------
     # Parity with the SQLite Store EXACTLY (same semantics): every
@@ -734,10 +866,21 @@ class SupabaseStore:
                   body={"delivery_ack": 1 if flag else 0},
                   prefer="return=minimal")
 
+    def set_auth_method(self, username, method):
+        # Key-signed hello (v1.3.9): how the agent's most recent
+        # hello authenticated, recorded from the hello exactly like
+        # set_delivery_ack records its declaration. Parity with the
+        # SQLite Store: unknown values are refused.
+        if method not in ("key", "secret", "resume", "bootstrap"):
+            return
+        self._req("PATCH", "users", self._eq("username", username),
+                  body={"auth_method": method},
+                  prefer="return=minimal")
+
     def list_users(self, query="", capability=""):
         q = ("select=username,display_name,pubkey,sign_pub,capabilities,"
-             "cap_desc,mode,decision_link,delivery_ack,last_seen,"
-             "created_at&order=username")
+             "cap_desc,mode,decision_link,delivery_ack,auth_method,"
+             "last_seen,created_at&order=username")
         if query:
             q += f"&username=like.%25{urllib.parse.quote(query)}%25"
         rows = self._get("users", q)
@@ -1341,7 +1484,6 @@ class SupabaseStore:
                 == role_name.lower()]
 
     def compute_trust(self, username):
-        from .store import Store
         rows = self._get("work", self._eq("assignee", username)
                          + "&select=status,deadline,updated_at")
         changes = self._get(
