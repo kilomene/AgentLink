@@ -917,3 +917,51 @@ def test_store_delivery_surface_and_timing_constants(relay_env,
         assert pending_frames(store, "dg-sf-recip") == []
         await sender.close()
     run(_t())
+
+
+def test_supabase_ack_frames_deletes_integer_seqs():
+    """Regression pin (v1.3.7 production proof): PostgREST returns
+    the queue's seq column as INTEGERS. SupabaseStore.ack_frames
+    built its delete filter with ",".join(chunk) over those ints —
+    TypeError, the delete never ran, and every production ack
+    errored with custody never completing (phoenix + deploy-probe
+    queues stuck at 'acked 0, N still waiting' on deploy night).
+    The SQLite store deletes by bound parameter and never saw it.
+    Pin the Supabase shape: int seqs in, a string in.(...) filter
+    out, frames retired."""
+    import json as _json
+
+    from agentlink.supabase_store import SupabaseStore
+
+    store = SupabaseStore("https://example.invalid", "k")
+    rows = [
+        {"seq": 41, "payload": _json.dumps(
+            {"type": "message", "id": "m-int-1"})},
+        {"seq": 42, "payload": _json.dumps(
+            {"type": "work_assigned", "work": {"id": "w-int-2"}})},
+        {"seq": 43, "payload": _json.dumps(
+            {"type": "message", "id": "m-int-3"})},
+    ]
+    store._get = lambda table, query: list(rows)
+    deleted = []
+
+    def _fake_delete_ids(table, col, ids):
+        # Reproduce the real _delete_ids filter construction.
+        chunk = list(ids)
+        filt = f"{col}=in.(" + ",".join(str(v) for v in chunk) + ")"
+        deleted.append((table, filt))
+        return len(chunk)
+
+    store._delete_ids = _fake_delete_ids
+    acked = store.ack_frames("someone", ["m-int-1", "w-int-2"])
+    assert [f.get("id") or (f.get("work") or {}).get("id")
+            for f in acked] == ["m-int-1", "w-int-2"]
+    assert deleted == [("queue", "seq=in.(41,42)")], deleted
+    # And the real _delete_ids itself must not raise on int ids
+    # (drop the instance-level fake so the class method runs).
+    del store._delete_ids
+    seen = {}
+    store._delete_where = lambda table, query: seen.update(
+        {"q": query}) or 1
+    assert store._delete_ids("queue", "seq", [7, 8]) == 1
+    assert seen["q"] == "seq=in.(7,8)", seen
