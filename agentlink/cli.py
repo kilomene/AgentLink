@@ -45,9 +45,17 @@ def _endpoint(args) -> str:
 
 
 async def _with_agent(args, fn):
+    from .client import InstanceCollision
     agent = Agent(_username(args), endpoint=_endpoint(args),
                   state_dir=_state_dir(args))
-    await agent.start()
+    try:
+        await agent.start()
+    except InstanceCollision as exc:
+        # One-shot commands never fight a running daemon for its
+        # own state (v1.3.7): the refusal IS the plain message —
+        # no traceback, no SQLite fight, no rival registration.
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1)
     try:
         return await fn(agent)
     finally:
@@ -71,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         print("commands: relay server register agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
               "alerts capabilities update doctor census service backup "
-              "oversight-keygen deregister remove-user")
+              "oversight-keygen deregister remove-user inbox sync")
         return 0
     cmd, rest = argv[0], argv[1:]
 
@@ -104,7 +112,39 @@ def main(argv: list[str] | None = None) -> int:
             info = a.whoami()
             await a.close()
             return info
-        _print(asyncio.run(_go()))
+        try:
+            _print(asyncio.run(_go()))
+        except Exception as exc:
+            # Registration failure reporting (v1.3.7): a failed
+            # registration is reported SPECIFICALLY — which step
+            # died, what the line said (the relay's verbatim
+            # reason where there is one), and what to retry —
+            # never a bare OS error or a silent death as the
+            # final word.
+            from .client import RegistrationFailed
+            from .config import DEFAULT_ENDPOINT
+            report = {
+                "registered": False,
+                "username": args.username,
+                "endpoint": _endpoint(args),
+                "state_dir": _state_dir(args),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "retry": "re-run the same command with the same"
+                         " --state-dir: a registration cut off"
+                         " mid-flight resumes with the same"
+                         " identity; nothing needs to be renamed"
+                         " or re-created",
+                "default_endpoint": DEFAULT_ENDPOINT,
+            }
+            if isinstance(exc, RegistrationFailed):
+                # What the LINE said, verbatim (client raises
+                # RegistrationFailed as "<reason>: <detail>").
+                report["line_said"] = str(exc)
+            _print(report)
+            print(f"registration FAILED for {args.username} via"
+                  f" {_endpoint(args)}: {exc}", file=sys.stderr)
+            return 1
         return 0
 
     if cmd == "whoami":
@@ -194,6 +234,11 @@ def main(argv: list[str] | None = None) -> int:
             await a.run()
         asyncio.run(_go())
         return 0
+
+    if cmd == "inbox":
+        return _inbox(rest)
+    if cmd == "sync":
+        return _sync(rest)
 
     if cmd == "directory":
         ap = argparse.ArgumentParser(prog="agentlink directory")
@@ -287,6 +332,61 @@ def main(argv: list[str] | None = None) -> int:
         return _capabilities(rest)
     print(f"unknown command {cmd!r}; see `agentlink --help`", file=sys.stderr)
     return 2
+
+
+def _inbox(rest: list[str]) -> int:
+    """Local mailbox view (v1.3.7): reads the agent's OWN canonical
+    mailbox (state dir's mailbox.db) with NO connection — an agent
+    must be able to see its own mailbox with zero forensic tooling.
+    One line per item: id, ts, from->to, kind, taken, and the first
+    80 chars of the body."""
+    from .mailbox import Mailbox
+    ap = argparse.ArgumentParser(prog="agentlink inbox")
+    _add_common(ap)
+    ap.add_argument("--limit", type=int, default=50)
+    ap.add_argument("--unread", action="store_true",
+                    help="only items never taken in")
+    ap.add_argument("--conversation", default=None,
+                    help="peer username, group:<id> or channel:<id>")
+    args = ap.parse_args(rest)
+    username = _username(args)
+    path = Path(_state_dir(args)).expanduser() / "mailbox.db"
+    if not path.exists():
+        _print({"username": username, "mailbox": str(path),
+                "items": [], "note": "no mailbox yet — nothing has"
+                " been journaled for this agent"})
+        return 0
+    mb = Mailbox(path, owner=username)
+    try:
+        rows = mb.list_items(limit=args.limit,
+                             conversation=args.conversation,
+                             unread_only=args.unread)
+    finally:
+        mb.close()
+    for r in rows:
+        m = r["msg"]
+        body = str(m.get("body") or m.get("title") or "")
+        print(f"{m.get('id')} {m.get('ts')} {m.get('from')}->"
+              f"{m.get('to')} {m.get('kind')} "
+              f"taken={1 if r['taken'] else 0} {body[:80]}")
+    return 0
+
+
+def _sync(rest: list[str]) -> int:
+    """History sync (v1.3.7): connect with the agent's identity and
+    backfill its canonical local mailbox from the relay's history —
+    the line's audit rows journaled locally, newest page first.
+    Prints the sync counts. (start() already syncs on every
+    connect; this command makes the pass explicit and reports it —
+    a second explicit pass is a no-op beyond what start() did.)"""
+    ap = argparse.ArgumentParser(prog="agentlink sync")
+    _add_common(ap)
+    args = ap.parse_args(rest)
+
+    async def _go(a):
+        return a.mailbox_sync or await a.sync_history()
+    _print(asyncio.run(_with_agent(args, _go)))
+    return 0
 
 
 def _deregister(rest: list[str]) -> int:
@@ -475,7 +575,18 @@ def _doctor(rest: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="agentlink doctor")
     ap.add_argument("--db", default="~/.agentlink/relay.db")
     ap.add_argument("--state-dir", default=None)
+    ap.add_argument("--for-install", action="store_true",
+                    help="install-landing mode (v1.3.7): verify THIS"
+                         " agent install — package importable with"
+                         " a version, state dir writable, endpoint"
+                         " configured, and registration state (an"
+                         " identity present, or the exact next step"
+                         " printed). Used by install.sh as its"
+                         " final gate: exit 0 only when the install"
+                         " genuinely landed")
     args = ap.parse_args(rest)
+    if getattr(args, "for_install", False):
+        return _doctor_for_install(args)
     state = Path(args.state_dir or DEFAULT_STATE_DIR).expanduser()
     report: dict = {"endpoint_default": DEFAULT_ENDPOINT,
                     "endpoint_resolved": resolve_endpoint(None),
@@ -508,6 +619,75 @@ def _doctor(rest: list[str]) -> int:
             if f.name.startswith(("secret-", "keys-", "groupkeys-")):
                 mode = _stat.S_IMODE(f.stat().st_mode)
                 check(f"identity_file_{f.name}_0600", mode == 0o600, oct(mode))
+    report["healthy"] = all(c["ok"] for c in report["checks"])
+    _print(report)
+    return 0 if report["healthy"] else 1
+
+
+def _doctor_for_install(args) -> int:
+    """Install-landing verification (v1.3.7): the checks an AGENT
+    install must pass before anyone may call it installed. A fresh
+    install legitimately has no relay DB and no identity yet, so
+    those are reported as state (with the exact next step), never
+    as failures; what FAILS the gate is a broken package, an
+    unwritable state dir, or a missing endpoint configuration."""
+    from .config import DEFAULT_ENDPOINT, resolve_endpoint
+    state = Path(_state_dir(args)).expanduser()
+    report: dict = {"mode": "install-check", "checks": []}
+
+    def check(name, ok, detail=""):
+        report["checks"].append({"name": name, "ok": bool(ok),
+                                 "detail": detail})
+
+    try:
+        import agentlink
+        from agentlink.client import Agent as _A  # noqa: F401
+        check("package_importable", True,
+              f"agentlink {agentlink.__version__}")
+        report["version"] = agentlink.__version__
+    except Exception as exc:
+        check("package_importable", False, str(exc))
+    try:
+        state.mkdir(parents=True, exist_ok=True)
+        probe = state / ".doctor-probe"
+        probe.write_text("ok")
+        probe.unlink()
+        check("state_dir_writable", True, str(state))
+    except Exception as exc:
+        check("state_dir_writable", False, f"{state}: {exc}")
+    try:
+        resolved = resolve_endpoint(getattr(args, "endpoint", None))
+        check("endpoint_configured", bool(resolved), resolved)
+        report["endpoint"] = resolved
+        report["default_endpoint"] = DEFAULT_ENDPOINT
+    except Exception as exc:
+        check("endpoint_configured", False, str(exc))
+    # Registration state: an identity is present when a secret or
+    # keys file exists for some username in the state dir (or the
+    # current.json pointer names one). Absent is a NEXT STEP, not
+    # a failure — the install landed; registration is the user's
+    # first act on it.
+    identity = None
+    cur = state / "current.json"
+    if cur.exists():
+        try:
+            identity = json.loads(cur.read_text()).get("username")
+        except Exception:
+            identity = None
+    if not identity and state.exists():
+        for f in sorted(state.iterdir()):
+            if f.name.startswith("secret-") and \
+                    f.name.endswith(".json"):
+                identity = f.name[len("secret-"):-len(".json")]
+                break
+    if identity:
+        report["registration"] = {"state": "registered",
+                                  "username": identity}
+    else:
+        report["registration"] = {
+            "state": "not_registered",
+            "next_step": "agentlink register --username @your-name"
+                         f"   (endpoint: {report.get('endpoint')})"}
     report["healthy"] = all(c["ok"] for c in report["checks"])
     _print(report)
     return 0 if report["healthy"] else 1
