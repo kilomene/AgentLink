@@ -450,3 +450,59 @@ def test_cross_server_room_signal_after_presence_grace(state_root):
     run(_t())
     home.stop()
     x3.stop()
+
+
+def test_room_signals_flow_with_fleet_scan_wedged(state_root):
+    """v1.4.4 pin — room signalling must not ride the fleet scan.
+    The v1.4.3 production room proof: relays restarted, the
+    health battery running, and an x3->home answer sat UNCLAIMED
+    in the store for 25s+ because the only drain lived inside
+    _fleet_scan_once, whose pass latency is unbounded under load.
+    Wedge both relays' scan passes entirely; the dedicated room
+    drain loop must still deliver signals both ways in seconds."""
+    tmp = tempfile.mkdtemp(prefix="agentlink-xr-wedge-")
+    db, home, x3, home_url, x3_url = _setup(tmp, state_root)
+
+    async def _wedged():
+        await asyncio.sleep(3600)
+
+    home.relay._fleet_scan_once = _wedged
+    x3.relay._fleet_scan_once = _wedged
+
+    async def _t():
+        phx = Agent("xrwphoenix", endpoint=home_url,
+                    state_dir=str(state_root / "xrwphoenix"))
+        probe = Agent("xrwprobe", endpoint=x3_url,
+                      state_dir=str(state_root / "xrwprobe"))
+        await phx.start()
+        await probe.start()
+        try:
+            g = await phx.group_create("xr-wedge", ["xrwprobe"])
+            gid = g["id"] if "id" in g else g["group_id"]
+            rid = (await phx.room_open(gid))["room_id"]
+            await probe.room_join(rid)
+            got = {"probe": [], "phx": []}
+
+            @probe.on_room_signal
+            async def _ps(frame):
+                got["probe"].append(frame)
+
+            @phx.on_room_signal
+            async def _hs(frame):
+                got["phx"].append(frame)
+
+            await phx.room_signal(rid, "xrwprobe", "offer",
+                                  {"type": "offer", "sdp": "v=0 o"})
+            assert await wait_for(lambda: len(got["probe"]) == 1,
+                                  timeout=6)
+            await probe.room_signal(rid, "xrwphoenix", "answer",
+                                    {"type": "answer", "sdp": "v=0 a"})
+            assert await wait_for(lambda: len(got["phx"]) == 1,
+                                  timeout=6)
+        finally:
+            await phx.close()
+            await probe.close()
+
+    run(_t())
+    home.stop()
+    x3.stop()
