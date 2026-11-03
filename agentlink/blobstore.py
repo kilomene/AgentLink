@@ -64,6 +64,9 @@ class LocalBlobStore:
             raise BlobNotFound(blob_id)
         return p.read_bytes()
 
+    def exists(self, blob_id: str) -> bool:
+        return self._path(blob_id).exists()
+
     def delete(self, blob_id: str) -> None:
         p = self._path(blob_id)
         if p.exists():
@@ -314,8 +317,39 @@ class R2BlobStore:
                           f"{len(out)} != {total}")
         return bytes(out)
 
+    def exists(self, blob_id: str) -> bool:
+        """Presence truth: True only on a definitive 200 HEAD;
+        BlobNotFound (404) is a definitive False. Any other
+        transport error PROPAGATES — through this egress an
+        unknown must never be read as an absence."""
+        try:
+            self._signed_request("HEAD", blob_id)
+            return True
+        except BlobNotFound:
+            return False
+
     def delete(self, blob_id: str) -> None:
-        self._signed_request("DELETE", blob_id)
+        """Delete, decided by presence — never by a response that
+        may not have arrived (v1.3.8, blob-layer truth). The
+        pre-1.3.8 delete trusted the DELETE response end to end:
+        through a lossy egress the request could EXECUTE at R2
+        while its response died in transit, _request_raw raised,
+        and the caller aborted believing the delete had failed —
+        orphaning the blob's metadata row permanently and
+        silently (the health battery's routine cleanup littered
+        the production store with exactly these orphans). Now: a
+        404 is success (the deleted state is already achieved),
+        and after any other failure the object's PRESENCE decides
+        — absent means the delete landed; still present means it
+        genuinely failed and the error propagates."""
+        try:
+            self._signed_request("DELETE", blob_id)
+        except BlobNotFound:
+            return
+        except Exception:
+            if not self.exists(blob_id):
+                return
+            raise
 
     def list_ids(self) -> list[str]:
         raise NotImplementedError(
