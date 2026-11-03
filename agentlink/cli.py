@@ -1159,18 +1159,22 @@ def _credentials(rest: list[str]) -> int:
     _add_common(ap)
     if sub == "put":
         ap.add_argument("service")
-        ap.add_argument("username",
+        # dest MUST NOT be "username": _add_common's --username is
+        # the AGENT's name and argparse would let the flag overwrite
+        # this positional (the v1.4.0 production proof caught an
+        # entry saved with the agent's name as its account).
+        ap.add_argument("account", metavar="username",
                         help="the account email/username saved")
         ap.add_argument("password")
         ap.add_argument("--notes", default="")
         args = ap.parse_args(r)
         _print(asyncio.run(_with_agent(
             args,
-            lambda a: a.vault.remember(args.service, args.username,
+            lambda a: a.vault.remember(args.service, args.account,
                                        args.password,
                                        notes=args.notes),
             forward={"cmd": "vault_put", "service": args.service,
-                     "username": args.username,
+                     "username": args.account,
                      "password": args.password,
                      "notes": args.notes})))
         return 0
