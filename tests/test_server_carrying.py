@@ -340,6 +340,114 @@ def test_better_brother_wins_the_claim(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# The carried-by label (v1.3.8): an agent-less carrier leaves
+# carried_by EMPTY in the row — composition must resolve the
+# carrier from its recorded server id, or honestly omit the name.
+# ---------------------------------------------------------------------------
+
+def test_carry_label_resolution_ladder():
+    """The resolution ladder, rung by rung: a recorded agent name
+    wins; a carrier id resolving to an agent-hosted server yields
+    that host agent; a carrier id resolving to an agent-less
+    operator relay yields its LABEL (no '@' — a server is not an
+    agent); an unresolvable id yields the bare state. The wart
+    shape — 'carried by @' with nothing after it — is unreachable
+    on every rung."""
+    by_id = {
+        "srv-a": {"server_id": "srv-a", "label": "A Relay",
+                  "host_agent": "alice"},
+        "srv-op": {"server_id": "srv-op", "label": "Operator Relay",
+                   "host_agent": ""},
+    }
+    base = {"carry_state": "carried", "carried_by": "",
+            "carried_by_id": ""}
+    assert Relay._carry_label({**base, "carried_by": "carol"}) == \
+        "carried by @carol"
+    assert Relay._carry_label({**base, "carried_by_id": "srv-a"},
+                              by_id) == "carried by @alice"
+    assert Relay._carry_label({**base, "carried_by_id": "srv-op"},
+                              by_id) == "carried by Operator Relay"
+    assert Relay._carry_label({**base, "carried_by_id": "ghost"},
+                              by_id) == "carried"
+    assert Relay._carry_label(dict(base)) == "carried"
+    assert Relay._carry_label({"carry_state": "home"}) == "at home"
+    assert Relay._carry_label({"carry_state": "down"}) == \
+        "down — awaiting carrier"
+    assert Relay._carry_label({"carry_state": ""}) == ""
+    # _server_entry alone (no set context) never dangles either.
+    entry = Relay.__new__(Relay)._server_entry({
+        "owner_agent": "victim", "carry_state": "carried",
+        "carried_by": "", "carried_by_id": "srv-op",
+        "carry_lease_until": int(time.time()) + 60,
+        "endpoint": "ws://victim", "server_id": "victim-server"})
+    assert entry["carry_state"] == "carried"
+    assert entry["carry_state_label"] == "carried"
+
+
+def test_agentless_carrier_dashboard_label(tmp_path):
+    """The production shape that produced the wart (v1.3.4 drill):
+    an OPERATOR relay — no host_agent, exactly like the Phoenix
+    Peer Relay — carries a fallen per-agent server. The claim
+    lands with carried_by='' and carried_by_id set. Composition
+    (the dashboard payload) must name the carrier truthfully by
+    its server label, on BOTH the Servers entry and the owner's
+    per-agent server line, and never render 'carried by @'."""
+    tmp = tempfile.mkdtemp(prefix="agentlink-carry-label-")
+    db = str(Path(tmp) / "shared.db")
+    victim_home = RelayHandle(
+        db, "Victim Server", host_agent="victim",
+        owner_agent="victim", server_id="victim-server")
+    operator = RelayHandle(db, "Operator Relay")  # no host_agent
+    victim_home.start()
+    operator.start()
+
+    async def _t():
+        store = Store(db)
+        store.claim("victim", "Victim")
+        assert await wait_for(
+            lambda: victim_home.relay._rated
+            and operator.relay._rated, timeout=60)
+        assert await wait_for(
+            lambda: _server_row(db, "victim-server")["health"] > 50,
+            timeout=30)
+        victim_home.crash()
+        _sql(db, "UPDATE servers SET home_last_seen = ?,"
+                 " last_seen = ? WHERE server_id = ?",
+             (int(time.time()) - 3600, int(time.time()) - 3600,
+              "victim-server"))
+        assert await wait_for(
+            lambda: _server_row(db, "victim-server")
+            ["carry_state"] == "carried", timeout=40)
+        row = _server_row(db, "victim-server")
+        # The premise, pinned: this is the row shape production
+        # produced — state carried, carrier NAME empty, carrier
+        # ID recorded.
+        assert row["carried_by"] == "", row
+        assert row["carried_by_id"] == operator.relay.server_id, row
+
+        data = operator.relay._dashboard_data()
+        srow = next(s for s in data["servers"]
+                    if s.get("server_id") == "victim-server")
+        assert srow["carry_state"] == "carried", srow
+        assert srow["carry_state_label"] == \
+            "carried by Operator Relay", srow
+        urow = next(u for u in data["users"]
+                    if u["username"] == "victim")
+        assert urow["server_state"] == "carried", urow
+        assert urow["server_state_label"] == \
+            "carried by Operator Relay", urow
+        # The raw field stays truthful (the row carries no agent
+        # name); only the composed label resolves it.
+        assert urow["server_carried_by"] == "", urow
+        store.close()
+    try:
+        asyncio.run(asyncio.wait_for(_t(), timeout=180))
+    finally:
+        operator.stop()
+        victim_home.stop()
+
+
+# ---------------------------------------------------------------------------
 # The full drill: carry -> traffic -> carrier falls -> hop -> handback.
 # ---------------------------------------------------------------------------
 
