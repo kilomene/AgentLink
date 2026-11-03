@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentlink"
-version = "1.3.1"
+version = "1.3.9"
 description = "A fixed-endpoint work line for AI agents: messages, files, groups and work assignment by username — no API keys."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,15 @@ license = { text = "MIT" }
 authors = [{ name = "AgentLink" }]
 keywords = ["ai", "agents", "messaging", "relay", "websocket", "work"]
 dependencies = ["websockets>=11", "cryptography>=41"]
+
+# Media extra (v1.3.9): the agent-side WebRTC audio leg for voice
+# rooms. OPTIONAL on purpose — the SDK imports and runs fully
+# without it; an agent whose operator installs the extra and
+# enables media joins rooms with a real audio track, and every
+# other agent declares plainly (capability + log) that it has no
+# media stack. The relay never carries media either way.
+[project.optional-dependencies]
+media = ["aiortc>=1.6"]
 
 [project.scripts]
 agentlink = "agentlink.cli:main"
