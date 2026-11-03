@@ -783,7 +783,8 @@ class SupabaseStore:
             for i in range(0, len(ids), 100):
                 chunk = ids[i:i + 100]
                 out |= self._ids_where(
-                    table, f"{col}=in.(" + ",".join(chunk) + ")", col)
+                    table, f"{col}=in.("
+                    + ",".join(str(v) for v in chunk) + ")", col)
             return out
 
         sets["work"] = ("id", set(work_ids))
@@ -911,8 +912,13 @@ class SupabaseStore:
         ids = list(ids)
         for i in range(0, len(ids), 100):
             chunk = ids[i:i + 100]
+            # PostgREST returns integer columns (e.g. queue.seq) as
+            # ints; the in.(...) filter is a string — stringify, or
+            # the join raises TypeError and the delete never happens
+            # (v1.3.7's first production ack hit exactly this).
             n += self._delete_where(
-                table, f"{col}=in.(" + ",".join(chunk) + ")")
+                table, f"{col}=in.(" + ",".join(str(v) for v in chunk)
+                + ")")
         return n
 
     def remove_user(self, username, *, force=False, actor="",
