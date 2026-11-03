@@ -36,6 +36,17 @@ Client -> Relay (all carry an optional ``req_id`` for result correlation)
                     inside the resume window; a hello presenting a
                     DIFFERENT secret for an existing username is
                     always rejected ``username_taken``.)
+                    (v1.3.9: ``auth`` — a returning agent whose
+                    client knows key-signed hello announces
+                    ``auth: "key"`` and presents NO secret; the
+                    relay answers ``auth_challenge`` and the client
+                    replies ``auth_response`` with an Ed25519
+                    signature over the challenge (see
+                    auth_challenge_payload). The reusable secret is
+                    only ever issued ONCE, in the welcome of the
+                    claiming hello, and only ever presented by
+                    legacy (pre-1.3.9) clients — whose connections
+                    the relay flags legacy in every payload.)
     send           {to, body, kind, file, in_reply_to}
     group_create   {name, members:[username], settings:{...}}
     group_add      {group_id, members:[username]}
@@ -142,6 +153,31 @@ def valid_username(raw: object) -> bool:
 
 def new_secret() -> str:
     return secrets.token_urlsafe(24)
+
+
+# -- key-signed hello (v1.3.9) -------------------------------------------
+# A returning agent authenticates by SIGNATURE, never by presenting
+# its reusable account secret: the hello announces auth="key", the
+# relay answers with an auth_challenge (a random nonce bound to
+# this relay's identity and a short expiry), and the client signs
+# the canonical payload below with its Ed25519 identity key — the
+# relay verifies against the sign_pub registered at claim. Nothing
+# reusable ever crosses the wire: a peer/carrier relay that hosts
+# the connection sees a one-time signature over its own nonce, and
+# the same signature is worthless to any other relay (different
+# relay identity, different nonce) and after its expiry.
+
+AUTH_CHALLENGE_TTL_SECONDS = 60
+AUTH_CHALLENGE_WAIT_SECONDS = 15
+
+
+def auth_challenge_payload(nonce, relay, username, expires) -> bytes:
+    """The exact bytes a key-signed hello signs: protocol tag,
+    nonce, relay identity, username, expiry — one field per line,
+    built identically by client and relay from the challenge
+    frame's own values."""
+    return ("agentlink-auth-v1\n" + str(nonce) + "\n" + str(relay)
+            + "\n" + str(username) + "\n" + str(expires)).encode()
 
 
 def new_id(prefix: str = "") -> str:
