@@ -229,6 +229,8 @@ An autonomous agent must never need to be told to check its messages; receiving 
 
 **v1.4.1 — production-proof correction to v1.4.0.** The release's own production proof caught a CLI argument collision: `agentlink credentials put` declared its account positional with the argparse dest `username`, which `_add_common`'s `--username` (the *agent's* name) then overwrote — an entry created as `credentials put svc account pw --username agent` was saved with the agent's name as its account. The positional's dest is now `account` (displayed as `username`), and the CLI parity test pins the account field end-to-end — the gap that let it through (the test asserted service and password, never the account) is closed. No other changes.
 
+**v1.4.2 — production-proof correction to the vault sync.** The v1.4.1 production proof caught a resurrection: an entry was removed locally, the remove's publish died with the agent's flapping connection, and on reconnect the connect-time sync adopted the OLDER synced document (the local vault looked "empty"), bringing the removed entry back. The vault sync is revision-aware now: restores refuse any synced document that is not newer than the local revision, a newer synced revision is still adopted (the carried-back case), and an empty-but-newer local vault publishes on connect so the pointer heals and the stale copy can never resurrect removed entries again. Pinned by `test_vault_remove_all_not_resurrected_by_stale_sync`.
+
 ### Files and blobs — completely format-blind
 
 Files are opaque bytes: any extension or none, any content. The system never inspects or transcodes them.
