@@ -217,8 +217,15 @@ def test_backend_factory_and_supabase_adapter_wiring(tmp_path):
     # the adapter touches.
     schema = (Path(__file__).parent.parent / "deploy"
               / "supabase-schema.sql").read_text()
-    for table in ("users", "queue", "groups", "group_members",
-                  "group_keys", "invites", "work", "work_deliveries",
-                  "dashboard_sessions", "audit_log"):
+    # The deploy copy is regenerated from canonical
+    # supabase/schema.sql + migrations (v1.3.9 WS5 resync), so the
+    # tables carry the production al_ prefix; the needles name
+    # the tables the adapter touches under that prefix, plus the
+    # v1.3.9 additions (rooms state, connection registry).
+    for table in ("al_users", "al_queue", "al_groups",
+                  "al_group_members", "al_group_keys", "al_invites",
+                  "al_work", "al_work_deliveries",
+                  "al_dashboard_sessions", "al_audit_log",
+                  "al_connections", "al_rooms", "al_room_frames"):
         assert f"create table if not exists {table}" in schema
     assert time.time() > 0  # (silence unused-import style checkers)
