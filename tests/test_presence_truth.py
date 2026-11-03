@@ -225,22 +225,26 @@ def test_fresh_heartbeat_unknown_server_never_guessed(tmp_path):
 
 
 def test_rooms_compose_backend_wide(tmp_path):
-    """A room opened on a brother server (its lifecycle landed in
-    the shared audit) is a room on THIS dashboard; closing it
-    removes it; the local relay's own live rooms merge in."""
+    """A room opened on a brother server (its live state in the
+    shared store since v1.3.9) is a room on THIS dashboard;
+    closing it removes it; the local relay's own live rooms merge
+    in. Participants are live via the shared connection registry —
+    the same presence facts every other surface reads."""
     store, home, peer = _mesh(tmp_path)
     store.claim("probe", "Probe")
     store.claim("phoenix", "Phoenix")
+    for u in ("probe", "phoenix"):
+        store.note_connection(u, PEER_EP, PEER_EP, HOME_EP)
+        store.touch(u)
     gid = store.create_group("room-group", "phoenix", None)
-    store.audit("room_opened", "probe", group_id=gid, status="r-bro1")
-    store.audit("room_joined", "phoenix", group_id=gid,
-                status="r-bro1")
+    store.room_create("r-bro1", gid, "probe")
+    store.room_add_participant("r-bro1", "phoenix")
     rooms = home._dashboard_data()["rooms"]
     mine = [r for r in rooms if r["id"] == "r-bro1"]
     assert len(mine) == 1
     assert sorted(mine[0]["participants"]) == ["phoenix", "probe"]
     assert mine[0]["creator"] == "probe"
-    store.audit("room_closed", "probe", group_id=gid, status="r-bro1")
+    store.room_close("r-bro1")
     rooms = home._dashboard_data()["rooms"]
     assert [r for r in rooms if r["id"] == "r-bro1"] == []
     home.rooms["r-local"] = {"group_id": gid, "creator": "phoenix",
