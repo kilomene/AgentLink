@@ -1244,6 +1244,10 @@ class Agent:
         """Fetch the synced vault document through the blob layer
         and adopt it (signature-verified under THIS identity — a
         foreign or tampered document is refused by construction).
+        REVISION-GUARDED: a synced document OLDER than the local
+        vault is never adopted — a remove-all whose publish failed
+        must not be rewound by the stale synced copy (the v1.4.1
+        production proof caught exactly that resurrection).
         Returns True when a document was adopted."""
         meta = await self._request({"type": "vault_fetch_meta"})
         if not meta.get("present") or not meta.get("blob_id"):
@@ -1252,8 +1256,14 @@ class Agent:
             {"type": "blob_get", "blob_id": meta["blob_id"]},
             timeout=120)
         core = self._credentials_vault()
-        count = core.adopt_document(
-            base64.b64decode(resp["data_b64"]))
+        data = base64.b64decode(resp["data_b64"])
+        remote_rev = core.document_revision(data)
+        if remote_rev <= core.revision and not core.load_error:
+            log.info("credentials vault: synced revision %s is not "
+                     "newer than local revision %s — keeping local",
+                     remote_rev, core.revision)
+            return False
+        count = core.adopt_document(data)
         self._vault_blob_id = meta["blob_id"]
         log.info("credentials vault restored from sync: %d entries "
                  "(revision %s)", count, core.revision)
@@ -1272,25 +1282,46 @@ class Agent:
             log.warning("credentials vault sync stopped: %s", exc)
 
     async def _vault_sync_on_connect(self) -> None:
-        """Connect-time vault reconciliation (start() calls this
-        guarded — a failure can never dark the line):
-        * a local vault (or a quarantined local document) publishes,
-          so the pointer follows the agent onto any server it rides;
-        * no local vault but a synced pointer exists → restore
-          (the carried path: same identity, new machine, vault
-          opens);
-        * nothing anywhere → nothing (a fresh agent's vault is
-          simply absent until its first save)."""
+        """Connect-time vault reconciliation (scheduled as a
+        post-boot task — a failure can never dark the line).
+        Revision-aware, so neither side can rewind the other:
+        * a QUARANTINED local document defers to the synced copy
+          (restore; never publish over it);
+        * a synced revision NEWER than local is adopted (the
+          vault moved on elsewhere — the carried-back case);
+        * a non-empty local vault publishes (the pointer follows
+          the agent onto any server it rides, and labels refresh
+          under a newly learned oversight key);
+        * an EMPTY local vault whose revision is NEWER than the
+          pointer publishes too — the remove-all heal: the pointer
+          must catch up so the stale synced copy can never
+          resurrect removed entries on a later restore;
+        * equal and empty → already in sync, nothing to do."""
         core = self._credentials_vault()
-        if len(core) > 0 or core.load_error:
-            if len(core) > 0:
-                await self._vault_publish()
-            else:
-                # Quarantined local file: never publish emptiness
-                # over a synced vault — restore instead.
-                await self._vault_restore_from_sync()
+        if core.load_error:
+            await self._vault_restore_from_sync()
             return
-        await self._vault_restore_from_sync()
+        meta = None
+        try:
+            meta = await self._request({"type": "vault_fetch_meta"})
+        except Exception:
+            meta = None
+        if meta and meta.get("present") \
+                and int(meta.get("version") or 0) > core.revision:
+            await self._vault_restore_from_sync()
+            return
+        if len(core) > 0:
+            await self._vault_publish()
+            return
+        if meta and meta.get("present") \
+                and core.revision > int(meta.get("version") or 0):
+            await self._vault_publish()
+            return
+        if not meta and core.revision > 0:
+            # The pointer read failed (sick connection) but a local
+            # vault exists — publish is the safe direction: it can
+            # only be refused as stale, never rewind anything.
+            await self._vault_publish()
 
     def _vault_decision_get(self, service_or_id):
         """The synchronous vault accessor handed to the agent's own
