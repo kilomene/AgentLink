@@ -233,6 +233,65 @@ def test_ghost_room_reaped_on_unclosed_death(state_root):
     x3.stop()
 
 
+def test_signal_routes_on_connection_note_when_last_seen_stale(state_root):
+    """Regression pin for the production-proof find (2026-11-03):
+    x3 refused a signal to phoenix with peer_offline although
+    phoenix was connected to home — the signal handler consulted
+    presence with NO connection map, so only last_seen counted,
+    and a participant between heartbeats (or a driver that has
+    not started its serve loop) read as gone. Presence for
+    routing is the shared truth: a fresh CONNECTION NOTE must
+    carry the decision even when last_seen is stale."""
+    import sqlite3
+
+    from agentlink.protocol import now_ts
+    tmp = tempfile.mkdtemp(prefix="agentlink-xr-")
+    db, home, x3, home_url, x3_url = _setup(tmp, state_root)
+
+    async def _t():
+        a = Agent("xrnote-a", endpoint=home_url,
+                  state_dir=str(state_root / "xrnote-a"))
+        b = Agent("xrnote-b", endpoint=x3_url,
+                  state_dir=str(state_root / "xrnote-b"))
+        await a.start()
+        await b.start()
+        try:
+            g = await a.group_create("xr-note", ["xrnote-b"])
+            gid = g["group_id"]
+            rid = (await a.room_open(gid))["room_id"]
+            await b.room_join(rid)
+            got = []
+
+            @a.on_room_signal
+            async def _hs(frame):
+                got.append(frame)
+
+            # Age a's last_seen far beyond the offline grace; its
+            # connection NOTE (written at hello by the home relay)
+            # stays fresh — the shared record says it is connected.
+            conn = sqlite3.connect(db)
+            conn.execute("UPDATE users SET last_seen = ?"
+                         " WHERE username = ?",
+                         (now_ts() - 3600, "xrnote-a"))
+            conn.commit()
+            conn.close()
+            await b.room_signal(rid, "xrnote-a", "answer",
+                                {"type": "answer", "sdp": "note-pin"})
+            assert await wait_for(lambda: len(got) == 1), \
+                "signal refused/routed nowhere on a stale last_seen"
+            assert got[0]["kind"] == "answer"
+        finally:
+            for ag in (a, b):
+                try:
+                    await ag.close()
+                except Exception:
+                    pass
+
+    run(_t())
+    home.stop()
+    x3.stop()
+
+
 def test_legacy_composition_fallback_for_recordless_store(state_root):
     """The pre-1.3.9 audit-replay composition survives ONLY as the
     fallback for a store backend without shared room records —
