@@ -603,6 +603,56 @@ def test_control_channel_vault_forwarding(tmp_path, state_root):
 
 # -- 12: group vault surface untouched ---------------------------------------------
 
+def test_vault_remove_all_not_resurrected_by_stale_sync(tmp_path,
+                                                        state_root):
+    """v1.4.2 regression pin — the defect the v1.4.1 PRODUCTION
+    proof caught: phoenix's proof entry was removed locally, the
+    remove's publish died with its flapping connection, and on
+    reconnect the connect-sync adopted the OLDER synced document,
+    resurrecting the removed entry. The sync is revision-aware
+    now: a stale pointer can never rewind a newer local vault,
+    and an empty-but-newer local vault HEALS the pointer."""
+    db = str(tmp_path / "relay.db")
+    h = RelayHandle(db, "vault-heal")
+    url = h.start()
+
+    async def _t():
+        agent = Agent("valhealer", endpoint=url,
+                      state_dir=str(state_root / "valhealer"))
+        await agent.start()
+        try:
+            entry_id = (await agent.vault.put(
+                "svc", "a@x.io", "pw-heal"))["id"]
+            meta = await agent._request({"type": "vault_fetch_meta"})
+            assert meta["version"] == 1 and meta["entries"] == 1
+            real_publish = agent._vault_publish
+
+            async def dead_publish():
+                raise RuntimeError("relay died mid-publish")
+
+            agent._vault_publish = dead_publish
+            try:
+                await agent.vault.remove(entry_id)
+            finally:
+                agent._vault_publish = real_publish
+            core = agent._credentials_vault()
+            assert len(core) == 0 and core.revision == 2
+            # The stale pointer still claims rev 1 with the entry.
+            meta = await agent._request({"type": "vault_fetch_meta"})
+            assert meta["version"] == 1 and meta["entries"] == 1
+            await agent._vault_sync_on_connect()
+            with pytest.raises(VaultError):
+                core.get(entry_id)
+            assert len(core) == 0
+            meta = await agent._request({"type": "vault_fetch_meta"})
+            assert meta["version"] == 2 and meta["entries"] == 0, meta
+        finally:
+            await agent.close()
+
+    run(_t())
+    h.stop()
+
+
 def test_group_vault_surface_untouched():
     for name in ("vault_put", "vault_list", "vault_pin",
                  "vault_remove"):
