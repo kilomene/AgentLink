@@ -181,6 +181,19 @@ class CredentialsVault:
     def document_bytes(self) -> bytes:
         return json.dumps(self.document()).encode()
 
+    def document_revision(self, data: bytes) -> int:
+        """The revision of a synced document WITHOUT adopting it —
+        verified first (a foreign or tampered document raises, so
+        a revision is only ever read from an authentic document of
+        this identity)."""
+        try:
+            doc = json.loads(data.decode())
+        except Exception as exc:
+            raise VaultError(
+                f"synced vault document is not valid JSON: {exc}")
+        _entries, revision = self._verify_document(doc)
+        return revision
+
     def adopt_document(self, data: bytes) -> int:
         """Replace the local vault with a verified synced document
         (the carried/restore path). Returns the entry count. Fails
