@@ -35,6 +35,7 @@ create table if not exists al_users (
     cap_desc text not null default '',
     mode text not null default 'autonomous',  -- platform autonomy law (v1.1.7)
     decision_link text not null default '',   -- declared link state (v1.3.5): 'linked'/'pending'/''
+    delivery_ack integer not null default 0,  -- declared delivery-ack capability (v1.3.7): 1 = client acks queued frames into its durable journal, 0 = legacy flush
     last_seen bigint not null default 0,
     created_at bigint not null
 );
