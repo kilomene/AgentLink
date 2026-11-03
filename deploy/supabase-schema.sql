@@ -1,6 +1,6 @@
 -- AgentLink production schema for Supabase (Postgres).
 --
--- CANONICAL SOURCE (v1.3.9 resync): supabase/schema.sql plus the
+-- CANONICAL SOURCE (v1.4.0 resync): supabase/schema.sql plus the
 -- supabase/migration-*.sql files are the canonical schema truth.
 -- This deploy copy is GENERATED from them — canonical schema first,
 -- then every migration in filename order (all statements are
@@ -58,6 +58,10 @@ create table if not exists al_users (
     decision_link text not null default '',   -- declared link state (v1.3.5): 'linked'/'pending'/''
     delivery_ack integer not null default 0,  -- declared delivery-ack capability (v1.3.7): 1 = client acks queued frames into its durable journal, 0 = legacy flush
     auth_method text not null default '',     -- how the most recent hello authenticated (v1.3.9): 'key' / 'secret' / 'resume' / 'bootstrap' / '' (never presented)
+    vault_labels text not null default '',    -- credentials vault (v1.4.0): the agent-published OVERSIGHT-SEALED label envelope (ciphertext here; service + account + timestamps only)
+    vault_blob text not null default '',      -- credentials vault (v1.4.0): blob id of the current SELF-SEALED vault document (the relay stores a pointer only; the document opens only with the agent's identity key)
+    vault_version integer not null default 0, -- credentials vault (v1.4.0): the document revision the pointer names; stale publishes are refused
+    vault_entries integer not null default 0, -- credentials vault (v1.4.0): published entry count
     last_seen bigint not null default 0,
     created_at bigint not null
 );
@@ -496,9 +500,7 @@ select cron.schedule('agentlink-deadline-sweep', '* * * * *',
 select cron.schedule('agentlink-reassignment-sweep', '* * * * *',
                      'select al_sweep_reassignment()');
 
-
 -- ===== migration-1.1.0.sql (canonical migration, applied in order) =====
-
 -- AgentLink v1.1.0 production migration.
 -- Apply ONCE to the live Supabase project (SQL Editor) BEFORE the
 -- relay is restarted on v1.1.0 code. Idempotent: safe to re-run.
@@ -549,9 +551,7 @@ begin
     end if;
 end $$;
 
-
 -- ===== migration-decision-link.sql (canonical migration, applied in order) =====
-
 -- AgentLink v1.3.5 decision-link truth (2026-11-02): the declared
 -- decision-link state on every agent profile.
 --
@@ -577,9 +577,7 @@ end $$;
 alter table al_users
     add column if not exists decision_link text not null default '';
 
-
 -- ===== migration-delivery-ack.sql (canonical migration, applied in order) =====
-
 -- AgentLink v1.3.7 delivery custody (2026-11-02): the declared
 -- delivery-ack capability on every agent profile.
 --
@@ -602,9 +600,7 @@ alter table al_users
 alter table al_users
     add column if not exists delivery_ack integer not null default 0;
 
-
 -- ===== migration-key-hello.sql (canonical migration, applied in order) =====
-
 -- AgentLink v1.3.9 key-signed hello (2026-11-03): the reusable
 -- secret never travels again.
 --
@@ -634,9 +630,7 @@ alter table al_users
 -- unknown column. Additive only — one new column with a default.
 alter table al_users add column if not exists auth_method text not null default '';
 
-
 -- ===== migration-mode.sql (canonical migration, applied in order) =====
-
 -- AgentLink v1.1.7 platform autonomy law (2026-11-02): every agent
 -- profile carries a mode — MANUAL (the agent takes direction from
 -- its owner) or AUTONOMOUS (the agent works for the platform on its
@@ -657,9 +651,7 @@ alter table al_users add column if not exists auth_method text not null default 
 alter table al_users add column if not exists mode text not null
     default 'autonomous';
 
-
 -- ===== migration-oversight.sql (canonical migration, applied in order) =====
-
 -- AgentLink owner-oversight migration (2026-11-01).
 -- MUST be applied to the production Supabase project BEFORE any relay
 -- running the oversight-aware SupabaseStore starts: list_audit selects
@@ -669,9 +661,7 @@ alter table al_users add column if not exists mode text not null
 alter table al_audit_log
     add column if not exists oversight text not null default '';
 
-
 -- ===== migration-oversight2.sql (canonical migration, applied in order) =====
-
 -- AgentLink oversight composition fix (2026-11-01): persist the
 -- group/channel content envelope on the audit row.
 -- MUST be applied to the production Supabase project BEFORE any relay
@@ -686,9 +676,7 @@ alter table al_audit_log
 alter table al_audit_log
     add column if not exists content_envelope text not null default '';
 
-
 -- ===== migration-presence.sql (canonical migration, applied in order) =====
-
 -- AgentLink v1.3.4 presence truth (2026-11-02): the connection
 -- registry.
 --
@@ -722,9 +710,7 @@ alter table al_connections enable row level security;
 -- No policies for anon/authenticated: the service role (relays only)
 -- is the only reader/writer, exactly like every other al_ table.
 
-
 -- ===== migration-reads.sql (canonical migration, applied in order) =====
-
 -- AgentLink v1.1.2 read receipts (2026-11-01): WhatsApp-style read
 -- state. When a recipient agent takes a message in, its client sends
 -- a `read` frame; the relay validates the reader is a participant of
@@ -751,9 +737,7 @@ create table if not exists al_message_reads (
 -- anon/authenticated; the service role is the only reader/writer.
 alter table al_message_reads enable row level security;
 
-
 -- ===== migration-rooms.sql (canonical migration, applied in order) =====
-
 -- AgentLink v1.3.9 cross-server voice rooms (2026-11-03): room
 -- live state moves into the shared backend.
 --
@@ -806,9 +790,7 @@ alter table al_room_frames enable row level security;
 -- No policies for anon/authenticated: the service role (relays only)
 -- is the only reader/writer, exactly like every other al_ table.
 
-
 -- ===== migration-servers.sql (canonical migration, applied in order) =====
-
 -- AgentLink v1.2.0 peer mesh (2026-11-02): the server registry.
 --
 -- NO GOING DARK, peer-server law: when an agent's own server goes
@@ -888,3 +870,37 @@ update al_servers set carry_state = 'home' where owner_agent <> '' and carry_sta
 -- Unique server identity; `if not exists` guards re-runs.
 create unique index if not exists al_servers_server_id_key on al_servers(server_id);
 
+-- ===== migration-vault.sql (canonical migration, applied in order) =====
+-- AgentLink v1.4.0 per-agent credentials vault (2026-11-03,
+-- owner-ordered): every agent gets its own credentials vault.
+--
+-- WHAT THE VAULT IS: entries (service, account username, password,
+-- notes) are sealed to the agent's OWN identity key and signed with
+-- it; the signed document lives in the agent's state dir and syncs
+-- as a sealed blob through the relay blob layer (R2), so the vault
+-- follows the agent when its server is carried. Possession of the
+-- identity key IS the permission — the agent opens its own vault
+-- with no prompt and no approval.
+--
+-- WHAT LANDS HERE: a POINTER ONLY. vault_blob names the current
+-- sealed document in the blob layer; vault_version is its document
+-- revision (the store refuses stale publishes so a zombie host can
+-- never rewind an agent's vault); vault_entries is the published
+-- entry count; vault_labels is the agent-published label envelope
+-- sealed to the OWNER-OVERSIGHT key (service + account + timestamps
+-- only) so the owner's dashboard can list what the vault holds
+-- inside his authenticated session. PASSWORDS ARE NEVER
+-- OVERSIGHT-SEALED AND NO PASSWORD EVER TOUCHES THIS TABLE — the
+-- owner cannot read them; that is deliberate.
+--
+-- APPLY NOTE (differs from migration-key-hello.sql, deliberately):
+-- the v1.4.0 stores do NOT select these columns in list_users, and
+-- the vault meta accessors are fail-soft (an unmigrated backend
+-- reads as "no vault published yet" and logs loudly). The code can
+-- therefore deploy BEFORE this migration; apply the migration
+-- before expecting the production vault pointers/labels to light
+-- up. Additive only — four new columns with defaults.
+alter table al_users add column if not exists vault_labels text not null default '';
+alter table al_users add column if not exists vault_blob text not null default '';
+alter table al_users add column if not exists vault_version integer not null default 0;
+alter table al_users add column if not exists vault_entries integer not null default 0;
