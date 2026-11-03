@@ -481,6 +481,21 @@ class Store:
                     home_endpoint TEXT NOT NULL DEFAULT '',
                     updated_at INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS rooms (
+                    room_id TEXT PRIMARY KEY,
+                    group_id TEXT NOT NULL DEFAULT '',
+                    creator TEXT NOT NULL DEFAULT '',
+                    participants TEXT NOT NULL DEFAULT '[]',
+                    opened_at INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0,
+                    closed INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS room_frames (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    to_username TEXT NOT NULL,
+                    frame TEXT NOT NULL,
+                    ts INTEGER NOT NULL DEFAULT 0
+                );
                 """
             )
             self._db.commit()
@@ -574,6 +589,16 @@ class Store:
         # agent itself — the relay only records it.
         _add("users", "delivery_ack",
              "delivery_ack INTEGER NOT NULL DEFAULT 0")
+        # Key-signed hello (v1.3.9): how this agent's most recent
+        # hello authenticated — 'key' (Ed25519 challenge-response,
+        # nothing reusable presented), 'secret' (a legacy client
+        # presenting its reusable secret), 'resume' (the v1.3.7
+        # key-match resume gate), 'bootstrap' (the claiming hello
+        # itself). A connection-side fact recorded from the hello,
+        # exactly like delivery_ack — surfaces flag legacy methods
+        # honestly instead of letting them pass as current.
+        _add("users", "auth_method",
+             "auth_method TEXT NOT NULL DEFAULT ''")
         # Peer mesh (v1.2.0): the server registry carries health,
         # rider load and effective capacity alongside identity.
         _add("servers", "health",
@@ -1443,6 +1468,198 @@ class Store:
                 " updated_at FROM connections").fetchall()
         return {r["username"]: dict(r) for r in rows}
 
+    # -- voice-room live state (v1.3.9, shared backend) -----------------
+    # Room state USED to live in each relay's own memory: a room
+    # opened on one server was unjoinable from another (join refused
+    # unknown_room, proven live 2026-11-03) and a room whose creator
+    # died unclosed haunted the dashboard as a ghost. The v1.3.4
+    # presence cure applies: the room record is a fact in the SHARED
+    # store — every relay reads/writes the same rooms — and frames
+    # for a participant connected to a brother relay ride a
+    # store-mediated path (room_frames) that each relay drains for
+    # its local peers on its scan tick, the same pattern as the
+    # cross-relay queue drain. Room rows are never deleted: a closed
+    # room stays as history (closed=1), only live composition reads
+    # closed=0. Participants are stored as a JSON list; membership
+    # changes are read-modify-write under the store lock, the same
+    # discipline as the queue's claim operations.
+
+    @staticmethod
+    def _shape_room(row) -> dict | None:
+        if row is None:
+            return None
+        r = dict(row)
+        try:
+            parts = json.loads(r.get("participants") or "[]")
+        except Exception:
+            parts = []
+        return {"room_id": r["room_id"],
+                "group_id": r.get("group_id") or "",
+                "creator": r.get("creator") or "",
+                "participants": [str(p) for p in parts],
+                "opened_at": int(r.get("opened_at") or 0),
+                "updated_at": int(r.get("updated_at") or 0),
+                "closed": bool(r.get("closed"))}
+
+    def room_create(self, room_id: str, group_id: str,
+                    creator: str) -> dict:
+        """Open a room record with the creator as first participant."""
+        now = now_ts()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO rooms (room_id, group_id, creator,"
+                " participants, opened_at, updated_at, closed)"
+                " VALUES (?, ?, ?, ?, ?, ?, 0)",
+                (room_id, group_id or "", creator,
+                 json.dumps([creator]), now, now))
+            self._db.commit()
+            row = self._db.execute(
+                "SELECT * FROM rooms WHERE room_id = ?",
+                (room_id,)).fetchone()
+        return self._shape_room(row)
+
+    def room_get(self, room_id: str) -> dict | None:
+        """The LIVE room record, or None when the room does not
+        exist or is closed — closed is terminal for every room
+        operation, exactly as a relay-local room dict vanishing was."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM rooms WHERE room_id = ? AND closed = 0",
+                (room_id,)).fetchone()
+        return self._shape_room(row)
+
+    def rooms_open(self) -> list[dict]:
+        """Every live (not closed) room in the backend, oldest first."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM rooms WHERE closed = 0"
+                " ORDER BY opened_at ASC").fetchall()
+        return [self._shape_room(r) for r in rows]
+
+    def room_add_participant(self, room_id: str,
+                             username: str) -> dict | None:
+        """Join: returns the updated live room, or None when the
+        room is unknown/closed."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM rooms WHERE room_id = ? AND closed = 0",
+                (room_id,)).fetchone()
+            room = self._shape_room(row)
+            if room is None:
+                return None
+            if username not in room["participants"]:
+                room["participants"].append(username)
+                self._db.execute(
+                    "UPDATE rooms SET participants = ?, updated_at = ?"
+                    " WHERE room_id = ?",
+                    (json.dumps(room["participants"]), now_ts(), room_id))
+                self._db.commit()
+            return room
+
+    def room_remove_participant(self, room_id: str,
+                                username: str) -> dict | None:
+        """Leave (or a connection's death, via the hosting relay):
+        returns the updated room, or None when the room is
+        unknown/closed. A room whose last participant leaves is
+        CLOSED in the same write — an empty room is not a live room."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM rooms WHERE room_id = ? AND closed = 0",
+                (room_id,)).fetchone()
+            room = self._shape_room(row)
+            if room is None:
+                return None
+            if username in room["participants"]:
+                room["participants"] = [
+                    p for p in room["participants"] if p != username]
+                closed = 0 if room["participants"] else 1
+                room["closed"] = bool(closed)
+                self._db.execute(
+                    "UPDATE rooms SET participants = ?, updated_at = ?,"
+                    " closed = ? WHERE room_id = ?",
+                    (json.dumps(room["participants"]), now_ts(),
+                     closed, room_id))
+                self._db.commit()
+            return room
+
+    def room_close(self, room_id: str) -> dict | None:
+        """Close a room outright (creator / group admin). Returns
+        the room as it stood, or None when unknown/already closed."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM rooms WHERE room_id = ? AND closed = 0",
+                (room_id,)).fetchone()
+            room = self._shape_room(row)
+            if room is None:
+                return None
+            self._db.execute(
+                "UPDATE rooms SET closed = 1, updated_at = ?"
+                " WHERE room_id = ?", (now_ts(), room_id))
+            self._db.commit()
+            room["closed"] = True
+            return room
+
+    def rooms_of_participant(self, username: str) -> list[dict]:
+        """Every live room this username is currently a participant
+        of — the disconnect reaper's work list."""
+        return [r for r in self.rooms_open()
+                if username in r["participants"]]
+
+    # -- store-mediated room frames (v1.3.9) ----------------------------
+    # A room_signal / room_event for a participant connected to a
+    # BROTHER relay cannot ride that relay's socket; it rides here.
+    # Each relay drains frames for its own local peers on its scan
+    # tick (claim = select + delete, the queue's discipline) and
+    # writes them to the socket. Signalling is perishable: a frame
+    # older than ROOM_FRAME_TTL_SECONDS at drain time is dropped,
+    # never delivered late — a stale ICE candidate or a superseded
+    # offer must not surface on a fresh connection.
+
+    def room_frame_put(self, to_username: str, frame: dict) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO room_frames (to_username, frame, ts)"
+                " VALUES (?, ?, ?)",
+                (to_username, json.dumps(frame), now_ts()))
+            self._db.commit()
+
+    def room_frames_drain(self, usernames,
+                          max_age: int = 120) -> dict:
+        """Claim every pending room frame for the given usernames:
+        returns {username: [frame, ...]} in insertion order. Stale
+        frames (older than max_age) are deleted WITHOUT delivery.
+        The claim is atomic under the store lock, so two relays
+        racing the same username can never deliver the same frame
+        twice."""
+        wanted = [u for u in (usernames or []) if u]
+        if not wanted:
+            return {}
+        now = now_ts()
+        marks = ",".join("?" * len(wanted))
+        out: dict[str, list] = {}
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT seq, to_username, frame, ts FROM room_frames"
+                f" WHERE to_username IN ({marks}) ORDER BY seq ASC",
+                wanted).fetchall()
+            if rows:
+                seqs = [r["seq"] for r in rows]
+                smarks = ",".join("?" * len(seqs))
+                self._db.execute(
+                    f"DELETE FROM room_frames WHERE seq IN ({smarks})",
+                    seqs)
+                self._db.commit()
+        for r in rows:
+            if now - int(r["ts"] or 0) > max_age:
+                continue  # stale signalling: claimed and dropped
+            try:
+                frame = json.loads(r["frame"])
+            except Exception:
+                continue
+            frame["queued"] = True
+            out.setdefault(r["to_username"], []).append(frame)
+        return out
+
     def list_room_audit(self) -> list[dict]:
         """EVERY voice-room lifecycle row, oldest first, no limit —
         the shared-store source for the dashboard's Voice Rooms
@@ -1471,7 +1688,9 @@ class Store:
                 " (SELECT COALESCE(MAX(updated_at), 0)"
                 "   FROM connections),"
                 " (SELECT COALESCE(MAX(last_seen), 0) FROM servers),"
-                " (SELECT COALESCE(MAX(seq), 0) FROM audit_log)"
+                " (SELECT COALESCE(MAX(seq), 0) FROM audit_log),"
+                " (SELECT COALESCE(MAX(updated_at), 0) FROM rooms),"
+                " (SELECT COALESCE(MAX(seq), 0) FROM room_frames)"
             ).fetchone()
         return "|".join(str(int(v or 0)) for v in row)
 
@@ -1817,6 +2036,20 @@ class Store:
                 (1 if flag else 0, username))
             self._db.commit()
 
+    def set_auth_method(self, username: str, method: str) -> None:
+        """Persist how the agent's most recent hello authenticated
+        (v1.3.9). Recorded from the hello itself, exactly like
+        set_delivery_ack — the relay reports what the connection
+        DID, never assigns it. Unknown values are refused so the
+        record can never drift out of the lawful states."""
+        if method not in ("key", "secret", "resume", "bootstrap"):
+            return
+        with self._lock:
+            self._db.execute(
+                "UPDATE users SET auth_method = ? WHERE username = ?",
+                (method, username))
+            self._db.commit()
+
     def sign_pub_of(self, username: str) -> str:
         with self._lock:
             row = self._db.execute(
@@ -1863,7 +2096,7 @@ class Store:
                 rows = self._db.execute(
                     "SELECT username, display_name, pubkey, sign_pub,"
                     " capabilities, cap_desc, mode, decision_link,"
-                    " delivery_ack, last_seen, created_at"
+                    " delivery_ack, auth_method, last_seen, created_at"
                     " FROM users"
                     " WHERE username LIKE ? ORDER BY username",
                     (f"%{query}%",),
@@ -1872,7 +2105,7 @@ class Store:
                 rows = self._db.execute(
                     "SELECT username, display_name, pubkey, sign_pub,"
                     " capabilities, cap_desc, mode, decision_link,"
-                    " delivery_ack, last_seen, created_at"
+                    " delivery_ack, auth_method, last_seen, created_at"
                     " FROM users ORDER BY username"
                 ).fetchall()
             out = []
