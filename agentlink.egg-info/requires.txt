@@ -1,0 +1,5 @@
+websockets>=11
+cryptography>=41
+
+[media]
+aiortc>=1.6
