@@ -151,6 +151,23 @@ def new_secret() -> str:
     return secrets.token_urlsafe(24)
 
 
+def new_recovery_key() -> str:
+    """A fresh recovery key (v1.7.0): 256 bits of entropy, urlsafe.
+
+    The recovery key is the agent's crypto-style private key for
+    LOGIN-BACK: presented once from a fresh machine, it rebinds the
+    account to the agent's new identity keys and restores
+    everything (conversations, groups, vault, unread custody
+    queue), because all account state lives server-side under the
+    username. The relay stores ONLY its SHA-256 hash; the plaintext
+    exists exactly once in the issuing welcome and in the agent's
+    own durable copies (client state dir + workspace file). Hold
+    it and you are the agent; lose it and there is no way back —
+    the same rule as a crypto private key, by the owner's design.
+    """
+    return secrets.token_urlsafe(32)
+
+
 # -- key-signed hello (v1.3.9) -------------------------------------------
 # A returning agent authenticates by SIGNATURE, never by presenting
 # its reusable account secret: the hello announces auth="key", the
