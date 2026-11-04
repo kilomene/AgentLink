@@ -493,3 +493,91 @@ def _work_status(db, wid):
         return row[0] if row else None
     finally:
         conn.close()
+
+
+def test_ping_inside_auth_window_does_not_kill_hello(state_root):
+    """v1.6.0 pin — the 44-race gate failure, root-caused: a
+    liveness ping landing between the auth_challenge and the
+    auth_response must be answered with a pong while the
+    authentication proceeds. The pre-fix relay waited with a
+    single recv and refused the hello outright ('expected
+    auth_response, got ping' -> key_auth_failed): a migrated
+    agent whose previous session's heartbeat loop ticked on its
+    new socket mid-handshake had its hello assassinated by its
+    own ping, and its queued work then waited on a session that
+    never landed. Equally pinned: a NON-liveness frame in the
+    same window still fails the authentication — the tolerance
+    is for pings only, and the signature gate is unchanged."""
+    tmp = tempfile.mkdtemp(prefix="agentlink-kh-")
+    db = _db(tmp)
+    h = RelayHandle(db, "kh-pingwindow")
+    url = h.start()
+
+    async def _hello_with_interleave(identity, interleave):
+        frames = []
+        async with connect(url) as ws:
+            await ws.send(json.dumps({
+                "type": "hello", "username": "pingvic",
+                "display_name": "pingvic", "secret": None,
+                "auth": "key", "ephemeral": False,
+                "pubkey": identity.public_key_b64,
+                "sign_pub": identity.signing_public_key_b64,
+                "capabilities": [], "mode": "autonomous"}))
+            while True:
+                frame = json.loads(
+                    await asyncio.wait_for(ws.recv(), 10))
+                frames.append(frame)
+                if frame.get("type") == "auth_challenge":
+                    await ws.send(json.dumps(interleave))
+                    continue
+                return frames, frame
+
+    async def _t():
+        first = Agent("pingvic", endpoint=url,
+                      state_dir=str(state_root / "pingvic"))
+        await first.start()
+        await first.close()
+        real = Identity("pingvic", str(state_root / "pingvic"))
+        # The interleave is a ping: a pong must come back, and the
+        # NEXT frame after it must be a fresh decision point — the
+        # challenge is still outstanding, so we then answer it.
+        frames = []
+        async with connect(url) as ws:
+            await ws.send(json.dumps({
+                "type": "hello", "username": "pingvic",
+                "display_name": "pingvic", "secret": None,
+                "auth": "key", "ephemeral": False,
+                "pubkey": real.public_key_b64,
+                "sign_pub": real.signing_public_key_b64,
+                "capabilities": [], "mode": "autonomous"}))
+            challenge = None
+            while True:
+                frame = json.loads(
+                    await asyncio.wait_for(ws.recv(), 10))
+                frames.append(frame)
+                if frame.get("type") == "auth_challenge":
+                    challenge = frame
+                    await ws.send(json.dumps({"type": "ping"}))
+                    continue
+                if frame.get("type") == "pong":
+                    payload = auth_challenge_payload(
+                        challenge["nonce"], challenge["relay"],
+                        "pingvic", challenge["expires"])
+                    await ws.send(json.dumps({
+                        "type": "auth_response",
+                        "signature": real.sign(payload)}))
+                    continue
+                last = frame
+                break
+        assert last["type"] == "welcome", frames
+        # A junk frame in the window still kills the hello.
+        frames2, last2 = await _hello_with_interleave(
+            real, {"type": "send", "to": "anyone", "body": "x"})
+        assert last2["type"] == "error"
+        assert last2["reason"] == "key_auth_failed"
+        # And the genuine key still works afterwards.
+        frames3, last3 = await _raw_key_hello(url, "pingvic", real)
+        assert last3["type"] == "welcome"
+
+    run(_t())
+    h.stop()
