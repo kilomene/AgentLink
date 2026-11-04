@@ -286,12 +286,25 @@ class Relay:
     # may set the number (the v1.2.x AGENTLINK_SERVER_HEALTH pin is
     # abolished — a tampered number is a lie the mesh would route
     # by). _health_events is the ONLY source of the percentage.
+    # Persistence (v1.6.2): the battery's earned percentage is
+    # published to this server's registry row every cycle; at boot
+    # the relay restores ITS OWN row's rating (see
+    # _restore_health_rating) and publishes it for exactly the
+    # re-earning window (until HEALTH_INITIAL_CYCLES cycles have
+    # run this boot), so a watchdog/deploy restart no longer makes
+    # a proven relay deflect riders while it re-tests. The restored
+    # number still originates only from battery evidence — the
+    # previous boot's — and it retires the moment this boot's
+    # battery has had its say: re-earned -> the live score rules;
+    # not re-earned -> UNRATED again. A server with no prior earned
+    # row (or only a stale one) still starts UNRATED.
     _health_events: object = field(
         default_factory=lambda: collections.deque(maxlen=20000),
         repr=False)
     _health_task: object = field(default=None, repr=False)
     _health_cycles: int = field(default=0, repr=False)
     _rated: bool = field(default=False, repr=False)
+    _restored_health: object = field(default=None, repr=False)
     _last_health_publish: object = field(default=None, repr=False)
     # Carrying (v1.3.0): server_id -> {"token", "endpoint", "owner"}
     # for the brothers' servers THIS relay currently carries, and
@@ -456,10 +469,60 @@ class Relay:
         """This server's published health: HEALTH_UNRATED (-1)
         until the battery has earned a first rating, then the
         measured score. Riders and carriers treat unrated exactly
-        like at/below the floor: not eligible."""
-        if not self._rated:
-            return HEALTH_UNRATED
-        return self._health_score()
+        like at/below the floor: not eligible. During a restarted
+        server's re-earning window (fewer than
+        HEALTH_INITIAL_CYCLES battery cycles completed this boot),
+        the rating it earned before the restart — restored from its
+        own registry row at boot (v1.6.2) — is published instead of
+        UNRATED, so a restart never deflects riders from a proven
+        server; the restored rating retires as soon as this boot's
+        battery completes the window, rated or not."""
+        if self._rated:
+            return self._health_score()
+        if self._restored_health is not None and \
+                self._health_cycles < HEALTH_INITIAL_CYCLES:
+            return int(self._restored_health)
+        return HEALTH_UNRATED
+
+    def _restore_health_rating(self) -> None:
+        """Boot-time restore of this server's earned health rating
+        (v1.6.2). Reads THIS server's registry row: if it carries a
+        rating the battery earned in a previous boot (>= 0) and its
+        heartbeat is still within the health-evidence window, that
+        rating becomes the published health for the re-earning
+        window (see _compute_health). Anything else — no row, an
+        UNRATED row, a stale row — leaves the server UNRATED: a
+        genuinely fresh server still starts unrated. Best-effort by
+        design: a store that cannot answer at boot never blocks the
+        relay from serving; the battery simply earns from zero.
+        Runs off the event loop (store round trip)."""
+        try:
+            row = self.store.get_server(self.server_id)
+        except Exception:
+            log.exception("health rating restore failed to read "
+                          "the registry; starting UNRATED")
+            return
+        if not row:
+            return
+        try:
+            health = int(row.get("health"))
+        except (TypeError, ValueError):
+            return
+        if health < 0:
+            return
+        last_seen = int(row.get("last_seen") or 0)
+        if now_ts() - last_seen > SERVER_HEALTH_WINDOW_SECONDS:
+            log.info("health rating NOT restored for %s: prior "
+                     "rating %s%% is stale (row heartbeat %ss old, "
+                     "window %ss); starting UNRATED",
+                     self.server_label, health,
+                     now_ts() - last_seen,
+                     SERVER_HEALTH_WINDOW_SECONDS)
+            return
+        self._restored_health = health
+        log.info("health rating restored for %s: %s%% earned before "
+                 "this restart; battery re-verification in progress",
+                 self.server_label, health)
 
     def _effective_capacity(self) -> int:
         health = self._compute_health()
@@ -2442,6 +2505,13 @@ class Relay:
         # backstop — see _reconcile_blobs.
         self._blob_task = asyncio.create_task(
             self._blob_reconcile_loop())
+        # Earned-health persistence (v1.6.2): restore this server's
+        # previously earned rating BEFORE the first registry write
+        # below — otherwise that write would publish UNRATED over
+        # the earned row and the restore would read back its own
+        # clobbering. Off-loop: a network-backed store's round trip
+        # must not stall the accept path.
+        await asyncio.to_thread(self._restore_health_rating)
         # Peer mesh (v1.2.0): register in the shared server registry
         # and heartbeat the row, so any client connecting anywhere
         # can discover this server. Off-loop: a network-backed
@@ -3235,8 +3305,26 @@ class Relay:
         return True
 
     # -- connection ---------------------------------------------------------
+    @staticmethod
+    def _close_telemetry(ws, exc=None) -> str:
+        """Close-code telemetry (v1.6.2): name WHY a socket ended —
+        the WebSocket close code and reason, from the ConnectionClosed
+        exception when one was caught, else from the socket itself.
+        Forensics before this release could not say what severed a
+        session (relay logs recorded a bare disconnect line and
+        nothing else); every disconnect line now carries this
+        suffix."""
+        code = getattr(exc, "code", None)
+        reason = getattr(exc, "reason", None)
+        if code is None:
+            code = getattr(ws, "close_code", None)
+        if not reason:
+            reason = getattr(ws, "close_reason", None) or ""
+        return "close_code=%s close_reason=%r" % (code, reason)
+
     async def _handle(self, ws) -> None:
         peer: Peer | None = None
+        closed_exc = None
         # Carrying (v1.3.0): a connection may arrive through a carry
         # alias (?carry=<id> or /carry/<id>) — this relay serves
         # that server's identity ONLY while it holds the carry
@@ -3594,9 +3682,10 @@ class Relay:
                     await self._on_deregister(ws, frame, peer)
                 else:
                     await self._error(ws, "unknown_type", req_id)
-        except websockets.exceptions.ConnectionClosed:
-            pass
+        except websockets.exceptions.ConnectionClosed as _closed:
+            closed_exc = _closed
         finally:
+            _telemetry = self._close_telemetry(ws, closed_exc)
             # Leaked-peer sweep (v1.3.7): _on_hello registers the
             # Peer in self.peers BEFORE the welcome is written; a
             # hello that died mid-handshake (dead socket at the
@@ -3620,7 +3709,8 @@ class Relay:
                                 leaked.username, leaked.connected_at,
                                 now_ts())
                     log.info("peer @%s disconnected (hello did not "
-                             "complete)", leaked.username)
+                             "complete) (%s)", leaked.username,
+                             _telemetry)
             if peer is not None and self.peers.get(peer.username) is peer:
                 del self.peers[peer.username]
                 if not peer.ephemeral:
@@ -3632,7 +3722,8 @@ class Relay:
                                              peer.connected_at,
                                              now_ts())
                     self._log_activity("offline", peer.username)
-                log.info("peer @%s disconnected", peer.username)
+                log.info("peer @%s disconnected (%s)",
+                         peer.username, _telemetry)
             # Room reaping (v1.3.9): this connection's room
             # participation ends with it, on the shared record —
             # a participant who vanishes without leave/close is
@@ -3865,10 +3956,43 @@ class Relay:
                         username)
         return ok
 
+    def _apply_hello_records(self, records) -> None:
+        """Run a hello's deferred record writes (v1.6.2 — see
+        _on_hello). Each write is individually guarded: a profile or
+        declaration record that fails is logged, never fatal — it
+        must not kill a hello that has already been welcomed. Runs
+        off the event loop (a network store's round trips must not
+        stall other connections)."""
+        for label, fn in records:
+            try:
+                fn()
+            except Exception:
+                log.exception("hello record write failed: %s", label)
+
     async def _on_hello(self, ws, frame, old, server_id: str = ""):
         if old is not None and self.peers.get(old.username) is old:
             del self.peers[old.username]
         req_id = frame.get("req_id")
+        # Deferred hello records (v1.6.2): the writes that RECORD a
+        # hello (profile, keys, mode, decision link, delivery
+        # declaration, presence note, activity) are collected here
+        # and applied AFTER the welcome is on the wire, off the
+        # event loop (see _apply_hello_records). Before this fix
+        # they ran inline, one store round trip each — with the
+        # network backend each is a proxied HTTPS call, and egress
+        # stalls stacked them past the client's 8s hello timeout:
+        # the welcome never arrived, the client deflected, and one
+        # drop became a cross-relay churn (332 hello-incomplete in
+        # the 2026-11-04 forensic window). Authentication itself
+        # (exists/verify/key challenge), the identity claim, and
+        # the auth record (which path authenticated — a security
+        # record, incl. the legacy-secret flag) stay BEFORE the
+        # welcome — they are the gate, and the claim's secret rides
+        # the welcome. The batch is awaited before this handler
+        # returns, so the row is fully recorded by the time the
+        # hello completes; only its position relative to the
+        # welcome changed.
+        hello_records: list = []
         display = str(frame.get("display_name") or frame.get("name") or "")[:64]
         secret = frame.get("secret")
         pubkey = str(frame.get("pubkey") or "")
@@ -4037,16 +4161,37 @@ class Relay:
                 auth_method = "resume"
                 verified = True
             if verified:
-                self.store.set_display_name(username, display or username)
-                self.store.set_pubkey(username, pubkey)
-                self.store.set_sign_pub(username, sign_pub)
+                hello_records += [
+                    ("display_name", lambda: self.store.set_display_name(
+                        username, display or username)),
+                    ("pubkey", lambda: self.store.set_pubkey(
+                        username, pubkey)),
+                    ("sign_pub", lambda: self.store.set_sign_pub(
+                        username, sign_pub)),
+                ]
                 if declared_mode:
-                    self.store.set_mode(username, declared_mode)
+                    hello_records.append(
+                        ("mode", lambda: self.store.set_mode(
+                            username, declared_mode)))
                 if declared_link:
-                    self.store.set_decision_link(username, declared_link)
+                    hello_records.append(
+                        ("decision_link",
+                         lambda: self.store.set_decision_link(
+                             username, declared_link)))
                 if declared_ack is not None:
-                    self._record_delivery_ack(username, declared_ack)
-                self._record_auth_method(username, auth_method)
+                    hello_records.append(
+                        ("delivery_ack",
+                         lambda: self._record_delivery_ack(
+                             username, declared_ack)))
+                # The auth record stays synchronous (pre-welcome):
+                # which path authenticated this identity — and the
+                # legacy-secret flag riding it — is a security
+                # record, part of the hello's semantics, not
+                # bookkeeping; it must be true the moment the hello
+                # completes. (One write; the forensic problem was
+                # the eight-write stack, not any single record.)
+                await asyncio.to_thread(self._record_auth_method,
+                                        username, auth_method)
         else:
             try:
                 # The delivery_ack declaration rides the claim when
@@ -4110,13 +4255,19 @@ class Relay:
                 await self._error(ws, "username_taken", req_id)
                 return None
             if declared_ack is not None:
-                self._record_delivery_ack(username, declared_ack)
+                hello_records.append(
+                    ("delivery_ack", lambda: self._record_delivery_ack(
+                        username, declared_ack)))
             # The claiming hello itself: the one unauthenticated
             # hello an identity ever makes — its welcome carries
             # the bootstrap secret ONCE, and every later hello from
             # a current client authenticates by key (v1.3.9).
             auth_method = "bootstrap"
-            self._record_auth_method(username, auth_method)
+            # Synchronous like the claim itself: it records HOW
+            # this identity was established (see the verified
+            # branch's note on the auth record).
+            await asyncio.to_thread(self._record_auth_method,
+                                    username, auth_method)
         stale = self.peers.get(username)
         if stale is not None and stale.ws is not ws:
             try:
@@ -4141,76 +4292,108 @@ class Relay:
         self.peers[username] = peer
         if core:
             self._last_core[username] = core
+
+        def _hello_presence_records() -> None:
+            # The hello's presence bookkeeping (v1.6.2: deferred
+            # with the rest of the hello records — three more store
+            # round trips that used to sit in front of the welcome).
+            # Order preserved: touch, connection note, offline-alert
+            # resolution, the online activity line.
+            try:
+                self.store.touch(username)
+            except Exception:
+                pass
+            self._note_connection(peer)
+            if self.store.resolve_alerts("agent_offline", username):
+                self._log_activity("alert_resolved", "system",
+                                   target=username,
+                                   status="agent_offline")
+            self._log_activity("online", username,
+                               status=f"auth:{auth_method}"
+                               if auth_method else "")
+
+        hello_records.append(("presence", _hello_presence_records))
+        welcome_error: Exception | None = None
         try:
-            self.store.touch(username)
-        except Exception:
-            pass
-        self._note_connection(peer)
-        if self.store.resolve_alerts("agent_offline", username):
-            self._log_activity("alert_resolved", "system", target=username,
-                               status="agent_offline")
-        self._log_activity("online", username,
-                           status=f"auth:{auth_method}"
-                           if auth_method else "")
-        if peer.delivery_ack:
-            # Custody flush (v1.3.7): PEEK the outbox — nothing is
-            # deleted and no audit status moves. Each frame is
-            # OFFERED and its offer stamped; frames stay in custody
-            # until this client's ack retires them, and the fleet
-            # scan re-offers whatever stays unacked on the resend
-            # cadence. Frames without ids are sent and forgotten
-            # here (an ack can never name them — see _offer_key for
-            # how the drain still bounds their re-offer).
-            peek = getattr(self.store, "pending_frames", None)
-            if peek is not None:
-                queued = peek(username) or []
-            else:
-                # A store that cannot peek yet cannot hold custody;
-                # fall back to the flush so nothing is stranded in
-                # the gap (pre-custody store only).
-                queued = self.store.dequeue_all(username)
-            await self._send(ws, {"type": "welcome", "req_id": req_id,
-                                  "username": username,
-                                  "secret": owner_secret,
-                                  "ephemeral": False,
-                                  "queued": len(queued),
-                                  "servers": self._live_servers(),
-                                  "updates_enabled":
-                                      self.updates_enabled,
-                                  "oversight_pubkey":
-                                      self.oversight_pubkey or None})
-            for q in queued:
-                try:
-                    await self._send(ws, q)
-                except websockets.exceptions.ConnectionClosed:
-                    break
-                if q.get("id"):
-                    peer.offered[str(q["id"])] = now_ts()
-            log.info("peer @%s registered, offered %d in custody",
-                     username, len(queued))
-        else:
-            queued = self.store.dequeue_all(username)
-            await self._send(ws, {"type": "welcome", "req_id": req_id,
-                                  "username": username,
-                                  "secret": owner_secret,
-                                  "ephemeral": False,
-                                  "queued": len(queued),
-                                  "servers": self._live_servers(),
-                                  "updates_enabled":
-                                      self.updates_enabled,
-                                  "oversight_pubkey":
-                                      self.oversight_pubkey or None})
-            for q in queued:
-                await self._send(ws, q)
-                if q.get("type") == "message" and q.get("id"):
-                    # A queued message's audit row said 'sent'/'queued'
-                    # while it waited; the flush IS the delivery.
+            if peer.delivery_ack:
+                # Custody flush (v1.3.7): PEEK the outbox — nothing is
+                # deleted and no audit status moves. Each frame is
+                # OFFERED and its offer stamped; frames stay in custody
+                # until this client's ack retires them, and the fleet
+                # scan re-offers whatever stays unacked on the resend
+                # cadence. Frames without ids are sent and forgotten
+                # here (an ack can never name them — see _offer_key for
+                # how the drain still bounds their re-offer).
+                peek = getattr(self.store, "pending_frames", None)
+                if peek is not None:
+                    queued = peek(username) or []
+                else:
+                    # A store that cannot peek yet cannot hold custody;
+                    # fall back to the flush so nothing is stranded in
+                    # the gap (pre-custody store only).
+                    queued = self.store.dequeue_all(username)
+                await self._send(ws, {"type": "welcome", "req_id": req_id,
+                                      "username": username,
+                                      "secret": owner_secret,
+                                      "ephemeral": False,
+                                      "queued": len(queued),
+                                      "servers": self._live_servers(),
+                                      "updates_enabled":
+                                          self.updates_enabled,
+                                      "oversight_pubkey":
+                                          self.oversight_pubkey or None})
+                for q in queued:
                     try:
-                        self.store.set_audit_status(q["id"], "delivered")
-                    except Exception:
-                        pass
-            log.info("peer @%s registered, flushed %d queued",
-                     username, len(queued))
+                        await self._send(ws, q)
+                    except websockets.exceptions.ConnectionClosed:
+                        break
+                    if q.get("id"):
+                        peer.offered[str(q["id"])] = now_ts()
+                log.info("peer @%s registered, offered %d in custody",
+                         username, len(queued))
+            else:
+                queued = self.store.dequeue_all(username)
+                await self._send(ws, {"type": "welcome", "req_id": req_id,
+                                      "username": username,
+                                      "secret": owner_secret,
+                                      "ephemeral": False,
+                                      "queued": len(queued),
+                                      "servers": self._live_servers(),
+                                      "updates_enabled":
+                                          self.updates_enabled,
+                                      "oversight_pubkey":
+                                          self.oversight_pubkey or None})
+                for q in queued:
+                    await self._send(ws, q)
+                    if q.get("type") == "message" and q.get("id"):
+                        # A queued message's audit row said 'sent'/'queued'
+                        # while it waited; the flush IS the delivery.
+                        try:
+                            self.store.set_audit_status(q["id"], "delivered")
+                        except Exception:
+                            pass
+                log.info("peer @%s registered, flushed %d queued",
+                         username, len(queued))
+        except Exception as exc:  # socket died mid-welcome/flush
+            welcome_error = exc
+        # Deferred hello records land now (v1.6.2): in the
+        # normal path the welcome and the custody flush are
+        # already on the wire — the client's hello completed at
+        # the welcome — and the batch runs off the event loop
+        # so its store round trips cannot stall other
+        # connections. The batch is UNCONDITIONAL: the hello
+        # authenticated, so its records (profile, declarations,
+        # and the presence touch the registration-resume gate
+        # reads) must land even when the socket died
+        # mid-welcome — a mid-welcome cutoff is exactly the
+        # half-registration that gate exists for. Awaited here
+        # so the user row is fully recorded before the hello
+        # handler returns (or reports the dead socket).
+        if hello_records:
+            await asyncio.to_thread(self._apply_hello_records,
+                                    hello_records)
+        if welcome_error is not None:
+            raise welcome_error
         # Awaiting-agent work: an agent coming online picks up pooled
         # group work immediately (point 29 fallback). DIRECT work is
         # restored too (v1.3.1): a 1:1 work parked in awaiting_agent
