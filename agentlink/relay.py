@@ -48,6 +48,8 @@ from .timing import (
     DELIVERY_RESEND_SECONDS,
     DELIVERY_STUCK_SECONDS,
     FIRST_HELLO_TIMEOUT_SECONDS,
+    FRAME_DRAIN_SECONDS_LOCAL,
+    FRAME_DRAIN_SECONDS_REMOTE,
     HEALTH_FRAME_TIMEOUT_SECONDS,
     HEALTH_INITIAL_CYCLES,
     HEALTH_PROBE_ROUNDS,
@@ -70,6 +72,14 @@ from .timing import (
 from .store import GroupFull, NotFound, RemovalBlocked, Store, UsernameTaken
 
 log = logging.getLogger("agentlink.relay")
+
+
+# Probe/test segregation (v1.6.0): the owner seat on the line —
+# the one participant disregarded when a thread's/item's parties
+# are classified production vs test (see Relay._dashboard_data).
+# Phoenix is the owner's own agent and fleet head; a conversation
+# between phoenix and a test agent is the TEST's conversation.
+OWNER_SEAT_USERNAME = "phoenix"
 
 ADMIN_ROLES = ("admin", "superadmin")
 
@@ -265,6 +275,7 @@ class Relay:
         os.environ.get("AGENTLINK_REQUIRE_OVERSIGHT", "") == "1")
     _scan_task: object = field(default=None, repr=False)
     _room_drain_task: object = field(default=None, repr=False)
+    _frame_drain_task: object = field(default=None, repr=False)
     _blob_task: object = field(default=None, repr=False)
     _server_hb_task: object = field(default=None, repr=False)
     # Earned health (v1.3.0): a server starts UNRATED — it carries
@@ -1824,6 +1835,129 @@ class Relay:
                 u["server_carried_by"] = srv.get("carried_by") or ""
                 u["server_state_label"] = \
                     srv.get("carry_state_label") or ""
+        # ---------------------------------------------------------------
+        # PROBE/TEST SEGREGATION (v1.6.0, owner's ruling 2026-11-04):
+        # the payload separates PRODUCTION from TEST server-side, in
+        # composition — never by frontend filtering, and never by
+        # endpoint: x/x2/x3 all compose from this one shared store
+        # (carrying and the mesh depend on it being shared), so the
+        # split key is the registration's DESIGNATION.
+        #
+        # THE RULE (one rule for every surface): an item files under
+        # TEST iff it has at least one party besides the owner seat
+        # (phoenix) and EVERY such party is test-designated. Parties
+        # are: a user row's own designation; a DM's two participants;
+        # a group/channel's members; a work item's assigner +
+        # assignee (+ its group's members when group-scoped); a
+        # chain's creator + step assignees (+ group members); a
+        # library entry's sender + recipient (+ group members); a
+        # group-vault entry's adder (+ its group's members). Mixed
+        # company files under production — the production line is
+        # where anything real is watched. The census is untouched:
+        # the splits below partition the same lists, so production +
+        # test always sum to the totals the census protects.
+        desig = {u["username"]: ("test" if u.get("designation")
+                                 == "test" else "production")
+                 for u in users}
+        test_names = {n for n, d in desig.items() if d == "test"}
+
+        def _parties_test(names) -> bool:
+            others = [n for n in names
+                      if n and n != OWNER_SEAT_USERNAME]
+            return bool(others) and all(
+                desig.get(n, "production") == "test" for n in others)
+
+        def _member_names(gid: str, channel: bool = False) -> list:
+            try:
+                rows = self.store.channel_members(gid) if channel \
+                    else self.store.members(gid)
+            except Exception:
+                rows = []
+            return [m.get("username", "") for m in rows or []]
+
+        groups_all = self.store.all_groups()
+        channels_all = self.store.all_channels()
+        channel_ids = {c["id"] for c in channels_all}
+        group_test: dict[str, bool] = {}
+        for g in groups_all:
+            group_test[g["id"]] = _parties_test(
+                _member_names(g["id"]))
+        for c in channels_all:
+            group_test[c["id"]] = _parties_test(
+                _member_names(c["id"], channel=True))
+
+        prod_users = [u for u in users
+                      if u["username"] not in test_names]
+        test_users = [u for u in users
+                      if u["username"] in test_names]
+
+        def _conv_test(c: dict) -> bool:
+            if c.get("group_id"):
+                return bool(group_test.get(c["group_id"]))
+            names = [p if isinstance(p, str)
+                     else p.get("username", "")
+                     for p in c.get("participants") or []]
+            return _parties_test(names)
+
+        convs_all = self._conversations()
+        prod_convs = [c for c in convs_all if not _conv_test(c)]
+        test_convs = [c for c in convs_all if _conv_test(c)]
+
+        def _party_names(item: dict, keys: tuple) -> list:
+            names = [item.get(k) or "" for k in keys]
+            gid = item.get("group_id")
+            if gid:
+                names += _member_names(
+                    gid, channel=gid in channel_ids)
+            return names
+
+        work_all = self.store.list_work_meta()
+        prod_work = [w for w in work_all
+                     if not _parties_test(
+                         _party_names(w, ("assigner", "assignee")))]
+        test_work = [w for w in work_all
+                     if _parties_test(
+                         _party_names(w, ("assigner", "assignee")))]
+        chains_all = self.store.list_chains_meta()
+
+        def _chain_test(c: dict) -> bool:
+            names = [c.get("creator") or ""]
+            for st in c.get("steps") or []:
+                names += list(st.get("assignees") or [])
+                if st.get("assignee"):
+                    names.append(st["assignee"])
+                if st.get("target_type") == "user" \
+                        and st.get("target"):
+                    names.append(st["target"])
+            gid = c.get("group_id")
+            if gid:
+                names += _member_names(gid)
+            return _parties_test(names)
+
+        prod_chains = [c for c in chains_all if not _chain_test(c)]
+        test_chains = [c for c in chains_all if _chain_test(c)]
+        library_all = self.store.library_all()
+        prod_library = [e for e in library_all
+                        if not _parties_test(_party_names(
+                            e, ("sender", "to_user")))]
+        test_library = [e for e in library_all
+                        if _parties_test(_party_names(
+                            e, ("sender", "to_user")))]
+        vault_all = self.store.vault_meta()
+        prod_vault = [v for v in vault_all
+                      if not _parties_test(_party_names(
+                          v, ("added_by",)))]
+        test_vault = [v for v in vault_all
+                      if _parties_test(_party_names(
+                          v, ("added_by",)))]
+        prod_groups = [g for g in groups_all
+                       if not group_test.get(g["id"])]
+        test_groups = [g for g in groups_all
+                       if group_test.get(g["id"])]
+        prod_channels = [c for c in channels_all
+                         if not group_test.get(c["id"])]
+        test_channels = [c for c in channels_all
+                         if group_test.get(c["id"])]
         return {
             "server": self.server_label,
             "servers": servers,
@@ -1834,17 +1968,33 @@ class Relay:
             "hello_incomplete": self._hello_incomplete_total,
             "hello_incomplete_by_reason":
                 dict(self._hello_incomplete_by_reason),
-            "online": sorted(u["username"] for u in users if u["online"]),
-            "users": users,
-            "groups": self.store.all_groups(),
-            "channels": self.store.all_channels(),
+            "online": sorted(u["username"] for u in prod_users
+                             if u["online"]),
+            "test_online": sorted(u["username"] for u in test_users
+                                  if u["online"]),
+            "users": prod_users,
+            "test_users": test_users,
+            "groups": prod_groups,
+            "test_groups": test_groups,
+            "channels": prod_channels,
+            "test_channels": test_channels,
             "rooms": self._dashboard_rooms(now),
-            "work": self.store.list_work_meta(),
+            "work": prod_work,
+            "test_work": test_work,
             "alerts": self.store.list_alerts(limit=50),
-            "chains": self.store.list_chains_meta(),
-            "library": self.store.library_all(),
-            "vault": self.store.vault_meta(),
-            "conversations": self._conversations(),
+            "chains": prod_chains,
+            "test_chains": test_chains,
+            "library": prod_library,
+            "test_library": test_library,
+            "vault": prod_vault,
+            "test_vault": test_vault,
+            "conversations": prod_convs,
+            "test_conversations": test_convs,
+            # Landing view (v1.6.0): a per-agent server's dashboard
+            # (owner_agent set — today exactly the probe server at
+            # x3) opens on the Probe Tests view; operator relays
+            # (home x, peer x2) open on Overview as always.
+            "landing": "probes" if self.owner_agent else "overview",
             "activity": [{**row, "evidence": (
                 "claimed" if row.get("kind") in (
                     "work_progress", "message", "group_message",
@@ -2259,6 +2409,17 @@ class Relay:
         # two can never deliver the same frame twice).
         self._room_drain_task = asyncio.create_task(
             self._room_drain_loop())
+        # Cross-relay frame delivery gets its OWN drain loop too
+        # (v1.6.0): the same unbounded-scan-latency argument as the
+        # room drain, applied to every queued frame — work pushed
+        # through a peer relay reached its worker in 1-second scan
+        # batches, so a concurrent assignment pool started its work
+        # seconds apart (the point-31 failure mode). One store
+        # drain per tick at the store's cadence; the scan keeps its
+        # own drain as a backstop (claiming is atomic, so the two
+        # can never deliver the same frame twice).
+        self._frame_drain_task = asyncio.create_task(
+            self._frame_drain_loop())
         # Blob-layer truth (v1.3.8): object/meta reconciliation
         # backstop — see _reconcile_blobs.
         self._blob_task = asyncio.create_task(
@@ -2309,26 +2470,95 @@ class Relay:
         if self._room_drain_task is not None:
             self._room_drain_task.cancel()
             self._room_drain_task = None
+        if self._frame_drain_task is not None:
+            self._frame_drain_task.cancel()
+            self._frame_drain_task = None
         if self._blob_task is not None:
             self._blob_task.cancel()
             self._blob_task = None
         if getattr(self, "dashboard", None) is not None:
             self.dashboard.stop()
             self.dashboard = None
-        # Force-close live peer sockets first (bounded): a relay
-        # shutting down must never hang on connected clients.
-        for peer in list(self.peers.values()):
+        # Close the LISTENER before the force-close snapshot
+        # (v1.6.0): stop() previously severed the peers it could
+        # see and only then closed the server — a session landing
+        # during stop's early phases (the carried-release wait can
+        # run seconds) was accepted after the snapshot, never
+        # severed, and wait_closed() below then waited on that
+        # live session while its connection handler kept answering
+        # its pings: the relay hung shutdown for ~25s and the
+        # agent sat on a corpse believing it was online, never
+        # failing over (the 44-race gate failure, recorded live).
+        # With the listener closed first, the peer snapshot is
+        # provably complete — no new session can exist after it.
+        if self._server is not None:
+            self._server.close()
+        # Force-close live sockets (bounded): a relay shutting
+        # down must never hang on connected clients. The sever set
+        # is the peer registry PLUS every connection the server
+        # itself tracks (server.websockets) (v1.6.0): a socket accepted but still
+        # mid-hello is not in self.peers yet — closing the
+        # listener before the snapshot (the first fix) moved the
+        # 44-race deadlock onto exactly those unregistered
+        # connections, with wait_closed() parked on a session
+        # whose handler kept answering its pings. Severing by the
+        # server's own accept-time registry leaves nothing alive
+        # for wait_closed() to wait on.
+        _sever = [peer.ws for peer in list(self.peers.values())]
+        try:
+            _known = {id(ws) for ws in _sever}
+            for _ws in list(self._server.websockets):
+                if id(_ws) not in _known:
+                    _sever.append(_ws)
+        except Exception:
+            pass
+        for _ws in _sever:
             try:
-                await asyncio.wait_for(peer.ws.close(), timeout=1)
+                await asyncio.wait_for(_ws.close(), timeout=1)
             except Exception:
                 try:
-                    peer.ws.transport.close()
+                    _ws.transport.close()
                 except Exception:
                     pass
         self.peers.clear()
         if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
+            # Drain to zero, sweeping as we go (v1.6.0): a
+            # connection whose handshake was in flight when the
+            # listener closed registers with the server a beat
+            # AFTER any one-shot sever sweep — and wait_closed()
+            # then waits on it while its handler keeps the
+            # session alive (the 44-race deadlock, recorded phase
+            # by phase: sever done at T, the winning session's
+            # hello completed at T+70ms, stop parked ~25s until
+            # outside teardown closed the socket). No new
+            # connection can START after close(), so a
+            # sweep-and-drain loop converges: sever everything
+            # registered, watch the drain with a shielded bounded
+            # wait, sweep again. The common case (registry already
+            # empty) exits on the first pass, unchanged.
+            _drain = asyncio.ensure_future(
+                self._server.wait_closed())
+            for _ in range(30):
+                try:
+                    for _ws in list(self._server.websockets):
+                        try:
+                            await asyncio.wait_for(
+                                _ws.close(), timeout=1)
+                        except Exception:
+                            try:
+                                _ws.transport.close()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(_drain), timeout=1)
+                    break
+                except (asyncio.TimeoutError, TimeoutError):
+                    continue
+            if not _drain.done():
+                _drain.cancel()
             self._server = None
         # Close the store only if this relay created it — a shared
         # backend handed in by the operator (failover topology) is
@@ -2472,33 +2702,36 @@ class Relay:
             except Exception:
                 continue
 
-    async def _fleet_scan_once(self) -> None:
+    async def _drain_pending_frames(self) -> None:
+        """Push store-queued frames to this relay's local peers:
+        the cross-relay live drain (points 16/18) — frames queued
+        via ANOTHER relay sharing this backend (or while the agent
+        was between connections) are delivered to the agent on THIS
+        relay. dequeue is atomic in the store, and _deliver
+        re-queues on a dead socket, so nothing is lost or doubled.
+
+        Delivery custody (v1.3.7): for an ACK-CAPABLE local peer
+        the drain PEEKS (pending_frames) and only RE-OFFERS —
+        custody frames are never dequeued here and never routed
+        through _deliver (which would enqueue a second custody
+        copy); a frame is re-offered only when its last offer is
+        older than DELIVERY_RESEND_SECONDS (or it was never
+        offered). Legacy local peers keep dequeue_all + _deliver
+        exactly as above. Ephemeral peers are skipped, as before.
+
+        v1.6.0: this drain is the delivery path's hot loop — it
+        runs on its OWN cadence (_frame_drain_loop), no longer
+        only inside the 1s fleet scan. Riding the scan quantized
+        cross-relay dispatch to the scan tick (up to a full second
+        of spread between back-to-back assignments — measured by
+        the point-31 pool test failing intermittently: work pushed
+        through a peer relay reached a worker in tick batches, and
+        three concurrent assignments started >0.8s apart). The
+        fleet scan still calls this drain every tick as backstop;
+        claiming is atomic in the store, so the two callers can
+        never deliver the same frame twice."""
         now = now_ts()
         store = self.store
-        # v1.1 hardening: the scan's bulk store work runs on worker
-        # threads (asyncio.to_thread), never on the event loop. With a
-        # network-backed store (Supabase) every call is a round trip;
-        # on the loop it starved hello/message handling and wedged
-        # reconnecting agents. Semantics are unchanged — the scan
-        # still runs sequentially, once per tick, in the same order;
-        # only the waiting moved off the loop. Frame delivery stays on
-        # the loop (it owns the sockets).
-        #
-        # Cross-relay live drain (points 16/18): frames queued via
-        # ANOTHER relay sharing this backend (or while this agent was
-        # between connections) are pushed to the agent on THIS relay
-        # within one scan tick — real-time across the fleet, not
-        # just at hello. dequeue is atomic in the store, and _deliver
-        # re-queues on a dead socket, so nothing is lost or doubled.
-        #
-        # Delivery custody (v1.3.7): for an ACK-CAPABLE local peer
-        # the drain PEEKS (pending_frames) and only RE-OFFERS —
-        # custody frames are never dequeued here and never routed
-        # through _deliver (which would enqueue a second custody
-        # copy); a frame is re-offered only when its last offer is
-        # older than DELIVERY_RESEND_SECONDS (or it was never
-        # offered). Legacy local peers keep dequeue_all + _deliver
-        # exactly as above. Ephemeral peers are skipped, as before.
         usernames = [u for u, p in list(self.peers.items())
                      if not getattr(p, "ephemeral", False)]
 
@@ -2539,6 +2772,51 @@ class Relay:
                 continue
             for frame in queued:
                 await self._deliver(username, frame)
+
+    async def _frame_drain_loop(self) -> None:
+        """The dedicated cross-relay frame drain (v1.6.0) — the
+        generalisation of the v1.4.4 room-drain pattern to ALL
+        queued frames. Push dispatch must not wait on the fleet
+        scan: the scan's 1s tick (plus its own unbounded pass
+        latency under load — reassignment sweeps, the health
+        battery, a network store) quantized delivery, so work
+        assigned through a peer relay arrived in second-wide
+        batches and a concurrent pool started its assignments
+        seconds apart instead of together. This loop does one
+        store drain per tick at FRAME_DRAIN_SECONDS_LOCAL (local
+        store) / FRAME_DRAIN_SECONDS_REMOTE (network-backed store,
+        the room drain's proven cadence). Per-tick failures are
+        swallowed: the next tick retries, and the fleet scan's own
+        drain remains as backstop."""
+        interval = FRAME_DRAIN_SECONDS_LOCAL \
+            if isinstance(self.store, Store) \
+            else FRAME_DRAIN_SECONDS_REMOTE
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._drain_pending_frames()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                continue
+
+    async def _fleet_scan_once(self) -> None:
+        now = now_ts()
+        store = self.store
+        # v1.1 hardening: the scan's bulk store work runs on worker
+        # threads (asyncio.to_thread), never on the event loop. With a
+        # network-backed store (Supabase) every call is a round trip;
+        # on the loop it starved hello/message handling and wedged
+        # reconnecting agents. Semantics are unchanged — the scan
+        # still runs sequentially, once per tick, in the same order;
+        # only the waiting moved off the loop. Frame delivery stays on
+        # the loop (it owns the sockets).
+        #
+        # Cross-relay frame drain: the dedicated _frame_drain_loop
+        # is the primary path (v1.6.0); this pass remains as its
+        # backstop (claiming is atomic, so the two can never
+        # deliver the same frame twice).
+        await self._drain_pending_frames()
         # Room frames: claimed and delivered by the shared helper —
         # the dedicated _room_drain_loop is the primary path
         # (v1.4.4); this pass remains as its backstop.
@@ -3485,9 +3763,12 @@ class Relay:
         here later (new nonce), not after the expiry (checked
         against the relay's own clock before verification).
 
-        Runs inline in _on_hello: pre-registration the socket has
-        exactly one outstanding exchange — this one — so awaiting
-        the response here cannot interleave with other frames.
+        Runs inline in _on_hello: pre-registration this exchange
+        is the only AUTHENTICATION traffic on the socket — but not
+        the only traffic: the client's connection-owned heartbeat
+        can interleave a ping inside the wait, and the wait loop
+        below answers liveness frames and keeps waiting rather
+        than mistaking one for a failed response (v1.6.0).
         Any failure — no key on record, a malformed or non-response
         frame, a timeout, a bad signature — is a plain False: the
         caller refuses the hello; nothing falls back silently."""
@@ -3510,9 +3791,36 @@ class Relay:
                               "nonce": nonce, "relay": relay_id,
                               "expires": expires, "username": username})
         try:
-            raw = await asyncio.wait_for(
-                ws.recv(), timeout=AUTH_CHALLENGE_WAIT_SECONDS)
-            frame = json.loads(raw)
+            # Wait for the auth_response inside ONE total deadline,
+            # tolerating interleaved LIVENESS frames (v1.6.0): the
+            # client's connection-owned heartbeat ticks every 5s —
+            # a stale loop from the session being replaced can land
+            # a ping on this very socket mid-handshake — and this
+            # window runs up to 15s. The pre-1.6.0 code did a single
+            # recv and failed the whole authentication on any other
+            # frame ("expected auth_response, got 'ping'" — the
+            # 44-race gate failure: a migrated agent's hello was
+            # assassinated by its own heartbeat, and its work then
+            # waited on a session that never landed). A ping is
+            # answered with the main loop's pong and the wait
+            # continues; any OTHER non-response frame still fails
+            # the authentication exactly as before, and the
+            # challenge's expiry is unchanged.
+            deadline = time.monotonic() + AUTH_CHALLENGE_WAIT_SECONDS
+            frame = None
+            while frame is None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise asyncio.TimeoutError()
+                raw = await asyncio.wait_for(ws.recv(), timeout=left)
+                candidate = json.loads(raw)
+                if isinstance(candidate, dict) and \
+                        candidate.get("type") == "ping":
+                    await self._send(ws, {
+                        "type": "pong",
+                        "req_id": candidate.get("req_id")})
+                    continue
+                frame = candidate
         except Exception:
             log.warning("key auth failed for @%s: no usable "
                         "auth_response within %ss", username,
@@ -3582,6 +3890,19 @@ class Relay:
         declared_mode = frame.get("mode")
         if declared_mode not in ("manual", "autonomous"):
             declared_mode = None
+        # Probe/test segregation (v1.6.0, owner's ruling): the
+        # registration declares its DESIGNATION — 'production' or
+        # 'test'. The declaration is honoured ONLY by the claim
+        # below, at first registration: a designation is never
+        # inferred from the username (deploy-probe is production
+        # permanently), and once the row exists the hello's
+        # declaration is IGNORED — after registration a designation
+        # changes only through the operator path
+        # (store.set_designation, `agentlink set-designation`), so
+        # an agent can never flip its own segregation.
+        declared_designation = frame.get("designation")
+        if declared_designation not in ("production", "test"):
+            declared_designation = None
         # Decision link (v1.3.5): the agent declares whether this
         # connection is linked to its own decision-making. Recorded
         # verbatim, never assigned — and it is the ONLY "missing"
@@ -3725,6 +4046,23 @@ class Relay:
                                 1 if declared_ack else 0
                     except Exception:
                         claim_kwargs = {}
+                # The designation declaration rides the claim the
+                # same way (v1.6.0): when the store's claim carries
+                # the parameter it is written with the row; a store
+                # that cannot take it yet gets the operator setter
+                # applied to the fresh row instead — either way the
+                # registration's declared designation is what lands.
+                _designation_on_claim = False
+                if declared_designation is not None:
+                    try:
+                        import inspect as _inspect2
+                        if "designation" in _inspect2.signature(
+                                self.store.claim).parameters:
+                            claim_kwargs["designation"] = \
+                                declared_designation
+                            _designation_on_claim = True
+                    except Exception:
+                        pass
                 owner_secret = self.store.claim(
                     username, display or username, pubkey, sign_pub,
                     capabilities=frame.get("capabilities") or [],
@@ -3732,6 +4070,16 @@ class Relay:
                     mode=declared_mode or "autonomous",
                     decision_link=declared_link or "",
                     **claim_kwargs)
+                if declared_designation is not None \
+                        and not _designation_on_claim:
+                    _set_des = getattr(self.store, "set_designation",
+                                       None)
+                    if _set_des is not None:
+                        try:
+                            _set_des(username, declared_designation,
+                                     actor="registration")
+                        except Exception:
+                            pass
             except UsernameTaken:
                 # Lost a claim race against a concurrent hello for
                 # the same new name (often the same identity's own
