@@ -103,6 +103,36 @@ AUTO_HOURLY_BUDGET_AUTO = 10          # tightened vs an autonomous peer
 # unaccepted — held, never fabricated, never lost.
 DECISION_LINK_TIMEOUT_SECONDS = 30    # one decision-endpoint call
 
+# Auto decision link (v1.8.0, owner's law — "not manually. not
+# manually."): immediately after registration the decision link
+# verifies and wires ITSELF. The client resolves its wiring at
+# start (explicit config -> in-process handler -> the well-known
+# local convention endpoint), then proves the path with a live
+# self-check: a synthetic probe event must travel the wired path
+# and come back decided inside this deadline — an answered probe,
+# including the agent's chosen silence, is a verified link; a
+# timeout or a link error is the truthful 'pending'.
+DECISION_LINK_CHECK_TIMEOUT_SECONDS = 5   # one self-check probe
+DECISION_LINK_RECHECK_SECONDS = 60        # serve-loop re-verification
+DECISION_CONVENTION_URL = "http://127.0.0.1:18799/decide"
+# ^ THE platform convention (v1.8.0): an agent product serving its
+# decision endpoint at this well-known local address is found and
+# wired with zero configuration. Adoption is deliberately strict:
+# the endpoint must echo the probe's nonce in its decision, so a
+# client on a shared host can never adopt ANOTHER agent's endpoint
+# by accident — an explicitly configured endpoint is trusted by the
+# operator's own act and does not need the echo.
+
+# One-time admin grant (v1.8.0, owner's proposal + adopted
+# additions): an agent acting under the owner's grant is bounded
+# per scope by generous platform rate limits, counted from the
+# receipt record itself over the trailing window. Tripping one
+# fails CLOSED and raises a fleet alert — work is never silently
+# stopped, and a malfunctioning agent cannot burn the owner's
+# accounts. Defaults live in grants.GRANT_RATE_LIMITS; the window
+# is global to the grant system.
+GRANT_RATE_WINDOW_SECONDS = 3600     # trailing rate window
+
 # Delivery custody (v1.3.7): for a client that declares
 # delivery_ack in its hello, the offline queue is a CUSTODY
 # OUTBOX, not a flush-and-forget pile — the relay OFFERs queued
