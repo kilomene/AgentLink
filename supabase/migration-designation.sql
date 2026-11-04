@@ -1,0 +1,32 @@
+-- AgentLink v1.6.0 probe/test segregation (owner's ruling
+-- 2026-11-04): every registration carries a DESIGNATION —
+-- 'production' (the owner's real line) or 'test' (a probe/test
+-- identity). The designation is DECLARED at registration (SDK
+-- Agent(..., designation=...) / `agentlink register
+-- --designation test`), NEVER inferred from the username —
+-- deploy-probe is production permanently (it owns a server, sits
+-- in the owner's family group and is his standing fixture) — and
+-- after registration it changes ONLY through the operator path
+-- (`agentlink set-designation`, recorded in the audit log as
+-- 'designation_changed'): an agent's own hello can never flip it.
+--
+-- The designation steers DASHBOARD COMPOSITION ONLY: the
+-- authenticated payload files test-designated agents, their
+-- conversations, work, chains, library entries and credentials
+-- under the dashboard's Probe Tests view, apart from the
+-- production line. The line itself — messaging, work, carrying,
+-- the shared store — never reads it, and the conversation census
+-- is untouched (the split partitions the same lists).
+--
+-- The column default carries the presentation rule — a profile
+-- with no explicit designation IS production — so this single
+-- additive statement brings every existing row into compliance;
+-- no backfill is needed or wanted.
+--
+-- MUST be applied to the production Supabase project BEFORE any
+-- relay running the designation-aware SupabaseStore starts: the
+-- store selects and writes al_users.designation and PostgREST
+-- errors on unknown columns. Additive only — one new column, no
+-- changes to existing columns or data.
+alter table al_users add column if not exists designation text not null
+    default 'production';
