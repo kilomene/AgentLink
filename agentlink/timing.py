@@ -120,6 +120,26 @@ DELIVERY_STUCK_SECONDS = 300     # unacked + recipient connected
                                  # since + older than this = stuck
 DELIVERY_HISTORY_PAGE = 200      # default history frame page size
 
+# Cross-relay frame drain (v1.6.0): queued frames (messages, work
+# assignments — anything one relay queued for an agent connected
+# to ANOTHER relay sharing the store) are pushed by a dedicated
+# drain loop, not by the 1s fleet scan. Riding the scan quantized
+# push dispatch to the scan tick plus the scan's own unbounded
+# pass latency: back-to-back assignments through a peer relay
+# arrived in second-wide batches, and a concurrent worker pool
+# started them seconds apart instead of together (the point-31
+# failure mode). The cadence matches the store's cost: a local
+# store drain is an in-process indexed query, so it runs hot; a
+# network-backed store pays a round trip per peer per tick, so it
+# runs at the room drain's proven cadence (v1.4.4) — still at
+# least twice as fast as the scan it replaces, and decoupled from
+# the scan's pass latency entirely. The fleet scan keeps its own
+# drain as backstop.
+FRAME_DRAIN_SECONDS_LOCAL = 0.15   # dedicated frame drain tick,
+                                   # local (SQLite) store
+FRAME_DRAIN_SECONDS_REMOTE = 0.5   # dedicated frame drain tick,
+                                   # network-backed store
+
 # Blob-layer truth (v1.3.8): the object/meta reconciliation sweep
 # cadence. Divergence is a slow leak and the delete path itself
 # verifies synchronously, so the sweep is a backstop, not a
