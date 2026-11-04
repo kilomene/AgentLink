@@ -73,6 +73,11 @@ from .timing import (
     UPDATE_CHECK_SECONDS,
 )
 from .store import GroupFull, NotFound, RemovalBlocked, Store, UsernameTaken
+from .grants import (
+    OWNER_ATTACHABLE_CONNECTORS,
+    GrantBroker,
+    TestMailboxAdapter,
+)
 
 log = logging.getLogger("agentlink.relay")
 
@@ -349,9 +354,24 @@ class Relay:
     # a guessing campaign against a name is visible in the log).
     _recovery_attempts: dict = field(default_factory=dict, repr=False)
 
+    # One-time admin grant (v1.8.0): the connector broker + its
+    # adapter registry. The registry ships with ONE reference
+    # adapter — the Gmail-shaped test mailbox — wired end-to-end;
+    # the owner's real connectors attach later, by his own
+    # action, as further adapters. No payment instrument exists
+    # anywhere in this surface (owner's hard exclusion).
+    _grant_broker: object = field(default=None, repr=False)
+    _grant_adapters: dict = field(default_factory=dict, repr=False)
+
     def __post_init__(self) -> None:
         self.store = self.backend_store or \
             Store(os.path.expanduser(self.db_path))
+        self._grant_adapters = {"testmail": TestMailboxAdapter()}
+        self._grant_broker = GrantBroker(
+            self.store, self._grant_adapters,
+            alert_fn=lambda kind, subject, detail:
+                self.store.open_alert(kind, subject, detail),
+            audit_fn=lambda *a, **kw: self.store.audit(*a, **kw))
         if self.blob_store is None:
             from .blobstore import create_blob_store
             default_root = os.path.join(
@@ -649,7 +669,26 @@ class Relay:
             state = declared
         else:
             state = "undeclared"
-        return {"decision_link": declared, "decision_state": state}
+        # Auto-link detail (v1.8.0): how the client wired itself
+        # and whether its self-check verified the path. The
+        # summary above stays the v1.3.5 truth ('linked' is only
+        # ever declared by a verified client); the detail rides
+        # alongside for surfaces that can say more.
+        detail = row.get("decision_link_detail") or ""
+        if isinstance(detail, str) and detail:
+            try:
+                detail = json.loads(detail)
+            except Exception:
+                detail = {}
+        if not isinstance(detail, dict):
+            detail = {}
+        mode = detail.get("mode") if detail.get("mode") in (
+            "config", "in_process", "handlers", "convention",
+            "none") else ""
+        return {"decision_link": declared, "decision_state": state,
+                "decision_mode": mode,
+                "decision_verified": bool(detail.get("verified"))
+                if detail else False}
 
     def _profile_of(self, username: str) -> dict | None:
         """The stored profile row for one agent (exact match), or
@@ -1858,6 +1897,21 @@ class Relay:
             # same honesty pattern as the delivery guarantee above.
             u["auth_legacy"] = (u.get("auth_method") or "") in (
                 "secret", "resume")
+            # One-time admin grant (v1.8.0): the agent's grant
+            # summary — status + scopes only, never anything a
+            # receipt would carry. Bound-key material stays in
+            # the store; surfaces state powers, not keys.
+            _gr = None
+            try:
+                _gr = self.store.grant_of(name)
+            except Exception:
+                _gr = None
+            u["grant"] = {
+                "status": _gr.get("status"),
+                "scopes": _gr.get("scopes") or [],
+                "granted_by": _gr.get("granted_by") or "",
+                "granted_at": _gr.get("granted_at") or 0,
+            } if _gr is not None else None
             # Credentials vault (v1.4.0): presence, entry count and
             # the OVERSIGHT-SEALED labels envelope — still sealed
             # here; the dashboard server opens it inside the owner's
@@ -1981,6 +2035,34 @@ class Relay:
         test_users = [u for u in users
                       if u["username"] in test_names]
 
+        # One-time admin grant (v1.8.0): the fleet's receipt feed
+        # and approval queue, split by the same registry rule as
+        # everything else (a receipt belongs to its agent's side
+        # of the line). Receipt detail is trimmed for the feed —
+        # the full record is one operator query away.
+        try:
+            _receipts = self.store.list_receipts(limit=200)
+        except Exception:
+            _receipts = []
+        _feed = [{"id": r["id"], "username": r["username"],
+                  "ts": r["ts"], "scope": r["scope"],
+                  "connector": r["connector"],
+                  "action": r["action"], "target": r["target"],
+                  "work_ref": r["work_ref"], "status": r["status"]}
+                 for r in reversed(_receipts)]
+        prod_grant_activity = [r for r in _feed
+                               if r["username"] not in test_names]
+        test_grant_activity = [r for r in _feed
+                               if r["username"] in test_names]
+        try:
+            _approvals = self.store.list_approvals(limit=50)
+        except Exception:
+            _approvals = []
+        prod_grant_approvals = [a for a in _approvals
+                                if a["username"] not in test_names]
+        test_grant_approvals = [a for a in _approvals
+                                if a["username"] in test_names]
+
         def _conv_test(c: dict) -> bool:
             if c.get("group_id"):
                 return bool(group_test.get(c["group_id"]))
@@ -2072,6 +2154,21 @@ class Relay:
             "work": prod_work,
             "test_work": test_work,
             "alerts": self.store.list_alerts(limit=50),
+            # One-time admin grant (v1.8.0): connectors the owner
+            # can attach (reference adapter live; real connectors
+            # attach by the owner's own action — none is attached
+            # by this release), the receipt feed, and the
+            # red-line approval queue.
+            "grant_connectors": (
+                [{"name": "testmail", "label": "Test mailbox "
+                  "(reference adapter)", "attached": True,
+                  "note": "Gmail-shaped test double — no real "
+                          "mail, no credentials"}]
+                + [dict(c) for c in OWNER_ATTACHABLE_CONNECTORS]),
+            "grant_activity": prod_grant_activity,
+            "test_grant_activity": test_grant_activity,
+            "grant_approvals": prod_grant_approvals,
+            "test_grant_approvals": test_grant_approvals,
             "chains": prod_chains,
             "test_chains": test_chains,
             "library": prod_library,
@@ -3478,6 +3575,10 @@ class Relay:
                     await self._on_history(ws, frame, peer)
                 elif ftype == "decision_link_update":
                     await self._on_decision_link_update(ws, frame, peer)
+                elif ftype == "grant_action":
+                    await self._on_grant_action(ws, frame, peer)
+                elif ftype == "grant_query":
+                    await self._on_grant_query(ws, frame, peer)
                 elif ftype == "group_create":
                     await self._on_group_create(ws, frame, peer)
                 elif ftype == "group_add":
@@ -3782,6 +3883,64 @@ class Relay:
                 self.store.set_decision_link(peer.username, value)
             except Exception:
                 pass
+        # Auto-link detail (v1.8.0): the wiring mode + self-check
+        # verdict ride the same live update, so a mid-session
+        # flip (a decision endpoint dying, then reviving) reaches
+        # every surface the moment the client declares it.
+        detail = frame.get("decision_link_detail")
+        if isinstance(detail, dict):
+            try:
+                self.store.set_decision_link_detail(
+                    peer.username, detail)
+            except Exception:
+                pass
+
+    # -- one-time admin grant (v1.8.0) --------------------------------
+    # The brokered-action surface. An agent acts ONLY for itself:
+    # the frame carries no username — the peer IS the actor, and
+    # the grant checked is the peer's own. Execution is store
+    # work (SQLite local / REST), so it runs off the event loop.
+
+    def _grant_summary(self, username: str) -> dict | None:
+        try:
+            g = self.store.grant_of(username)
+        except Exception:
+            return None
+        if g is None:
+            return None
+        return {"status": g.get("status"),
+                "scopes": g.get("scopes") or [],
+                "granted_by": g.get("granted_by") or "",
+                "granted_at": g.get("granted_at") or 0}
+
+    async def _on_grant_action(self, ws, frame,
+                               peer: Peer) -> None:
+        connector = str(frame.get("connector") or "")
+        action = str(frame.get("action") or "")
+        params = frame.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        work_ref = str(frame.get("work_ref") or "")
+        out = await asyncio.to_thread(
+            self._grant_broker.execute, peer.username, connector,
+            action, params, work_ref)
+        # Always an ok=True ANSWER: the outcome dict carries the
+        # verdict (executed / refused / awaiting_approval /
+        # rate_limited / error). A refusal is a successful answer
+        # to the query, not a protocol failure — agent code reads
+        # the status; it does not catch its own grant refusals.
+        await self._result(ws, frame.get("req_id"), True, out)
+
+    async def _on_grant_query(self, ws, frame,
+                              peer: Peer) -> None:
+        """'Show my grant' over the wire (v1.8.0): the agent
+        states its exact current scopes and grant state —
+        truthfully, from the store, never from a cache."""
+        summary = await asyncio.to_thread(self._grant_summary,
+                                          peer.username)
+        await self._result(ws, frame.get("req_id"), True,
+                           {"grant": summary})
+
 
     async def _on_ack(self, ws, frame, peer: Peer) -> None:
         """Delivery ack (v1.3.7, custody): an ack-capable client
@@ -4062,6 +4221,15 @@ class Relay:
         declared_link = frame.get("decision_link")
         if declared_link not in ("linked", "pending"):
             declared_link = None
+        # Auto decision link (v1.8.0): the wiring DETAIL riding
+        # the same declaration — how the client wired itself and
+        # whether its live self-check verified the path. Recorded
+        # like the summary (the store normalises the mode set);
+        # a hello without it (a pre-1.8.0 client) leaves the
+        # stored detail standing.
+        declared_link_detail = frame.get("decision_link_detail")
+        if not isinstance(declared_link_detail, dict):
+            declared_link_detail = None
         # Delivery custody (v1.3.7): the client declares whether it
         # acknowledges delivery (delivery_ack: 1) — recorded on the
         # user row exactly like the decision link above, and kept on
@@ -4263,6 +4431,11 @@ class Relay:
                         ("decision_link",
                          lambda: self.store.set_decision_link(
                              username, declared_link)))
+                if declared_link_detail is not None:
+                    hello_records.append(
+                        ("decision_link_detail",
+                         lambda: self.store.set_decision_link_detail(
+                             username, declared_link_detail)))
                 if declared_ack is not None:
                     hello_records.append(
                         ("delivery_ack",
@@ -4384,6 +4557,18 @@ class Relay:
                             _set_rec(username, _recovery_hash)
                         except Exception:
                             pass
+                if declared_link_detail is not None:
+                    # Auto-link detail on a fresh claim (v1.8.0):
+                    # the summary rode the claim itself; the
+                    # detail lands via the setter, same pattern.
+                    _set_detail = getattr(
+                        self.store, "set_decision_link_detail", None)
+                    if _set_detail is not None:
+                        try:
+                            _set_detail(username,
+                                        declared_link_detail)
+                        except Exception:
+                            pass
             except UsernameTaken:
                 # Lost a claim race against a concurrent hello for
                 # the same new name (often the same identity's own
@@ -4454,6 +4639,39 @@ class Relay:
                                if auth_method else "")
 
         hello_records.append(("presence", _hello_presence_records))
+        # Onboarding surface (v1.8.0): the welcome tells the agent
+        # its OWN wiring truth and its grant state — the same
+        # facts the dashboard shows — so no agent ever has to
+        # guess or invent its state. decision_link echoes what
+        # this hello declared (falling back to the stored row for
+        # a hello that declared nothing); grant is the agent's
+        # one-time admin grant summary, or None.
+        welcome_link = declared_link
+        welcome_link_detail = declared_link_detail
+        if welcome_link is None or welcome_link_detail is None:
+            _row = self._profile_of(username) or {}
+            if welcome_link is None:
+                welcome_link = _row.get("decision_link") or None
+            if welcome_link_detail is None:
+                _raw = _row.get("decision_link_detail") or ""
+                if isinstance(_raw, str) and _raw:
+                    try:
+                        welcome_link_detail = json.loads(_raw)
+                    except Exception:
+                        welcome_link_detail = None
+                elif isinstance(_raw, dict):
+                    welcome_link_detail = _raw
+        welcome_grant = None
+        try:
+            _g = self.store.grant_of(username)
+        except Exception:
+            _g = None
+        if _g is not None:
+            welcome_grant = {
+                "status": _g.get("status"),
+                "scopes": _g.get("scopes") or [],
+                "granted_by": _g.get("granted_by") or "",
+                "granted_at": _g.get("granted_at") or 0}
         welcome_error: Exception | None = None
         try:
             if peer.delivery_ack:
@@ -4482,6 +4700,10 @@ class Relay:
                                       "servers": self._live_servers(),
                                       "updates_enabled":
                                           self.updates_enabled,
+                                      "decision_link": welcome_link,
+                                      "decision_link_detail":
+                                          welcome_link_detail,
+                                      "grant": welcome_grant,
                                       "oversight_pubkey":
                                           self.oversight_pubkey or None})
                 for q in queued:
@@ -4504,6 +4726,10 @@ class Relay:
                                       "servers": self._live_servers(),
                                       "updates_enabled":
                                           self.updates_enabled,
+                                      "decision_link": welcome_link,
+                                      "decision_link_detail":
+                                          welcome_link_detail,
+                                      "grant": welcome_grant,
                                       "oversight_pubkey":
                                           self.oversight_pubkey or None})
                 for q in queued:
@@ -4547,6 +4773,17 @@ class Relay:
                 "recovery_login", username,
                 status="identity rebound by recovery key; account "
                        "secret and recovery key rotated")
+            # Grant rebind (v1.8.0): the recovery login has
+            # already proven possession of the account, so an
+            # active one-time admin grant follows the identity to
+            # its new keys — the SAME agent picks its grant back
+            # up; a different identity could never reach this
+            # point (it would need the recovery key).
+            try:
+                self.store.rebind_grants(username, sign_pub)
+            except Exception:
+                log.exception("grant rebind failed for @%s",
+                              username)
             try:
                 alert = self.store.open_alert(
                     "recovery_login", username,
