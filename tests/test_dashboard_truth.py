@@ -146,6 +146,12 @@ def test_group_channel_and_work_items_chronological(tmp_path):
 
 def test_zero_message_group_and_channel_are_conversations(tmp_path):
     relay = _relay(tmp_path)
+    # beulah is one of the owner's production agents; register
+    # her so the fixture models the production registry — since
+    # v1.6.1 the dashboard filing rule keys on registry
+    # membership, and this test's subject is the payload's
+    # production conversation list.
+    relay.store.claim("beulah", "beulah", designation="production")
     gid = relay.store.create_group("Nova family", "phoenix", None)
     relay.store.add_member(gid, "beulah", role="member",
                            added_by="phoenix")
