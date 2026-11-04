@@ -225,7 +225,10 @@ def test_autonomous_dm_and_group_mention_replies(relay_env, state_root):
         assert reply["body"] == "brain reply to: hello bot"
         assert (reply.get("meta") or {}).get("autonomous") is True
         # The brain got the structured context the contract promises.
-        ctx = seen_ctx[0]
+        # v1.8.0: the registration self-check probe (kind
+        # "link_check") precedes real events in the callable's
+        # stream by law — the first MESSAGE ctx is the subject.
+        ctx = [c for c in seen_ctx if c.get("kind") == "message"][0]
         assert ctx["agent"]["username"] == "helperbot"
         assert ctx["agent"]["mode"] == "autonomous"
         assert ctx["agent"]["capabilities"] == ["help"]
