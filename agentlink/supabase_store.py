@@ -316,23 +316,31 @@ class SupabaseStore:
     def claim(self, username, display_name, pubkey="", sign_pub="",
               capabilities=None, cap_desc="", mode="autonomous",
               decision_link="", delivery_ack=0,
-              designation="production"):
+              designation="production", recovery_hash=""):
         secret = new_secret()
+        body = {
+            "username": username, "secret": _sha(secret),
+            "display_name": display_name, "pubkey": pubkey,
+            "sign_pub": sign_pub,
+            "capabilities": json.dumps(capabilities or []),
+            "cap_desc": cap_desc,
+            "mode": mode if mode in ("manual", "autonomous")
+                    else "autonomous",
+            "decision_link": decision_link if decision_link in
+                    ("linked", "pending") else "",
+            "delivery_ack": 1 if delivery_ack else 0,
+            "designation": designation if designation in
+                    ("production", "test") else "production",
+            "created_at": now_ts()}
+        if recovery_hash:
+            # Recovery keys (v1.7.0): only the SHA-256 hash is
+            # stored, exactly as claim() stores the secret. Sent
+            # only when a key was issued, so a store whose
+            # migration has not run yet never sees the column.
+            body["recovery_hash"] = recovery_hash
         try:
-            self._req("POST", "users", body={
-                "username": username, "secret": _sha(secret),
-                "display_name": display_name, "pubkey": pubkey,
-                "sign_pub": sign_pub,
-                "capabilities": json.dumps(capabilities or []),
-                "cap_desc": cap_desc,
-                "mode": mode if mode in ("manual", "autonomous")
-                        else "autonomous",
-                "decision_link": decision_link if decision_link in
-                        ("linked", "pending") else "",
-                "delivery_ack": 1 if delivery_ack else 0,
-                "designation": designation if designation in
-                        ("production", "test") else "production",
-                "created_at": now_ts()}, prefer="return=minimal")
+            self._req("POST", "users", body=body,
+                      prefer="return=minimal")
         except Exception as exc:
             if "409" in str(exc) or "duplicate" in str(exc):
                 raise UsernameTaken(username)
@@ -370,6 +378,24 @@ class SupabaseStore:
             self._req("PATCH", "users", self._eq("username", username),
                       body={"secret": _sha(secret)},
                       prefer="return=minimal")
+
+    # -- recovery keys (v1.7.0), SQLite parity ---------------------
+    # Only the SHA-256 hash of the recovery key ever lives here;
+    # '' = not enrolled. See store.py for the full rationale.
+
+    def recovery_hash_of(self, username):
+        row = self._one("users", self._eq("username", username)
+                        + "&select=recovery_hash")
+        return str(row["recovery_hash"]) if row else ""
+
+    def set_recovery_hash(self, username, key_hash, used_at=None):
+        if not key_hash:
+            return
+        body = {"recovery_hash": key_hash}
+        if used_at is not None:
+            body["recovery_used_at"] = int(used_at)
+        self._req("PATCH", "users", self._eq("username", username),
+                  body=body, prefer="return=minimal")
 
     def sign_pub_of(self, username):
         row = self._one("users", self._eq("username", username)
@@ -927,7 +953,8 @@ class SupabaseStore:
         # hello authenticated, recorded from the hello exactly like
         # set_delivery_ack records its declaration. Parity with the
         # SQLite Store: unknown values are refused.
-        if method not in ("key", "secret", "resume", "bootstrap"):
+        if method not in ("key", "secret", "resume", "bootstrap",
+                          "recovery"):
             return
         self._req("PATCH", "users", self._eq("username", username),
                   body={"auth_method": method},
@@ -1031,7 +1058,8 @@ class SupabaseStore:
     def list_users(self, query="", capability=""):
         q = ("select=username,display_name,pubkey,sign_pub,capabilities,"
              "cap_desc,mode,decision_link,delivery_ack,auth_method,"
-             "designation,last_seen,created_at&order=username")
+             "designation,last_seen,recovery_hash,recovery_used_at,"
+             "created_at&order=username")
         if query:
             q += f"&username=like.%25{urllib.parse.quote(query)}%25"
         rows = self._get("users", q)
@@ -1053,6 +1081,11 @@ class SupabaseStore:
             # Delivery-ack declaration (v1.3.7): anything not
             # explicitly recorded as ack-capable presents as 0.
             r["delivery_ack"] = 1 if r.get("delivery_ack") else 0
+            # Recovery enrollment (v1.7.0): surfaces expose ONLY
+            # the enrolled flag + last-used stamp — the stored
+            # hash itself never leaves the store.
+            r["recovery_enrolled"] = bool(r.pop("recovery_hash", ""))
+            r["recovery_used_at"] = int(r.get("recovery_used_at") or 0)
             if capability and capability.lower() not in \
                     [c.lower() for c in r["capabilities"]]:
                 continue
