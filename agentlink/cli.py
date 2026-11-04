@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         print("commands: relay server register agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
               "credentials alerts capabilities update doctor census service backup "
-              "oversight-keygen deregister remove-user inbox sync")
+              "oversight-keygen deregister remove-user set-designation inbox sync")
         return 0
     cmd, rest = argv[0], argv[1:]
 
@@ -112,18 +112,33 @@ def main(argv: list[str] | None = None) -> int:
         return _deregister(rest)
     if cmd == "remove-user":
         return _remove_user(rest)
+    if cmd == "set-designation":
+        return _set_designation(rest)
 
     if cmd == "register":
         ap = argparse.ArgumentParser(prog="agentlink register")
         _add_common(ap)
         ap.add_argument("--display-name", default=None)
+        ap.add_argument("--designation", default="production",
+                        choices=["production", "test"],
+                        help="registration designation (v1.6.0): "
+                             "PASS --designation test for every "
+                             "probe/test/scratch registration — the "
+                             "identity then files under the "
+                             "dashboard's Probe Tests view, apart "
+                             "from the production line. Default "
+                             "production. Never inferred from the "
+                             "username; after registration only the "
+                             "operator path (`agentlink "
+                             "set-designation`) changes it")
         args = ap.parse_args(rest)
         if not getattr(args, "username", None):
             raise SystemExit("register needs --username @name")
 
         async def _go():
             a = Agent(args.username, display_name=args.display_name,
-                      endpoint=_endpoint(args), state_dir=_state_dir(args))
+                      endpoint=_endpoint(args), state_dir=_state_dir(args),
+                      designation=args.designation)
             await a.start()
             info = a.whoami()
             await a.close()
@@ -188,6 +203,17 @@ def main(argv: list[str] | None = None) -> int:
                              "is the default — the agent works for "
                              "the platform on its own; manual is the "
                              "explicit opt-out")
+        ap.add_argument("--designation", default="production",
+                        choices=["production", "test"],
+                        help="registration designation (v1.6.0): use "
+                             "'test' when this registration is a "
+                             "probe/test identity — it files under "
+                             "the dashboard's Probe Tests view, "
+                             "apart from the production line. "
+                             "Declared only at registration; after "
+                             "that only the operator path "
+                             "(`agentlink set-designation`) changes "
+                             "it")
         ap.add_argument("--decision-endpoint", default=None,
                         help="the agent's own local decision endpoint "
                              "(autonomous mode): a URL the runtime "
@@ -201,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
         async def _go():
             a = Agent(_username(args), endpoint=_endpoint(args),
                       state_dir=_state_dir(args), mode=args.mode,
+                      designation=args.designation,
                       decision_endpoint=args.decision_endpoint)
             if args.mode == "manual":
                 # Manual mode shell (unchanged from before the
@@ -245,7 +272,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"WORK {work['id']}: {work['title']} "
                       f"from @{work['assigner']}", flush=True)
 
-            print("online as", a.username, f"(mode: {a.mode})",
+            print("online as", a.username,
+                  f"(mode: {a.mode}, designation: {a.designation})",
                   flush=True)
             await a.run()
         asyncio.run(_go())
@@ -436,6 +464,56 @@ def _deregister(rest: list[str]) -> int:
         print(f"deregister failed: {exc}", file=sys.stderr)
         return 1
     return 0
+
+
+def _set_designation(rest: list[str]) -> int:
+    """OPERATOR designation change (v1.6.0): the ONLY path by
+    which a registered agent's production/test designation changes
+    after registration. Executes immediately (it is fully
+    reversible — the identity and every conversation stay exactly
+    where they are; only dashboard composition moves) and the
+    store records every executed change in the append-only audit
+    log as kind 'designation_changed', actor 'operator'.
+
+    Uses the relay's backend selection (AGENTLINK_BACKEND /
+    --backend + --db), so it addresses the same store the relay
+    serves — SQLite file or Supabase (production)."""
+    from .backend import create_store
+    from .protocol import normalize_username
+    ap = argparse.ArgumentParser(prog="agentlink set-designation")
+    ap.add_argument("username")
+    ap.add_argument("--designation", required=True,
+                    choices=["production", "test"],
+                    help="the designation to set")
+    ap.add_argument("--backend", default=None,
+                    help="sqlite (default) | supabase")
+    ap.add_argument("--db", default="~/.agentlink/relay.db")
+    args = ap.parse_args(rest)
+    username = normalize_username(args.username)
+    if username is None:
+        print(f"bad username {args.username!r}", file=sys.stderr)
+        return 2
+    store = create_store(args.backend, db_path=args.db)
+    try:
+        rows = store.list_users(query=username)
+        if not any(r["username"] == username for r in rows):
+            print(f"no such registration: @{username}",
+                  file=sys.stderr)
+            return 2
+        before = store.designation_of(username)
+        changed = store.set_designation(username, args.designation,
+                                        actor="operator")
+        after = store.designation_of(username)
+        _print({"username": username, "before": before,
+                "designation": after, "changed": bool(changed),
+                "audit": "designation_changed" if changed else
+                         "unchanged — nothing recorded"})
+        return 0
+    finally:
+        try:
+            store.close()
+        except Exception:
+            pass
 
 
 def _remove_user(rest: list[str]) -> int:
