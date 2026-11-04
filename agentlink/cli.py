@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         print("commands: relay server register reclaim agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
               "credentials alerts capabilities update doctor census service backup "
-              "oversight-keygen deregister remove-user set-designation inbox sync")
+              "oversight-keygen deregister remove-user set-designation grant my-grant inbox sync")
         return 0
     cmd, rest = argv[0], argv[1:]
 
@@ -114,6 +114,10 @@ def main(argv: list[str] | None = None) -> int:
         return _remove_user(rest)
     if cmd == "set-designation":
         return _set_designation(rest)
+    if cmd == "grant":
+        return _grant(rest)
+    if cmd == "my-grant":
+        return _my_grant(rest)
 
     if cmd == "register":
         ap = argparse.ArgumentParser(prog="agentlink register")
@@ -577,6 +581,215 @@ def _set_designation(rest: list[str]) -> int:
             store.close()
         except Exception:
             pass
+
+
+def _grant(rest: list[str]) -> int:
+    """OPERATOR one-time admin grant (v1.8.0): the owner's side of
+    the grant — issue it once, watch its receipts, revoke it in
+    one step. Store-direct like set-designation (it addresses the
+    same store the relay serves, SQLite or Supabase), so a grant
+    or a revoke lands in the one place the broker reads on EVERY
+    action: a revoke is effective the moment this command returns.
+
+    Subcommands: issue / revoke / show / activity / approvals /
+    approve / reject / connectors. Payment instruments are
+    outside the grant entirely — no scope names one, and none
+    ever will (owner's hard exclusion)."""
+    from .backend import create_store
+    from .grants import (GRANT_SCOPES, OWNER_ATTACHABLE_CONNECTORS,
+                          activity_report, render_activity_markdown,
+                          valid_scopes)
+    from .protocol import normalize_username
+    sub = rest[0] if rest else "show"
+    r = rest[1:] if rest else []
+
+    def _store(args):
+        return create_store(args.backend, db_path=args.db)
+
+    def _backend_args(ap):
+        ap.add_argument("--backend", default=None,
+                        help="sqlite (default) | supabase")
+        ap.add_argument("--db", default="~/.agentlink/relay.db")
+
+    if sub == "issue":
+        ap = argparse.ArgumentParser(prog="agentlink grant issue")
+        ap.add_argument("username")
+        ap.add_argument("--scopes", required=True,
+                        help="comma-separated scope names; the "
+                             "lawful set is: "
+                             + ", ".join(GRANT_SCOPES))
+        ap.add_argument("--by", default="operator",
+                        help="who issues the grant (recorded)")
+        _backend_args(ap)
+        args = ap.parse_args(r)
+        username = normalize_username(args.username)
+        if username is None:
+            print(f"bad username {args.username!r}", file=sys.stderr)
+            return 2
+        scopes = valid_scopes(
+            [s.strip() for s in args.scopes.split(",")])
+        if scopes is None:
+            print("bad scopes: the lawful set is "
+                  + ", ".join(GRANT_SCOPES), file=sys.stderr)
+            return 2
+        store = _store(args)
+        try:
+            row = next((u for u in store.list_users(query=username)
+                        if u["username"] == username), None)
+            if row is None:
+                print(f"no such registration: @{username}",
+                      file=sys.stderr)
+                return 2
+            grant = store.set_grant(username, scopes, args.by,
+                                    row.get("sign_pub") or "")
+            _print({"grant": grant,
+                    "bound_to": "username + current identity key"})
+            return 0
+        finally:
+            store.close()
+    if sub == "revoke":
+        ap = argparse.ArgumentParser(prog="agentlink grant revoke")
+        ap.add_argument("username")
+        ap.add_argument("--by", default="operator")
+        _backend_args(ap)
+        args = ap.parse_args(r)
+        username = normalize_username(args.username)
+        if username is None:
+            print(f"bad username {args.username!r}", file=sys.stderr)
+            return 2
+        store = _store(args)
+        try:
+            changed = store.revoke_grant(username, args.by)
+            _print({"username": username, "revoked": bool(changed),
+                    "grant": store.grant_of(username)})
+            return 0
+        finally:
+            store.close()
+    if sub == "show":
+        ap = argparse.ArgumentParser(prog="agentlink grant show")
+        ap.add_argument("username")
+        _backend_args(ap)
+        args = ap.parse_args(r)
+        username = normalize_username(args.username)
+        if username is None:
+            print(f"bad username {args.username!r}", file=sys.stderr)
+            return 2
+        store = _store(args)
+        try:
+            _print({"username": username,
+                    "grant": store.grant_of(username)})
+            return 0
+        finally:
+            store.close()
+    if sub == "activity":
+        ap = argparse.ArgumentParser(
+            prog="agentlink grant activity")
+        ap.add_argument("username")
+        ap.add_argument("--hours", type=float, default=24.0,
+                        help="window ending now (default 24h)")
+        ap.add_argument("--since", type=int, default=None,
+                        help="window start, epoch seconds (overrides "
+                             "--hours)")
+        ap.add_argument("--until", type=int, default=None)
+        ap.add_argument("--format", choices=["md", "json"],
+                        default="md",
+                        help="md = the owner's activity document")
+        _backend_args(ap)
+        args = ap.parse_args(r)
+        username = normalize_username(args.username)
+        if username is None:
+            print(f"bad username {args.username!r}", file=sys.stderr)
+            return 2
+        import time as _time
+        since = args.since if args.since is not None else int(
+            _time.time() - args.hours * 3600)
+        store = _store(args)
+        try:
+            report = activity_report(store, username, since,
+                                     args.until)
+            if args.format == "json":
+                _print(report)
+            else:
+                print(render_activity_markdown(report))
+            return 0
+        finally:
+            store.close()
+    if sub == "approvals":
+        ap = argparse.ArgumentParser(
+            prog="agentlink grant approvals")
+        ap.add_argument("--status", default="awaiting_approval")
+        ap.add_argument("--username", default=None)
+        _backend_args(ap)
+        args = ap.parse_args(r)
+        store = _store(args)
+        try:
+            _print({"approvals": store.list_approvals(
+                status=args.status or None,
+                username=args.username)})
+            return 0
+        finally:
+            store.close()
+    if sub in ("approve", "reject"):
+        ap = argparse.ArgumentParser(
+            prog=f"agentlink grant {sub}")
+        ap.add_argument("approval_id")
+        ap.add_argument("--by", default="operator")
+        _backend_args(ap)
+        args = ap.parse_args(r)
+        store = _store(args)
+        try:
+            row = store.decide_approval(
+                args.approval_id, sub == "approve", args.by)
+            if row is None:
+                print("no awaiting approval with that id",
+                      file=sys.stderr)
+                return 2
+            out = {"approval": row}
+            if sub == "approve":
+                # Execute the decided action through a broker on
+                # this store (the full gate re-runs — grant,
+                # identity, scope, rate — before anything runs).
+                # The dashboard's approve executes inside the
+                # relay process against its live adapters; for the
+                # reference test mailbox both paths are identical.
+                from .grants import GrantBroker, TestMailboxAdapter
+                broker = GrantBroker(
+                    store, {"testmail": TestMailboxAdapter()},
+                    alert_fn=lambda k, s, d: store.open_alert(k, s, d),
+                    audit_fn=lambda *a, **kw: store.audit(*a, **kw))
+                out["execution"] = broker.execute_approved(row)
+            _print(out)
+            return 0
+        finally:
+            store.close()
+    if sub == "connectors":
+        _print({"attached": [
+                    {"name": "testmail", "attached": True,
+                     "note": "reference adapter — Gmail-shaped "
+                             "test mailbox; no real mail, no "
+                             "credentials"}],
+                "owner_attachable": OWNER_ATTACHABLE_CONNECTORS,
+                "note": "real connectors attach by the owner's "
+                        "own action only; payment instruments are "
+                        "never attachable"})
+        return 0
+    print(f"unknown grant subcommand {sub!r}: issue revoke show "
+          "activity approvals approve reject connectors",
+          file=sys.stderr)
+    return 2
+
+
+def _my_grant(rest: list[str]) -> int:
+    """'Show my grant' (v1.8.0): the AGENT-side surface — the
+    agent states its exact current scopes and grant state,
+    read live from the relay (never a stale cache)."""
+    ap = argparse.ArgumentParser(prog="agentlink my-grant")
+    _add_common(ap)
+    args = ap.parse_args(rest)
+    _print({"username": _username(args),
+            "grant": asyncio.run(_with_agent(args,
+                                             lambda a: a.my_grant()))})
+    return 0
 
 
 def _remove_user(rest: list[str]) -> int:
