@@ -747,6 +747,13 @@ class Agent:
         # site); everywhere else the secret never travels.
         self._legacy_auth_endpoints: set[str] = set()
         self._ws = None
+        # Close-code telemetry (v1.6.2): the last session socket's
+        # close code/reason, captured by the read loop when the
+        # connection dies, so the session-end log can name WHY the
+        # session ended (before this, client logs recorded a bare
+        # disconnect line and forensics could not name the trigger).
+        self._closed_code = None
+        self._closed_reason = ""
         self._reader: asyncio.Task | None = None
         self._ping_task: asyncio.Task | None = None
         self._message_handler = None
@@ -2230,11 +2237,28 @@ class Agent:
         raise RegistrationFailed("connection closed before welcome")
 
     async def _read_loop(self) -> None:
+        # Close-code telemetry (v1.6.2): reset for this session, then
+        # capture WHY the socket ended. An abnormal close raises
+        # ConnectionClosed into the except; a NORMAL close (1000/
+        # 1001) simply ends the async-for (websockets' iterator
+        # swallows ConnectionClosedOK), so the finally reads the
+        # code/reason off the socket itself. The socket is bound at
+        # entry — the same object the async-for iterates — so a
+        # later session's socket can never be misread as this one's.
+        ws = self._ws
+        self._closed_code = None
+        self._closed_reason = ""
         try:
-            async for raw in self._ws:
+            async for raw in ws:
                 await self._dispatch(json.loads(raw))
-        except websockets.exceptions.ConnectionClosed:
-            pass
+        except websockets.exceptions.ConnectionClosed as exc:
+            self._closed_code = exc.code
+            self._closed_reason = exc.reason or ""
+        finally:
+            if self._closed_code is None and ws is not None:
+                self._closed_code = getattr(ws, "close_code", None)
+                self._closed_reason = getattr(
+                    ws, "close_reason", None) or self._closed_reason
 
     async def _ping_loop(self, ws=None) -> None:
         """The connection's heartbeat (v1.4.3 — owned by start(),
@@ -2727,8 +2751,16 @@ class Agent:
                 if self._ping_task is not None:
                     self._ping_task.cancel()
                     self._ping_task = None
-            log.warning("disconnected from %s; reconnecting (home first)",
-                        self.current_endpoint)
+            _close_code = self._closed_code
+            _close_reason = self._closed_reason
+            if _close_code is None and self._ws is not None:
+                _close_code = getattr(self._ws, "close_code", None)
+                _close_reason = getattr(
+                    self._ws, "close_reason", None) or _close_reason
+            log.warning("disconnected from %s (close_code=%s "
+                        "close_reason=%r); reconnecting (home first)",
+                        self.current_endpoint, _close_code,
+                        _close_reason)
             # INSTANT first retry on a drop (points 43b/44): a
             # disconnect races all endpoints again immediately; the
             # capped pacing applies only between FAILED attempts.
