@@ -219,6 +219,7 @@ class Store:
                     capabilities TEXT NOT NULL DEFAULT '[]',
                     cap_desc TEXT NOT NULL DEFAULT '',
                     mode TEXT NOT NULL DEFAULT 'autonomous',
+                    designation TEXT NOT NULL DEFAULT 'production',
                     decision_link TEXT NOT NULL DEFAULT '',
                     delivery_ack INTEGER NOT NULL DEFAULT 0,
                     vault_labels TEXT NOT NULL DEFAULT '',
@@ -577,6 +578,18 @@ class Store:
         # only ever an explicit opt-out recorded by the agent itself.
         _add("users", "mode",
              "mode TEXT NOT NULL DEFAULT 'autonomous'")
+        # Probe/test segregation (v1.6.0, owner's ruling): every
+        # registration carries a DESIGNATION — 'production' (the
+        # line the owner runs) or 'test' (a probe/test identity).
+        # It is DECLARED at registration, never inferred from the
+        # username (deploy-probe is production permanently — it owns
+        # a server and is the owner's standing fixture), and after
+        # registration it changes ONLY through the operator path
+        # (set_designation): an agent can never flip its own. The
+        # designation steers dashboard composition ONLY — the line
+        # itself (messages, work, carrying) never reads it.
+        _add("users", "designation",
+             "designation TEXT NOT NULL DEFAULT 'production'")
         # Decision link (v1.3.5, "the agent is the brain"): the
         # agent's own hello declares whether its line connection is
         # linked to its decision-making — 'linked' / 'pending' / ''
@@ -1392,9 +1405,12 @@ class Store:
     def claim(self, username: str, display_name: str, pubkey: str = "",
               sign_pub: str = "", capabilities=None,
               cap_desc: str = "", mode: str = "autonomous",
-              decision_link: str = "", delivery_ack: int = 0) -> str:
+              decision_link: str = "", delivery_ack: int = 0,
+              designation: str = "production") -> str:
         secret = new_secret()
         mode = mode if mode in ("manual", "autonomous") else "autonomous"
+        designation = designation if designation in (
+            "production", "test") else "production"
         decision_link = decision_link if decision_link in (
             "linked", "pending") else ""
         delivery_ack = 1 if delivery_ack else 0
@@ -1403,13 +1419,14 @@ class Store:
                 self._db.execute(
                     "INSERT INTO users (username, secret, display_name, pubkey,"
                     " sign_pub, capabilities, cap_desc, mode, decision_link,"
-                    " delivery_ack, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " delivery_ack, designation, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     # Only the SHA-256 hash is stored — the relay DB never
                     # holds a usable secret.
                     (username, _hash_token(secret), display_name, pubkey,
                      sign_pub, json.dumps(capabilities or []), cap_desc,
-                     mode, decision_link, delivery_ack, now_ts()),
+                     mode, decision_link, delivery_ack, designation,
+                     now_ts()),
                 )
                 self._db.commit()
             except sqlite3.IntegrityError:
@@ -2042,6 +2059,48 @@ class Store:
                 (mode, username))
             self._db.commit()
 
+    def set_designation(self, username: str, designation: str,
+                        actor: str = "operator") -> bool:
+        """OPERATOR-ONLY designation change (v1.6.0). The one door
+        through which a registered agent's production/test
+        designation may change after registration — the relay never
+        calls this from a hello (an agent's own designation
+        declaration is honoured only by claim(), at registration),
+        so an agent can never flip itself out of (or into) the
+        test segregation. Every executed change is written to the
+        append-only audit log as kind 'designation_changed'.
+        Returns True when the stored value actually changed."""
+        if designation not in ("production", "test"):
+            return False
+        with self._lock:
+            row = self._db.execute(
+                "SELECT designation FROM users WHERE username = ?",
+                (username,)).fetchone()
+            if row is None:
+                return False
+            current = row[0] if row[0] in (
+                "production", "test") else "production"
+            if current == designation:
+                return False
+            self._db.execute(
+                "UPDATE users SET designation = ? WHERE username = ?",
+                (designation, username))
+            self._db.commit()
+        self.audit("designation_changed", actor, target=username,
+                   status=designation)
+        return True
+
+    def designation_of(self, username: str) -> str:
+        """The stored designation, presented by the standing rule:
+        anything not explicitly 'test' is production."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT designation FROM users WHERE username = ?",
+                (username,)).fetchone()
+        if row is None:
+            return "production"
+        return "test" if row[0] == "test" else "production"
+
     def set_decision_link(self, username: str, state: str) -> None:
         """Persist the agent's declared decision-link state
         (v1.3.5). Recorded from the agent's own hello — the agent
@@ -2177,7 +2236,8 @@ class Store:
                 rows = self._db.execute(
                     "SELECT username, display_name, pubkey, sign_pub,"
                     " capabilities, cap_desc, mode, decision_link,"
-                    " delivery_ack, auth_method, last_seen, created_at"
+                    " delivery_ack, auth_method, designation, last_seen,"
+                    " created_at"
                     " FROM users"
                     " WHERE username LIKE ? ORDER BY username",
                     (f"%{query}%",),
@@ -2186,7 +2246,8 @@ class Store:
                 rows = self._db.execute(
                     "SELECT username, display_name, pubkey, sign_pub,"
                     " capabilities, cap_desc, mode, decision_link,"
-                    " delivery_ack, auth_method, last_seen, created_at"
+                    " delivery_ack, auth_method, designation, last_seen,"
+                    " created_at"
                     " FROM users ORDER BY username"
                 ).fetchall()
             out = []
@@ -2201,6 +2262,10 @@ class Store:
                 # not an explicit 'manual' presents as autonomous.
                 d["mode"] = d.get("mode") if d.get("mode") in (
                     "manual", "autonomous") else "autonomous"
+                # Presentation rule (segregation, v1.6.0): anything
+                # not explicitly 'test' presents as production.
+                d["designation"] = "test" \
+                    if d.get("designation") == "test" else "production"
                 # Delivery-ack declaration (v1.3.7): anything not
                 # explicitly recorded as ack-capable presents as 0.
                 d["delivery_ack"] = 1 if d.get("delivery_ack") else 0
