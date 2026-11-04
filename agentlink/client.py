@@ -422,6 +422,30 @@ class ResumeUnsupported(Exception):
     — it never silently restarts the task from zero."""
 
 
+def _quarantine_db_file(path: Path) -> None:
+    """Rename a corrupt SQLite database aside, WAL sidecars
+    included (v1.6.0). A leftover -wal/-shm pair belongs to the
+    corrupt incarnation: replayed against the rebuilt database it
+    would resurrect the corruption the quarantine exists to
+    escape (the 43d rebuild depends on this). Sidecars are renamed
+    alongside where possible and unlinked otherwise — the rebuilt
+    store comes from the backend mirror / history backfill, never
+    from the corrupt file's remains."""
+    try:
+        path.rename(path.with_suffix(".corrupt"))
+    except Exception:
+        pass
+    for suffix in ("-wal", "-shm"):
+        side = path.with_name(path.name + suffix)
+        try:
+            side.rename(side.with_name(side.name + ".corrupt"))
+        except Exception:
+            try:
+                side.unlink()
+            except Exception:
+                pass
+
+
 class TaskJournal:
     """The agent's local task store (point 30): SQLite in the state
     dir, mode 0600. Every assignment is journaled on receipt, and
@@ -430,7 +454,31 @@ class TaskJournal:
 
     def __init__(self, path: Path):
         import sqlite3
+        # Header sanity BEFORE sqlite sees the file (v1.6.0):
+        # under WAL, a garbage main file can be shadowed by a
+        # still-valid -wal sidecar (page 1 lives there), so sqlite
+        # would "recover" a database whose base file was destroyed
+        # — masking exactly the corruption the quarantine +
+        # mirror-rebuild path (point 43d) exists for. A non-empty
+        # file without the SQLite header IS a corrupt journal.
+        if Path(path).exists() and Path(path).stat().st_size > 0:
+            with open(path, "rb") as fh:
+                if fh.read(16) != b"SQLite format 3\x00":
+                    raise sqlite3.DatabaseError(
+                        "file is not a database")
         self._db = sqlite3.connect(str(path), check_same_thread=False)
+        # WAL + busy timeout — the relay Store's posture (v1.6.0).
+        # Under sqlite defaults (rollback journal, one fsync pair
+        # per commit) a single journal commit measured 80–800ms on
+        # real disk, paid synchronously on the event loop for EVERY
+        # assignment before its handler may start (journal-first,
+        # point 30) — dispatch latency, not durability. WAL keeps
+        # synchronous=FULL (the durability contract is unchanged:
+        # a commit survives process death and power loss exactly
+        # as before) while a commit becomes one sequential append:
+        # ~25ms worst case on the same disk.
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA busy_timeout=10000")
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS journal ("
             " work_id TEXT PRIMARY KEY, attempt INTEGER NOT NULL DEFAULT 1,"
@@ -506,6 +554,16 @@ class Agent:
     # manual exists only as an explicit opt-out.
     MODES = ("manual", "autonomous")
 
+    # Registration designations (probe/test segregation, v1.6.0):
+    # PRODUCTION = the owner's real line; TEST = a probe/test
+    # identity, filed apart in the owner's dashboard. Declared
+    # ONCE, here at registration, and declared by the registering
+    # side — never inferred from the username. After registration
+    # the designation is the operator's to change, never the
+    # agent's (the relay honours this declaration only on the
+    # claiming hello).
+    DESIGNATIONS = ("production", "test")
+
     def __init__(self, username: str | None = None,
         display_name: str | None = None,
         endpoint: str | None = None,
@@ -518,6 +576,7 @@ class Agent:
         oversight_pubkey: str | None = None,
         auto_read: bool = True,
         mode: str = "autonomous",
+        designation: str = "production",
         brain=None,
         decision_link=None,
         on_decision=None,
@@ -532,6 +591,12 @@ class Agent:
             raise ValueError(
                 f"bad mode {mode!r}: expected one of {self.MODES}")
         self.mode = m
+        d = str(designation or "").strip().lower()
+        if d not in self.DESIGNATIONS:
+            raise ValueError(
+                f"bad designation {designation!r}: expected one of "
+                f"{self.DESIGNATIONS}")
+        self.designation = d
         # The DECISION LINK (v1.3.5): the link between this line
         # connection and the agent's OWN decision-making. The agent
         # is its own intelligence — this client is never its mind;
@@ -779,10 +844,7 @@ class Agent:
             except Exception:
                 # Corrupt journal: quarantine it; start() rebuilds the
                 # journal from the backend mirror (point 43d).
-                try:
-                    jpath.rename(jpath.with_suffix(".corrupt"))
-                except Exception:
-                    pass
+                _quarantine_db_file(jpath)
                 self._journal = TaskJournal(jpath)
                 self._pending_repairs.append("journal_corrupt_rebuilt")
         # Canonical mailbox (v1.3.7): the durable local journal for
@@ -801,10 +863,7 @@ class Agent:
                 self.mailbox = Mailbox(mpath, owner=self.username)
                 self.mailbox.count()  # header sanity check
             except Exception:
-                try:
-                    mpath.rename(mpath.with_suffix(".corrupt"))
-                except Exception:
-                    pass
+                _quarantine_db_file(mpath)
                 try:
                     self.mailbox = Mailbox(mpath, owner=self.username)
                 except Exception:
@@ -1467,6 +1526,7 @@ class Agent:
     def whoami(self) -> dict:
         return {"username": self.username,
                 "display_name": self.display_name,
+                "designation": self.designation,
                 "endpoint": self.endpoint,
                 "endpoints": list(self.endpoints),
                 "servers": list(self.known_servers)}
@@ -1912,6 +1972,11 @@ class Agent:
             "capabilities": self.capabilities,
             "cap_description": self.cap_description,
             "mode": self.mode,
+            # Probe/test segregation (v1.6.0): declared at
+            # registration; the relay records it only on the
+            # claiming hello — after that the designation is the
+            # operator's (an agent cannot flip its own).
+            "designation": self.designation,
             "decision_link": self._declared_link_sent,
             # Delivery custody (v1.3.7): this client journals every
             # inbound item into its canonical local mailbox and acks
@@ -2074,7 +2139,7 @@ class Agent:
                 # production room proof caught exactly this).
                 if self._ping_task is None or self._ping_task.done():
                     self._ping_task = asyncio.create_task(
-                        self._ping_loop())
+                        self._ping_loop(self._ws))
                 # Owner-seat control channel (v1.3.9): once the
                 # reader is live, the lock holder starts serving
                 # forwarded one-shot commands (send / group add).
@@ -2171,7 +2236,7 @@ class Agent:
         except websockets.exceptions.ConnectionClosed:
             pass
 
-    async def _ping_loop(self) -> None:
+    async def _ping_loop(self, ws=None) -> None:
         """The connection's heartbeat (v1.4.3 — owned by start(),
         not by run()): a ping every HEARTBEAT_SECONDS for as long
         as the connection lives, plus the last-alive stamp the
@@ -2179,10 +2244,26 @@ class Agent:
         Presence derives from these pings on every relay, so they
         must flow for EVERY connected client — daemon or one-shot
         embedding alike. A send failure ends the loop; the reader
-        owns disconnect handling and a reconnect re-spawns it."""
+        owns disconnect handling and a reconnect re-spawns it.
+
+        SESSION-BOUND (v1.6.0): the loop is tied to the socket it
+        was spawned for and dies the moment that socket is no
+        longer the live one. It previously read self._ws
+        dynamically and was cancelled only by close() — never by
+        run()'s per-session teardown — so a loop sleeping through
+        a reconnect could wake after the new session's socket was
+        installed and write its ping onto the NEW connection,
+        inside that hello's key-auth window; the relay's auth wait
+        mistook the ping for a failed auth_response and refused
+        the hello (the 44-race gate failure). run()'s teardown
+        now also cancels the task (see run()); this identity
+        guard is the second lock on the same door."""
+        ws = ws if ws is not None else self._ws
         stamp = self.state_dir / f"heartbeat-{self.username}.txt"
         while True:
             await asyncio.sleep(HEARTBEAT_SECONDS)
+            if self._ws is not ws:
+                return
             try:
                 if self._ws is not None:
                     await self._send_raw({
@@ -2637,6 +2718,15 @@ class Agent:
                 mesh.cancel()
                 if self._reader is not None:
                     self._reader.cancel()
+                # The heartbeat dies with its session (v1.6.0):
+                # close() always cancelled it, but this per-session
+                # teardown did not — a surviving loop could wake on
+                # the NEXT session's socket and ping inside its
+                # key-auth window (the 44-race gate failure). The
+                # loop is also socket-bound as a second lock.
+                if self._ping_task is not None:
+                    self._ping_task.cancel()
+                    self._ping_task = None
             log.warning("disconnected from %s; reconnecting (home first)",
                         self.current_endpoint)
             # INSTANT first retry on a drop (points 43b/44): a
@@ -2915,6 +3005,11 @@ class Agent:
                 data = await self._request({"type": "work_inbox",
                                             "status": None,
                                             "group_id": None})
+                # Same cold-key guard as the boot resume pass
+                # (_ensure_keys_for_work): the rebuild decrypts
+                # the same mirror and must not drop group
+                # checkpoints to an empty key cache.
+                await self._ensure_keys_for_work(data.get("work", []))
                 for raw in data.get("work", []):
                     if raw.get("assignee") != self.username:
                         continue
@@ -3602,6 +3697,7 @@ class Agent:
         return {"username": self.username,
                 "display_name": self.display_name,
                 "mode": self.mode,
+                "designation": self.designation,
                 "capabilities": list(self.capabilities),
                 "cap_description": self.cap_description}
 
@@ -4625,7 +4721,23 @@ class Agent:
             # this agent, including work frames by their work id.
             if work.get("id"):
                 await self._send_ack([work["id"]])
-            self.assigned_work.append(work)
+            # ONE RECORD PER (id, attempt) — key-guarded append
+            # (v1.6.0): this append is shared by the normal path
+            # and the boot-defer path above, and the defer path
+            # deliberately skips the _seen_work guard (the resume
+            # pass owns the spawn) — but the resume pass ALSO
+            # appends this work as its own record. Unguarded, a
+            # custody re-offer landing in the window between the
+            # resume pass journaling the work and the boot gate
+            # opening appended a SECOND assigned_work entry for
+            # one assignment. (The window was a rarity at the old
+            # 1s scan cadence; the dedicated frame drain made it
+            # routine — the gate caught it.) Key-guard the append
+            # itself so every path agrees on the invariant.
+            if not any(w.get("id") == work.get("id")
+                       and int(w.get("attempt") or 1) == wkey[1]
+                       for w in self.assigned_work):
+                self.assigned_work.append(work)
             if _boot_defer:
                 return
             if self._work_handler is not None or self._autonomous_on():
@@ -4700,6 +4812,23 @@ class Agent:
         finally:
             self._running_work.discard(key)
 
+    async def _ensure_keys_for_work(self, raws) -> None:
+        """Fetch the group keys an inbox's group work needs BEFORE
+        any of it is decrypted (43d, hardened in v1.6.0): group
+        content and checkpoints are group-key-sealed, and a
+        restart can reach a journal-populating pass with the key
+        cache cold — file deleted (only a CORRUPT cache triggers
+        the resync in self_check) or keys not yet re-delivered.
+        Decrypting anyway silently drops the checkpoint the
+        backend mirror faithfully kept; the entry then looks
+        checkpoint-less forever. Ensuring keys first makes the
+        mirror's contents recoverable at every population pass,
+        not just the lucky ones."""
+        for raw in raws:
+            gid = raw.get("group_id")
+            if gid and gid not in self._group_keys:
+                await self._ensure_group_key(gid)
+
     async def _resume_open_work(self) -> None:
         """Boot steps 3-4: fetch open assignments from the relay, merge
         the local journal, and re-invoke handlers — with the exact
@@ -4708,6 +4837,7 @@ class Agent:
             return
         data = await self._request({"type": "work_inbox", "status": None,
                                     "group_id": None})
+        await self._ensure_keys_for_work(data.get("work", []))
         for raw in data.get("work", []):
             if raw.get("assignee") != self.username:
                 continue
@@ -4720,7 +4850,22 @@ class Agent:
                 self._journal.put(work)
                 entry = self._journal.get(work["id"])
             work["checkpoint"] = entry.get("checkpoint") if entry else None
-            if work not in self.assigned_work:
+            # Dedup on the (id, attempt) KEY, never on dict
+            # equality (v1.6.0): the frame path may already have
+            # appended its own decrypt of this same assignment —
+            # with the dedicated frame drain, custody frames now
+            # routinely land DURING boot, before this pass — and
+            # the two dicts are only transiently equal (either may
+            # be mutated by its runner), so `work not in
+            # assigned_work` intermittently appended a SECOND
+            # entry for one assignment (assigned_work is the
+            # agent's public workload record; a duplicate corrupts
+            # every count built on it). Exactly one entry per
+            # (id, attempt), whichever path arrives first.
+            if not any(w.get("id") == work["id"]
+                       and int(w.get("attempt") or 1)
+                       == int(work.get("attempt") or 1)
+                       for w in self.assigned_work):
                 self.assigned_work.append(work)
             # Mark the attempt seen (a custody re-offer of the
             # same work_assigned frame later in the session is a
@@ -4742,13 +4887,49 @@ class Agent:
         """Persist a resume point (point 30): local journal first, then
         the E2E-encrypted backend mirror (assigner copy + group copy),
         so the checkpoint travels with the assignment."""
-        if self._journal is not None:
-            self._journal.set_checkpoint(work_id, data)
         entry = self._journal.get(work_id) if self._journal else None
         work = entry or next((w for w in self.assigned_work
                               if w["id"] == work_id), None)
         if work is None:
-            return
+            # The assignment's push may not have been ingested yet:
+            # a checkpoint recorded the moment work lands races the
+            # frame that carries it (the 43d failure mode, root-
+            # caused in the v1.6.0 gate — the call returned
+            # silently, the mirror stayed empty, and a later
+            # restart had nothing to recover). A checkpoint for
+            # unknown work is NEVER a silent no-op: fetch the
+            # assignment from the backend, journal it, and mirror
+            # as usual. Only a work id the backend itself does not
+            # hold for this agent is an error — a loud one.
+            data_inbox = await self._request(
+                {"type": "work_inbox", "status": None,
+                 "group_id": None})
+            for raw in data_inbox.get("work", []):
+                if raw.get("id") != work_id \
+                        or raw.get("assignee") != self.username:
+                    continue
+                await self._ensure_keys_for_work([raw])
+                work = self._decrypt_work(raw)
+                # Key-based dedup, as in _resume_open_work: one
+                # assigned_work entry per (id, attempt).
+                if not any(w.get("id") == work["id"]
+                           and int(w.get("attempt") or 1)
+                           == int(work.get("attempt") or 1)
+                           for w in self.assigned_work):
+                    self.assigned_work.append(work)
+                break
+        if work is None:
+            raise ValueError(
+                f"checkpoint for unknown work {work_id}: not in "
+                "the local journal, not among assigned work, and "
+                "not in the backend inbox — nothing was mirrored")
+        if self._journal is not None:
+            # Journal-first (the point-30 order): the entry must
+            # exist for the checkpoint to land on, so journal the
+            # work itself first when this call is what found it.
+            if self._journal.get(work_id) is None:
+                self._journal.put(work)
+            self._journal.set_checkpoint(work_id, data)
         frame = {"type": "work_checkpoint", "work_id": work_id,
                  "attempt": int(work.get("attempt") or 1)}
         assigner = work.get("assigner")
