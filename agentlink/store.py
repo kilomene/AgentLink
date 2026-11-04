@@ -221,6 +221,7 @@ class Store:
                     mode TEXT NOT NULL DEFAULT 'autonomous',
                     designation TEXT NOT NULL DEFAULT 'production',
                     decision_link TEXT NOT NULL DEFAULT '',
+                    decision_link_detail TEXT NOT NULL DEFAULT '',
                     delivery_ack INTEGER NOT NULL DEFAULT 0,
                     recovery_hash TEXT NOT NULL DEFAULT '',
                     recovery_used_at INTEGER NOT NULL DEFAULT 0,
@@ -504,6 +505,50 @@ class Store:
                     frame TEXT NOT NULL,
                     ts INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS grants (
+                    username TEXT PRIMARY KEY,
+                    scopes TEXT NOT NULL DEFAULT '[]',
+                    granted_by TEXT NOT NULL DEFAULT '',
+                    granted_at INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    bound_sign_pub TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS grant_receipts (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT UNIQUE NOT NULL,
+                    username TEXT NOT NULL,
+                    ts INTEGER NOT NULL,
+                    scope TEXT NOT NULL DEFAULT '',
+                    connector TEXT NOT NULL DEFAULT '',
+                    action TEXT NOT NULL DEFAULT '',
+                    target TEXT NOT NULL DEFAULT '',
+                    work_ref TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '',
+                    prev_hash TEXT NOT NULL DEFAULT '',
+                    sig TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS grant_approvals (
+                    id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    ts INTEGER NOT NULL,
+                    scope TEXT NOT NULL DEFAULT '',
+                    connector TEXT NOT NULL DEFAULT '',
+                    action TEXT NOT NULL DEFAULT '',
+                    target TEXT NOT NULL DEFAULT '',
+                    params TEXT NOT NULL DEFAULT '{}',
+                    work_ref TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'awaiting_approval',
+                    decided_by TEXT NOT NULL DEFAULT '',
+                    decided_at INTEGER NOT NULL DEFAULT 0,
+                    receipt_id TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS grant_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
             self._db.commit()
@@ -601,6 +646,15 @@ class Store:
         # and are never modelled here as parts to be supplied.
         _add("users", "decision_link",
              "decision_link TEXT NOT NULL DEFAULT ''")
+        # Auto decision link (v1.8.0, owner's law): the declared
+        # link's DETAIL — how the client wired itself (mode:
+        # config / in_process / handlers / convention / none) and
+        # whether its live self-check VERIFIED the path — as a
+        # JSON object. The plain decision_link column keeps the
+        # v1.3.5 summary ('linked' only when verified); this
+        # column carries the rest of the truth.
+        _add("users", "decision_link_detail",
+             "decision_link_detail TEXT NOT NULL DEFAULT ''")
         # Delivery custody (v1.3.7): the agent's own hello declares
         # whether its client acks queued frames into its durable
         # journal (1) or still takes the legacy destructive flush
@@ -2167,6 +2221,348 @@ class Store:
                 (state, username))
             self._db.commit()
 
+    def set_decision_link_detail(self, username: str,
+                                 detail: dict) -> None:
+        """Persist the auto-link DETAIL (v1.8.0): how the client
+        wired itself and whether its self-check verified the
+        path — {"mode", "verified", "checked_at"}. Normalised
+        here so no store can carry a mode outside the lawful set;
+        the relay only ever records what the agent declared."""
+        if not isinstance(detail, dict):
+            return
+        mode = detail.get("mode")
+        if mode not in ("config", "in_process", "handlers",
+                        "convention", "none"):
+            return
+        clean = {"mode": mode,
+                 "verified": bool(detail.get("verified")),
+                 "checked_at": int(detail.get("checked_at") or 0)}
+        with self._lock:
+            self._db.execute(
+                "UPDATE users SET decision_link_detail = ?"
+                " WHERE username = ?",
+                (json.dumps(clean), username))
+            self._db.commit()
+
+    # -- one-time admin grant (v1.8.0) --------------------------------
+    # The grant record, its append-only signed receipts, and its
+    # approval queue. Receipts have NO update or delete path —
+    # append-only is structural, and every receipt is signed with
+    # the platform receipt key (grant_meta) and chained to the
+    # previous receipt's hash at insert time, under the store
+    # lock, so the chain can never fork inside one store.
+
+    def grant_of(self, username: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM grants WHERE username = ?",
+                (username,)).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        try:
+            d["scopes"] = json.loads(d.get("scopes") or "[]")
+        except Exception:
+            d["scopes"] = []
+        return d
+
+    def set_grant(self, username: str, scopes: list,
+                  granted_by: str, bound_sign_pub: str) -> dict:
+        """Issue (or re-issue) the one-time admin grant for an
+        agent, bound to the identity key presented. Recorded in
+        the audit log by the store itself, like set_designation —
+        a grant existing without an audit row must be impossible.
+        The scope set is validated HERE as well as at every
+        issuing surface (grants.valid_scopes): an out-of-law set
+        — any scope outside GRANT_SCOPES, payment instruments
+        included by their absence — can never be persisted."""
+        from .grants import valid_scopes
+        checked = valid_scopes(scopes)
+        if checked is None:
+            raise ValueError(
+                f"unlawful grant scope set {scopes!r}")
+        scopes = checked
+        ts = now_ts()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO grants (username, scopes, granted_by,"
+                " granted_at, status, bound_sign_pub, updated_at)"
+                " VALUES (?, ?, ?, ?, 'active', ?, ?)"
+                " ON CONFLICT(username) DO UPDATE SET"
+                " scopes = excluded.scopes,"
+                " granted_by = excluded.granted_by,"
+                " granted_at = excluded.granted_at,"
+                " status = 'active',"
+                " bound_sign_pub = excluded.bound_sign_pub,"
+                " updated_at = excluded.updated_at",
+                (username, json.dumps(list(scopes)), granted_by,
+                 ts, bound_sign_pub, ts))
+            self._db.commit()
+        self.audit("grant_issued", granted_by or "operator",
+                   target=username,
+                   status="scopes=" + ",".join(scopes))
+        return self.grant_of(username)
+
+    def revoke_grant(self, username: str, by: str = "") -> bool:
+        """The kill switch: effective immediately — the broker
+        re-reads the grant on every action."""
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE grants SET status = 'revoked',"
+                " updated_at = ? WHERE username = ?"
+                " AND status = 'active'",
+                (now_ts(), username))
+            self._db.commit()
+        if cur.rowcount:
+            self.audit("grant_revoked", by or "operator",
+                       target=username)
+        return bool(cur.rowcount)
+
+    def rebind_grants(self, username: str,
+                      new_sign_pub: str) -> int:
+        """Recovery rebind (v1.8.0): a v1.7.0 recovery login has
+        already proven possession of the account (the recovery
+        key), so an ACTIVE grant follows the identity to its new
+        keys. Called ONLY from the relay's verified recovery
+        path — nothing else may move a grant's binding."""
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE grants SET bound_sign_pub = ?,"
+                " updated_at = ? WHERE username = ?"
+                " AND status = 'active'"
+                " AND bound_sign_pub != ?",
+                (new_sign_pub, now_ts(), username, new_sign_pub))
+            self._db.commit()
+        if cur.rowcount:
+            self.audit("grant_rebound", "relay", target=username,
+                       status="identity rebound by recovery login")
+        return cur.rowcount
+
+    def _grant_keypair_nolock(self) -> tuple[str, str]:
+        """(seed_b64, pub_b64) of the receipt keypair, minting it
+        on first use. CALLER MUST HOLD the store lock — the public
+        accessor and add_receipt both funnel here so the lock is
+        never taken twice (the store lock is not re-entrant)."""
+        row = self._db.execute(
+            "SELECT value FROM grant_meta WHERE key = ?",
+            ("receipt_signing_key",)).fetchone()
+        if row is not None:
+            seed_b64, pub_b64 = row["value"].split(":", 1)
+            return seed_b64, pub_b64
+        from cryptography.hazmat.primitives.asymmetric.ed25519 \
+            import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import \
+            serialization
+        import base64 as _b64
+        key = Ed25519PrivateKey.generate()
+        seed = key.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption())
+        pub = key.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw)
+        seed_b64 = _b64.b64encode(seed).decode()
+        pub_b64 = _b64.b64encode(pub).decode()
+        self._db.execute(
+            "INSERT INTO grant_meta (key, value) VALUES (?, ?)",
+            ("receipt_signing_key", f"{seed_b64}:{pub_b64}"))
+        self._db.commit()
+        return seed_b64, pub_b64
+
+    def grant_receipt_pubkey(self) -> str:
+        """The platform receipt public key (base64), minting the
+        keypair on first use. The private seed lives ONLY in
+        grant_meta inside the relay's own store — the same trust
+        domain as the store file itself (0600, operator-only)."""
+        with self._lock:
+            return self._grant_keypair_nolock()[1]
+
+    def _receipt_sign_nolock(self, canonical: bytes) -> str:
+        """Sign with the receipt key. CALLER MUST HOLD the store
+        lock (see _grant_keypair_nolock)."""
+        import base64 as _b64
+        from cryptography.hazmat.primitives.asymmetric.ed25519 \
+            import Ed25519PrivateKey
+        seed_b64, _pub = self._grant_keypair_nolock()
+        key = Ed25519PrivateKey.from_private_bytes(
+            _b64.b64decode(seed_b64))
+        return _b64.b64encode(key.sign(canonical)).decode()
+
+    def add_receipt(self, rec: dict) -> dict:
+        """Append ONE grant receipt: id + timestamp assigned
+        here, chained to the previous receipt's hash, signed.
+        There is deliberately no update/delete counterpart."""
+        from .grants import receipt_canonical, receipt_hash
+        rec = dict(rec)
+        rec.setdefault("id", new_id("rcpt-"))
+        rec.setdefault("ts", now_ts())
+        for k in ("scope", "connector", "action", "target",
+                  "work_ref", "status"):
+            rec[k] = str(rec.get(k) or "")
+        if not isinstance(rec.get("detail"), dict):
+            rec["detail"] = {}
+        with self._lock:
+            prev = self._db.execute(
+                "SELECT id, username, ts, scope, connector, action,"
+                " target, work_ref, status, detail, prev_hash, sig"
+                " FROM grant_receipts ORDER BY seq DESC LIMIT 1"
+            ).fetchone()
+            if prev is not None:
+                pd = dict(prev)
+                try:
+                    pd["detail"] = json.loads(pd.get("detail")
+                                              or "{}")
+                except Exception:
+                    pd["detail"] = {}
+                rec["prev_hash"] = receipt_hash(pd)
+            else:
+                rec["prev_hash"] = ""
+            rec["sig"] = self._receipt_sign_nolock(
+                receipt_canonical(rec))
+            self._db.execute(
+                "INSERT INTO grant_receipts (id, username, ts,"
+                " scope, connector, action, target, work_ref,"
+                " status, detail, prev_hash, sig)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (rec["id"], rec["username"], rec["ts"],
+                 rec["scope"], rec["connector"], rec["action"],
+                 rec["target"], rec["work_ref"], rec["status"],
+                 json.dumps(rec["detail"]), rec["prev_hash"],
+                 rec["sig"]))
+            self._db.commit()
+        return rec
+
+    def list_receipts(self, username: str | None = None,
+                      since: int = 0, until: int | None = None,
+                      limit: int = 300) -> list[dict]:
+        q = ("SELECT * FROM grant_receipts WHERE ts >= ?")
+        args: list = [int(since)]
+        if username:
+            q += " AND username = ?"
+            args.append(username)
+        if until is not None:
+            q += " AND ts <= ?"
+            args.append(int(until))
+        q += " ORDER BY seq ASC LIMIT ?"
+        args.append(int(limit))
+        with self._lock:
+            rows = self._db.execute(q, args).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d.pop("seq", None)
+            try:
+                d["detail"] = json.loads(d.get("detail") or "{}")
+            except Exception:
+                d["detail"] = {}
+            out.append(d)
+        return out
+
+    def receipt_count(self, username: str, scope: str,
+                      since: int, status: str = "executed") -> int:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM grant_receipts"
+                " WHERE username = ? AND scope = ? AND ts >= ?"
+                " AND status = ?",
+                (username, scope, int(since), status)).fetchone()
+        return int(row["n"])
+
+    def add_approval(self, ap: dict) -> dict:
+        ap = dict(ap)
+        ap.setdefault("id", new_id("gappr-"))
+        ap.setdefault("ts", now_ts())
+        ap.setdefault("status", "awaiting_approval")
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO grant_approvals (id, username, ts,"
+                " scope, connector, action, target, params,"
+                " work_ref, reason, status) VALUES"
+                " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ap["id"], ap["username"], ap["ts"],
+                 str(ap.get("scope") or ""),
+                 str(ap.get("connector") or ""),
+                 str(ap.get("action") or ""),
+                 str(ap.get("target") or ""),
+                 json.dumps(ap.get("params") or {}),
+                 str(ap.get("work_ref") or ""),
+                 str(ap.get("reason") or ""), ap["status"]))
+            self._db.commit()
+        self.audit("grant_approval_queued", ap["username"],
+                   status=str(ap.get("reason") or ""),
+                   ref_id=ap["id"])
+        return self.get_approval(ap["id"])
+
+    def get_approval(self, approval_id: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM grant_approvals WHERE id = ?",
+                (approval_id,)).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        try:
+            d["params"] = json.loads(d.get("params") or "{}")
+        except Exception:
+            d["params"] = {}
+        return d
+
+    def list_approvals(self, status: str | None = None,
+                       username: str | None = None,
+                       limit: int = 100) -> list[dict]:
+        q = "SELECT * FROM grant_approvals WHERE 1 = 1"
+        args: list = []
+        if status:
+            q += " AND status = ?"
+            args.append(status)
+        if username:
+            q += " AND username = ?"
+            args.append(username)
+        q += " ORDER BY ts DESC LIMIT ?"
+        args.append(int(limit))
+        with self._lock:
+            rows = self._db.execute(q, args).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["params"] = json.loads(d.get("params") or "{}")
+            except Exception:
+                d["params"] = {}
+            out.append(d)
+        return out
+
+    def decide_approval(self, approval_id: str, approved: bool,
+                        by: str = "") -> dict | None:
+        """The owner's decision on a queued red-line action —
+        the approval gate's second half. Only an
+        awaiting_approval row can be decided; the decision is
+        audit-recorded either way."""
+        ap = self.get_approval(approval_id)
+        if ap is None or ap.get("status") != "awaiting_approval":
+            return ap
+        status = "approved" if approved else "rejected"
+        with self._lock:
+            self._db.execute(
+                "UPDATE grant_approvals SET status = ?,"
+                " decided_by = ?, decided_at = ? WHERE id = ?",
+                (status, by or "operator", now_ts(), approval_id))
+            self._db.commit()
+        self.audit("grant_approval_" + status, by or "operator",
+                   target=ap["username"], ref_id=approval_id)
+        return self.get_approval(approval_id)
+
+    def set_approval_receipt(self, approval_id: str,
+                             receipt_id: str) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE grant_approvals SET receipt_id = ?,"
+                " status = 'executed' WHERE id = ?"
+                " AND status = 'approved'",
+                (receipt_id, approval_id))
+            self._db.commit()
+
     def set_delivery_ack(self, username: str, flag) -> None:
         """Persist the agent's declared delivery-ack capability
         (v1.3.7). Recorded from the agent's own hello, exactly like
@@ -2288,6 +2684,7 @@ class Store:
                 rows = self._db.execute(
                     "SELECT username, display_name, pubkey, sign_pub,"
                     " capabilities, cap_desc, mode, decision_link,"
+                    " decision_link_detail,"
                     " delivery_ack, auth_method, designation, last_seen,"
                     " recovery_hash, recovery_used_at, created_at"
                     " FROM users"
@@ -2298,6 +2695,7 @@ class Store:
                 rows = self._db.execute(
                     "SELECT username, display_name, pubkey, sign_pub,"
                     " capabilities, cap_desc, mode, decision_link,"
+                    " decision_link_detail,"
                     " delivery_ack, auth_method, designation, last_seen,"
                     " recovery_hash, recovery_used_at, created_at"
                     " FROM users ORDER BY username"
@@ -2396,6 +2794,13 @@ class Store:
             ("alerts", "subject = ?", (u,)),
             ("blobs", "owner = ? OR for_user = ?", (u, u)),
             ("library", "sender = ? OR to_user = ?", (u, u)),
+            # One-time admin grant (v1.8.0): the grant, its
+            # receipts and its approvals belong to the
+            # registration — a name re-claimed later by a
+            # DIFFERENT identity must never inherit them.
+            ("grant_approvals", "username = ?", (u,)),
+            ("grant_receipts", "username = ?", (u,)),
+            ("grants", "username = ?", (u,)),
             ("users", "username = ?", (u,)),
         ]
 
