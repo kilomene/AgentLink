@@ -57,9 +57,28 @@ class Mailbox:
         except OSError:
             pass
         self._lock = threading.Lock()
+        # Header sanity BEFORE sqlite sees the file (v1.6.0): under
+        # WAL a garbage main file can be shadowed by a still-valid
+        # -wal sidecar, masking the corruption the quarantine +
+        # history-backfill path exists for. A non-empty file
+        # without the SQLite header IS a corrupt mailbox.
+        if self.path.exists() and self.path.stat().st_size > 0:
+            with open(self.path, "rb") as fh:
+                if fh.read(16) != b"SQLite format 3\x00":
+                    raise sqlite3.DatabaseError(
+                        "file is not a database")
         self._db = sqlite3.connect(str(self.path),
                                    check_same_thread=False)
         with self._lock:
+            # WAL + busy timeout — the relay Store's posture
+            # (v1.6.0), for the same reason as the TaskJournal:
+            # commit-per-write under rollback-journal defaults cost
+            # 80–800ms of fsync on real disk, on the client's event
+            # loop, ahead of every ack and dispatch. WAL keeps
+            # synchronous=FULL — the durability contract (journaled
+            # before processed, only then acked) is unchanged.
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute("PRAGMA busy_timeout=10000")
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS items ("
                 " id TEXT PRIMARY KEY, ts INTEGER, kind TEXT,"
