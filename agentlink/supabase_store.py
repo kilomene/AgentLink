@@ -939,6 +939,277 @@ class SupabaseStore:
                   body={"decision_link": state},
                   prefer="return=minimal")
 
+    def set_decision_link_detail(self, username, detail):
+        # Auto decision link (v1.8.0): the wiring DETAIL the
+        # client declares — mode + self-check verdict — recorded
+        # exactly like the summary above. Normalised to the same
+        # lawful mode set as the SQLite store.
+        if not isinstance(detail, dict):
+            return
+        mode = detail.get("mode")
+        if mode not in ("config", "in_process", "handlers",
+                        "convention", "none"):
+            return
+        clean = {"mode": mode,
+                 "verified": bool(detail.get("verified")),
+                 "checked_at": int(detail.get("checked_at") or 0)}
+        self._req("PATCH", "users", self._eq("username", username),
+                  body={"decision_link_detail": json.dumps(clean)},
+                  prefer="return=minimal")
+
+    # -- one-time admin grant (v1.8.0), SQLite parity ----------------
+    # See store.py for the doctrine. Receipts are append-only:
+    # this class grows insert/read methods for them and NO
+    # update/delete path, exactly like the SQLite store.
+
+    @staticmethod
+    def _shape_grant(row):
+        if row is None:
+            return None
+        d = dict(row)
+        try:
+            d["scopes"] = json.loads(d.get("scopes") or "[]")
+        except Exception:
+            d["scopes"] = []
+        return d
+
+    def grant_of(self, username):
+        row = self._one("grants", self._eq("username", username)
+                        + "&select=*")
+        return self._shape_grant(row)
+
+    def set_grant(self, username, scopes, granted_by,
+                  bound_sign_pub):
+        # Scope law enforced in the store too (SQLite parity):
+        # an out-of-law set can never be persisted.
+        from .grants import valid_scopes
+        checked = valid_scopes(scopes)
+        if checked is None:
+            raise ValueError(
+                f"unlawful grant scope set {scopes!r}")
+        scopes = checked
+        ts = now_ts()
+        body = {"username": username,
+                "scopes": json.dumps(list(scopes)),
+                "granted_by": granted_by, "granted_at": ts,
+                "status": "active",
+                "bound_sign_pub": bound_sign_pub, "updated_at": ts}
+        self._req("POST", "grants", body=body,
+                  prefer="resolution=merge-duplicates,"
+                         "return=representation")
+        self.audit("grant_issued", granted_by or "operator",
+                   target=username,
+                   status="scopes=" + ",".join(scopes))
+        return self.grant_of(username)
+
+    def revoke_grant(self, username, by=""):
+        rows = self._req(
+            "PATCH", "grants",
+            self._eq("username", username) + "&status=eq.active",
+            body={"status": "revoked", "updated_at": now_ts()},
+            prefer="return=representation")
+        n = len(rows) if isinstance(rows, list) else 0
+        if n:
+            self.audit("grant_revoked", by or "operator",
+                       target=username)
+        return bool(n)
+
+    def rebind_grants(self, username, new_sign_pub):
+        rows = self._req(
+            "PATCH", "grants",
+            self._eq("username", username) + "&status=eq.active"
+            + f"&bound_sign_pub=neq.{urllib.parse.quote(new_sign_pub, safe='')}",
+            body={"bound_sign_pub": new_sign_pub,
+                  "updated_at": now_ts()},
+            prefer="return=representation")
+        n = len(rows) if isinstance(rows, list) else 0
+        if n:
+            self.audit("grant_rebound", "relay", target=username,
+                       status="identity rebound by recovery login")
+        return n
+
+    def _grant_meta_get(self, key):
+        row = self._one("grant_meta", self._eq("key", key)
+                        + "&select=value")
+        return row["value"] if row else None
+
+    def grant_receipt_pubkey(self):
+        value = self._grant_meta_get("receipt_signing_key")
+        if value:
+            return value.split(":", 1)[1]
+        from cryptography.hazmat.primitives.asymmetric.ed25519 \
+            import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        import base64 as _b64
+        key = Ed25519PrivateKey.generate()
+        seed = key.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption())
+        pub = key.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw)
+        seed_b64 = _b64.b64encode(seed).decode()
+        pub_b64 = _b64.b64encode(pub).decode()
+        self._req("POST", "grant_meta",
+                  body={"key": "receipt_signing_key",
+                        "value": f"{seed_b64}:{pub_b64}"},
+                  prefer="resolution=merge-duplicates,"
+                         "return=minimal")
+        return pub_b64
+
+    def _receipt_sign(self, canonical: bytes) -> str:
+        import base64 as _b64
+        from cryptography.hazmat.primitives.asymmetric.ed25519 \
+            import Ed25519PrivateKey
+        value = self._grant_meta_get("receipt_signing_key")
+        if not value:
+            self.grant_receipt_pubkey()
+            return self._receipt_sign(canonical)
+        seed_b64 = value.split(":", 1)[0]
+        key = Ed25519PrivateKey.from_private_bytes(
+            _b64.b64decode(seed_b64))
+        return _b64.b64encode(key.sign(canonical)).decode()
+
+    def add_receipt(self, rec):
+        from .grants import receipt_canonical, receipt_hash
+        rec = dict(rec)
+        rec.setdefault("id", new_id("rcpt-"))
+        rec.setdefault("ts", now_ts())
+        for k in ("scope", "connector", "action", "target",
+                  "work_ref", "status"):
+            rec[k] = str(rec.get(k) or "")
+        if not isinstance(rec.get("detail"), dict):
+            rec["detail"] = {}
+        prev_rows = self._get(
+            "grant_receipts",
+            "select=id,username,ts,scope,connector,action,target,"
+            "work_ref,status,detail,prev_hash,sig"
+            "&order=seq.desc&limit=1")
+        if prev_rows:
+            pd = dict(prev_rows[0])
+            if isinstance(pd.get("detail"), str):
+                try:
+                    pd["detail"] = json.loads(pd["detail"] or "{}")
+                except Exception:
+                    pd["detail"] = {}
+            rec["prev_hash"] = receipt_hash(pd)
+        else:
+            rec["prev_hash"] = ""
+        rec["sig"] = self._receipt_sign(receipt_canonical(rec))
+        body = {"id": rec["id"], "username": rec["username"],
+                "ts": rec["ts"], "scope": rec["scope"],
+                "connector": rec["connector"],
+                "action": rec["action"], "target": rec["target"],
+                "work_ref": rec["work_ref"], "status": rec["status"],
+                "detail": json.dumps(rec["detail"]),
+                "prev_hash": rec["prev_hash"], "sig": rec["sig"]}
+        self._req("POST", "grant_receipts", body=body,
+                  prefer="return=minimal")
+        return rec
+
+    def list_receipts(self, username=None, since=0, until=None,
+                      limit=300):
+        q = f"ts=gte.{int(since)}&select=*&order=seq.asc" \
+            f"&limit={int(limit)}"
+        if username:
+            q += "&" + self._eq("username", username)
+        if until is not None:
+            q += f"&ts=lte.{int(until)}"
+        rows = self._get("grant_receipts", q)
+        out = []
+        for r in rows:
+            d = dict(r)
+            d.pop("seq", None)
+            if isinstance(d.get("detail"), str):
+                try:
+                    d["detail"] = json.loads(d["detail"] or "{}")
+                except Exception:
+                    d["detail"] = {}
+            out.append(d)
+        return out
+
+    def receipt_count(self, username, scope, since,
+                      status="executed"):
+        rows = self._get(
+            "grant_receipts",
+            self._eq("username", username)
+            + "&" + self._eq("scope", scope)
+            + f"&ts=gte.{int(since)}"
+            + "&" + self._eq("status", status)
+            + "&select=id")
+        return len(rows)
+
+    def add_approval(self, ap):
+        ap = dict(ap)
+        ap.setdefault("id", new_id("gappr-"))
+        ap.setdefault("ts", now_ts())
+        ap.setdefault("status", "awaiting_approval")
+        body = {"id": ap["id"], "username": ap["username"],
+                "ts": ap["ts"], "scope": str(ap.get("scope") or ""),
+                "connector": str(ap.get("connector") or ""),
+                "action": str(ap.get("action") or ""),
+                "target": str(ap.get("target") or ""),
+                "params": json.dumps(ap.get("params") or {}),
+                "work_ref": str(ap.get("work_ref") or ""),
+                "reason": str(ap.get("reason") or ""),
+                "status": ap["status"]}
+        self._req("POST", "grant_approvals", body=body,
+                  prefer="return=minimal")
+        self.audit("grant_approval_queued", ap["username"],
+                   status=str(ap.get("reason") or ""),
+                   ref_id=ap["id"])
+        return self.get_approval(ap["id"])
+
+    @staticmethod
+    def _shape_approval(row):
+        if row is None:
+            return None
+        d = dict(row)
+        if isinstance(d.get("params"), str):
+            try:
+                d["params"] = json.loads(d["params"] or "{}")
+            except Exception:
+                d["params"] = {}
+        return d
+
+    def get_approval(self, approval_id):
+        row = self._one("grant_approvals",
+                        self._eq("id", approval_id) + "&select=*")
+        return self._shape_approval(row)
+
+    def list_approvals(self, status=None, username=None,
+                       limit=100):
+        q = f"select=*&order=ts.desc&limit={int(limit)}"
+        if status:
+            q += "&" + self._eq("status", status)
+        if username:
+            q += "&" + self._eq("username", username)
+        return [self._shape_approval(r)
+                for r in self._get("grant_approvals", q)]
+
+    def decide_approval(self, approval_id, approved, by=""):
+        ap = self.get_approval(approval_id)
+        if ap is None or ap.get("status") != "awaiting_approval":
+            return ap
+        status = "approved" if approved else "rejected"
+        self._req("PATCH", "grant_approvals",
+                  self._eq("id", approval_id),
+                  body={"status": status,
+                        "decided_by": by or "operator",
+                        "decided_at": now_ts()},
+                  prefer="return=minimal")
+        self.audit("grant_approval_" + status, by or "operator",
+                   target=ap["username"], ref_id=approval_id)
+        return self.get_approval(approval_id)
+
+    def set_approval_receipt(self, approval_id, receipt_id):
+        self._req("PATCH", "grant_approvals",
+                  self._eq("id", approval_id) + "&status=eq.approved",
+                  body={"receipt_id": receipt_id,
+                        "status": "executed"},
+                  prefer="return=minimal")
+
     def set_delivery_ack(self, username, flag):
         # Delivery custody (v1.3.7): the agent declares in its
         # hello whether its client acks queued frames into its
@@ -1057,7 +1328,8 @@ class SupabaseStore:
 
     def list_users(self, query="", capability=""):
         q = ("select=username,display_name,pubkey,sign_pub,capabilities,"
-             "cap_desc,mode,decision_link,delivery_ack,auth_method,"
+             "cap_desc,mode,decision_link,decision_link_detail,"
+             "delivery_ack,auth_method,"
              "designation,last_seen,recovery_hash,recovery_used_at,"
              "created_at&order=username")
         if query:
@@ -1178,12 +1450,19 @@ class SupabaseStore:
         ("channel_members", "username"),
         ("invites", "created_by"),
         ("alerts", "subject"),
+        # One-time admin grant (v1.8.0): grant, receipts and
+        # approvals die with the registration — a name re-claimed
+        # by a different identity never inherits them.
+        ("grant_approvals", "username"),
+        ("grant_receipts", "username"),
+        ("grants", "username"),
     )
     _REMOVAL_ORDER = (
         "work_deliveries", "work_checkpoints", "work", "chain_steps",
         "chains", "queue", "message_reads", "group_keys",
         "group_members", "channel_keys", "channel_members", "invites",
-        "upload_sessions", "alerts", "blobs", "library", "users")
+        "upload_sessions", "alerts", "blobs", "library",
+        "grant_approvals", "grant_receipts", "grants", "users")
 
     def removal_blockers(self, username):
         blockers = []
