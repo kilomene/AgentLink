@@ -1836,36 +1836,54 @@ class Relay:
                 u["server_state_label"] = \
                     srv.get("carry_state_label") or ""
         # ---------------------------------------------------------------
-        # PROBE/TEST SEGREGATION (v1.6.0, owner's ruling 2026-11-04):
-        # the payload separates PRODUCTION from TEST server-side, in
-        # composition — never by frontend filtering, and never by
-        # endpoint: x/x2/x3 all compose from this one shared store
-        # (carrying and the mesh depend on it being shared), so the
-        # split key is the registration's DESIGNATION.
+        # PROBE/TEST SEGREGATION (v1.6.0, owner's ruling 2026-11-04;
+        # filing rule corrected v1.6.1): the payload separates
+        # PRODUCTION from TEST server-side, in composition — never
+        # by frontend filtering, and never by endpoint: x/x2/x3 all
+        # compose from this one shared store (carrying and the mesh
+        # depend on it being shared), so the split key is the
+        # registration's DESIGNATION + REGISTRY MEMBERSHIP.
         #
-        # THE RULE (one rule for every surface): an item files under
-        # TEST iff it has at least one party besides the owner seat
-        # (phoenix) and EVERY such party is test-designated. Parties
-        # are: a user row's own designation; a DM's two participants;
-        # a group/channel's members; a work item's assigner +
-        # assignee (+ its group's members when group-scoped); a
-        # chain's creator + step assignees (+ group members); a
-        # library entry's sender + recipient (+ group members); a
-        # group-vault entry's adder (+ its group's members). Mixed
-        # company files under production — the production line is
-        # where anything real is watched. The census is untouched:
-        # the splits below partition the same lists, so production +
-        # test always sum to the totals the census protects.
+        # THE RULE (v1.6.1 — one rule for every surface, implemented
+        # once in _parties_test below): an item files under PRODUCTION
+        # only when EVERY party besides the owner seat (phoenix) is a
+        # production-REGISTERED user. It files under TEST if ANY such
+        # party is test-designated OR is not in the registry at all
+        # (unknown, deregistered, or ephemeral — decided by registry
+        # membership, never by name patterns). Parties are: a user
+        # row's own designation; a DM's two participants; a
+        # group/channel's members; a work item's assigner + assignee
+        # (+ its group's members when group-scoped); a chain's
+        # creator + step assignees (+ group members); a library
+        # entry's sender + recipient (+ group members); a group-vault
+        # entry's adder (+ its group's members).
+        #
+        # Why v1.6.1: the v1.6.0 rule keyed on the registered test
+        # set only, so a thread whose counterparty had NO designation
+        # — a deregistered drill identity, a health-battery dial-*
+        # peer, a never-registered probe handle — defaulted to
+        # production and leaked into the owner's main dashboard (six
+        # threads, verified live 2026-11-04). Registry membership is
+        # the correct default: what is not production-registered is
+        # not production. The census is untouched: the splits below
+        # partition the same lists, so production + test always sum
+        # to the totals the census protects.
         desig = {u["username"]: ("test" if u.get("designation")
                                  == "test" else "production")
                  for u in users}
         test_names = {n for n, d in desig.items() if d == "test"}
 
         def _parties_test(names) -> bool:
+            # THE filing rule (v1.6.1), stated once, used by every
+            # split below: TEST iff any party besides the owner seat
+            # is not a production-registered user — test-designated,
+            # unknown, deregistered or ephemeral all file test;
+            # production keeps only all-production-registered
+            # company. An item with no party besides the owner seat
+            # files production.
             others = [n for n in names
                       if n and n != OWNER_SEAT_USERNAME]
-            return bool(others) and all(
-                desig.get(n, "production") == "test" for n in others)
+            return any(desig.get(n) != "production" for n in others)
 
         def _member_names(gid: str, channel: bool = False) -> list:
             try:
