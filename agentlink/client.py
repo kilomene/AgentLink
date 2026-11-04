@@ -256,6 +256,14 @@ DEFAULT_STATE_DIR = os.path.expanduser("~/.agentlink")
 
 _MENTION_RE = re.compile(r"@([a-z0-9][a-z0-9._-]{0,30})", re.IGNORECASE)
 
+# Pubkey cache freshness (v1.7.0): how long a resolved peer key
+# may be reused before pubkey_of re-resolves it through the
+# relay. A peer's key changes when its account is rebound (a
+# recovery login) — the relay's key_rotated notice invalidates
+# the entry immediately on the reclaiming relay; this TTL is
+# the fleet-wide backstop for peers connected elsewhere.
+_PUBKEY_CACHE_TTL_SECONDS = 300.0
+
 
 def core_fingerprint() -> dict:
     """The hardened-core fingerprint (v1.2.0), declared at hello.
@@ -582,6 +590,8 @@ class Agent:
         on_decision=None,
         decision_endpoint: str | None = None,
         media: bool = False,
+        workspace: str | None = None,
+        recovery_key: str | None = None,
     ):
         u = normalize_username(username)
         if u is None and not ephemeral:
@@ -697,6 +707,26 @@ class Agent:
         self.known_servers: list[dict] = []
         self.state_dir = Path(state_dir).expanduser()
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        # Recovery keys (v1.7.0, owner's design): the agent's
+        # login-back credential and its DURABLE storage contract.
+        # workspace= names the agent's workspace — where its
+        # documents live and the place a machine/state wipe does
+        # not reach (AGENTLINK_WORKSPACE env, default ~/workspace):
+        # every issued recovery key is written there at a fixed
+        # path so a wiped agent can find its own way back.
+        # recovery_key= is the explicit manual-reclaim credential
+        # (see `agentlink reclaim`); the automatic paths discover
+        # the stored copies on their own.
+        self.workspace = Path(
+            workspace or os.environ.get("AGENTLINK_WORKSPACE")
+            or "~/workspace").expanduser()
+        self._recovery_key_manual = recovery_key or None
+        # The most recently issued/used recovery key (plaintext —
+        # held by the agent itself, exactly like its identity
+        # keys; the server only ever holds the hash) and the
+        # workspace file that carries its durable copy.
+        self.recovery_key: str | None = None
+        self.recovery_file: str | None = None
         self.ephemeral = ephemeral
         self.identity: Identity | None = None
         if not ephemeral and self.username:
@@ -767,7 +797,7 @@ class Agent:
         self.chain_events: list[dict] = []
         self._pending: dict[str, asyncio.Future] = {}
         self._reply_waiters: dict[str, asyncio.Future] = {}
-        self._pubkey_cache: dict[str, str] = {}
+        self._pubkey_cache: dict[str, tuple[str, float]] = {}
         self._group_keys: dict[str, dict] = {}  # gid -> {epoch, key bytes}
         self._load_group_keys()
         # Read receipts (v1.1.2): with auto_read on (the default),
@@ -1478,6 +1508,127 @@ class Agent:
              "display_name": self.display_name}))
         os.replace(ctmp, cur)
 
+    # -- recovery keys (v1.7.0) -------------------------------------
+    # The owner's storage law: a recovery key is written to BOTH
+    # the client state dir AND a fixed path in the agent's
+    # WORKSPACE — the durable document store that survives the
+    # machine/state wipe the key exists for. One copy in the very
+    # place that can be wiped would be a spare key kept inside the
+    # locked house.
+
+    def _recovery_state_path(self) -> Path:
+        return self.state_dir / f"recovery-{self.username}.json"
+
+    def _recovery_workspace_path(self) -> Path:
+        return self.workspace / f"agentlink-recovery-{self.username}.txt"
+
+    def _save_recovery_key(self, key: str) -> None:
+        """Persist an issued recovery key per the storage contract
+        (both copies, 0600, atomic) and SURFACE it: the key, the
+        exact file paths, and the instruction — so the agent can
+        also record it in its own long-term memory."""
+        if not key or self.ephemeral or not self.username:
+            return
+        self.recovery_key = key
+        # (a) the state-dir copy — the fast local copy, in the
+        # _save_secret atomic pattern.
+        p = self._recovery_state_path()
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"username": self.username,
+                                   "endpoint": self.endpoint,
+                                   "recovery_key": key}))
+        os.replace(tmp, p)
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
+        # (b) THE WORKSPACE FILE — plain text that explains itself
+        # to whichever future instance of the agent finds it after
+        # a wipe, with the owner's warning inside it.
+        wp = self._recovery_workspace_path()
+        try:
+            self.workspace.mkdir(parents=True, exist_ok=True)
+            wtmp = wp.with_suffix(".txt.tmp")
+            wtmp.write_text(
+                f"AgentLink recovery key — @{self.username}\n"
+                f"username: {self.username}\n"
+                f"endpoint: {self.endpoint}\n"
+                f"recovery_key: {key}\n"
+                f"\n"
+                f"NEVER DELETE THIS FILE. This is your AgentLink "
+                f"recovery key — the only way back into "
+                f"@{self.username} if this machine or your client "
+                f"state is wiped. Boot your client with this "
+                f"workspace intact (or run `agentlink reclaim`) "
+                f"and present it: everything — conversations, "
+                f"groups, vault, unread messages — is restored, "
+                f"because it all lives server-side under your "
+                f"username. Keep a copy in your own long-term "
+                f"memory as well. Whoever holds this key IS "
+                f"@{self.username}: guard it like a private key. "
+                f"When you use it, it burns and a new one is "
+                f"issued into this file.\n")
+            os.replace(wtmp, wp)
+            try:
+                os.chmod(wp, 0o600)
+            except OSError:
+                pass
+            self.recovery_file = str(wp)
+        except Exception:
+            log.exception("could not write the workspace recovery "
+                          "file at %s", wp)
+        log.warning(
+            "RECOVERY KEY issued for @%s — this is your login-back "
+            "credential, the ONLY way back into your account if "
+            "this machine or your client state is ever wiped. It "
+            "is saved in your client state (%s) and in your "
+            "workspace (%s). RECORD IT IN YOUR OWN LONG-TERM "
+            "MEMORY AS WELL. Never share it: whoever holds it IS "
+            "@%s.", self.username, p, wp, self.username)
+
+    def _find_recovery_key(self) -> str | None:
+        """Discover a stored recovery key: the WORKSPACE file
+        first (the durable copy that survives a client-state
+        wipe), then the state-dir copy. None when this agent
+        holds no key anywhere.
+
+        A stored copy is SCOPED to the line that issued it: the
+        endpoint recorded in the copy must be this client's
+        configured home endpoint. A leftover copy from another
+        line (a test relay, a previous deployment, a different
+        network) is never presented — a credential is not
+        sprayed at lines that did not issue it, and a stale
+        file can never turn a fresh registration on a new line
+        into a refused recovery attempt."""
+        if self.ephemeral or not self.username:
+            return None
+        home = str(self.endpoint or "")
+        try:
+            wp = self._recovery_workspace_path()
+            if wp.exists():
+                key = ""
+                ep = ""
+                for line in wp.read_text().splitlines():
+                    if line.startswith("recovery_key:"):
+                        key = line.split(":", 1)[1].strip()
+                    elif line.startswith("endpoint:"):
+                        ep = line.split(":", 1)[1].strip()
+                if key and (not ep or ep == home):
+                    return key
+        except Exception:
+            pass
+        try:
+            p = self._recovery_state_path()
+            if p.exists():
+                data = json.loads(p.read_text())
+                key = data.get("recovery_key")
+                ep = str(data.get("endpoint") or "")
+                if key and (not ep or ep == home):
+                    return str(key)
+        except Exception:
+            pass
+        return None
+
     def _group_keys_path(self) -> Path:
         return self.state_dir / f"groupkeys-{self.username}.json"
 
@@ -1531,12 +1682,30 @@ class Agent:
             pass
 
     def whoami(self) -> dict:
+        # Recovery surface (v1.7.0): whether this agent HOLDS a
+        # recovery key — its login-back credential — and the
+        # workspace file that carries the durable copy. The key
+        # itself is never printed here (it lives in the files and
+        # in the agent's own memory, nowhere else).
+        _rec_held = bool(self.recovery_key or self._recovery_key_manual)
+        _rec_file = self.recovery_file
+        if self.username and not self.ephemeral:
+            try:
+                if self._find_recovery_key():
+                    _rec_held = True
+                _wp = self._recovery_workspace_path()
+                if _rec_file is None and _wp.exists():
+                    _rec_file = str(_wp)
+            except Exception:
+                pass
         return {"username": self.username,
                 "display_name": self.display_name,
                 "designation": self.designation,
                 "endpoint": self.endpoint,
                 "endpoints": list(self.endpoints),
-                "servers": list(self.known_servers)}
+                "servers": list(self.known_servers),
+                "recovery_key_held": _rec_held,
+                "recovery_file": _rec_file}
 
     # -- peer discovery (v1.2.0) ---------------------------------------------
     # The mesh is learned, never configured by hand: every relay's
@@ -1925,7 +2094,8 @@ class Agent:
             for t in tasks:
                 t.cancel()
 
-    async def start(self, endpoint: str | None = None) -> str:
+    async def start(self, endpoint: str | None = None,
+                    _force_recovery: bool = False) -> str:
         if self.identity is None:  # ephemeral dial client
             self.identity = Identity.ephemeral()
         url = endpoint or self.endpoint
@@ -1969,8 +2139,27 @@ class Agent:
         # registration has no saved secret and bootstraps exactly
         # as before: the claim's welcome issues the secret ONCE.
         _saved_secret = None if self.ephemeral else self._load_secret()
+        # Recovery login (v1.7.0): when this client has NO usable
+        # identity for its username but holds a recovery key, the
+        # hello IS a recovery hello — it presents the key with
+        # this client's (fresh) identity, and the relay rebinds
+        # the account to it: LOGIN BACK, never re-register. The
+        # door is taken when (a) a recovery credential was given
+        # explicitly (Agent(recovery_key=...) / `agentlink
+        # reclaim`, or a forced retry after a key-auth mismatch in
+        # this very start), or (b) there is no saved secret at all
+        # (fresh/wiped state) and a stored key is discovered in
+        # the workspace file or the state dir.
+        _recovery_key = None
+        if not self.ephemeral and self.username:
+            if _force_recovery or self._recovery_key_manual:
+                _recovery_key = self._recovery_key_manual or \
+                    self._find_recovery_key()
+            elif _saved_secret is None:
+                _recovery_key = self._find_recovery_key()
         _key_auth = bool(_saved_secret) and \
-            url not in self._legacy_auth_endpoints
+            url not in self._legacy_auth_endpoints and \
+            _recovery_key is None
         await self._send_raw({
             "type": "hello", "username": self.username or None,
             "display_name": self.display_name,
@@ -1991,9 +2180,11 @@ class Agent:
             # until the ack, and marks audit delivered only then.
             "delivery_ack": 1,
             "client_version": _package_version(),
-            "secret": None if (self.ephemeral or _key_auth)
-                      else _saved_secret,
-            "auth": "key" if _key_auth else None,
+            "secret": None if (self.ephemeral or _key_auth
+                               or _recovery_key) else _saved_secret,
+            "auth": "recovery" if _recovery_key else (
+                "key" if _key_auth else None),
+            "recovery_key": _recovery_key,
             "ephemeral": self.ephemeral,
             "home_endpoint": self.endpoint,
             "core": core_fingerprint(),
@@ -2121,6 +2312,12 @@ class Agent:
                     pass
                 if frame.get("secret"):
                     self._save_secret(frame["secret"])
+                if frame.get("recovery_key"):
+                    # Issued at claim / enrollment / recovery
+                    # rotation (v1.7.0): persist per the storage
+                    # contract (state dir + workspace file) and
+                    # surface it to the agent.
+                    self._save_recovery_key(frame["recovery_key"])
                 if frame.get("servers"):
                     # Peer discovery (v1.2.0): learn the live mesh
                     # from whichever relay served this hello, merge
@@ -2231,6 +2428,27 @@ class Agent:
                         "secret hello for THIS endpoint only; the "
                         "secret never travels to a relay that "
                         "answers challenges.", url)
+                if not _force_recovery and _recovery_key is None \
+                        and not self.ephemeral and self.username and \
+                        frame.get("reason") == "key_auth_failed" and \
+                        self._find_recovery_key():
+                    # Identity mismatch (v1.7.0): this machine's
+                    # identity keys no longer match the account —
+                    # the state was rebuilt around a surviving
+                    # secret file, so the signature gate (rightly)
+                    # refuses — but a recovery key is on file. Take
+                    # the recovery door ONCE: the relay rebinds the
+                    # account to this identity and everything is
+                    # restored. A refused recovery is final: the
+                    # retry's own refusal propagates as-is.
+                    log.warning(
+                        "key-signed hello refused for @%s "
+                        "(identity mismatch) — a recovery key is "
+                        "on file; logging back in with it instead",
+                        self.username)
+                    await self._ws.close()
+                    return await self.start(endpoint,
+                                            _force_recovery=True)
                 await self._ws.close()
                 raise RegistrationFailed(
                     f"{frame.get('reason')}: {frame.get('detail', '')}")
@@ -2792,12 +3010,21 @@ class Agent:
         u = normalize_username(username) or username
         if u == self.username and self.identity:
             return self.identity.public_key_b64
-        if u in self._pubkey_cache:
-            return self._pubkey_cache[u]
+        # The cache carries a freshness stamp (v1.7.0): a peer's
+        # key can CHANGE under its username — a recovery login
+        # rebinds the account to fresh keys — and a cache that
+        # never re-reads would seal to the dead key for the whole
+        # session. Entries older than the TTL are re-resolved
+        # through the relay (the authoritative row), and a
+        # key_rotated notice from the relay drops the entry the
+        # moment a rebind happens.
+        ent = self._pubkey_cache.get(u)
+        if ent and (time.time() - ent[1]) < _PUBKEY_CACHE_TTL_SECONDS:
+            return ent[0]
         data = await self._request({"type": "get_key", "username": u})
         pub = data.get("pubkey") or ""
         if pub:
-            self._pubkey_cache[u] = pub
+            self._pubkey_cache[u] = (pub, time.time())
         return pub
 
     def _encrypt_obj(self, recipient_pub: str, obj: dict) -> dict:
@@ -2858,6 +3085,14 @@ class Agent:
             if self._read_handler is not None:
                 asyncio.create_task(self._run_simple_handler(
                     self._read_handler, frame))
+            return
+        if ftype == "key_rotated":
+            # A peer's account was rebound to fresh identity keys
+            # (a recovery login, v1.7.0): the cached key for that
+            # username is dead — drop it so the next seal resolves
+            # the CURRENT key through the relay.
+            self._pubkey_cache.pop(
+                str(frame.get("username") or ""), None)
             return
         if ftype == "group_key":
             try:
@@ -3493,7 +3728,8 @@ class Agent:
             log.exception("failed to decrypt message %s", frame.get("id"))
             return
         if frame.get("from_pubkey"):
-            self._pubkey_cache[frame["from"]] = frame["from_pubkey"]
+            self._pubkey_cache[frame["from"]] = (
+                frame["from_pubkey"], time.time())
         file_payload = payload.get("file")
         if file_payload and file_payload.get("blob_id"):
             try:
@@ -5564,7 +5800,8 @@ class Agent:
                                     "capability": capability})
         for u in data["users"]:
             if u.get("pubkey"):
-                self._pubkey_cache[u["username"]] = u["pubkey"]
+                self._pubkey_cache[u["username"]] = (
+                    u["pubkey"], time.time())
         return data["users"]
 
     # -- deregistration (v1.1.10) ------------------------------------------------------------
