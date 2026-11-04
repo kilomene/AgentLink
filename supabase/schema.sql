@@ -34,6 +34,7 @@ create table if not exists al_users (
     capabilities jsonb not null default '[]',
     cap_desc text not null default '',
     mode text not null default 'autonomous',  -- platform autonomy law (v1.1.7)
+    designation text not null default 'production',  -- probe/test segregation (v1.6.0): 'production' | 'test' — declared at registration, operator-changeable only, steers dashboard composition only
     decision_link text not null default '',   -- declared link state (v1.3.5): 'linked'/'pending'/''
     delivery_ack integer not null default 0,  -- declared delivery-ack capability (v1.3.7): 1 = client acks queued frames into its durable journal, 0 = legacy flush
     auth_method text not null default '',     -- how the most recent hello authenticated (v1.3.9): 'key' / 'secret' / 'resume' / 'bootstrap' / '' (never presented)
