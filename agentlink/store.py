@@ -222,6 +222,8 @@ class Store:
                     designation TEXT NOT NULL DEFAULT 'production',
                     decision_link TEXT NOT NULL DEFAULT '',
                     delivery_ack INTEGER NOT NULL DEFAULT 0,
+                    recovery_hash TEXT NOT NULL DEFAULT '',
+                    recovery_used_at INTEGER NOT NULL DEFAULT 0,
                     vault_labels TEXT NOT NULL DEFAULT '',
                     vault_content TEXT NOT NULL DEFAULT '',
                     vault_blob TEXT NOT NULL DEFAULT '',
@@ -607,6 +609,18 @@ class Store:
         # agent itself — the relay only records it.
         _add("users", "delivery_ack",
              "delivery_ack INTEGER NOT NULL DEFAULT 0")
+        # Recovery keys (v1.7.0, owner's design): every registration
+        # is issued a high-entropy RECOVERY KEY — the agent's
+        # crypto-style private key for LOGIN-BACK. Only its SHA-256
+        # hash is ever stored here (recovery_hash; '' = not
+        # enrolled): nobody — not the relay, not the dashboard, not
+        # a database reader — can read the key back. recovery_used_at
+        # stamps the last successful recovery login (the used key is
+        # burned and rotated at that moment).
+        _add("users", "recovery_hash",
+             "recovery_hash TEXT NOT NULL DEFAULT ''")
+        _add("users", "recovery_used_at",
+             "recovery_used_at INTEGER NOT NULL DEFAULT 0")
         # Key-signed hello (v1.3.9): how this agent's most recent
         # hello authenticated — 'key' (Ed25519 challenge-response,
         # nothing reusable presented), 'secret' (a legacy client
@@ -1406,7 +1420,8 @@ class Store:
               sign_pub: str = "", capabilities=None,
               cap_desc: str = "", mode: str = "autonomous",
               decision_link: str = "", delivery_ack: int = 0,
-              designation: str = "production") -> str:
+              designation: str = "production",
+              recovery_hash: str = "") -> str:
         secret = new_secret()
         mode = mode if mode in ("manual", "autonomous") else "autonomous"
         designation = designation if designation in (
@@ -1419,14 +1434,14 @@ class Store:
                 self._db.execute(
                     "INSERT INTO users (username, secret, display_name, pubkey,"
                     " sign_pub, capabilities, cap_desc, mode, decision_link,"
-                    " delivery_ack, designation, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " delivery_ack, designation, recovery_hash, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     # Only the SHA-256 hash is stored — the relay DB never
                     # holds a usable secret.
                     (username, _hash_token(secret), display_name, pubkey,
                      sign_pub, json.dumps(capabilities or []), cap_desc,
                      mode, decision_link, delivery_ack, designation,
-                     now_ts()),
+                     recovery_hash or "", now_ts()),
                 )
                 self._db.commit()
             except sqlite3.IntegrityError:
@@ -1464,6 +1479,42 @@ class Store:
             self._db.execute(
                 "UPDATE users SET secret = ? WHERE username = ?",
                 (_hash_token(secret), username))
+            self._db.commit()
+
+    # -- recovery keys (v1.7.0) -------------------------------------------
+    # The recovery key is the agent's login-back credential: only
+    # its SHA-256 hash ever lives here (exactly like the account
+    # secret) — the plaintext is issued ONCE in a welcome and kept
+    # by the agent. '' hash = not enrolled (every pre-1.7.0 row
+    # until its first verified post-upgrade hello enrolls it).
+
+    def recovery_hash_of(self, username: str) -> str:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT recovery_hash FROM users WHERE username = ?",
+                (username,)
+            ).fetchone()
+        return str(row["recovery_hash"]) if row else ""
+
+    def set_recovery_hash(self, username: str, key_hash: str,
+                          used_at: int | None = None) -> None:
+        """Store a recovery key's SHA-256 hash. With used_at (a
+        recovery login just succeeded), the rotation stamps the
+        use; without it (issuance/enrollment) the stamp is left
+        alone."""
+        if not key_hash:
+            return
+        with self._lock:
+            if used_at is None:
+                self._db.execute(
+                    "UPDATE users SET recovery_hash = ?"
+                    " WHERE username = ?",
+                    (key_hash, username))
+            else:
+                self._db.execute(
+                    "UPDATE users SET recovery_hash = ?,"
+                    " recovery_used_at = ? WHERE username = ?",
+                    (key_hash, int(used_at), username))
             self._db.commit()
 
     def touch(self, username: str) -> None:
@@ -2135,7 +2186,8 @@ class Store:
         set_delivery_ack — the relay reports what the connection
         DID, never assigns it. Unknown values are refused so the
         record can never drift out of the lawful states."""
-        if method not in ("key", "secret", "resume", "bootstrap"):
+        if method not in ("key", "secret", "resume", "bootstrap",
+                          "recovery"):
             return
         with self._lock:
             self._db.execute(
@@ -2237,7 +2289,7 @@ class Store:
                     "SELECT username, display_name, pubkey, sign_pub,"
                     " capabilities, cap_desc, mode, decision_link,"
                     " delivery_ack, auth_method, designation, last_seen,"
-                    " created_at"
+                    " recovery_hash, recovery_used_at, created_at"
                     " FROM users"
                     " WHERE username LIKE ? ORDER BY username",
                     (f"%{query}%",),
@@ -2247,7 +2299,7 @@ class Store:
                     "SELECT username, display_name, pubkey, sign_pub,"
                     " capabilities, cap_desc, mode, decision_link,"
                     " delivery_ack, auth_method, designation, last_seen,"
-                    " created_at"
+                    " recovery_hash, recovery_used_at, created_at"
                     " FROM users ORDER BY username"
                 ).fetchall()
             out = []
@@ -2269,6 +2321,13 @@ class Store:
                 # Delivery-ack declaration (v1.3.7): anything not
                 # explicitly recorded as ack-capable presents as 0.
                 d["delivery_ack"] = 1 if d.get("delivery_ack") else 0
+                # Recovery enrollment (v1.7.0): surfaces expose
+                # ONLY the enrolled flag + last-used stamp — the
+                # stored hash itself never leaves the store.
+                d["recovery_enrolled"] = bool(d.pop(
+                    "recovery_hash", ""))
+                d["recovery_used_at"] = int(
+                    d.get("recovery_used_at") or 0)
                 if capability and capability.lower() not in \
                         [c.lower() for c in d["capabilities"]]:
                     continue
