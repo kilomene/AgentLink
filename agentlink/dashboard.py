@@ -533,7 +533,8 @@ class DashboardServer:
         store. Stub stores without the targeted fetch keep the old
         scan (test doubles only; shipped stores all have it)."""
         ids = []
-        for c in data.get("conversations", []):
+        for c in data.get("conversations", []) \
+                + data.get("test_conversations", []):
             for item in c.get("items", []):
                 if item.get("id"):
                     ids.append(item["id"])
@@ -542,7 +543,7 @@ class DashboardServer:
                 ids.append(row["ref_id"])
             if row.get("work_id"):
                 ids.append(row["work_id"])
-        for e in data.get("library", []):
+        for e in data.get("library", []) + data.get("test_library", []):
             if e.get("work_id"):
                 ids.append(e["work_id"])
         store = self.relay.store
@@ -840,7 +841,8 @@ class DashboardServer:
             if isinstance(r, dict) and isinstance(r.get("oversight"), dict):
                 audit_ov[(r.get("ref_id") or r.get("work_id") or "",
                           r.get("ts"), r.get("from"))] = r["oversight"]
-        for c in data.get("conversations", []):
+        for c in data.get("conversations", []) \
+                + data.get("test_conversations", []):
             for item in c.get("items", []):
                 ov = item.pop("oversight", None)
                 cenv = item.pop("content_envelope", None)
@@ -870,14 +872,14 @@ class DashboardServer:
         # resolves, else an honest not-downloadable state. Sources
         # (wraps, descriptors) stay server-side — the payload gains
         # only the URL or the state, never wraps, keys or bytes.
-        for e in data.get("library", []):
+        for e in data.get("library", []) + data.get("test_library", []):
             if self._library_source(e, rows) is not None:
                 e["download_url"] = f"/api/library/{e['id']}/download"
             else:
                 e["not_downloadable"] = True
                 e["download_note"] = \
                     "sealed before owner oversight"
-        for v in data.get("vault", []):
+        for v in data.get("vault", []) + data.get("test_vault", []):
             desc = v.pop("descriptor", None)
             v.pop("blob_id", None)
             if self._vault_downloadable(desc) \
@@ -903,7 +905,10 @@ class DashboardServer:
         # oversight key, or when an envelope does not open, the
         # fields stay honestly None while presence and count
         # remain factual.
-        for u in data.get("users", []):
+        # Probe/test segregation (v1.6.0): test agents' vaults open
+        # under exactly the same owner-session rule — the loop runs
+        # over production users and test users alike.
+        for u in data.get("users", []) + data.get("test_users", []):
             vault = u.get("vault")
             if not isinstance(vault, dict):
                 continue
@@ -3046,6 +3051,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
  .part{background:rgba(255,255,255,.55);border:1px solid var(--line);border-radius:99px;
    padding:1px 9px;display:inline-block;margin:1px 2px}
  /* ---------- WhatsApp-style chat (glass) ---------- */
+ .probepointer{margin:10px 2px 2px;padding:10px 14px;border:1px dashed rgba(51,80,10,.35);border-radius:12px;background:rgba(255,255,255,.55);font-size:13.5px}
+ .probepointer a{color:#33500a;font-weight:600;text-decoration:none}
  .sealednote{background:rgba(255,243,224,.85);border:1px solid #e0a93e;
    border-radius:12px;padding:10px 14px;font-size:13px;margin-bottom:12px;
    backdrop-filter:blur(10px)}
@@ -3174,6 +3181,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <a class="navitem active" href="#/overview" data-route="overview">Overview</a>
   <a class="navitem" href="#/agents" data-route="agents">Agents</a>
   <a class="navitem" href="#/conversations" data-route="conversations">Conversations</a>
+  <a class="navitem" href="#/probes" data-route="probes">Probe Tests</a>
   <div class="navgroup">Work</div>
   <a class="navitem" href="#/work" data-route="work">Work</a>
   <a class="navitem" href="#/chains" data-route="chains">Chains</a>
@@ -3207,6 +3215,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <span class="pill awaiting">awaiting approval</span> after a proven delivery —
   the decision happens on the line, by the assigner or a group admin, never here.</div></div>
   <div class="stats" id="ovstats"></div>
+  <div id="ovprobes"></div>
   <div id="alerts"></div>
   <div class="grid2">
    <div class="card"><h2>Groups &amp; Channels</h2>
@@ -3246,6 +3255,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="chatmsgs hidden" id="chatmsgs"></div>
    </div>
   </div>
+ </section>
+ <section class="view" id="view-probes">
+  <div class="vhead"><h1>Probe Tests</h1>
+  <div class="vsub">🧪 <b>Probe &amp; test agents — kept apart from the
+  production line.</b> Everything here belongs to registrations
+  designated <b>test</b> (declared at registration, or designated by
+  the operator): their roster, conversations, work and credentials
+  live in this view so the main dashboard stays the production line
+  only. The line itself is unchanged — a test agent messages, works
+  and is carried exactly like any other agent; a test agent's DM
+  with Phoenix opens here, not in Conversations. The credentials
+  below are TEST agents' own vaults — a separate set from the
+  production Credentials view, opened under the same rule: plaintext
+  only inside this authenticated session.</div></div>
+  <div class="card"><h2>Test agents — presence, activity, trust</h2>
+    <table class="stack"><tbody id="probe-users"></tbody></table></div>
+  <div class="chatwrap" id="probechatwrap">
+   <div class="chatlist"><div class="chatlisthead">Test chats</div><div id="probeconvs"></div></div>
+   <div class="chatpane" id="probechatpane">
+    <div class="chatempty" id="probechatempty">Select a test conversation to watch it live.</div>
+    <div class="chathead hidden" id="probechathead"></div>
+    <div class="chatmsgs hidden" id="probechatmsgs"></div>
+   </div>
+  </div>
+  <div class="card"><h2>Test work</h2>
+    <table class="stack"><tbody id="probe-work"></tbody></table></div>
+  <div class="card"><h2>Test agents' credentials</h2>
+    <div class="vsub">Each test agent's own credentials vault, shown in
+    full — service, account, secret, auth type — inside this
+    authenticated session only. Not the production agents' vaults
+    (those live in Credentials) and not the group Vault.</div>
+    <table class="stack"><tbody id="probe-credentials"></tbody></table></div>
  </section>
  <section class="view" id="view-work">
   <div class="vhead"><h1>Work</h1>
@@ -3356,7 +3397,7 @@ function keyed(tbody, items, keyFn, htmlFn, bindFn){
   }
   existing.forEach(n=>n.remove());
 }
-let seenAct='', lastData=null, openConv='';
+let seenAct='', lastData=null, openConv='', openProbeConv='', landingApplied=false;
 function notify(title, body){
   if(!('Notification' in window)) return;
   if(Notification.permission==='default') Notification.requestPermission();
@@ -3369,7 +3410,7 @@ function senderBits(i){ let h='';
   return h; }
 
 /* ---- hash routing: every section is its own full view ---- */
-const ROUTES=['overview','agents','conversations','work','chains','library','vault','credentials','rooms','activity'];
+const ROUTES=['overview','agents','conversations','probes','work','chains','library','vault','credentials','rooms','activity'];
 let curRoute='';
 function parseRoute(){
   const h=location.hash.replace(/^#[/]?/,'');
@@ -3380,6 +3421,7 @@ function parseRoute(){
   return {route, arg: rest?decodeURIComponent(rest):''};
 }
 let chatJustOpened=false;
+let probeChatJustOpened=false;
 function applyRoute(){
   const {route, arg}=parseRoute();
   curRoute=route;
@@ -3390,6 +3432,10 @@ function applyRoute(){
   if(route==='conversations'){
     if(arg!==openConv){ openConv=arg; chatJustOpened=true; }
     renderChat();
+  }
+  if(route==='probes'){
+    if(arg!==openProbeConv){ openProbeConv=arg; probeChatJustOpened=true; }
+    renderProbeChat();
   }
   window.scrollTo(0,0);
   if(window.innerWidth<900) setDrawer(false);
@@ -3439,14 +3485,17 @@ function senderColor(name){ let h=0;
 function ptTime(ts){ if(!ts) return '';
   return new Intl.DateTimeFormat('en-US',{timeZone:'America/Los_Angeles',
     hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(ts*1000)); }
+function allGroups(){ return [...((lastData&&lastData.groups)||[]),
+  ...((lastData&&lastData.test_groups)||[])]; }
+function allChannels(){ return [...((lastData&&lastData.channels)||[]),
+  ...((lastData&&lastData.test_channels)||[])]; }
 function convChannel(c){
   if(!c.group_id) return null;
-  const gs=((lastData&&lastData.groups)||[]);
-  if(gs.some(x=>x.id===c.group_id)) return null;
-  return ((lastData&&lastData.channels)||[]).find(x=>x.id===c.group_id)||null;
+  if(allGroups().some(x=>x.id===c.group_id)) return null;
+  return allChannels().find(x=>x.id===c.group_id)||null;
 }
 function convName(c){
-  if(c.group_id){ const g=((lastData&&lastData.groups)||[]).find(x=>x.id===c.group_id);
+  if(c.group_id){ const g=allGroups().find(x=>x.id===c.group_id);
     if(g) return g.name;
     const ch=convChannel(c);
     if(ch) return '📣 '+ch.name;
@@ -3551,10 +3600,10 @@ function itemHtml(c,i){
     (i.text?' · '+esc(i.text):'')+
     (i.priority==='urgent'?' · URGENT':'')+' · '+ptTime(i.ts)+' PT</span></div>';
 }
-function renderChat(){
+function renderChatScope(cfg){
   if(!lastData) return;
-  const convs=lastData.conversations||[];
-  const list=document.getElementById('convs');
+  const convs=lastData[cfg.convsKey]||[];
+  const list=document.getElementById(cfg.list);
   keyed(list, convs, c=>c.key, c=>{
     const li=c.items[c.items.length-1], t=convName(c);
     return '<div class="chatrow" data-key="'+esc(c.key)+'">'+
@@ -3566,14 +3615,14 @@ function renderChat(){
       '<div class="cside"><div class="ctime">'+(li?ptTime(li.ts):'')+'</div>'+
       '<div class="countbadge">'+c.items.length+'</div></div></div>'; },
     (node,c)=>{ node.onclick=()=>{
-      location.hash='#/conversations/'+encodeURIComponent(c.key); }; });
+      location.hash='#/'+cfg.route+'/'+encodeURIComponent(c.key); }; });
   [...list.children].forEach(n=>
-    n.classList.toggle('active', n.dataset.key===openConv));
-  const wrap=document.getElementById('chatwrap');
-  const empty=document.getElementById('chatempty'),
-        head=document.getElementById('chathead'),
-        msgs=document.getElementById('chatmsgs');
-  const c=convs.find(x=>x.key===openConv);
+    n.classList.toggle('active', n.dataset.key===cfg.getOpen()));
+  const wrap=document.getElementById(cfg.wrap);
+  const empty=document.getElementById(cfg.empty),
+        head=document.getElementById(cfg.head),
+        msgs=document.getElementById(cfg.msgs);
+  const c=convs.find(x=>x.key===cfg.getOpen());
   if(!c){ wrap.classList.remove('open');
     empty.classList.remove('hidden'); head.classList.add('hidden');
     msgs.classList.add('hidden'); return; }
@@ -3594,7 +3643,7 @@ function renderChat(){
     '<div class="hmain"><div class="hname">'+esc(convName(c))+'</div>'+
     '<div class="hsub">'+sub+'</div></div><span class="live-dot"></span>';
   const bb=head.querySelector('.backbtn');
-  if(bb) bb.onclick=()=>{ location.hash='#/conversations'; };
+  if(bb) bb.onclick=()=>{ location.hash='#/'+cfg.route; };
   const nearBottom=msgs.scrollHeight-msgs.scrollTop-msgs.clientHeight<140;
   if(!c.items.length){
     /* A conversation with no messages yet still OPENS as a chat —
@@ -3607,9 +3656,26 @@ function renderChat(){
     if(staleNote) staleNote.remove();
     keyed(msgs, c.items, i=>[i.id,i.kind,i.ts].join('|'), i=>itemHtml(c,i));
   }
-  if(chatJustOpened||nearBottom) msgs.scrollTop=msgs.scrollHeight;
-  chatJustOpened=false;
+  if(cfg.getJustOpened()||nearBottom) msgs.scrollTop=msgs.scrollHeight;
+  cfg.clearJustOpened();
 }
+/* Chat scopes (v1.6.0): the production Conversations view and the
+   Probe Tests view render threads through ONE renderer — identical
+   rows, identical thread rendering incl. in-conversation files —
+   differing only in which payload split they read and which route
+   they navigate. */
+const CHAT_PROD={convsKey:'conversations', list:'convs',
+  wrap:'chatwrap', empty:'chatempty', head:'chathead',
+  msgs:'chatmsgs', route:'conversations', getOpen:()=>openConv,
+  getJustOpened:()=>chatJustOpened,
+  clearJustOpened:()=>{ chatJustOpened=false; }};
+const CHAT_PROBE={convsKey:'test_conversations', list:'probeconvs',
+  wrap:'probechatwrap', empty:'probechatempty', head:'probechathead',
+  msgs:'probechatmsgs', route:'probes', getOpen:()=>openProbeConv,
+  getJustOpened:()=>probeChatJustOpened,
+  clearJustOpened:()=>{ probeChatJustOpened=false; }};
+function renderChat(){ renderChatScope(CHAT_PROD); }
+function renderProbeChat(){ renderChatScope(CHAT_PROBE); }
 function actRow(a){
   return '<tr class="'+(a.priority==='urgent'?'urgent-row':'')+'"><td><small>'+
     pt(a.ts)+'</small></td><td>'+esc(a.kind)+' <span class="pill '+a.evidence+
@@ -3667,8 +3733,31 @@ function alertHtml(a){
   return '<div class="alert enter">⚠ <b>'+esc(a.kind)+'</b> — '+esc(a.subject)+
     ' <small>'+esc(a.detail||'')+' · '+pt(a.created_at)+'</small></div>';
 }
+function userRow(u){
+  return   `<tr><td>@${esc(u.username)}<br><small>${esc((u.capabilities||[]).join(', '))}</small></td>
+   <td class="${u.online?'on':'off'}"><span class="dot ${u.online?'on':''}"></span>${u.online?'online':'offline'}<br><small>${u.online?esc(u.activity_state||''):((!u.online&&u.last_seen)?'last seen '+pt(u.last_seen):esc(u.activity_state||''))}</small></td>
+   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.decision_state==='pending'?`<br><span class="pill health bad">decision link pending</span><br><small>line held — messages & work queueing</small>`:u.decision_state==='linked'?`<br><small>decision link: wired</small>`:''}${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state_label?esc(u.server_state_label):u.server_state==='carried'?(u.server_carried_by?'carried by @'+esc(u.server_carried_by):'carried'):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}${deliveryHtml(u)}${authHtml(u)}${vaultHtml(u)}</td>
+   <td>${u.reachability?esc(u.reachability):''}${u.current_server_label?'<br><small>server: '+esc(u.current_server_label)+'</small>':''}${u.home&&u.current_server&&u.current_server.endpoint&&u.home!==u.current_server.endpoint?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`;
+}
+function workRow(w){
+  return   `<tr class="${w.priority==='urgent'?'urgent-row':''}"><td>${esc(w.id)}<br><small>${pt(w.updated_at)}</small></td>
+   <td>@${esc(w.assigner)} → @${esc(w.assignee)}${w.group_id?'<br><small>'+esc(w.group_id)+'</small>':''}</td>
+   <td>${w.status==='awaiting_approval'?'<span class="pill awaiting">⏳ awaiting approval</span>':'<span class="pill">'+esc(w.status)+'</span>'} ${w.priority==='urgent'?'<span class="pill urgent">URGENT</span>':''} ${w.require_approval?'<span class="pill gate">🔒 approval gate</span>':''}
+   <div class="bar"><i style="width:${w.progress_percent||0}%"></i></div>
+   <small>${w.progress_percent||0}% agent-reported</small>
+   ${w.status==='awaiting_approval'?'<br><small>⏳ decision by @'+esc(w.assigner)+(w.group_id?' or a group admin':'')+' — on the line, not here</small>':''}
+   ${w.deadline?'<br><small>⏰ '+pt(w.deadline)+' · '+countdown(w)+'</small>':''}
+   ${w.proof_verified?'<br><span class="pill verified">signed proof ✓</span>':''}</td></tr>`;
+}
 function render(d){
  lastData=d;
+ /* Landing (v1.6.0): a per-agent server's dashboard (today the
+    probe server at x3) opens on Probe Tests when the owner
+    arrives without a route; operator relays land on Overview
+    as always. An explicit hash always wins. */
+ if(!landingApplied){ landingApplied=true;
+   if(d.landing==='probes' && !location.hash)
+     location.hash='#/probes'; }
  document.getElementById('stamp').textContent='updated '+new Date().toLocaleTimeString();
  document.getElementById('serverline').textContent=(d.server||'')+(d.updates_enabled===false?' · ⚠ agent self-updates DISABLED by relay operator':'');
  document.getElementById('livedot').classList.remove('down');
@@ -3681,12 +3770,14 @@ function render(d){
      ' <small>resolved · '+pt(a.created_at)+'</small></div>').join('') ||
    '<div class="sub">No alerts.</div>';
  renderStats(d);
+ const _tu=(d.test_users||[]).length;
+ document.getElementById('ovprobes').innerHTML=_tu?
+   '<div class="probepointer">🧪 <a href="#/probes">'
+   +'<b>'+_tu+' test agent'+(_tu===1?'':'s')+'</b> in Probe Tests →</a>'
+   +'<br><small>Probe & test registrations are kept apart from the production line.</small></div>':'';
  document.getElementById('sealednote').classList.toggle('hidden', !!d.oversight_enabled);
- keyed(document.getElementById('users'), d.users||[], u=>u.username, u=>
-  `<tr><td>@${esc(u.username)}<br><small>${esc((u.capabilities||[]).join(', '))}</small></td>
-   <td class="${u.online?'on':'off'}"><span class="dot ${u.online?'on':''}"></span>${u.online?'online':'offline'}<br><small>${u.online?esc(u.activity_state||''):((!u.online&&u.last_seen)?'last seen '+pt(u.last_seen):esc(u.activity_state||''))}</small></td>
-   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.decision_state==='pending'?`<br><span class="pill health bad">decision link pending</span><br><small>line held — messages & work queueing</small>`:u.decision_state==='linked'?`<br><small>decision link: wired</small>`:''}${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state_label?esc(u.server_state_label):u.server_state==='carried'?(u.server_carried_by?'carried by @'+esc(u.server_carried_by):'carried'):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}${deliveryHtml(u)}${authHtml(u)}${vaultHtml(u)}</td>
-   <td>${u.reachability?esc(u.reachability):''}${u.current_server_label?'<br><small>server: '+esc(u.current_server_label)+'</small>':''}${u.home&&u.current_server&&u.current_server.endpoint&&u.home!==u.current_server.endpoint?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`);
+ keyed(document.getElementById('users'), d.users||[], u=>u.username, userRow);
+ keyed(document.getElementById('probe-users'), d.test_users||[], u=>u.username, userRow);
  keyed(document.getElementById('servers'), d.servers||[], s=>s.endpoint, s=>
   `<tr><td>${esc(s.label||s.endpoint)}<br><small>${esc(s.endpoint)}</small>${s.owner_agent&&s.home_endpoint&&s.home_endpoint!==s.endpoint?'<br><small>home: '+esc(s.home_endpoint)+'</small>':''}</td>
    <td>${s.owner_agent?'owner @'+esc(s.owner_agent)+((s.carry_state_label||s.carry_state)?'<br><small>'+esc(s.carry_state_label||(s.carry_state==='carried'?(s.carried_by?'carried by @'+s.carried_by:'carried'):s.carry_state==='home'?'at home':s.carry_state==='down'?'down — awaiting carrier':''))+(s.carry_state==='carried'?' (helper — server still belongs to @'+esc(s.owner_agent)+')':'')+'</small>':''):(s.host_agent?'hosted by @'+esc(s.host_agent):'operator relay')}</td>
@@ -3696,20 +3787,14 @@ function render(d){
   [...(d.groups||[]).map(g=>({k:'g:'+g.id,html:`<tr><td>${esc(g.name)}</td><td><span class="pill">${g.member_count} members</span></td><td>by @${esc(g.creator)}</td></tr>`})),
    ...(d.channels||[]).map(c=>({k:'c:'+c.id,html:`<tr><td>📣 ${esc(c.name)}</td><td><span class="pill">${c.member_count} subscribers</span></td><td>channel · by @${esc(c.creator)}</td></tr>`}))],
   x=>x.k, x=>x.html);
- keyed(document.getElementById('work'), d.work||[], w=>w.id, w=>
-  `<tr class="${w.priority==='urgent'?'urgent-row':''}"><td>${esc(w.id)}<br><small>${pt(w.updated_at)}</small></td>
-   <td>@${esc(w.assigner)} → @${esc(w.assignee)}${w.group_id?'<br><small>'+esc(w.group_id)+'</small>':''}</td>
-   <td>${w.status==='awaiting_approval'?'<span class="pill awaiting">⏳ awaiting approval</span>':'<span class="pill">'+esc(w.status)+'</span>'} ${w.priority==='urgent'?'<span class="pill urgent">URGENT</span>':''} ${w.require_approval?'<span class="pill gate">🔒 approval gate</span>':''}
-   <div class="bar"><i style="width:${w.progress_percent||0}%"></i></div>
-   <small>${w.progress_percent||0}% agent-reported</small>
-   ${w.status==='awaiting_approval'?'<br><small>⏳ decision by @'+esc(w.assigner)+(w.group_id?' or a group admin':'')+' — on the line, not here</small>':''}
-   ${w.deadline?'<br><small>⏰ '+pt(w.deadline)+' · '+countdown(w)+'</small>':''}
-   ${w.proof_verified?'<br><span class="pill verified">signed proof ✓</span>':''}</td></tr>`);
+ keyed(document.getElementById('work'), d.work||[], w=>w.id, workRow);
+ keyed(document.getElementById('probe-work'), d.test_work||[], w=>w.id, workRow);
  keyed(document.getElementById('chains'), d.chains||[], c=>c.id, c=>
   `<tr><td>${esc(c.id)}<br><small>by @${esc(c.creator)}</small></td>
    <td><span class="pill">${esc(c.status)}</span></td>
    <td>${(c.steps||[]).map(s=>`<div>${s.position}. ${esc(s.target||s.target_type)} — ${esc(s.work_status||s.status)} ${s.progress_percent? '('+s.progress_percent+'%)':''}</div>`).join('')}</td></tr>`);
  renderChat();
+ renderProbeChat();
  keyed(document.getElementById('library'), d.library||[], e=>e.id, e=>
   `<tr><td>${esc(e.filename)}<br><small>${esc(e.sha256).slice(0,12)}… · ${e.size} B</small></td><td>@${esc(e.sender)} → @${esc(e.to_user)}</td><td><small>${pt(e.ts)}</small></td><td>${e.download_url?`<a class="dllink" href="${esc(e.download_url)}" download>⬇ Download</a>`:`<span class="sealed-note">🔒 not downloadable — ${esc(e.download_note||'sealed before owner oversight')}</span>`}</td></tr>`);
  keyed(document.getElementById('vault'), d.vault||[], v=>v.id, v=>
@@ -3719,27 +3804,32 @@ function render(d){
  // only (see the view's own boundary note). One row per entry; an
  // agent whose vault is present but whose content was never
  // shared with oversight gets an honest labels-only row.
- const credRows=[];
- for(const u of (d.users||[])){
+ function credRowsFor(users, emptyNote){
+ const rows=[];
+ for(const u of (users||[])){
    const v=u.vault||{};
    if(!v.present) continue;
    if(Array.isArray(v.content)&&v.content.length){
      for(const e of v.content){
-       credRows.push({id:u.username+'|'+e.id, html:
+       rows.push({id:u.username+'|'+e.id, html:
         `<tr><td><b>${esc(e.service||'')}</b><br><small>@${esc(u.username)} · ${esc(e.auth_type||'password')}</small></td><td>${esc(e.username||'')}<br><small>created ${pt(e.created_at)} · updated ${pt(e.updated_at)}</small></td><td><code>${esc(e.password||'')}</code>${e.notes?`<br><small>${esc(e.notes)}</small>`:''}</td></tr>`});
      }
    } else if(Array.isArray(v.content)){
-     credRows.push({id:u.username+'|empty', html:
+     rows.push({id:u.username+'|empty', html:
       `<tr><td colspan="3"><small>@${esc(u.username)} — credentials vault is empty</small></td></tr>`});
    } else {
-     credRows.push({id:u.username+'|labels', html:
+     rows.push({id:u.username+'|labels', html:
       `<tr><td colspan="3"><small>@${esc(u.username)} — ${v.entries||0} entr${v.entries===1?'y':'ies'}, content not shared with oversight (labels only)</small></td></tr>`});
    }
  }
- if(!credRows.length) credRows.push({id:'none', html:
-  '<tr><td colspan="3"><small>No agent has published a credentials vault yet.</small></td></tr>'});
- keyed(document.getElementById('credentials'), credRows, r=>r.id,
-  r=>r.html);
+ if(!rows.length) rows.push({id:'none', html:
+  '<tr><td colspan="3"><small>'+emptyNote+'</small></td></tr>'});
+ return rows;
+ }
+ keyed(document.getElementById('credentials'),
+  credRowsFor(d.users, 'No agent has published a credentials vault yet.'), r=>r.id, r=>r.html);
+ keyed(document.getElementById('probe-credentials'),
+  credRowsFor(d.test_users, 'No test agent has published a credentials vault yet.'), r=>r.id, r=>r.html);
  keyed(document.getElementById('rooms'), d.rooms||[], r=>r.id, r=>
   `<tr><td>${esc(r.id)}</td><td>${esc(r.group_id)}</td><td>${(r.participants||[]).map(p=>'@'+esc(p)).join(', ')}</td></tr>`);
  const actKey=a=>[a.ts,a.kind,a.from,a.to||'',a.work_id||'',a.status||''].join('|');
