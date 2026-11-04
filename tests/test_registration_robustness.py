@@ -576,9 +576,17 @@ def test_resume_rotation_closes_the_window(relay_env, state_root):
 
         # Post-window return WITHOUT any secret: the gate itself
         # is unchanged — refused, exactly as before v1.3.8.
+        # (v1.7.0: the return must hold NEITHER credential — the
+        # recovery copies go too. An agent presenting its
+        # recovery key logs back in through the recovery door,
+        # which is a different, stronger credential than the
+        # resume gate this test pins shut.)
         secret_path.unlink()
+        (Path(state_dir) / "recovery-windowkid.json").unlink(
+            missing_ok=True)
         a4 = Agent("windowkid", endpoint=relay_env["url"],
-                   state_dir=state_dir)
+                   state_dir=state_dir,
+                   workspace=str(state_root / "windowkid-ws-empty"))
         with pytest.raises(RegistrationFailed):
             await asyncio.wait_for(a4.start(), timeout=25)
         await a4.close()
@@ -708,7 +716,8 @@ def test_wrong_secret_still_rejected(relay_env, state_root):
             {"username": "keepreg",
              "secret": "a-different-secret-entirely"}))
         bad = Agent("keepreg", endpoint=relay_env["url"],
-                    state_dir=str(forged))
+                    state_dir=str(forged),
+                    workspace=str(state_root / "forged-ws"))
         with pytest.raises(RegistrationFailed):
             await asyncio.wait_for(bad.start(), timeout=20)
         assert store.exists("keepreg")
