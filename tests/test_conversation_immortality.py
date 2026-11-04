@@ -51,6 +51,13 @@ GROUP_IDS = ["m-grp-1", "m-grp-2"]
 def _seed_conversations(store: Store) -> None:
     """Three conversations whose items are then buried under feed
     noise by the caller."""
+    # The counterparties are the owner's production agents (the
+    # exact threads of his 2026-11-02 report); register them so
+    # the fixture models the production registry — since v1.6.1
+    # the dashboard filing rule keys on registry membership.
+    store.claim("beulah", "beulah", designation="production")
+    store.claim("deploy-probe", "deploy-probe",
+                designation="production")
     store.audit("message", "phoenix", target="beulah",
                 ref_id=OLD_DM_IDS[0])
     store.audit("message", "beulah", target="phoenix",
