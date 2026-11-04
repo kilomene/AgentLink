@@ -89,6 +89,9 @@ from .timing import (
     AUTO_MAX_CONSECUTIVE_REPLIES,
     AUTO_REPLY_DELAY_AUTO_SECONDS,
     AUTO_REPLY_DELAY_SECONDS,
+    DECISION_CONVENTION_URL,
+    DECISION_LINK_CHECK_TIMEOUT_SECONDS,
+    DECISION_LINK_RECHECK_SECONDS,
     DECISION_LINK_TIMEOUT_SECONDS,
     HEARTBEAT_SECONDS,
     HOME_PROBE_SECONDS,
@@ -643,6 +646,33 @@ class Agent:
                 f"bad decision_endpoint {ep!r}: expected an http(s) "
                 "URL of the agent's own local decision endpoint")
         self.decision_endpoint = ep or None
+        # Auto decision link (v1.8.0, owner's law — "not manually.
+        # not manually."): where the endpoint came from. An
+        # explicitly configured endpoint ("config") is the
+        # operator's own act and is trusted as such; an endpoint
+        # ADOPTED from the well-known local convention
+        # ("convention") had to prove it belongs to this agent
+        # (nonce echo) before adoption — see _autowire_decision_link.
+        self._endpoint_origin = "config" if ep else None
+        # The link's living state: how it is wired (mode: config /
+        # in_process / handlers / convention / none) and whether
+        # the live self-check has VERIFIED the path. Resolved and
+        # verified at every start() BEFORE the hello, so the first
+        # hello already carries the truth; re-verified on the
+        # serve loop's recheck cadence and on every real decision
+        # outcome. _declared_detail_sent is the last detail JSON
+        # this client declared to the relay.
+        self._link_mode = "none"
+        self._link_verified = False
+        self._link_checked_at = 0
+        self._link_task = None
+        self._declared_detail_sent = ""
+        # One-time admin grant (v1.8.0): the grant summary the
+        # last welcome carried (None = no grant / not yet known).
+        # my_grant() refreshes it live over the wire; whoami()
+        # states it. The agent's exact scopes are always one
+        # query away and never guessed.
+        self.grant: dict | None = None
         self.username = u or ""
         self.display_name = display_name or self.username
         self.capabilities = list(capabilities or [])
@@ -825,6 +855,12 @@ class Agent:
         # hello-time snapshot (v1.3.5 fix — see
         # _refresh_link_declaration).
         self._declared_link_sent: str | None = None
+        # True once a hello frame has actually been written on
+        # some connection (v1.8.0): decision_link_update frames
+        # may only ever FOLLOW a hello — one racing ahead of the
+        # hello on a fresh socket is protocol garbage at the
+        # relay's auth gate. The hello carries the state anyway.
+        self._hello_sent = False
         # In-daemon self-update (v1.1.8): the checker task lives for
         # the whole daemon lifetime (across reconnect cycles). The
         # 15-minute check runs INSIDE the agent — the previous design
@@ -1278,15 +1314,20 @@ class Agent:
 
     async def vault_remember(self, service: str, username: str,
                              password: str, notes: str = "",
-                             auth_type: str = "password") -> dict:
+                             auth_type: str = "password",
+                             grant_receipt: str = "") -> dict:
         """THE auto-save path (owner's order): the one call an agent
         — or its account-creation helper — makes the moment it
         creates an account, so the login (service, account email /
         username, password) lands in its own vault automatically.
         No permission, no prompt. Flat alias of
-        ``agent.vault.remember(...)``; returns the saved entry."""
-        return await self.vault.remember(service, username, password,
-                                         notes, auth_type=auth_type)
+        ``agent.vault.remember(...)``; returns the saved entry.
+        ``grant_receipt`` (v1.8.0) stamps the entry with the id of
+        the signed grant receipt under which the account was
+        created, for the dashboard's provenance column."""
+        return await self.vault.remember(
+            service, username, password, notes, auth_type=auth_type,
+            grant_receipt=grant_receipt)
 
     async def _vault_publish(self) -> None:
         """Upload the current vault document through the blob layer
@@ -1705,7 +1746,60 @@ class Agent:
                 "endpoints": list(self.endpoints),
                 "servers": list(self.known_servers),
                 "recovery_key_held": _rec_held,
-                "recovery_file": _rec_file}
+                "recovery_file": _rec_file,
+                # Onboarding surface (v1.8.0): the agent states
+                # its own decision-link wiring truthfully (mode +
+                # verified state — the same facts its hello
+                # declares) and its admin grant summary as the
+                # last welcome carried it; my_grant() refreshes
+                # the grant live. No grant is ever implied:
+                # absent is None.
+                "decision_link": self.decision_link_state,
+                "grant": self.grant}
+
+    # -- one-time admin grant (v1.8.0) --------------------------------
+    # 'Show my grant': the agent states its exact current scopes
+    # and grant state truthfully — read live from the relay's
+    # store on every call, never from a stale cache alone.
+    # grant_action() is the brokered door: the relay checks the
+    # grant (identity-bound, scope, red lines, rate) on EVERY
+    # action and writes a signed receipt for every outcome.
+    # Payment instruments are outside this surface entirely —
+    # no scope, adapter or code path here touches them.
+
+    async def my_grant(self) -> dict | None:
+        """The agent's exact current grant: {"status", "scopes",
+        "granted_by", "granted_at"} or None when no grant is on
+        record. Read live from the relay (the welcome cache is
+        only the fallback when the query cannot complete)."""
+        if self._ws is not None:
+            try:
+                out = await self._request(
+                    {"type": "grant_query"}, timeout=10.0)
+                self.grant = out.get("grant")
+                return self.grant
+            except Exception:
+                pass
+        return self.grant
+
+    async def grant_action(self, connector: str, action: str,
+                           params: dict | None = None,
+                           work_ref: str = "") -> dict:
+        """Run ONE brokered connector action under the grant.
+        Returns the outcome dict: {"status": "executed", ...}
+        on success; {"status": "refused", "reason", ...} when
+        the grant does not cover it; {"status":
+        "awaiting_approval", "approval_id", ...} when the
+        action crosses a red line (it queues for the owner's
+        decision instead of executing); {"status":
+        "rate_limited", ...} when a blast-radius limit trips.
+        Every outcome carries a receipt_id — the signed,
+        append-only receipt the relay wrote for it."""
+        out = await self._request(
+            {"type": "grant_action", "connector": connector,
+             "action": action, "params": dict(params or {}),
+             "work_ref": work_ref}, timeout=30.0)
+        return out
 
     # -- peer discovery (v1.2.0) ---------------------------------------------
     # The mesh is learned, never configured by hand: every relay's
@@ -2125,7 +2219,14 @@ class Agent:
                 f" wss://x.novamail.store/ws; a first registration"
                 f" with this same state dir resumes cleanly once"
                 f" the line answers.") from exc
+        # Auto decision link (v1.8.0, owner's law): wire and
+        # VERIFY the link BEFORE the hello is composed, so the
+        # first hello already declares the truth — how the link
+        # is wired and whether its self-check came back decided.
+        await self._autowire_decision_link()
         self._declared_link_sent = self._decision_declaration()
+        self._declared_detail_sent = json.dumps(
+            self._decision_detail(), sort_keys=True)
         # Key-signed hello (v1.3.9): a RETURNING identity (one with
         # a saved bootstrap secret) authenticates by SIGNATURE —
         # the hello announces auth="key" and carries NO secret; the
@@ -2174,6 +2275,10 @@ class Agent:
             # operator's (an agent cannot flip its own).
             "designation": self.designation,
             "decision_link": self._declared_link_sent,
+            # Auto-link detail (v1.8.0): the wiring mode + the
+            # self-check verdict riding beside the summary.
+            "decision_link_detail": self._decision_detail()
+            if self._autonomous_on() else None,
             # Delivery custody (v1.3.7): this client journals every
             # inbound item into its canonical local mailbox and acks
             # items back — the relay keeps custody of queued frames
@@ -2189,6 +2294,7 @@ class Agent:
             "home_endpoint": self.endpoint,
             "core": core_fingerprint(),
         })
+        self._hello_sent = True
         # Bounded welcome wait (v1.1 hardening): a hello that lands in
         # a bad egress window — or on a relay whose loop is briefly
         # busy — must not park this client on a silent socket forever.
@@ -2323,6 +2429,11 @@ class Agent:
                     # from whichever relay served this hello, merge
                     # it into the race set, and persist it.
                     self._learn_servers(frame["servers"])
+                # Onboarding surface (v1.8.0): the welcome states
+                # the agent's own grant (or None) — cached for
+                # whoami(); my_grant() refreshes it live.
+                if "grant" in frame:
+                    self.grant = frame.get("grant")
                 if frame.get("updates_enabled") is not None:
                     # The relay operator's switch (hardened core):
                     # the ONLY sanctioned way the checker is off.
@@ -2344,6 +2455,15 @@ class Agent:
                 if self._ping_task is None or self._ping_task.done():
                     self._ping_task = asyncio.create_task(
                         self._ping_loop(self._ws))
+                # Decision-link re-verification (v1.8.0): the
+                # wired path must keep proving itself for the
+                # life of the connection — an endpoint that dies
+                # mid-session flips the declaration to pending
+                # within one recheck cadence, and revives it the
+                # same way. Session-bound like the heartbeat.
+                if self._link_task is None or self._link_task.done():
+                    self._link_task = asyncio.create_task(
+                        self._link_recheck_loop(self._ws))
                 # Owner-seat control channel (v1.3.9): once the
                 # reader is live, the lock holder starts serving
                 # forwarded one-shot commands (send / group add).
@@ -2543,6 +2663,9 @@ class Agent:
         if self._ping_task is not None:
             self._ping_task.cancel()
             self._ping_task = None
+        if self._link_task is not None:
+            self._link_task.cancel()
+            self._link_task = None
         if self._ws is not None:
             try:
                 await self._ws.close()
@@ -2969,6 +3092,9 @@ class Agent:
                 if self._ping_task is not None:
                     self._ping_task.cancel()
                     self._ping_task = None
+                if self._link_task is not None:
+                    self._link_task.cancel()
+                    self._link_task = None
             _close_code = self._closed_code
             _close_reason = self._closed_reason
             if _close_code is None and self._ws is not None:
@@ -3819,8 +3945,12 @@ class Agent:
             if inspect.isawaitable(result):
                 result = await result
         except Exception:
+            # A real dispatch through the agent's own handler
+            # failed (v1.8.0): the link state hears about it.
+            self._note_link_failure()
             log.exception("on_message handler failed")
             return
+        self._note_link_success()
         if result:
             try:
                 if msg.get("group_id"):
@@ -3886,20 +4016,260 @@ class Agent:
 
     @property
     def decision_linked(self) -> bool:
-        """Public: True when the decision link is wired (see
-        _decision_wired). Meaningful in autonomous mode."""
+        """Public: True when the decision link is wired AND its
+        live self-check has verified the path (v1.8.0 — before
+        the first check has run, wired is the best available
+        fact and is reported as such). Meaningful in autonomous
+        mode."""
+        if self._link_checked_at:
+            return bool(self._link_verified)
         return self._decision_wired()
 
+    @property
+    def decision_link_state(self) -> dict:
+        """Public (v1.8.0): the link's full living state —
+        {"mode", "verified", "checked_at", "state"} — the same
+        facts the hello declares and whoami() states."""
+        return {**self._decision_detail(),
+                "state": self._decision_declaration() or "n/a"}
+
     def _decision_declaration(self) -> str:
-        """What the hello declares to the relay (v1.3.5), so the
-        dashboard and the directory can state the fact instead of
-        leaving silence unexplained: "linked" / "pending" for an
-        autonomous agent; "" when the question does not apply
-        (manual mode — the agent is directed by its operator — or
-        an ephemeral tooling connection)."""
+        """What the hello declares to the relay (v1.3.5; verified
+        semantics v1.8.0), so the dashboard and the directory can
+        state the fact instead of leaving silence unexplained:
+        "linked" / "pending" for an autonomous agent; "" when the
+        question does not apply (manual mode — the agent is
+        directed by its operator — or an ephemeral tooling
+        connection). Since v1.8.0, once the self-check has run
+        "linked" means WIRED AND VERIFIED: the link was found by
+        the auto-wiring and its live probe came back decided; a
+        wired path that has not answered its probe is declared
+        "pending" — the truthful state, never an optimistic one.
+        (Before any check has run — a client that was never
+        started — the declaration states the wiring alone; the
+        hello a relay records is always the verified form,
+        because start() verifies before it composes the hello.)"""
         if not self._autonomous_on():
             return ""
+        if self._link_checked_at:
+            return "linked" if self._link_verified else "pending"
+        # No self-check has run yet (a constructed-but-unstarted
+        # client): the declaration states the wiring, as it did
+        # pre-1.8.0. start() always verifies BEFORE the hello,
+        # so anything a relay ever records is the verified form.
         return "linked" if self._decision_wired() else "pending"
+
+    def _decision_detail(self) -> dict:
+        """The auto-link detail (v1.8.0): how this client wired
+        itself and whether the self-check verified the path —
+        declared beside the summary in every hello and update."""
+        return {"mode": self._link_mode,
+                "verified": bool(self._link_verified),
+                "checked_at": int(self._link_checked_at or 0)}
+
+    # -- auto decision link (v1.8.0, owner's law) ---------------------
+    # Immediately after registration the decision link must
+    # verify and wire ITSELF — "not manually. not manually."
+    # Resolution order: an explicitly configured decision
+    # endpoint; the in-process decision callable the hosting
+    # program registered with the SDK (the process running this
+    # client IS the agent); the agent's own registered handlers;
+    # the platform's well-known local convention endpoint. The
+    # wired path is then PROVEN with a synthetic probe event.
+    # Automatic wiring only ever FINDS the agent's own
+    # intelligence — it never substitutes one: an agent with
+    # nothing reachable stays silent, queues, and declares
+    # 'pending' on every surface.
+
+    def _local_link_mode(self) -> str | None:
+        """The wiring this process already carries, in the
+        owner's precedence order: (1) an explicitly configured
+        decision endpoint — the operator's own deliberate act
+        wins over every automatic discovery; (2) the in-process
+        decision callable the hosting program registered; (3)
+        an already-adopted convention endpoint; (4) the agent's
+        registered handlers. None when nothing local is wired
+        (the convention probe is the remaining door).
+        _call_decision dispatches in this same order, so the
+        declared mode is always the path decisions really take."""
+        if self.decision_endpoint is not None \
+                and self._endpoint_origin == "config":
+            return "config"
+        if self._decision_callable is not None:
+            return "in_process"
+        if self.decision_endpoint is not None \
+                and self._endpoint_origin == "convention":
+            return "convention"
+        if self._message_handler is not None \
+                or self._work_handler is not None:
+            return "handlers"
+        return None
+
+    def _link_check_ctx(self, nonce: str) -> dict:
+        return {"kind": "link_check",
+                "agent": self._agent_profile(),
+                "username": self.username,
+                "nonce": nonce,
+                "synthetic": True}
+
+    async def _run_link_check(self, mode: str) -> bool:
+        """The live self-check (v1.8.0): a synthetic probe event
+        travels the wired path and must come back DECIDED inside
+        the deadline. Any decision value — including the agent's
+        chosen silence (None) — is a decision; a link error or a
+        timeout is not. Handlers mode is the one exception to
+        probing: the path is the process itself, so verification
+        is structural (a handler is registered) and real dispatch
+        outcomes carry the state from there — injecting a fake
+        event into the agent's own handler would falsify the
+        very event stream the honesty law protects."""
+        import secrets as _secrets
+        nonce = _secrets.token_hex(8)
+        ctx = self._link_check_ctx(nonce)
+        try:
+            if mode == "handlers":
+                # No probe is injected: a synthetic frame would
+                # falsify the agent's own event stream (handlers
+                # act on frames — they count, record, reply).
+                # The in-process path has no transport that can
+                # be down; a registered handler IS the verified
+                # wiring, and real dispatch outcomes (a handler
+                # raising, a handler answering) move the state
+                # from here — see _note_link_failure/_success
+                # call sites on the handler paths.
+                return (self._message_handler is not None
+                        or self._work_handler is not None)
+            await asyncio.wait_for(
+                self._call_decision(ctx),
+                timeout=DECISION_LINK_CHECK_TIMEOUT_SECONDS)
+            return True
+        except Exception:
+            return False
+
+    async def _probe_convention(self) -> bool:
+        """Probe THE convention endpoint (v1.8.0):
+        DECISION_CONVENTION_URL. Adoption is deliberately
+        strict — the endpoint must echo the probe's nonce in its
+        decision, proving it is answering THIS agent's probe as
+        a decision endpoint for this agent. On a shared host,
+        another agent's endpoint (which decides in its own
+        words, without this agent's nonce) is never adopted."""
+        import secrets as _secrets
+        nonce = _secrets.token_hex(8)
+        ctx = self._link_check_ctx(nonce)
+        url = DECISION_CONVENTION_URL
+
+        def _post() -> tuple[int, bytes]:
+            import urllib.error
+            import urllib.request
+            req = urllib.request.Request(
+                url, data=json.dumps(ctx).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST")
+            try:
+                with urllib.request.urlopen(
+                        req,
+                        timeout=DECISION_LINK_CHECK_TIMEOUT_SECONDS
+                        ) as resp:
+                    return resp.status, resp.read()
+            except urllib.error.HTTPError as exc:
+                return exc.code, exc.read() or b""
+
+        try:
+            status, raw = await asyncio.wait_for(
+                asyncio.to_thread(_post),
+                timeout=DECISION_LINK_CHECK_TIMEOUT_SECONDS + 2)
+        except Exception:
+            return False
+        if status != 200 or nonce.encode() not in raw:
+            return False
+        self.decision_endpoint = url
+        self._endpoint_origin = "convention"
+        log.info("decision link: adopted the convention endpoint "
+                 "%s (nonce-verified as this agent's own)", url)
+        return True
+
+    async def _autowire_decision_link(self) -> None:
+        """Wire + verify the decision link (v1.8.0). Runs BEFORE
+        every hello — at registration and on every connect — so
+        the declaration the hello carries is always the current
+        truth. Never raises: a wiring failure is a state
+        ('pending'), not a registration failure."""
+        if not self._autonomous_on():
+            self._link_mode = "none"
+            self._link_verified = False
+            return
+        try:
+            mode = self._local_link_mode()
+            if mode is None:
+                if await self._probe_convention():
+                    mode = "convention"
+                    self._set_link_state(mode, True)
+                    return
+                mode = "none"
+            # The mode lands BEFORE the check runs, so the check
+            # travels the very path the mode declares (dispatch
+            # follows the resolved mode — see _call_decision).
+            self._link_mode = mode
+            verified = await self._run_link_check(mode) \
+                if mode != "none" else False
+            self._set_link_state(mode, verified)
+        except Exception:
+            log.exception("decision link auto-wiring failed")
+            self._link_mode = "none"
+            self._link_verified = False
+
+    def _set_link_state(self, mode: str, verified: bool) -> None:
+        """Record a link state and re-declare it if it changed.
+        Single funnel for every transition — auto-wiring, the
+        recheck loop, real decision outcomes — so the stored
+        declaration can never drift from the living state."""
+        changed = (mode != self._link_mode
+                   or bool(verified) != self._link_verified)
+        self._link_mode = mode
+        self._link_verified = bool(verified)
+        self._link_checked_at = int(time.time())
+        if changed:
+            self._refresh_link_declaration()
+
+    def _note_link_failure(self) -> None:
+        """A real decision call failed at the link (v1.8.0): the
+        state flips to pending TRUTHFULLY, at once — surfaces
+        stop calling a dead path 'linked' the moment it dies."""
+        if self._link_verified and self._link_mode != "none":
+            self._set_link_state(self._link_mode, False)
+
+    def _note_link_success(self) -> None:
+        """A real decision came back over the link (v1.8.0): a
+        path that was failing has answered again — the state
+        recovers without waiting for the recheck cadence."""
+        if not self._link_verified and self._link_mode != "none":
+            self._set_link_state(self._link_mode, True)
+
+    async def _link_recheck_loop(self, ws=None) -> None:
+        """Serve-loop re-verification (v1.8.0), session-bound
+        like the heartbeat: every DECISION_LINK_RECHECK_SECONDS
+        the wired path must prove itself again (a decision
+        endpoint can die mid-session; the declaration follows
+        within one cadence), and an unwired client retries the
+        full auto-wiring (its agent may have started its
+        endpoint after registering)."""
+        ws = ws if ws is not None else self._ws
+        while True:
+            await asyncio.sleep(DECISION_LINK_RECHECK_SECONDS)
+            if self._ws is not ws or self._ws is None:
+                return
+            try:
+                if not self._autonomous_on():
+                    continue
+                if self._link_mode == "none":
+                    await self._autowire_decision_link()
+                else:
+                    verified = await self._run_link_check(
+                        self._link_mode)
+                    self._set_link_state(self._link_mode, verified)
+            except Exception:
+                log.exception("decision link recheck failed")
 
     def _refresh_link_declaration(self) -> None:
         """Re-declare the decision link when its state changes
@@ -3910,51 +4280,98 @@ class Agent:
         "pending" stranding real agents' work and mislabelling
         wired agents). Best-effort by design: if there is no live
         connection or no running loop yet, the next hello carries
-        the current value, which is the same truth one step later."""
+        the current value, which is the same truth one step later.
+
+        v1.8.0: the declaration is the (summary, detail) pair —
+        a mode or verification change re-declares exactly like a
+        summary change. A handler/callable registered while the
+        link stood at 'none' first re-resolves the local wiring
+        and schedules its verification."""
         if not self._autonomous_on():
             return
+        if self._link_mode == "none":
+            local = self._local_link_mode()
+            if local in ("in_process", "handlers"):
+                self._link_mode = local
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None:
+                    loop.create_task(self._verify_and_declare(local))
         current = self._decision_declaration()
-        if current == self._declared_link_sent or self._ws is None:
+        detail = self._decision_detail()
+        detail_json = json.dumps(detail, sort_keys=True)
+        if (current == self._declared_link_sent
+                and detail_json == self._declared_detail_sent) \
+                or self._ws is None or not self._hello_sent:
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
         self._declared_link_sent = current
-        loop.create_task(self._send_link_update(current))
+        self._declared_detail_sent = detail_json
+        loop.create_task(self._send_link_update(current, detail))
 
-    async def _send_link_update(self, value: str) -> None:
+    async def _verify_and_declare(self, mode: str) -> None:
+        verified = await self._run_link_check(mode)
+        self._set_link_state(mode, verified)
+
+    async def _send_link_update(self, value: str,
+                                detail: dict) -> None:
         try:
-            await self._send_raw({"type": "decision_link_update",
-                                  "decision_link": value})
+            await self._send_raw(
+                {"type": "decision_link_update",
+                 "decision_link": value,
+                 "decision_link_detail": detail})
         except Exception:
             pass
 
     def _warn_if_unlinked(self) -> None:
-        """Autonomous mode with the decision link NOT wired (no
-        decision callable, no decision endpoint, no handlers): the
-        connection will hold the line — it will not reply to
+        """Autonomous mode with the decision link NOT VERIFIED:
+        the connection will hold the line — it will not reply to
         messages and will not execute work, because answering or
         accepting on the agent's behalf without its own decision
         would be fabrication. Say so LOUDLY at startup: silence by
         surprise would be a lie about the agent's presence; the
-        held line, declared, is the truth."""
+        held line, declared, is the truth. Since v1.8.0 the
+        client has already TRIED to wire itself — explicit
+        config, the in-process callable, its handlers, and the
+        convention endpoint — so this warning distinguishes the
+        two honest cases: nothing was found anywhere, or a path
+        was found but its self-check did not come back decided."""
         if not self._autonomous_on() or self._auto_warned_unlinked:
             return
-        if self._decision_wired():
+        if self._link_verified:
             return
         self._auto_warned_unlinked = True
-        log.warning(
-            "DECISION LINK PENDING: @%s is in autonomous mode, and "
-            "this line connection is not yet linked to the agent's "
-            "decision-making — the agent itself is the intelligence; "
-            "until its operator links it (Agent(..., "
-            "decision_link=<the agent's own decision callable>), an "
-            "out-call decision endpoint (--decision-endpoint / "
-            "AGENTLINK_DECISION_ENDPOINT), or its own handlers), "
-            "this connection holds the line: messages and work queue "
-            "safely and are NOT answered or accepted on the agent's "
-            "behalf.", self.username)
+        if self._link_mode == "none":
+            log.warning(
+                "DECISION LINK PENDING: @%s is in autonomous mode, "
+                "and the auto-wiring found no link to the agent's "
+                "own decision-making — it searched the explicit "
+                "config (decision_endpoint= / "
+                "AGENTLINK_DECISION_ENDPOINT / --decision-endpoint), "
+                "an in-process decision callable (Agent(..., "
+                "decision_link=...)), the agent's own handlers, and "
+                "the platform convention endpoint %s, and none "
+                "answered — the agent itself is the intelligence, "
+                "and this connection is only its line: it holds "
+                "the line until a link verifies: messages and work "
+                "queue safely and are NOT answered or accepted on "
+                "the agent's behalf.",
+                self.username, DECISION_CONVENTION_URL)
+        else:
+            log.warning(
+                "DECISION LINK UNVERIFIED: @%s is in autonomous "
+                "mode and its decision link is wired via %s, but "
+                "the live self-check did not come back decided — "
+                "the line is held (messages and work queue, "
+                "nothing is answered on the agent's behalf) until "
+                "the path answers again; the client keeps "
+                "re-checking on its own.",
+                self.username, self._link_mode)
         self._auto_log("decision_link_pending_warning")
 
     # Pre-1.3.5 name, kept as an alias so nothing that calls it
@@ -3979,7 +4396,15 @@ class Agent:
         the same way. A link FAILURE (endpoint unreachable, timed
         out, unusable answer) raises DecisionLinkError — the event
         was never decided, and callers hold it; a failure is never
-        dressed up as the agent's silence."""
+        dressed up as the agent's silence.
+
+        Dispatch follows the owner's precedence (v1.8.0): an
+        explicitly configured endpoint answers before the
+        in-process callable when BOTH are present — the declared
+        mode and the real path never diverge."""
+        if self._link_mode in ("config", "convention") \
+                and self.decision_endpoint is not None:
+            return await self._call_decision_endpoint(ctx)
         fn = self._decision_callable
         if fn is not None:
             result = fn(ctx)
@@ -4147,6 +4572,10 @@ class Agent:
                 # message stays unanswered and unread (held), and
                 # the failure is logged as what it is: a
                 # connection-side fact, not the agent's silence.
+                # The declared link state flips to pending at
+                # once (v1.8.0) — a dead path is never still
+                # called 'linked' on any surface.
+                self._note_link_failure()
                 log.warning("decision link failed on a message "
                             "from @%s: %s", sender, exc)
                 self._auto_log("decision_link_error", conv,
@@ -4156,6 +4585,7 @@ class Agent:
                 log.exception("decision callable failed on a message")
                 self._auto_log("decision_error", conv, sender=sender)
                 return
+            self._note_link_success()
             if reply is None:
                 # The agent's own decision-making chose silence;
                 # that ends the exchange.
@@ -4238,6 +4668,9 @@ class Agent:
         except DecisionLinkError as exc:
             # The LINK failed — the agent never decided. The work
             # stays exactly where it was: unaccepted, undelivered.
+            # The declared link state flips to pending at once
+            # (v1.8.0), exactly as on the message path.
+            self._note_link_failure()
             log.warning("decision link failed on work %s: %s",
                         work.get("id"), exc)
             self._auto_log("work_decision_link_error", conv,
@@ -4249,6 +4682,7 @@ class Agent:
             self._auto_log("work_decision_error", conv,
                            work_id=work.get("id"))
             return
+        self._note_link_success()
         if result is None:
             self._auto_log("work_decision_silent", conv,
                            work_id=work.get("id"))
@@ -5063,6 +5497,10 @@ class Agent:
                         result = handler(work)
                     if inspect.isawaitable(result):
                         await result
+                    # A real dispatch through the agent's own
+                    # work handler completed (v1.8.0): the link
+                    # state hears about it, as on the message path.
+                    self._note_link_success()
                 except ResumeUnsupported as exc:
                     # Explicit, never silent (point 30).
                     log.warning("resume_failed for %s: %s", work["id"], exc)
