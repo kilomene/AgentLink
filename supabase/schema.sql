@@ -36,6 +36,7 @@ create table if not exists al_users (
     mode text not null default 'autonomous',  -- platform autonomy law (v1.1.7)
     designation text not null default 'production',  -- probe/test segregation (v1.6.0): 'production' | 'test' — declared at registration, operator-changeable only, steers dashboard composition only
     decision_link text not null default '',   -- declared link state (v1.3.5): 'linked'/'pending'/''
+    decision_link_detail text not null default '',  -- auto decision link (v1.8.0): JSON {mode, verified, checked_at} beside the summary
     delivery_ack integer not null default 0,  -- declared delivery-ack capability (v1.3.7): 1 = client acks queued frames into its durable journal, 0 = legacy flush
     recovery_hash text not null default '',   -- recovery keys (v1.7.0): SHA-256 hash of the agent's login-back recovery key ONLY (the plaintext is never stored); '' = not enrolled
     recovery_used_at bigint not null default 0, -- recovery keys (v1.7.0): epoch of the last successful recovery login (the used key burned + rotated then)
@@ -482,3 +483,61 @@ select cron.schedule('agentlink-deadline-sweep', '* * * * *',
                      'select al_sweep_deadlines()');
 select cron.schedule('agentlink-reassignment-sweep', '* * * * *',
                      'select al_sweep_reassignment()');
+
+-- ------------------------------------------------------- onboarding (v1.8.0)
+-- Auto decision link detail (on al_users above) + the one-time
+-- admin grant: grants, the signed append-only receipt chain,
+-- the red-line approval queue, and grant key material. Payment
+-- instruments are never in scope (owner's hard exclusion). See
+-- supabase/migration-onboarding.sql for the applied-to-live form.
+create table if not exists al_grants (
+    username text primary key,
+    scopes text not null default '[]',
+    granted_by text not null default '',
+    granted_at bigint not null default 0,
+    status text not null default 'active',
+    bound_sign_pub text not null default '',
+    updated_at bigint not null default 0
+);
+
+create table if not exists al_grant_receipts (
+    seq bigint generated always as identity unique,
+    id text primary key,
+    username text not null,
+    ts bigint not null default 0,
+    scope text not null default '',
+    connector text not null default '',
+    action text not null default '',
+    target text not null default '',
+    work_ref text not null default '',
+    status text not null default '',
+    detail text not null default '{}',
+    prev_hash text not null default '',
+    sig text not null default ''
+);
+create index if not exists al_grant_receipts_user_ts
+    on al_grant_receipts (username, ts);
+
+create table if not exists al_grant_approvals (
+    id text primary key,
+    username text not null,
+    ts bigint not null default 0,
+    scope text not null default '',
+    connector text not null default '',
+    action text not null default '',
+    target text not null default '',
+    params text not null default '{}',
+    work_ref text not null default '',
+    reason text not null default '',
+    status text not null default 'awaiting_approval',
+    decided_by text not null default '',
+    decided_at bigint not null default 0,
+    receipt_id text not null default ''
+);
+create index if not exists al_grant_approvals_status
+    on al_grant_approvals (status, ts);
+
+create table if not exists al_grant_meta (
+    key text primary key,
+    value text not null default ''
+);
