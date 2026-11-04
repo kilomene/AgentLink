@@ -28,11 +28,17 @@ Pinned here:
      + the owner's exact 7 test names = 15) — users/test_users
      split exactly; deploy-probe is PRODUCTION despite its name;
      splits sum to the totals (users, conversations).
-  5. CONVERSATION RULES — a DM whose non-owner-seat participant
-     is test files under test_conversations; a production DM
-     stays; a group files under test iff EVERY member besides
-     phoenix is test (mixed company stays production; a
-     phoenix+only-test group files under test).
+  5. CONVERSATION RULES (v1.6.1) — an item files under
+     PRODUCTION only when every party besides phoenix is a
+     production-REGISTERED user; it files under TEST if any such
+     party is test-designated OR not in the registry at all
+     (unknown, deregistered, ephemeral — registry membership,
+     never name patterns). So: a production DM stays; a DM with
+     a test agent files under test; a MIXED group (even one test
+     member) files under test; a DM whose counterparty was never
+     registered files under test; a DM whose counterparty was
+     deregistered files under test (the thread itself survives —
+     immortality: refile, never delete).
   6. WORK / CHAINS / LIBRARY / VAULT follow the same rule.
   7. IMMORTALITY — designation flips alone change NO census
      digest and no conversation/item totals.
@@ -205,6 +211,18 @@ def _seeded_relay(tmp_path) -> Relay:
     s.audit("message", "muse2", target="phoenix", ref_id="dm-t2")
     s.audit("message", "phoenix", target="beulah", ref_id="dm-p1")
     s.audit("message", "muse2", target="muse3", ref_id="dm-t3")
+    # v1.6.1 blind-spot fixtures: a counterparty that was NEVER
+    # registered (no designation exists for it at all) and one
+    # that was registered and then DEREGISTERED (its thread
+    # survives by immortality; its registry row does not).
+    s.audit("message", "phoenix", target="ghost-probe",
+            ref_id="dm-g1")
+    s.audit("message", "ghost-probe", target="phoenix",
+            ref_id="dm-g2")
+    s.claim("ex-drill", "Ex Drill", designation="production")
+    s.audit("message", "phoenix", target="ex-drill", ref_id="dm-x1")
+    s.audit("message", "ex-drill", target="phoenix", ref_id="dm-x2")
+    s.remove_user("ex-drill", force=True, actor="operator")
     # Groups: all-test (no phoenix), phoenix+only-test, mixed.
     g_test = s.create_group("probe lab", "muse2", None)
     for m in ("muse2", "muse3", "toto"):
@@ -232,7 +250,9 @@ def _seeded_relay(tmp_path) -> Relay:
                           [{"name": "real.txt", "size": 3,
                             "sha256": "b" * 64}])
     # Group vault: an entry in the all-test group by a test agent;
-    # an entry in the mixed group by a production agent.
+    # an entry in the mixed group by a production agent — under
+    # the v1.6.1 rule the mixed group's test member files BOTH
+    # entries under test (the group is a party to the entry).
     s.vault_add(g_test, {"name": "probe-file", "size": 1,
                          "sha256": "c" * 64}, "muse2")
     s.vault_add(g_mixed, {"name": "real-file", "size": 1,
@@ -274,23 +294,57 @@ def test_payload_split_conversations(tmp_path):
     ids = relay._test_ids
     assert ids["g_test"] in {c["group_id"]
                              for c in d["test_conversations"]}
-    # phoenix + only test members: every member besides phoenix is
-    # test, so the group files under test (the stated rule).
+    # phoenix + only test members files under test.
     assert ids["g_seat"] in {c["group_id"]
                              for c in d["test_conversations"]}
-    # Mixed company stays production.
+    # v1.6.1: MIXED company files under test too — one test
+    # member is enough (the production list keeps only company
+    # that is entirely production-registered).
     assert ids["g_mixed"] in {c["group_id"]
-                              for c in d["conversations"]}
+                              for c in d["test_conversations"]}
+    assert ids["g_mixed"] not in {c["group_id"]
+                                  for c in d["conversations"]}
     # The split partitions the conversation list: sums to the
     # un-split total, nothing dropped, nothing duplicated.
     all_convs = relay._conversations()
     assert len(d["conversations"]) + len(d["test_conversations"]) \
         == len(all_convs)
     assert prod_keys.isdisjoint(test_keys)
-    # Groups split the same way.
+    # Groups split the same way: all three seeded groups carry a
+    # test member, so all file under test under the v1.6.1 rule.
     assert {g["id"] for g in d["test_groups"]} == {
-        ids["g_test"], ids["g_seat"]}
-    assert {g["id"] for g in d["groups"]} == {ids["g_mixed"]}
+        ids["g_test"], ids["g_seat"], ids["g_mixed"]}
+    assert {g["id"] for g in d["groups"]} == set()
+
+
+def test_payload_split_unregistered_and_deregistered(tmp_path):
+    """v1.6.1 — the blind spot the owner caught live: the v1.6.0
+    rule keyed on the REGISTERED test set, so a counterparty with
+    no designation (never registered, or deregistered since)
+    defaulted the thread to production. Membership decides now:
+    not production-registered => not production."""
+    relay = _seeded_relay(tmp_path)
+    d = relay._dashboard_data()
+    prod_keys = {c["key"] for c in d["conversations"]}
+    test_keys = {c["key"] for c in d["test_conversations"]}
+    # Never-registered counterparty: files under test.
+    assert "dm:ghost-probe|phoenix" in test_keys
+    assert "dm:ghost-probe|phoenix" not in prod_keys
+    # Deregistered counterparty: the thread survives (immortality)
+    # and files under test.
+    assert "dm:ex-drill|phoenix" in test_keys
+    assert "dm:ex-drill|phoenix" not in prod_keys
+    assert "ex-drill" not in {u["username"] for u in d["users"]}
+    assert "ex-drill" not in {u["username"]
+                              for u in d["test_users"]}
+    # Production-only company stays in main.
+    assert "dm:beulah|phoenix" in prod_keys
+    # Totals invariant: the split still partitions every thread.
+    all_convs = relay._conversations()
+    assert len(d["conversations"]) + len(d["test_conversations"]) \
+        == len(all_convs)
+    assert prod_keys.isdisjoint(test_keys)
+    assert prod_keys | test_keys == {c["key"] for c in all_convs}
 
 
 def test_payload_split_work_chains_library_vault(tmp_path):
@@ -304,8 +358,12 @@ def test_payload_split_work_chains_library_vault(tmp_path):
     assert d["test_chains"][0]["creator"] == "muse2"
     assert {e["filename"] for e in d["test_library"]} == {"probe.txt"}
     assert {e["filename"] for e in d["library"]} == {"real.txt"}
-    assert {v["name"] for v in d["test_vault"]} == {"probe-file"}
-    assert {v["name"] for v in d["vault"]} == {"real-file"}
+    # v1.6.1: the mixed group's vault entry files under test with
+    # the group (one test member is enough); no vault entry here
+    # is all-production company.
+    assert {v["name"] for v in d["test_vault"]} == {"probe-file",
+                                                    "real-file"}
+    assert {v["name"] for v in d["vault"]} == set()
 
 
 def test_designation_alone_changes_no_census(tmp_path):
