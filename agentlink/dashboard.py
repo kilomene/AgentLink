@@ -1147,6 +1147,84 @@ class DashboardServer:
                     return self._send(302, "", extra={
                         "Location": "/",
                         "Set-Cookie": f"{COOKIE}=; HttpOnly; Path=/; Max-Age=0"})
+                if path.startswith("/api/grant/"):
+                    # One-time admin grant (v1.8.0): the owner's
+                    # grant actions, inside his authenticated
+                    # session ONLY (the same gate as every other
+                    # operator surface). Issue binds the grant to
+                    # the agent row's CURRENT identity key; revoke
+                    # is effective immediately (the broker reads
+                    # grant state on every action); approve DECIDES
+                    # a queued red-line action and executes it
+                    # through THIS relay's own broker, so the live
+                    # adapter instance is the one that runs.
+                    if not self._authed():
+                        return self._send(
+                            401, '{"error":"login required"}',
+                            "application/json")
+                    from .grants import valid_scopes
+                    from .protocol import normalize_username
+                    store = dash.relay.store
+
+                    def _json(code, obj):
+                        return self._send(code, json.dumps(obj),
+                                          "application/json")
+                    if path == "/api/grant/issue":
+                        username = normalize_username(
+                            (form.get("username") or [""])[0])
+                        scopes = valid_scopes(
+                            [s.strip() for s in
+                             (form.get("scopes") or [""])[0]
+                             .split(",") if s.strip()])
+                        row = None
+                        if username:
+                            row = next(
+                                (u for u in store.list_users(
+                                    query=username)
+                                 if u["username"] == username), None)
+                        if row is None or scopes is None:
+                            return _json(400, {
+                                "ok": False,
+                                "error": "unknown agent or scopes"})
+                        grant = store.set_grant(
+                            username, scopes, "operator-dashboard",
+                            row.get("sign_pub") or "")
+                        dash.notify()
+                        return _json(200, {"ok": True,
+                                           "grant": grant})
+                    if path == "/api/grant/revoke":
+                        username = normalize_username(
+                            (form.get("username") or [""])[0])
+                        if not username:
+                            return _json(400, {"ok": False,
+                                               "error": "bad username"})
+                        changed = store.revoke_grant(
+                            username, "operator-dashboard")
+                        dash.notify()
+                        return _json(200, {
+                            "ok": True, "revoked": bool(changed),
+                            "grant": store.grant_of(username)})
+                    if path in ("/api/grant/approve",
+                                "/api/grant/reject"):
+                        approval_id = (form.get("id") or [""])[0]
+                        row = store.decide_approval(
+                            approval_id,
+                            path.endswith("approve"),
+                            "operator-dashboard")
+                        if row is None:
+                            return _json(404, {
+                                "ok": False,
+                                "error": "no awaiting approval "
+                                         "with that id"})
+                        out = {"ok": True, "approval": row}
+                        if path.endswith("approve"):
+                            out["execution"] = \
+                                dash.relay._grant_broker \
+                                .execute_approved(row)
+                        dash.notify()
+                        return _json(200, out)
+                    return _json(404, {"ok": False,
+                                       "error": "unknown grant action"})
                 return self._send(404, "not found", "text/plain")
 
             def _stream(self):
@@ -3126,6 +3204,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
    color:#0a5c8c;background:rgba(140,220,90,.25);border:1px solid rgba(90,140,40,.45);
    border-radius:999px;padding:3px 10px;white-space:nowrap}
  a.dllink:hover{background:rgba(140,220,90,.45)}
+ button.gbtn{font-size:12px;font-weight:600;cursor:pointer;color:#0a5c8c;
+   background:rgba(140,220,90,.25);border:1px solid rgba(90,140,40,.45);
+   border-radius:999px;padding:3px 10px;white-space:nowrap}
+ button.gbtn:hover{background:rgba(140,220,90,.45)}
+ button.gbtn.danger{color:#8c1d0a;background:rgba(255,120,80,.18);
+   border-color:rgba(160,60,30,.45)}
+ button.gbtn:disabled{opacity:.5;cursor:wait}
+ label.gscope{display:inline-block;font-size:12px;margin:1px 4px 1px 0;
+   white-space:nowrap}
  .sealed-note{font-size:11.5px;color:var(--faint);font-style:italic;white-space:nowrap}
  .filechip{display:flex;gap:8px;align-items:center;background:rgba(255,255,255,.6);
    border:1px dashed rgba(120,140,170,.5);border-radius:10px;padding:6px 9px;
@@ -3189,6 +3276,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <a class="navitem" href="#/library" data-route="library">Library</a>
   <a class="navitem" href="#/vault" data-route="vault">Vault</a>
   <a class="navitem" href="#/credentials" data-route="credentials">Credentials</a>
+  <a class="navitem" href="#/grants" data-route="grants">Admin Grants</a>
   <div class="navgroup">Live</div>
   <a class="navitem" href="#/rooms" data-route="rooms">Voice Rooms</a>
   <a class="navitem" href="#/activity" data-route="activity">Alerts &amp; Activity</a>
@@ -3330,6 +3418,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="card"><h2>Agent Credentials</h2>
     <table class="stack"><tbody id="credentials"></tbody></table></div>
  </section>
+ <section class="view" id="view-grants">
+  <div class="vhead"><h1>Admin Grants</h1>
+  <div class="vsub">The one-time admin grant (v1.8.0): you issue it once,
+  per agent, with named scopes — the agent then acts through the
+  connector broker under those scopes with no per-action prompts. Every
+  brokered action writes a signed, append-only receipt (the live feed
+  below); red-line actions (security settings, bulk deletion, granting
+  third-party access) queue for your decision even under an active
+  grant. Revoke takes effect immediately — the broker checks grant
+  state on every action. <b>Payment instruments are never in scope:
+  no grant, scope or adapter touches credit/ATM cards.</b> Real
+  connectors (Gmail, Outlook) attach by your own action only; the one
+  wired adapter today is the Gmail-shaped test mailbox.</div></div>
+  <div class="card"><h2>Connectors</h2>
+    <table class="stack"><tbody id="grant-connectors"></tbody></table></div>
+  <div class="card"><h2>Grants by Agent</h2>
+    <table class="stack"><thead><tr><th>Agent</th><th>Grant</th><th>Scopes</th><th>Action</th></tr></thead>
+    <tbody id="grants"></tbody></table></div>
+  <div class="card"><h2>Red-Line Approvals</h2>
+    <table class="stack"><tbody id="grant-approvals"></tbody></table></div>
+  <div class="card"><h2>Grant Activity — signed receipts, live</h2>
+    <table class="stack"><tbody id="grant-activity"></tbody></table></div>
+  <div class="card"><h2>Grant Activity — Probe Tests</h2>
+    <table class="stack"><tbody id="test-grant-activity"></tbody></table></div>
+ </section>
  <section class="view" id="view-rooms">
   <div class="vhead"><h1>Voice Rooms</h1>
   <div class="vsub">Live voice rooms — the relay carries signalling only;
@@ -3410,7 +3523,7 @@ function senderBits(i){ let h='';
   return h; }
 
 /* ---- hash routing: every section is its own full view ---- */
-const ROUTES=['overview','agents','conversations','probes','work','chains','library','vault','credentials','rooms','activity'];
+const ROUTES=['overview','agents','conversations','probes','work','chains','library','vault','credentials','grants','rooms','activity'];
 let curRoute='';
 function parseRoute(){
   const h=location.hash.replace(/^#[/]?/,'');
@@ -3736,7 +3849,7 @@ function alertHtml(a){
 function userRow(u){
   return   `<tr><td>@${esc(u.username)}<br><small>${esc((u.capabilities||[]).join(', '))}</small></td>
    <td class="${u.online?'on':'off'}"><span class="dot ${u.online?'on':''}"></span>${u.online?'online':'offline'}<br><small>${u.online?esc(u.activity_state||''):((!u.online&&u.last_seen)?'last seen '+pt(u.last_seen):esc(u.activity_state||''))}</small></td>
-   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.decision_state==='pending'?`<br><span class="pill health bad">decision link pending</span><br><small>line held — messages & work queueing</small>`:u.decision_state==='linked'?`<br><small>decision link: wired</small>`:''}${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state_label?esc(u.server_state_label):u.server_state==='carried'?(u.server_carried_by?'carried by @'+esc(u.server_carried_by):'carried'):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}${deliveryHtml(u)}${authHtml(u)}${vaultHtml(u)}</td>
+   <td><span class="pill trust">trust ${u.trust_score}</span><br><span class="pill ${u.mode==='manual'?'manual':'autonomous'}">${u.mode==='manual'?'MANUAL':'AUTONOMOUS'}</span>${u.decision_state==='pending'?`<br><span class="pill health bad">decision link pending</span><br><small>${u.decision_mode&&u.decision_mode!=='none'?`wired via ${esc(u.decision_mode)} — self-check not verified; line held`:'line held — messages & work queueing'}</small>`:u.decision_state==='linked'?`<br><small>decision link: wired${u.decision_mode?` · ${esc(u.decision_mode)}`:''}${u.decision_verified?' · verified':''}</small>`:''}${u.server_health===-1?`<br><span class="pill health">server UNRATED — testing</span>`:u.server_health!=null?`<br><span class="pill health${u.server_health<=50?' bad':''}">server health ${u.server_health}%</span>`:''}${u.server_state?`<br><small>server: ${u.server_state_label?esc(u.server_state_label):u.server_state==='carried'?(u.server_carried_by?'carried by @'+esc(u.server_carried_by):'carried'):u.server_state==='home'?'at home':u.server_state==='down'?'down — awaiting carrier':esc(u.server_state)}</small>`:''}${u.core_compliant===false?'<br><span class="pill health bad">core ⚠ non-compliant</span>':''}${u.connection_pattern==='check-in'?'<br><span class="pill health bad">check-in pattern — not continuously connected</span>':''}${deliveryHtml(u)}${authHtml(u)}${vaultHtml(u)}</td>
    <td>${u.reachability?esc(u.reachability):''}${u.current_server_label?'<br><small>server: '+esc(u.current_server_label)+'</small>':''}${u.home&&u.current_server&&u.current_server.endpoint&&u.home!==u.current_server.endpoint?'<br><small>home: '+esc(u.home)+'</small>':''}</td></tr>`;
 }
 function workRow(w){
@@ -3812,7 +3925,7 @@ function render(d){
    if(Array.isArray(v.content)&&v.content.length){
      for(const e of v.content){
        rows.push({id:u.username+'|'+e.id, html:
-        `<tr><td><b>${esc(e.service||'')}</b><br><small>@${esc(u.username)} · ${esc(e.auth_type||'password')}</small></td><td>${esc(e.username||'')}<br><small>created ${pt(e.created_at)} · updated ${pt(e.updated_at)}</small></td><td><code>${esc(e.password||'')}</code>${e.notes?`<br><small>${esc(e.notes)}</small>`:''}</td></tr>`});
+        `<tr><td><b>${esc(e.service||'')}</b><br><small>@${esc(u.username)} · ${esc(e.auth_type||'password')}</small></td><td>${esc(e.username||'')}<br><small>created ${pt(e.created_at)} · updated ${pt(e.updated_at)}</small>${e.grant_receipt?`<br><small>created under grant · receipt ${esc(e.grant_receipt)}</small>`:''}</td><td><code>${esc(e.password||'')}</code>${e.notes?`<br><small>${esc(e.notes)}</small>`:''}</td></tr>`});
      }
    } else if(Array.isArray(v.content)){
      rows.push({id:u.username+'|empty', html:
@@ -3830,6 +3943,51 @@ function render(d){
   credRowsFor(d.users, 'No agent has published a credentials vault yet.'), r=>r.id, r=>r.html);
  keyed(document.getElementById('probe-credentials'),
   credRowsFor(d.test_users, 'No test agent has published a credentials vault yet.'), r=>r.id, r=>r.html);
+ // Admin grants (v1.8.0): connectors, per-agent grants with
+ // issue/revoke, the red-line approval queue, and the live
+ // signed-receipt feed — all from the relay payload; the actions
+ // POST back into this authenticated session.
+ keyed(document.getElementById('grant-connectors'),
+  d.grant_connectors||[], c=>c.name, c=>
+  `<tr><td><b>${esc(c.name)}</b></td><td>${c.attached?'<span class="pill autonomous">attached</span>':'<span class="pill">owner-attachable</span>'}<br><small>${esc(c.note||'')}</small></td></tr>`);
+ function grantRowsFor(users){
+  const rows=[];
+  for(const u of (users||[])){
+    const g=u.grant;
+    const scopes=g&&g.status==='active'?g.scopes:[];
+    const checks=GRANT_SCOPES.map(s=>
+     `<label class="gscope"><input type="checkbox" data-scope="${s}" data-user="${esc(u.username)}" ${scopes.includes(s)?'checked':''}> ${s}</label>`).join(' ');
+    rows.push({id:u.username, html:
+     `<tr><td><b>@${esc(u.username)}</b></td>`+
+     `<td>${g?(g.status==='active'?'<span class="pill autonomous">ACTIVE</span>':'<span class="pill health bad">REVOKED</span>')+'<br><small>by '+esc(g.granted_by||'')+' · '+pt(g.granted_at)+'</small>':'<small>no grant</small>'}</td>`+
+     `<td>${checks}</td>`+
+     `<td><button class="gbtn" data-gact="issue" data-user="${esc(u.username)}">${g&&g.status==='active'?'Re-issue':'Issue grant'}</button> `+
+     (g&&g.status==='active'?`<button class="gbtn danger" data-gact="revoke" data-user="${esc(u.username)}">Revoke</button>`:'')+
+     `</td></tr>`});
+  }
+  if(!rows.length) rows.push({id:'none', html:'<tr><td colspan="4"><small>No agents registered.</small></td></tr>'});
+  return rows;
+ }
+ keyed(document.getElementById('grants'),
+  [...grantRowsFor(d.users), ...grantRowsFor(d.test_users)], r=>r.id, r=>r.html);
+ function apprRowsFor(list){
+  const rows=(list||[]).map(a=>({id:a.id, html:
+   `<tr><td><small>${pt(a.ts)}</small><br><b>@${esc(a.username)}</b></td><td>${esc(a.connector)}.${esc(a.action)}<br><small>${esc(a.reason||'')}</small></td><td>${a.status==='awaiting_approval'?`<button class="gbtn" data-gact="approve" data-id="${esc(a.id)}">Approve &amp; execute</button> <button class="gbtn danger" data-gact="reject" data-id="${esc(a.id)}">Reject</button>`:`<small>${esc(a.status)}${a.receipt_id?' · receipt '+esc(a.receipt_id):''}</small>`}</td></tr>`}));
+  if(!rows.length) rows.push({id:'none', html:'<tr><td colspan="3"><small>No red-line actions are waiting for a decision.</small></td></tr>'});
+  return rows;
+ }
+ keyed(document.getElementById('grant-approvals'),
+  [...apprRowsFor(d.grant_approvals), ...apprRowsFor(d.test_grant_approvals)], r=>r.id, r=>r.html);
+ function receiptRows(list, emptyNote){
+  const rows=(list||[]).map(r=>({id:r.id, html:
+   `<tr><td><small>${pt(r.ts)}</small></td><td><b>@${esc(r.username)}</b><br><small>${esc(r.connector)}.${esc(r.action)}${r.target?' → '+esc(r.target):''}</small></td><td><span class="pill">${esc(r.scope||'—')}</span> <span class="pill ${r.status==='executed'?'autonomous':r.status==='refused'||r.status==='rate_limited'?'health bad':''}">${esc(r.status)}</span><br><small>receipt ${esc(r.id)}</small></td></tr>`}));
+  if(!rows.length) rows.push({id:'none', html:'<tr><td colspan="3"><small>'+emptyNote+'</small></td></tr>'});
+  return rows;
+ }
+ keyed(document.getElementById('grant-activity'),
+  receiptRows(d.grant_activity, 'No grant activity yet.'), r=>r.id, r=>r.html);
+ keyed(document.getElementById('test-grant-activity'),
+  receiptRows(d.test_grant_activity, 'No test grant activity yet.'), r=>r.id, r=>r.html);
  keyed(document.getElementById('rooms'), d.rooms||[], r=>r.id, r=>
   `<tr><td>${esc(r.id)}</td><td>${esc(r.group_id)}</td><td>${(r.participants||[]).map(p=>'@'+esc(p)).join(', ')}</td></tr>`);
  const actKey=a=>[a.ts,a.kind,a.from,a.to||'',a.work_id||'',a.status||''].join('|');
@@ -3853,6 +4011,42 @@ document.getElementById('navtoggle').onclick=()=>setDrawer(drawer.classList.cont
 backdrop.onclick=()=>setDrawer(false);
 if(window.innerWidth<900) setDrawer(false);
 applyRoute();
+// Admin grants (v1.8.0): the scope set mirrors agentlink.grants
+// .GRANT_SCOPES (the server validates again — this list is only
+// the picker). Actions POST form-encoded into this authenticated
+// session; the server pushes a fresh snapshot when one lands.
+const GRANT_SCOPES=['mail.read','mail.send','calendar.read','calendar.write','drive.read','drive.write'];
+async function grantPost(path, fields){
+  try{
+    const r=await fetch(path,{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:new URLSearchParams(fields)});
+    return await r.json();
+  }catch(e){ return {ok:false, error:String(e)}; }
+}
+document.addEventListener('click', async ev=>{
+  const b=ev.target.closest('[data-gact]');
+  if(!b) return;
+  const act=b.dataset.gact, user=b.dataset.user, id=b.dataset.id;
+  b.disabled=true;
+  if(act==='issue'){
+    const scopes=[...document.querySelectorAll(
+      'input[data-scope][data-user="'+CSS.escape(user)+'"]:checked')]
+      .map(i=>i.dataset.scope);
+    if(!scopes.length){ alert('Pick at least one scope.'); b.disabled=false; return; }
+    const out=await grantPost('/api/grant/issue',
+      {username:user, scopes:scopes.join(',')});
+    if(!out.ok) alert('Issue failed: '+(out.error||'unknown'));
+  } else if(act==='revoke'){
+    if(!confirm('Revoke the grant for @'+user+'? It takes effect immediately.')){ b.disabled=false; return; }
+    const out=await grantPost('/api/grant/revoke', {username:user});
+    if(!out.ok) alert('Revoke failed: '+(out.error||'unknown'));
+  } else if(act==='approve'||act==='reject'){
+    const out=await grantPost('/api/grant/'+act, {id});
+    if(!out.ok) alert('Decision failed: '+(out.error||'unknown'));
+  }
+  b.disabled=false;
+});
 const es=new EventSource('/api/stream');
 es.onmessage=e=>render(JSON.parse(e.data));
 es.onerror=()=>{ document.getElementById('livedot').classList.add('down');
