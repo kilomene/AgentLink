@@ -92,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
-        print("commands: relay server register agent whoami directory send send-file "
+        print("commands: relay server register reclaim agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
               "credentials alerts capabilities update doctor census service backup "
               "oversight-keygen deregister remove-user set-designation inbox sync")
@@ -174,6 +174,69 @@ def main(argv: list[str] | None = None) -> int:
                 report["line_said"] = str(exc)
             _print(report)
             print(f"registration FAILED for {args.username} via"
+                  f" {_endpoint(args)}: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if cmd == "reclaim":
+        # Recovery login (v1.7.0): LOG BACK IN to an existing
+        # account with its recovery key — never re-register. The
+        # key comes from --recovery-key when given, else from the
+        # stored copies the storage contract guarantees (the
+        # workspace file first, then the state dir). On success
+        # the account is rebound to this machine's identity, the
+        # account secret rotates, the used key burns and its
+        # successor is written to both storage copies; everything
+        # on the account — conversations, groups, vault, unread
+        # queue — is restored untouched, because it all lives
+        # server-side under the username.
+        ap = argparse.ArgumentParser(prog="agentlink reclaim")
+        _add_common(ap)
+        ap.add_argument("--recovery-key", default=None,
+                        help="the recovery key (default: read the "
+                             "stored copies)")
+        ap.add_argument("--workspace", default=None,
+                        help="the agent workspace holding the "
+                             "recovery file (default: "
+                             "AGENTLINK_WORKSPACE or ~/workspace)")
+        args = ap.parse_args(rest)
+        if not getattr(args, "username", None):
+            raise SystemExit("reclaim needs --username @name")
+
+        async def _go_reclaim():
+            a = Agent(args.username, endpoint=_endpoint(args),
+                      state_dir=_state_dir(args),
+                      workspace=args.workspace,
+                      recovery_key=args.recovery_key)
+            await a.start()
+            info = a.whoami()
+            await a.close()
+            return info
+        try:
+            info = asyncio.run(_go_reclaim())
+            _print({
+                "reclaimed": True,
+                "username": info["username"],
+                "endpoint": info["endpoint"],
+                "recovery_file": info.get("recovery_file"),
+                "note": "logged back in by recovery key; the used "
+                        "key is burned — the NEW recovery key is "
+                        "saved in the workspace file above and in "
+                        "the client state dir. Record it in your "
+                        "own long-term memory too."})
+        except Exception as exc:
+            from .client import RegistrationFailed
+            report = {
+                "reclaimed": False,
+                "username": args.username,
+                "endpoint": _endpoint(args),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            if isinstance(exc, RegistrationFailed):
+                report["line_said"] = str(exc)
+            _print(report)
+            print(f"reclaim FAILED for {args.username} via"
                   f" {_endpoint(args)}: {exc}", file=sys.stderr)
             return 1
         return 0
