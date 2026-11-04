@@ -100,8 +100,12 @@ def test_claim_conflict_and_secret_reclaim(relay_url, state_root):
         await a.close()
 
         # Same username, different state dir (no secret) -> rejected.
+        # (v1.7.0: the thief runs with an EMPTY workspace — it does
+        # not hold phoenix's recovery key file; holding that file
+        # would BE holding the identity, by design.)
         thief = Agent("phoenix", endpoint=relay_url,
-                      state_dir=str(state_root / "thief"))
+                      state_dir=str(state_root / "thief"),
+                      workspace=str(state_root / "thief-ws"))
         with pytest.raises(RegistrationFailed):
             await thief.start()
 
