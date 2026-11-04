@@ -193,10 +193,16 @@ def test_wrong_secret_cannot_connect(relay_env, state_root):
         victim = await make(relay_env, state_root, "victim")
         await victim.close()
         # Fresh state dir, same username: no saved secret -> claim
-        # attempt against an existing name -> refused.
+        # attempt against an existing name -> refused. (v1.7.0:
+        # the impostor also runs with an EMPTY workspace — it
+        # does not hold the victim's recovery key file. Holding
+        # that file IS holding the identity, by the owner's
+        # crypto model; a bare name with no credential is what
+        # this test refuses.)
         impostor_dir = state_root / "impostor"
         bad = Agent("victim", endpoint=relay_env["url"],
-                    state_dir=str(impostor_dir))
+                    state_dir=str(impostor_dir),
+                    workspace=str(state_root / "impostor-ws"))
         with pytest.raises(RegistrationFailed):
             await bad.start()
         # A forged secret file fares no better.
@@ -205,7 +211,8 @@ def test_wrong_secret_cannot_connect(relay_env, state_root):
         (forged / "secret-victim.json").write_text(json.dumps(
             {"username": "victim", "secret": "not-the-secret"}))
         bad2 = Agent("victim", endpoint=relay_env["url"],
-                     state_dir=str(forged))
+                     state_dir=str(forged),
+                     workspace=str(state_root / "impostor-ws"))
         with pytest.raises(RegistrationFailed):
             await bad2.start()
         assert store.exists("victim")
