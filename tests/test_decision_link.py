@@ -308,8 +308,13 @@ def test_brain_alias_still_works_and_declares_linked(relay_env, state_root):
                  if m.get("from") == "legacybrain"][0]
         assert reply["body"] == "brain alias reply to: hello legacy"
         assert (reply.get("meta") or {}).get("autonomous") is True
-        assert seen_ctx and seen_ctx[0]["kind"] == "message"
-        assert seen_ctx[0]["agent"]["username"] == "legacybrain"
+        # v1.8.0: the registration self-check probe (kind
+        # "link_check") is the callable's first event by law —
+        # the first MESSAGE ctx is the pin's subject.
+        msg_ctx = [c for c in seen_ctx if c["kind"] == "message"]
+        assert msg_ctx and msg_ctx[0]["agent"]["username"] \
+            == "legacybrain"
+        assert any(c["kind"] == "link_check" for c in seen_ctx)
         rows = {r["username"]: r for r in await poster.directory()}
         assert rows["legacybrain"]["decision_link"] == "linked"
         assert store_rows(relay_env)["legacybrain"]["decision_link"] \
@@ -499,7 +504,10 @@ async def _exercise_endpoint_failure(relay_env, state_root, url, tag):
     boss = await make(relay_env, state_root, boss_name, mode="manual")
     worker = await make(relay_env, state_root, worker_name,
                         decision_endpoint=url)
-    assert worker._decision_declaration() == "linked"
+    # v1.8.0 verified declarations: the endpoint is wired but
+    # its registration self-check FAILED (that is this pin's
+    # setup), so the truthful declaration is "pending".
+    assert worker._decision_declaration() == "pending"
     store = relay_env["relay"].store
 
     res = await boss.send_message(worker_name, "please answer this")
