@@ -37,7 +37,9 @@ create table if not exists al_users (
     designation text not null default 'production',  -- probe/test segregation (v1.6.0): 'production' | 'test' — declared at registration, operator-changeable only, steers dashboard composition only
     decision_link text not null default '',   -- declared link state (v1.3.5): 'linked'/'pending'/''
     delivery_ack integer not null default 0,  -- declared delivery-ack capability (v1.3.7): 1 = client acks queued frames into its durable journal, 0 = legacy flush
-    auth_method text not null default '',     -- how the most recent hello authenticated (v1.3.9): 'key' / 'secret' / 'resume' / 'bootstrap' / '' (never presented)
+    recovery_hash text not null default '',   -- recovery keys (v1.7.0): SHA-256 hash of the agent's login-back recovery key ONLY (the plaintext is never stored); '' = not enrolled
+    recovery_used_at bigint not null default 0, -- recovery keys (v1.7.0): epoch of the last successful recovery login (the used key burned + rotated then)
+    auth_method text not null default '',     -- how the most recent hello authenticated (v1.3.9): 'key' / 'secret' / 'resume' / 'bootstrap' / 'recovery' / '' (never presented)
     vault_labels text not null default '',    -- credentials vault (v1.4.0): the agent-published OVERSIGHT-SEALED label envelope (ciphertext here; service + account + timestamps only)
     vault_content text not null default '',   -- credentials vault (v1.5.0): the agent-published OVERSIGHT-SEALED FULL-content envelope (ciphertext here; plaintext only in the agent and the owner's authenticated dashboard session — the Credentials view)
     vault_blob text not null default '',      -- credentials vault (v1.4.0): blob id of the current SELF-SEALED vault document (the relay stores a pointer only; the document opens only with the agent's identity key)
