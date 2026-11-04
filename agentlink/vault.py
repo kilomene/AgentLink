@@ -251,6 +251,12 @@ class CredentialsVault:
                 "password": obj.get("password") or "",
                 "auth_type": obj.get("auth_type") or "password",
                 "notes": obj.get("notes") or "",
+                # Grant provenance (v1.8.0): the id of the signed
+                # grant receipt under which this credential was
+                # created, or "" when it was not created under a
+                # grant. Carried into the oversight content payload
+                # so the dashboard can show the provenance.
+                "grant_receipt": obj.get("grant_receipt") or "",
                 "created_at": int(obj.get("created_at")
                                   or rec["created_at"]),
                 "updated_at": int(obj.get("updated_at")
@@ -283,7 +289,8 @@ class CredentialsVault:
         return len(self._entries)
 
     def put(self, service: str, username: str, password: str,
-            notes: str = "", auth_type: str = "password") -> dict:
+            notes: str = "", auth_type: str = "password",
+            grant_receipt: str = "") -> dict:
         """Save one account login into the vault and return the full
         entry (including its id). Saving the same service + account
         again UPDATES that entry (new password/notes, fresh
@@ -291,7 +298,12 @@ class CredentialsVault:
         rotating a password it owns lands on the same entry.
         ``auth_type`` names the FORM of the secret (v1.5.0):
         "password" (default), "api_key", "token" or "other" — the
-        secret value itself rides in ``password`` either way."""
+        secret value itself rides in ``password`` either way.
+        ``grant_receipt`` (v1.8.0) records provenance: the id of
+        the signed grant receipt under which this credential was
+        created (empty when it was not). An update that passes no
+        receipt keeps the entry's existing provenance — a
+        credential's origin does not wash off by being edited."""
         service = str(service or "").strip()
         username = str(username or "").strip()
         if not service or not username:
@@ -321,6 +333,10 @@ class CredentialsVault:
                               "password": str(password),
                               "auth_type": auth_type,
                               "notes": str(notes or ""),
+                              "grant_receipt": str(
+                                  grant_receipt
+                                  or entry.get("grant_receipt")
+                                  or ""),
                               "updated_at": now})
                 entry_id = rec["id"]
                 created = entry["created_at"]
@@ -331,6 +347,7 @@ class CredentialsVault:
                          "password": str(password),
                          "auth_type": auth_type,
                          "notes": str(notes or ""),
+                         "grant_receipt": str(grant_receipt or ""),
                          "created_at": now, "updated_at": now}
             envelope = self._identity.encrypt_for(
                 self._identity.public_key_b64,
@@ -343,14 +360,16 @@ class CredentialsVault:
             return {"id": entry_id, **entry}
 
     def remember(self, service: str, username: str, password: str,
-                 notes: str = "", auth_type: str = "password") -> dict:
+                 notes: str = "", auth_type: str = "password",
+                 grant_receipt: str = "") -> dict:
         """THE auto-save path (owner's order): the one call an agent
         — or its account-creation helper — makes the moment it
         creates an account, so the login lands in its vault
         automatically. Identical semantics to put(); the separate
         name is the paved road, documented as the default."""
         return self.put(service, username, password, notes,
-                        auth_type=auth_type)
+                        auth_type=auth_type,
+                        grant_receipt=grant_receipt)
 
     def get(self, service_or_id: str) -> dict:
         """Open one entry in full (password included) — the agent
@@ -455,20 +474,24 @@ class VaultAccess:
         return self._agent._credentials_vault()
 
     async def put(self, service: str, username: str, password: str,
-                  notes: str = "", auth_type: str = "password") -> dict:
+                  notes: str = "", auth_type: str = "password",
+                  grant_receipt: str = "") -> dict:
         entry = self._core().put(service, username, password, notes,
-                                 auth_type=auth_type)
+                                 auth_type=auth_type,
+                                 grant_receipt=grant_receipt)
         await self._agent._vault_sync_after_mutation()
         return entry
 
     async def remember(self, service: str, username: str,
                        password: str, notes: str = "",
-                       auth_type: str = "password") -> dict:
+                       auth_type: str = "password",
+                       grant_receipt: str = "") -> dict:
         """THE auto-save path: call this the moment an account is
         created and the login is in the vault — no permission, no
         prompt, no second step."""
         entry = self._core().remember(service, username, password,
-                                      notes, auth_type=auth_type)
+                                      notes, auth_type=auth_type,
+                                      grant_receipt=grant_receipt)
         await self._agent._vault_sync_after_mutation()
         return entry
 
