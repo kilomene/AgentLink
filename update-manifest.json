@@ -1,7 +1,7 @@
 {
-  "version": "1.6.1",
+  "version": "1.6.2",
   "files": {
-    "agentlink/__init__.py": "a6d0f11cb25f0b34de3201c6ca92777485d5ae87240e6238f2fbfc040a47b3fd",
+    "agentlink/__init__.py": "88c485f5f46c2479d7ac1a05c3c17d387f30980a1bbc46622b8244c2812c1a9b",
     "agentlink/__main__.py": "307299fda7b77d22c64cb51430ec75e5f59d78e9c948786afb3b2544fe45e4b7",
     "agentlink/alerts_local.py": "c08cd95bfaf6f4e5968e3b4cc85c49d74c0b5b54f66e6120235e38b4078ca82d",
     "agentlink/backend.py": "91a7ad63bdcbd3ddcf4c797b23bc6df06a508ea54eba37f370fdc6f609844068",
@@ -9,7 +9,7 @@
     "agentlink/blobstore.py": "28a6b3591fc9d682524e9f7b9650e5353840b8692b6c026aca4b74ff44296988",
     "agentlink/census.py": "2cb5d77c3ff78c226d1a2c3be37de1bf889c59c61bde57f30c940299c226b78b",
     "agentlink/cli.py": "6baad9b80d35299257a7941264639797cfe786b57fa86340b59d24f49b3ae2ad",
-    "agentlink/client.py": "bf08c45ccb4b905924b8ff661f1ce18eca20ff1db9ed174409ebf51ed20112ce",
+    "agentlink/client.py": "34048220148bf21db3e95e63c815091cbdbe457e17400f9f386cb6079f121e4f",
     "agentlink/config.py": "903954c47bad67559cb7daaa828ab5ad154c80c075d34ce638ab6411e1c2e5a6",
     "agentlink/crypto.py": "6d653e0d5ae4999d65354e23c388314833c6c03c27e852357431921c78905637",
     "agentlink/dashboard.py": "3b42ffaf7a8a98affcb81a4652c5a108cca0b6c55e4c9814c1073b1dcab9a99f",
@@ -17,7 +17,7 @@
     "agentlink/mailbox.py": "8af341002195c09edb82e391627285a3093d1402f3e625555127b179e3098da3",
     "agentlink/media.py": "fdf5cef33872b824f71e33e2c9c5ad4716288b5f5e5fa8feb85bbff15fdf8ef9",
     "agentlink/protocol.py": "2531af63996a48a385cff633bc9cd2ee8cf8af8799376132f92ee3276bb1afc2",
-    "agentlink/relay.py": "17721168e2fdc2fe58b476555482f9bf2228b1c8387ee24a8ce4e26140ae212b",
+    "agentlink/relay.py": "a2116b58a475d4d1e54fc149fa7c01b41b7c0a8eb1ceaf228e3d1cd9f095e54c",
     "agentlink/store.py": "bf11e25620404f5a0acf330ecb8dd97f1853f66667a2c01d1c0c9f2cbae4eaee",
     "agentlink/supabase_store.py": "9e181e95556c3668cbd03863873e6f026205ab67dc4aeba99dfc4725b6802ab5",
     "agentlink/timing.py": "5c475975878e38372eadd1791bb642894dd938419db930612ca92bbaf5cd8460",
