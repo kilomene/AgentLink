@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -29,6 +31,7 @@ from .protocol import (
     MAX_FRAME,
     auth_challenge_payload,
     new_id,
+    new_recovery_key,
     new_secret,
     normalize_username,
     now_ts,
@@ -339,6 +342,12 @@ class Relay:
     _hello_incomplete_total: int = field(default=0, repr=False)
     _hello_incomplete_by_reason: dict = field(
         default_factory=dict, repr=False)
+    # Recovery logins (v1.7.0): refused recovery-hello attempts per
+    # username, this relay process's running count (the durable
+    # record of a SUCCESS is the audit kind 'recovery_login' + the
+    # fleet alert; refusals are logged with their running count so
+    # a guessing campaign against a name is visible in the log).
+    _recovery_attempts: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self.store = self.backend_store or \
@@ -4107,10 +4116,86 @@ class Relay:
                     f"rider capacity {cap} reached at health "
                     f"{health}% — try another server")
                 return None
+        # Recovery login (v1.7.0): an auth="recovery" hello against
+        # a username with NO row is refused recovery_failed — it
+        # must never silently become a fresh claim (the claim path
+        # below is for hello frames that ask to register, and a
+        # recovery key proves ownership of an EXISTING account or
+        # it proves nothing).
+        welcome_recovery: str | None = None
+        if frame.get("auth") == "recovery" and \
+                not self.store.exists(username):
+            self._recovery_attempts[username] = \
+                self._recovery_attempts.get(username, 0) + 1
+            log.warning(
+                "hello refused: recovery_failed for @%s "
+                "(attempt %d; unknown username — nothing changed)",
+                username, self._recovery_attempts[username])
+            await self._error(ws, "recovery_failed", req_id,
+                              "recovery refused: no such registered "
+                              "username")
+            return None
         if self.store.exists(username):
             owner_secret = secret
             auth_method = ""
             verified = False
+            # Recovery login (v1.7.0, owner's design): the agent
+            # presents its RECOVERY KEY — the crypto-style private
+            # key for LOGIN-BACK — and the relay verifies it
+            # against the stored SHA-256 hash ONLY (constant-time
+            # compare; the plaintext is never stored, logged or
+            # shown anywhere). This gate is its own door: it never
+            # falls through to key/secret/resume, and no other gate
+            # ever falls through to it (a failed recovery changes
+            # NOTHING on the row). On success: the verified block
+            # below binds the hello's FRESH identity keys to the
+            # row (replacing the lost ones), the account secret
+            # rotates (the fresh secret rides the welcome), and the
+            # used recovery key BURNS — its successor is issued in
+            # the same welcome, so a captured key replays nowhere.
+            # Everything else about the account — conversations,
+            # groups, vault, the unread custody queue — lives
+            # server-side under the username and simply flows,
+            # exactly as after any verified hello.
+            if frame.get("auth") == "recovery":
+                presented = str(frame.get("recovery_key") or "")
+                stored_hash = ""
+                _rh_of = getattr(self.store, "recovery_hash_of",
+                                 None)
+                if _rh_of is not None:
+                    try:
+                        stored_hash = _rh_of(username) or ""
+                    except Exception:
+                        stored_hash = ""
+                _ok = bool(presented and stored_hash) and \
+                    hmac.compare_digest(
+                        hashlib.sha256(
+                            presented.encode()).hexdigest(),
+                        stored_hash)
+                if not _ok:
+                    self._recovery_attempts[username] = \
+                        self._recovery_attempts.get(username, 0) + 1
+                    log.warning(
+                        "hello refused: recovery_failed for @%s "
+                        "(attempt %d; wrong key or unenrolled row "
+                        "— nothing changed)",
+                        username, self._recovery_attempts[username])
+                    await self._error(
+                        ws, "recovery_failed", req_id,
+                        "recovery refused: the recovery key did "
+                        "not verify for this username")
+                    return None
+                rotated_secret = new_secret()
+                self.store.set_secret(username, rotated_secret)
+                owner_secret = rotated_secret
+                welcome_recovery = new_recovery_key()
+                self.store.set_recovery_hash(
+                    username,
+                    hashlib.sha256(
+                        welcome_recovery.encode()).hexdigest(),
+                    used_at=now_ts())
+                auth_method = "recovery"
+                verified = True
             # Key-signed hello (v1.3.9): the client announces
             # auth="key" and presents NO secret; authentication is
             # the Ed25519 challenge-response against the registered
@@ -4192,6 +4277,34 @@ class Relay:
                 # the eight-write stack, not any single record.)
                 await asyncio.to_thread(self._record_auth_method,
                                         username, auth_method)
+                # Recovery enrollment (v1.7.0): a row with no
+                # recovery hash (every pre-1.7.0 registration) is
+                # issued a recovery key ONCE, in this welcome, on
+                # its first verified key/secret hello after the
+                # upgrade. The hash lands on the row BEFORE the
+                # welcome (the plaintext has to ride it), so later
+                # hellos see the row enrolled and never re-issue.
+                # A store without the recovery surface (a foreign
+                # test double) simply skips enrollment.
+                if auth_method in ("key", "secret"):
+                    _rh_of = getattr(self.store, "recovery_hash_of",
+                                     None)
+                    _sr_h = getattr(self.store, "set_recovery_hash",
+                                    None)
+                    if _rh_of is not None and _sr_h is not None:
+                        try:
+                            if not _rh_of(username):
+                                welcome_recovery = new_recovery_key()
+                                _sr_h(
+                                    username,
+                                    hashlib.sha256(
+                                        welcome_recovery.encode()
+                                    ).hexdigest())
+                        except Exception:
+                            log.exception(
+                                "recovery enrollment failed for "
+                                "@%s", username)
+                            welcome_recovery = None
         else:
             try:
                 # The delivery_ack declaration rides the claim when
@@ -4226,6 +4339,26 @@ class Relay:
                             _designation_on_claim = True
                     except Exception:
                         pass
+                # Recovery key issuance (v1.7.0, owner's design):
+                # every NEW registration is issued a recovery key
+                # at claim time. Only its SHA-256 hash is stored —
+                # it rides the claim itself (atomic with the row)
+                # when the store's claim carries the parameter, the
+                # operator-setter pattern otherwise — and the
+                # PLAINTEXT rides the welcome ONCE. It is never
+                # stored, logged or displayed anywhere else.
+                welcome_recovery = new_recovery_key()
+                _recovery_hash = hashlib.sha256(
+                    welcome_recovery.encode()).hexdigest()
+                _recovery_on_claim = False
+                try:
+                    import inspect as _inspect4
+                    if "recovery_hash" in _inspect4.signature(
+                            self.store.claim).parameters:
+                        claim_kwargs["recovery_hash"] = _recovery_hash
+                        _recovery_on_claim = True
+                except Exception:
+                    pass
                 owner_secret = self.store.claim(
                     username, display or username, pubkey, sign_pub,
                     capabilities=frame.get("capabilities") or [],
@@ -4241,6 +4374,14 @@ class Relay:
                         try:
                             _set_des(username, declared_designation,
                                      actor="registration")
+                        except Exception:
+                            pass
+                if not _recovery_on_claim:
+                    _set_rec = getattr(self.store,
+                                       "set_recovery_hash", None)
+                    if _set_rec is not None:
+                        try:
+                            _set_rec(username, _recovery_hash)
                         except Exception:
                             pass
             except UsernameTaken:
@@ -4335,6 +4476,7 @@ class Relay:
                 await self._send(ws, {"type": "welcome", "req_id": req_id,
                                       "username": username,
                                       "secret": owner_secret,
+                                      "recovery_key": welcome_recovery,
                                       "ephemeral": False,
                                       "queued": len(queued),
                                       "servers": self._live_servers(),
@@ -4356,6 +4498,7 @@ class Relay:
                 await self._send(ws, {"type": "welcome", "req_id": req_id,
                                       "username": username,
                                       "secret": owner_secret,
+                                      "recovery_key": welcome_recovery,
                                       "ephemeral": False,
                                       "queued": len(queued),
                                       "servers": self._live_servers(),
@@ -4392,6 +4535,45 @@ class Relay:
         if hello_records:
             await asyncio.to_thread(self._apply_hello_records,
                                     hello_records)
+        if auth_method == "recovery":
+            # Recovery login visibility (v1.7.0): the audit row and
+            # the owner's fleet alert land AFTER the welcome — the
+            # agent is home first; the record of HOW it got home
+            # follows immediately and can never block the door. A
+            # recovery login is always visible to the owner, never
+            # silent: it means an identity was rebound by whoever
+            # holds the recovery key.
+            self._log_activity(
+                "recovery_login", username,
+                status="identity rebound by recovery key; account "
+                       "secret and recovery key rotated")
+            try:
+                alert = self.store.open_alert(
+                    "recovery_login", username,
+                    f"@{username} logged back in with its recovery "
+                    f"key at "
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(now_ts()))} UTC"
+                    f" — identity rebound to new keys; account "
+                    f"secret and recovery key rotated")
+                await self._dispatch_alert(alert)
+            except Exception:
+                log.exception("recovery_login alert failed for "
+                              "@%s", username)
+            # The fleet's pubkey caches now hold a DEAD key for
+            # this username (v1.7.0): tell every peer connected
+            # HERE that the binding rotated, so their next seal to
+            # this agent resolves its CURRENT key instead of
+            # sealing to the lost one for the rest of their
+            # session. (Peers on other relays heal through the
+            # client cache's freshness TTL.)
+            for other in list(self.peers.values()):
+                if other.username == username:
+                    continue
+                try:
+                    await self._send(other.ws, {
+                        "type": "key_rotated", "username": username})
+                except Exception:
+                    pass
         if welcome_error is not None:
             raise welcome_error
         # Awaiting-agent work: an agent coming online picks up pooled
