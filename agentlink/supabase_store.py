@@ -315,7 +315,8 @@ class SupabaseStore:
     # -- users -----------------------------------------------------------------
     def claim(self, username, display_name, pubkey="", sign_pub="",
               capabilities=None, cap_desc="", mode="autonomous",
-              decision_link="", delivery_ack=0):
+              decision_link="", delivery_ack=0,
+              designation="production"):
         secret = new_secret()
         try:
             self._req("POST", "users", body={
@@ -329,6 +330,8 @@ class SupabaseStore:
                 "decision_link": decision_link if decision_link in
                         ("linked", "pending") else "",
                 "delivery_ack": 1 if delivery_ack else 0,
+                "designation": designation if designation in
+                        ("production", "test") else "production",
                 "created_at": now_ts()}, prefer="return=minimal")
         except Exception as exc:
             if "409" in str(exc) or "duplicate" in str(exc):
@@ -849,6 +852,56 @@ class SupabaseStore:
         self._req("PATCH", "users", self._eq("username", username),
                   body={"mode": mode}, prefer="return=minimal")
 
+    def set_designation(self, username, designation,
+                        actor="operator"):
+        # OPERATOR-ONLY designation change (v1.6.0), SQLite parity:
+        # the one door through which a registered agent's
+        # production/test designation may change after registration.
+        # The relay never calls this from a hello — an agent's own
+        # declaration is honoured only by claim(), at registration —
+        # so an agent can never flip itself out of (or into) the
+        # test segregation. Every executed change is recorded in
+        # the append-only audit log as 'designation_changed'.
+        # Fail-soft like the vault pointer: an unmigrated backend
+        # (or a vanished user) reads as "no change", never a raise
+        # into an operator tool.
+        if designation not in ("production", "test"):
+            return False
+        try:
+            row = self._one("users", self._eq("username", username)
+                            + "&select=designation")
+            if row is None:
+                return False
+            current = "test" if row.get("designation") == "test" \
+                else "production"
+            if current == designation:
+                return False
+            self._req("PATCH", "users", self._eq("username", username),
+                      body={"designation": designation},
+                      prefer="return=minimal")
+        except Exception:
+            return False
+        try:
+            self.audit("designation_changed", actor, target=username,
+                       status=designation)
+        except Exception:
+            pass
+        return True
+
+    def designation_of(self, username):
+        # The stored designation, presented by the standing rule:
+        # anything not explicitly 'test' is production (SQLite
+        # parity, including for an unknown user).
+        try:
+            row = self._one("users", self._eq("username", username)
+                            + "&select=designation")
+        except Exception:
+            return "production"
+        if row is None:
+            return "production"
+        return "test" if row.get("designation") == "test" \
+            else "production"
+
     def set_decision_link(self, username, state):
         # Decision link (v1.3.5): the agent declares in its hello
         # whether its connection is linked to its own
@@ -978,7 +1031,7 @@ class SupabaseStore:
     def list_users(self, query="", capability=""):
         q = ("select=username,display_name,pubkey,sign_pub,capabilities,"
              "cap_desc,mode,decision_link,delivery_ack,auth_method,"
-             "last_seen,created_at&order=username")
+             "designation,last_seen,created_at&order=username")
         if query:
             q += f"&username=like.%25{urllib.parse.quote(query)}%25"
         rows = self._get("users", q)
@@ -993,6 +1046,10 @@ class SupabaseStore:
             # an explicit 'manual' presents as autonomous.
             r["mode"] = r.get("mode") if r.get("mode") in (
                 "manual", "autonomous") else "autonomous"
+            # Presentation rule (segregation, v1.6.0): anything not
+            # explicitly 'test' presents as production.
+            r["designation"] = "test" \
+                if r.get("designation") == "test" else "production"
             # Delivery-ack declaration (v1.3.7): anything not
             # explicitly recorded as ack-capable presents as 0.
             r["delivery_ack"] = 1 if r.get("delivery_ack") else 0
