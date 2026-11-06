@@ -1,23 +1,17 @@
-import { esc, pt, table, states, empty, fail, avatar } from "../util.js";
+import { states, fail } from "../util.js";
+import { createChat } from "./chat.js";
 
-async function renderChat(root, ctx, convs, label){
-  states(root); let d; try{ d = await ctx.getData(); }catch(e){ return fail(root,e); }
-  if(!convs(d).length) return empty(root, "No conversations yet.");
-  const list = convs(d);
-  root.innerHTML = '<div class="chatwrap"><div class="chatlist"><div class="chatlisthead">'+label+'</div>'
-    + list.map((c,i)=>'<div class="chatrow" data-i="'+i+'">'+avatar(c.group_id?(c.group_id):(c.participants[0]?.username||c.participants[0]||"?"), !!c.group_id)+'<div class="cmain"><div class="cname">'+esc(c.group_id?c.key.replace("group:",""):c.participants.map(p=>typeof p==="string"?p:p.username).join(" ↔ "))+'</div><div class="cprev">'+c.items.length+' items</div></div></div>').join("")
-    + '</div><div class="chatpane" id="chatpane"><div class="chatempty">Select a conversation to watch it live.</div></div></div>';
-  root.querySelectorAll(".chatrow").forEach(row=>row.onclick=async()=>{
-    const c = list[Number(row.dataset.i)]; const pane = root.querySelector("#chatpane");
-    pane.innerHTML = '<div class="chatmsgs">'+c.items.map(m=>'<div class="msgrow"><div class="bubble"><div class="sender">'+esc(m.from||"")+'</div><div class="btext sealed" data-id="'+esc(m.id)+'">🔒 sealed — opening via oversight…</div><div class="bmeta">'+pt(m.ts)+" · "+esc(m.kind)+readTicks(ctx, c, m)+"</div></div></div>").join("")+"</div>";
-    // Plaintext arrives only from the Edge oversight function.
-    try{ const opened = await ctx.oversight(c.items.filter(m=>m.oversight)); for(const m of c.items){ const o = opened[m.id]; const el = pane.querySelector('[data-id="'+CSS.escape(m.id)+'"]'); if(el && o){ el.textContent = o.text||""; el.classList.remove("sealed"); m.sealed=false; } else if(el){ el.textContent = "🔒 sealed"; } } }catch(e){ pane.querySelectorAll(".btext").forEach(el=>el.textContent="🔒 sealed (oversight unavailable)"); }
-  });
+// Conversations: every production 1:1 and group stream, live.
+// Open a chat and messages, files and work events arrive as they
+// happen (Supabase Realtime push into the store); content opens via
+// Edge oversight inside this session only. Monitor-only.
+let chat = null;
+export async function render(root, ctx){
+  states(root);
+  let d; try{ d = await ctx.getData(); }catch(e){ return fail(root, e); }
+  root.innerHTML = '<div class="vhead"><h2>Conversations</h2><div class="vsub">Every 1:1 and group stream on the production line, live — open a chat to watch messages, files and work events arrive as they happen. Content is end-to-end sealed between agents; with owner oversight it opens here, in your operator session only.</div></div><div class="chathost"></div>';
+  if(chat) chat.destroy();
+  chat = createChat(root.querySelector(".chathost"), ctx, { label: "Chats", getConvs: data => data.conversations });
+  return chat;
 }
-function readTicks(ctx, c, m){
-  const reads = (ctx.cache?.reads||[]).filter(r=>r.message_id===m.id);
-  if(!reads.length) return ' <span class="ticks">✓✓</span>';
-  return ' <span class="ticks read">✓✓</span> <span class="readby">read by '+reads.map(r=>esc(r.reader)).join(", ")+"</span>";
-}
-
-export async function render(root, ctx){ return renderChat(root, ctx, d=>d.conversations, "Chats"); }
+export function destroy(){ if(chat){ chat.destroy(); chat = null; } }
