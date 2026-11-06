@@ -1,13 +1,16 @@
 """Serverless transport for AgentLink v2.0 (Phase 3+4; daemon port
 landed in the v2.0 daemon-loop phase).
 
-Dual-transport note: AgentLink ships two live transports during the
-v2.0 transition. The RELAY transport (``client.py``: websockets to a
-home/peer relay) remains the default; this module is the SERVERLESS
-transport selected by configuration flip::
+Dual-transport note: AgentLink ships two transports. The SERVERLESS
+transport (this module) is the default since 2.0.1 — the v1 relay
+was retired at the v2.0 cutover, and defaulting to it stranded
+every auto-updated agent on a dead endpoint (beulah, frozen from
+2026-11-04 until this fix). The RELAY transport (``client.py``:
+websockets to a home/peer relay) remains only as an explicit
+opt-in for private relay deployments::
 
-    AGENTLINK_TRANSPORT=serverless   # this module
-    AGENTLINK_TRANSPORT=relay        # client.py (default today)
+    AGENTLINK_TRANSPORT=serverless   # this module (default)
+    AGENTLINK_TRANSPORT=relay        # client.py (explicit opt-in)
 
 ``client.py``'s daemon loop is wired onto this module behind that
 flip (``Agent._start_serverless``): login, the supervision threads
@@ -78,6 +81,7 @@ service key is accepted, stored, or sent anywhere by this module.
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import threading
@@ -184,12 +188,15 @@ class Refusal(TransportError):
 def transport_mode(env: dict | None = None) -> str:
     """The configured transport: ``"serverless"`` or ``"relay"``.
 
-    Reads ``AGENTLINK_TRANSPORT`` (default ``"relay"`` during the
-    transition; the coordinator's client wiring consumes this).
+    Reads ``AGENTLINK_TRANSPORT`` (default ``"serverless"`` since
+    2.0.1: the v1 relay is retired, so the old relay default
+    stranded every updated agent that had no flip set — beulah's
+    heartbeat froze on 2026-11-04 and never recovered on 2.0.0;
+    the coordinator's client wiring consumes this).
     """
     env = os.environ if env is None else env
-    mode = str(env.get("AGENTLINK_TRANSPORT") or "relay").strip().lower()
-    return "serverless" if mode == "serverless" else "relay"
+    mode = str(env.get("AGENTLINK_TRANSPORT") or "serverless").strip().lower()
+    return "relay" if mode == "relay" else "serverless"
 
 
 class ServerlessConfig:
@@ -214,17 +221,49 @@ class ServerlessConfig:
         self.login_edge_url = (login_edge_url or "").rstrip("/")
         self.table_prefix = table_prefix or ""
 
+    # Production endpoints, baked in at 2.0.1 so a stock daemon
+    # connects with ZERO configuration: the v2.0 fleet could not
+    # come back after the relay retired because every value below
+    # existed only as an env var on the coordinator's own host
+    # (beulah's 2.0.0 had none of them and kept dialing the dead
+    # relay). Every value here is a PUBLIC client coordinate — the
+    # anon key is the RLS-guarded public key the dashboard serves
+    # to the world in its config.js; RLS, not key secrecy, is the
+    # perimeter (this class's own contract). Env always overrides.
+    PRODUCTION_DEFAULTS = {
+        "AGENTLINK_SUPABASE_URL":
+            "https://gqmzwbmmloklrkvxlmdc.supabase.co",
+        "AGENTLINK_SUPABASE_ANON_KEY":
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh"
+            "YmFzZSIsInJlZiI6ImdxbXp3Ym1tbG9rbHJrdnhsbWRjIiwicm9s"
+            "ZSI6ImFub24iLCJpYXQiOjE3OTM1NzMxOTIsImV4cCI6MjEwOTE"
+            "0OTE5Mn0.trixR09C_xLZZ1LC7VnB9DXuVG3ABZZrrZ0ZQx7xd6A",
+        "AGENTLINK_FIREBASE_PROJECT": "agentlink-84609",
+        "AGENTLINK_FIREBASE_DATABASE_URL":
+            "https://agentlink-84609-default-rtdb.firebaseio.com",
+        "AGENTLINK_LOGIN_EDGE_URL":
+            "https://gqmzwbmmloklrkvxlmdc.supabase.co"
+            "/functions/v1/agentlink-login",
+    }
+
     @classmethod
     def from_env(cls, env: dict | None = None) -> "ServerlessConfig":
         env = os.environ if env is None else env
+        d = cls.PRODUCTION_DEFAULTS
         return cls(
-            supabase_url=env.get("AGENTLINK_SUPABASE_URL", ""),
-            anon_key=env.get("AGENTLINK_SUPABASE_ANON_KEY", ""),
-            firebase_project_id=env.get("AGENTLINK_FIREBASE_PROJECT", ""),
+            supabase_url=env.get("AGENTLINK_SUPABASE_URL",
+                                 d["AGENTLINK_SUPABASE_URL"]),
+            anon_key=env.get("AGENTLINK_SUPABASE_ANON_KEY",
+                             d["AGENTLINK_SUPABASE_ANON_KEY"]),
+            firebase_project_id=env.get(
+                "AGENTLINK_FIREBASE_PROJECT",
+                d["AGENTLINK_FIREBASE_PROJECT"]),
             firebase_api_key=env.get("AGENTLINK_FIREBASE_API_KEY", ""),
             firebase_database_url=env.get(
-                "AGENTLINK_FIREBASE_DATABASE_URL", ""),
-            login_edge_url=env.get("AGENTLINK_LOGIN_EDGE_URL", ""),
+                "AGENTLINK_FIREBASE_DATABASE_URL",
+                d["AGENTLINK_FIREBASE_DATABASE_URL"]),
+            login_edge_url=env.get("AGENTLINK_LOGIN_EDGE_URL",
+                                   d["AGENTLINK_LOGIN_EDGE_URL"]),
             table_prefix=env.get("AGENTLINK_SUPABASE_TABLE_PREFIX",
                                  "al_"))
 
@@ -237,6 +276,22 @@ class ServerlessConfig:
     @property
     def rest_base(self) -> str:
         return self.supabase_url + "/rest/v1"
+
+
+def _read_body(resp) -> bytes:
+    """Read a response body, tolerating a stream clipped AFTER
+    the payload arrived: http.client raises IncompleteRead when
+    a chunked response loses its terminating chunk (this host's
+    egress proxy does exactly that, intermittently), and the
+    exception's .partial carries the bytes that DID arrive —
+    the same doctrine blobstore's R2 reader follows. Whether
+    those bytes are the complete payload is judged by the
+    body's own parser downstream: a truly truncated body still
+    fails there, unchanged."""
+    try:
+        return resp.read()
+    except http.client.IncompleteRead as exc:
+        return exc.partial or b""
 
 
 def _default_opener(method, url, headers, body):
@@ -252,9 +307,9 @@ def _default_opener(method, url, headers, body):
         req.add_header(k, v)
     try:
         with proxycreds.open_url(req, timeout=30) as resp:
-            return resp.status, dict(resp.headers), resp.read()
+            return resp.status, dict(resp.headers), _read_body(resp)
     except urllib.error.HTTPError as exc:
-        return exc.code, dict(exc.headers or {}), exc.read() or b""
+        return exc.code, dict(exc.headers or {}), _read_body(exc) or b""
 
 
 def _loads(val, default):
@@ -552,6 +607,7 @@ class ServerlessTransport:
             self._rest("POST", "activeness", body={
                 "username": self.username, "state": state,
                 "beat_at": now_ts(),
+                "client_version": self.client_version,
                 "transport": ("slow-sync" if self.slow_sync_active
                               else "rtdb"),
                 "updated_at": now_ts()},
@@ -793,7 +849,8 @@ class ServerlessTransport:
             priority=frame["priority"],
             size=len(str((content or {}).get("ct") or "")),
             mentions=frame["mentions"], ref_id=mid,
-            oversight=json.dumps(oversight) if oversight else "")
+            oversight=json.dumps(oversight) if oversight else "",
+            content_envelope=json.dumps(content) if content else "")
         self._tap(conversation_id_for_dm(self.username, to_user), mid)
         return {"id": mid, "to": to_user, "queued": True}
 
@@ -968,27 +1025,41 @@ class ServerlessTransport:
             raise TransportError("login required before fetch_conversation")
         kinds = ",".join(CONTENT_AUDIT_KINDS)
         base = _AUDIT_SELECT_SEQ + f"&kind=in.({kinds})"
+        # The window is selected SERVER-side: the newest ``limit``
+        # rows by seq (desc + limit), reversed back to oldest-first
+        # below. Fetching the whole thread and slicing locally put
+        # the entire history on the wire for every read — on a
+        # lossy link the response truncates and the read fails
+        # outright (proven live 2026-11-06: the exercise's history
+        # check clipped at a fixed byte ceiling on every attempt).
+        # limit=0/None keeps the unbounded full read.
+        lim = int(limit) if limit else 0
+        order = "&order=seq.desc" if lim else "&order=seq.asc"
         if group_id:
             query = (base + "&" + self._eq("group_id", group_id)
-                     + "&order=seq.asc")
+                     + order)
         elif peer:
             peer_q = urllib.parse.quote(str(peer), safe="")
             me_q = urllib.parse.quote(self.username, safe="")
             query = (base + "&or=(and(actor.eq." + me_q
                      + ",target.eq." + peer_q + "),and(actor.eq."
                      + peer_q + ",target.eq." + me_q + "))"
-                     + "&order=seq.asc")
+                     + order)
         else:
             raise TransportError(
                 "fetch_conversation needs peer= or group_id=")
+        if lim:
+            query += f"&limit={lim}"
         rows = self._rest("GET", "audit_log", query) or []
         shaped = [_shape_audit_row(r) for r in rows]
+        if lim:
+            shaped.reverse()
         if group_id:
-            return shaped[-int(limit):] if limit else shaped
+            return shaped
         pair = {self.username, str(peer)}
         mine = [r for r in shaped
                 if {r.get("from"), r.get("to")} == pair]
-        return mine[-int(limit):] if limit else mine
+        return mine
 
     # -- directory / keys / memberships (the daemon's read path) ---------
     # The reads the client daemon's request surface needs, executed
@@ -1162,6 +1233,7 @@ class ServerlessTransport:
                         status="read", ref_id=mid)
             self._enqueue(sender, {
                 "type": "read_receipt", "id": mid,
+                "from": self.username,
                 "reader": self.username, "read_at": read_at,
                 "group_id": gid or None,
                 "channel_id": gid if kind == "channel_message"
