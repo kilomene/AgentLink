@@ -73,6 +73,13 @@ class FakeHttp:
         self.queue_rows = []   # stored al_queue rows (dicts)
         self.audit_rows = []   # stored al_audit_log rows (raw cols)
         self.postgrest_401_once = False
+        self.rpc_result = True       # al_attach_oversight's verdict
+        self.audit_patch_failures = 0  # next N audit PATCHes -> 500
+        self.empty_get_responses = 0   # next N PostgREST GETs -> 200, zero-byte body
+        self.empty_queue_gets_after_first = False  # queue GETs past the first -> empty body
+        self._queue_gets_seen = 0
+        self.group_member_rows = []    # al_group_members seed
+        self.channel_member_rows = []  # al_channel_members seed
         self._seq = 1000
 
     # -- helpers for tests -------------------------------------------
@@ -102,6 +109,15 @@ class FakeHttp:
     def __call__(self, method, url, headers, body):
         obj = json.loads(body) if body else None
         self.calls.append((method, url, headers, obj))
+        if method == "GET" and "/rest/v1/" in url \
+                and self.empty_get_responses > 0:
+            self.empty_get_responses -= 1
+            return 200, {}, b""
+        if method == "GET" and "/rest/v1/al_queue" in url:
+            self._queue_gets_seen += 1
+            if self.empty_queue_gets_after_first \
+                    and self._queue_gets_seen > 1:
+                return 200, {}, b""
         status, payload = self._route(method, url, obj)
         raw = b"" if payload is None else json.dumps(payload).encode()
         return status, {}, raw
@@ -157,6 +173,18 @@ class FakeHttp:
         parsed = urllib.parse.urlparse(url)
         table = parsed.path.rsplit("/", 1)[-1]
         query = urllib.parse.parse_qs(parsed.query)
+        if "/rpc/" in parsed.path:
+            return 200, self.rpc_result
+        if table in ("al_group_members", "al_channel_members") \
+                and method == "GET":
+            rows = self.group_member_rows if table == "al_group_members" \
+                else self.channel_member_rows
+            key = "group_id" if table == "al_group_members" \
+                else "channel_id"
+            want = query.get(key, [""])[0]
+            if want.startswith("eq."):
+                rows = [r for r in rows if r.get(key) == want[3:]]
+            return 200, rows
         if table == "al_queue":
             if method == "POST":
                 self._seq += 1
@@ -170,6 +198,12 @@ class FakeHttp:
                 if want.startswith("eq."):
                     rows = [r for r in rows
                             if r["to_username"] == want[3:]]
+                off = query.get("offset", [""])[0]
+                lim = query.get("limit", [""])[0]
+                if off.isdigit():
+                    rows = rows[int(off):]
+                if lim.isdigit():
+                    rows = rows[:int(lim)]
                 return 200, rows
             if method == "DELETE":
                 seqs = set()
@@ -196,6 +230,9 @@ class FakeHttp:
                     rows = rows[:int(lim)]
                 return 200, rows
             if method == "PATCH":
+                if self.audit_patch_failures > 0:
+                    self.audit_patch_failures -= 1
+                    return 500, {"message": "simulated write loss"}
                 return 204, None
         if method in ("POST", "PATCH"):
             return 201 if method == "POST" else 204, None
@@ -481,6 +518,100 @@ def test_ack_releases_only_matching_and_marks_delivered(logged_in):
     assert fake.find("DELETE", "/rest/v1/al_queue") == []
 
 
+def test_ack_status_write_precedes_custody_release(logged_in):
+    fake, transport = logged_in
+    fake.seed_queue("alice", {"type": "message", "id": "m1"})
+    fake.calls.clear()
+    transport.ack(["m1"])
+    patch_at = next(i for i, (m, u, _h, _b) in enumerate(fake.calls)
+                    if m == "PATCH" and "al_audit_log" in u)
+    delete_at = next(i for i, (m, u, _h, _b) in enumerate(fake.calls)
+                     if m == "DELETE" and "al_queue" in u)
+    assert patch_at < delete_at
+
+
+def test_ack_failed_status_write_keeps_custody_for_retry(logged_in):
+    fake, transport = logged_in
+    fake.seed_queue("alice", {"type": "message", "id": "m1"})
+    fake.seed_queue("alice", {"type": "message", "id": "m2"})
+    fake.audit_patch_failures = 1  # m1's status write is lost
+    fake.calls.clear()
+    acked = transport.ack(["m1", "m2"])
+    # m1 was NOT retired (its frame stays in custody for the next
+    # cycle); m2's failure-free ack was not aborted by m1's.
+    assert [f.get("id") for f in acked] == ["m2"]
+    remaining = [json.loads(r["payload"])["id"] for r in fake.queue_rows]
+    assert remaining == ["m1"]
+    # The retry lands whole: status write, then custody release.
+    acked = transport.ack(["m1"])
+    assert [f.get("id") for f in acked] == ["m1"]
+    assert fake.queue_rows == []
+
+
+def test_attach_oversight_rpc_round_trip(logged_in):
+    fake, transport = logged_in
+    fake.calls.clear()
+    out = transport.attach_oversight(
+        {"ref_id": "ref-1", "oversight": dict(OVERSIGHT)})
+    assert out == {"attached": True}
+    calls = [(m, u, b) for (m, u, _h, b) in fake.calls if "/rpc/" in u]
+    assert len(calls) == 1
+    method, url, body = calls[0]
+    assert method == "POST"
+    assert url.endswith("/rest/v1/rpc/al_attach_oversight")
+    assert body["p_ref_id"] == "ref-1"
+    assert json.loads(body["p_oversight"]) == OVERSIGHT
+    # The function's own verdict (row already wrapped / not mine)
+    # surfaces as attached=False, not an error.
+    fake.rpc_result = False
+    out = transport.attach_oversight(
+        {"ref_id": "ref-1", "oversight": dict(OVERSIGHT)})
+    assert out == {"attached": False}
+    # A missing wrap is a no-op: no RPC is spent on it.
+    fake.calls.clear()
+    assert transport.attach_oversight({"ref_id": "ref-1"}) == \
+        {"attached": False}
+    assert [c for c in fake.calls if "/rpc/" in c[1]] == []
+
+
+def test_request_group_key_enqueues_admins_only(logged_in):
+    fake, transport = logged_in
+    fake.group_member_rows = [
+        {"group_id": "g1", "username": "alice", "role": "member"},
+        {"group_id": "g1", "username": "bob", "role": "admin"},
+        {"group_id": "g1", "username": "carol", "role": "superadmin"},
+        {"group_id": "g1", "username": "dave", "role": "member"},
+        {"group_id": "g2", "username": "erin", "role": "admin"},
+    ]
+    fake.calls.clear()
+    out = transport.request_group_key({"group_id": "g1"})
+    assert out == {"admins": ["bob", "carol"]}
+    queued = {r["to_username"]: json.loads(r["payload"])
+              for r in fake.queue_rows}
+    assert set(queued) == {"bob", "carol"}
+    for frame in queued.values():
+        assert frame["type"] == "group_key_request"
+        assert frame["group_id"] == "g1"
+        assert frame["from"] == "alice"
+        assert frame["id"]
+
+
+def test_request_channel_key_enqueues_admins_only(logged_in):
+    fake, transport = logged_in
+    fake.channel_member_rows = [
+        {"channel_id": "c1", "username": "alice", "role": "member"},
+        {"channel_id": "c1", "username": "bob", "role": "admin"},
+        {"channel_id": "c1", "username": "dave", "role": "member"},
+    ]
+    out = transport.request_channel_key({"channel_id": "c1"})
+    assert out == {"admins": ["bob"]}
+    queued = {r["to_username"]: json.loads(r["payload"])
+              for r in fake.queue_rows}
+    assert set(queued) == {"bob"}
+    assert queued["bob"]["type"] == "channel_key_request"
+    assert queued["bob"]["channel_id"] == "c1"
+
+
 def test_fetch_conversation_dm_shaping(logged_in):
     fake, transport = logged_in
     fake.audit_rows = [
@@ -571,6 +702,144 @@ def test_stream_failure_engages_slow_sync():
         fake.seed_queue("alice", {"type": "message", "id": "m9"})
         frames = transport.slow_sync_once()
         assert [f["frame"]["id"] for f in frames] == ["m9"]
+    finally:
+        transport.logout()
+
+
+def test_silent_stream_death_engages_slow_sync():
+    # 2.0.6 (found live in the release exercise): a stream whose
+    # path died silently — opened fine, then no line ever arrives
+    # and no error is raised — must surface as an ordinary stream
+    # failure (socket read timeout -> DoorbellError), so the
+    # supervisor reconnects and slow-sync takes over delivery.
+    # Before the fix the listen loop blocked on it forever and
+    # delivery stalled while presence stayed green.
+    fake = FakeHttp()
+
+    def stalling_stream(url, headers):
+        def gen():
+            raise TimeoutError("read timed out")
+            yield b""
+        return gen()
+
+    transport = make_transport(fake, stream_opener=stalling_stream)
+    try:
+        transport.login("alice", fake.identity.sign)
+        assert transport.listen_signals(lambda p, d: None) is False
+        assert transport.slow_sync_active is True
+    finally:
+        transport.logout()
+
+
+def test_stream_socket_carries_a_liveness_timeout():
+    # The opener must never leave a stream socket unbounded: an
+    # infinite timeout is exactly the half-open trap above.
+    import inspect
+    src = inspect.getsource(doorbell_mod._default_stream_opener)
+    assert "settimeout(None)" not in src
+    assert "STREAM_READ_TIMEOUT_S" in src
+    assert 60 <= doorbell_mod.STREAM_READ_TIMEOUT_S <= 300
+
+
+def test_empty_body_get_is_retried_then_raises(logged_in):
+    # 2.0.6 (found live in the release exercise): this VM's
+    # egress proxy answers LARGE PostgREST reads with 200 and a
+    # zero-byte body. PostgREST itself never does that (an empty
+    # result set is "[]"), so an empty body on a GET is a clipped
+    # transfer, not a result. Before the fix _rest returned None
+    # for it and fetch_unacked read that as "queue empty" —
+    # delivery stalled forever with every health light green.
+    fake, transport = logged_in
+    fake.seed_queue("alice", {"type": "message", "id": "m1"})
+    fake.calls.clear()
+    fake.empty_get_responses = 10  # outlasts the retry budget
+    with pytest.raises(TransportError):
+        transport.fetch_unacked()
+    gets = fake.find("GET", "/rest/v1/al_queue")
+    assert len(gets) == 4  # initial attempt + 3 bounded retries
+
+
+def test_empty_body_get_recovers_on_retry(logged_in):
+    # The same fault, transient: two emptied responses, then the
+    # real one — the fetch must land the rows, not report an
+    # empty queue.
+    fake, transport = logged_in
+    fake.seed_queue("alice", {"type": "message", "id": "m1"})
+    fake.empty_get_responses = 2
+    frames = transport.fetch_unacked()
+    assert [f["frame"]["id"] for f in frames] == ["m1"]
+
+
+def test_fetch_unacked_pages_through_a_deep_queue(logged_in):
+    # 2.0.6: the custody read pages at _QUEUE_PAGE rows — one
+    # whole-queue response is exactly the size a lossy path
+    # kills. 25 seeded rows must arrive complete and in seq
+    # order across multiple page reads.
+    fake, transport = logged_in
+    for i in range(25):
+        fake.seed_queue("alice", {"type": "message",
+                                  "id": f"m{i:02d}"})
+    fake.calls.clear()
+    frames = transport.fetch_unacked()
+    assert [f["frame"]["id"] for f in frames] == \
+        [f"m{i:02d}" for i in range(25)]
+    gets = fake.find("GET", "/rest/v1/al_queue")
+    assert len(gets) >= 3  # paged, not one whole-queue read
+
+
+def test_fetch_unacked_returns_partial_progress(logged_in):
+    # A page failure AFTER progress returns the progress (the
+    # caller processes and acks it; the next cycle resumes the
+    # rest) — only a first-page failure raises.
+    fake, transport = logged_in
+    for i in range(25):
+        fake.seed_queue("alice", {"type": "message",
+                                  "id": f"m{i:02d}"})
+    fake.empty_queue_gets_after_first = True
+    frames = transport.fetch_unacked()
+    assert [f["frame"]["id"] for f in frames] == \
+        [f"m{i:02d}" for i in range(transport._QUEUE_PAGE)]
+
+
+def test_empty_body_write_still_returns_none(logged_in):
+    # Writes keep the legitimate empty -> None path (a 204 /
+    # return=minimal response is bodyless by design); the
+    # empty-body suspicion applies to reads only.
+    fake, transport = logged_in
+    fake.queue_rows = []
+    out = transport._rest("DELETE", "queue", "seq=in.(424242)")
+    assert out is None
+
+
+def test_slow_sync_fetches_even_with_a_healthy_stream(monkeypatch):
+    # 2.0.6 (found live in the release exercise): delivery must
+    # not hinge on signal arrival. A freshly booted daemon whose
+    # stream snapshot was lost sat on a full custody queue and
+    # fetched NOTHING because the cadence fetch was gated on
+    # slow_sync_active (stream known-down). The reconciliation
+    # fetch now runs every cadence regardless; signals remain
+    # only the instant path.
+    import threading as _threading
+    monkeypatch.setattr(transport_mod, "SLOW_SYNC_INTERVAL_SECONDS",
+                        0.2)
+    fake = FakeHttp()
+    transport = make_transport(fake)
+    try:
+        transport.login("alice", fake.identity.sign)
+        assert transport.slow_sync_active is False
+        fake.seed_queue("alice", {"type": "message", "id": "m-lost-tap"})
+        delivered = []
+        stop = _threading.Event()
+        worker = _threading.Thread(
+            target=transport.run_slow_sync,
+            args=(lambda frames: delivered.extend(frames), stop),
+            daemon=True)
+        worker.start()
+        time.sleep(1.15)
+        stop.set()
+        worker.join(timeout=5)
+        ids = [f["frame"]["id"] for f in delivered]
+        assert "m-lost-tap" in ids
     finally:
         transport.logout()
 
