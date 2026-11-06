@@ -150,6 +150,23 @@ ONLINE_MAX_AGE_S = 10
 #: or on a fired disconnect, the agent reads "offline".
 SUSPECT_MAX_AGE_S = 15
 
+#: Read timeout on a live event stream's socket. RTDB holds an
+#: idle stream open with periodic keep-alive events, so a healthy
+#: stream produces a line far more often than this; a stream that
+#: has produced NOTHING for this long is not quiet, it is
+#: half-open — the path died silently (an egress proxy desync can
+#: eat the connection without surfacing an error) and no event
+#: will ever arrive on it again. The timeout converts that silent
+#: death into an ordinary stream failure: the supervisor
+#: reconnects and slow-sync engages, so delivery degrades to the
+#: 60s fallback instead of stalling forever while presence — on
+#: its independent REST beats — stays green. (Before 2.0.6 the
+#: stream opener CLEARED the socket timeout entirely, on the
+#: theory that the listen loop's reconnect covers drops; a
+#: half-open stream never drops, it just never speaks. Found live
+#: in the 2.0.6 exercise, 2026-11-06.)
+STREAM_READ_TIMEOUT_S = 90
+
 #: The fan-out valve (Phase 1 quota proof, migration-v200-cron.sql
 #: S6): raw presence fan-out at circle-10 would download ~19.9 GB/mo
 #: against the 10 GB free tier, so every client ALSO maintains a
@@ -369,11 +386,13 @@ def _default_stream_opener(url, headers):
     """Open an RTDB event stream; returns an iterable of raw
     lines (bytes). Raises DoorbellError on any failure to open.
     The CONNECT goes through proxycreds.open_url (fresh
-    credential at dial time, like every other leg); the dial
-    timeout is then cleared on the live socket so the
-    long-lived stream is not cut by it — if clearing is not
-    possible on this response shape, the supervised listen
-    loop's reconnect covers the eventual drop."""
+    credential at dial time, like every other leg); on the live
+    socket the dial timeout is replaced with
+    STREAM_READ_TIMEOUT_S — long enough that a healthy stream's
+    keep-alives never trip it, finite so a silently half-open
+    stream fails loudly into the supervised listen loop's
+    reconnect + slow-sync fallback instead of blocking the
+    listen loop forever."""
     req = urllib.request.Request(url, method="GET")
     for k, v in (headers or {}).items():
         req.add_header(k, v)
@@ -384,7 +403,7 @@ def _default_stream_opener(url, headers):
     try:
         sock = resp.fp.raw._sock
         if sock is not None:
-            sock.settimeout(None)
+            sock.settimeout(STREAM_READ_TIMEOUT_S)
     except Exception:
         pass
     if getattr(resp, "status", 200) >= 400:
