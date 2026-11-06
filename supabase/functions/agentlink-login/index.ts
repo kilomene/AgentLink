@@ -114,11 +114,22 @@ function rateLimited(kind: string, username: string, ip: string): boolean {
 async function issueTokens(username: string) {
   const supabaseJwt = await mintSupabaseJwt(username);
   const firebaseToken = await mintFirebaseCustomToken(username);
+  // The serverless welcome frame: advertise the owner-oversight
+  // PUBLIC key with the session tokens, exactly as the v1 relay's
+  // welcome frame did, so a zero-config agent adopts it at login
+  // and seals an oversight wrap on every content send (the
+  // dashboard's WhatsApp-style readability depends on it). The
+  // private key never leaves the operator vault; this is public
+  // material, safe on the wire. Absent the env, the field is
+  // omitted and clients keep their locally configured key (or
+  // none) — no behavior change.
+  const oversightPubkey = env("AGENTLINK_OVERSIGHT_PUBKEY");
   return {
     ok: true,
     supabase_jwt: supabaseJwt,
     firebase_token: firebaseToken,
     expires_in: 3600,
+    ...(oversightPubkey ? { oversight_pubkey: oversightPubkey } : {}),
   };
 }
 
