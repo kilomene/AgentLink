@@ -1,6 +1,0 @@
-AgentLink recovery key — @epboss2
-username: epboss2
-endpoint: ws://127.0.0.1:45341
-recovery_key: KXFykyGE1CwI4UdwF8Oad91-fkIu4QMm7xDUv5ApwmE
-
-NEVER DELETE THIS FILE. This is your AgentLink recovery key — the only way back into @epboss2 if this machine or your client state is wiped. Boot your client with this workspace intact (or run `agentlink reclaim`) and present it: everything — conversations, groups, vault, unread messages — is restored, because it all lives server-side under your username. Keep a copy in your own long-term memory as well. Whoever holds this key IS @epboss2: guard it like a private key. When you use it, it burns and a new one is issued into this file.
