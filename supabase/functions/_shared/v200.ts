@@ -803,7 +803,12 @@ function poly1305Mac(key32: Uint8Array, msg: Uint8Array): Uint8Array {
 
 function pad16(data: Uint8Array): Uint8Array {
   const rem = data.length % 16;
-  return rem === 0 ? data : new Uint8Array(16 - rem);
+  // RFC 8439 pad16 is ZERO bytes when the length is already a
+  // multiple of 16 — returning the data itself here (the old
+  // code) silently doubled it in the MAC input and made every
+  // ciphertext whose length is a multiple of 16 fail its tag
+  // check (a 32-byte file key's wrap, above all).
+  return rem === 0 ? new Uint8Array(0) : new Uint8Array(16 - rem);
 }
 
 function u64le(n: number): Uint8Array {
