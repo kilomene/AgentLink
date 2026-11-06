@@ -69,6 +69,7 @@ class FakeHttp:
         self.challenge_count = 0
         self.verify_ok = None
         self.last_verify = None
+        self.advertise_oversight = ""   # verify-reply oversight key
         self.queue_rows = []   # stored al_queue rows (dicts)
         self.audit_rows = []   # stored al_audit_log rows (raw cols)
         self.postgrest_401_once = False
@@ -132,9 +133,12 @@ class FakeHttp:
                             "role": "authenticated",
                             "username": obj["username"],
                             "exp": self.jwt_exp})
-            return 200, {"supabase_jwt": jwt,
-                         "firebase_custom_token": "custom-token-1",
-                         "expires_at": self.jwt_exp}
+            reply = {"supabase_jwt": jwt,
+                     "firebase_custom_token": "custom-token-1",
+                     "expires_at": self.jwt_exp}
+            if self.advertise_oversight:
+                reply["oversight_pubkey"] = self.advertise_oversight
+            return 200, reply
         # Firebase RTDB.
         if url.startswith(RTDB):
             if "/signals/" in url and method == "GET":
@@ -377,6 +381,80 @@ def test_fetch_unacked_peeks_in_seq_order_without_releasing(logged_in):
     assert all(r["frame"]["queued"] is True for r in rows)
     assert fake.find("DELETE", "/rest/v1/al_queue") == []
     assert len(fake.queue_rows) == 3  # custody intact
+
+
+def test_login_surfaces_advertised_oversight_key():
+    # 2.0.4: the login Edge advertises the owner-oversight public
+    # key with the session tokens (the serverless welcome frame);
+    # the transport must surface it for the Agent to adopt. A reply
+    # without the field leaves the key empty, and a later reply
+    # that omits it never wipes a key already delivered.
+    fake = FakeHttp()
+    fake.advertise_oversight = "oversight-pub-b64"
+    transport = make_transport(fake)
+    assert transport.oversight_pubkey == ""
+    transport.login("alice", fake.identity.sign)
+    assert transport.oversight_pubkey == "oversight-pub-b64"
+    transport.logout()
+
+    fake2 = FakeHttp()
+    transport2 = make_transport(fake2)
+    transport2.login("alice", fake2.identity.sign)
+    assert transport2.oversight_pubkey == ""
+    transport2.logout()
+
+
+def test_clipped_get_body_retries_then_succeeds():
+    # 2.0.3 (soak catch, 2026-11-06): an imperfect network clipped a
+    # large queue response mid-JSON and the raw JSONDecodeError
+    # escaped _rest into the daemon's signal handler. A read whose
+    # body will not decode is a transient fault: retried in place.
+    good = json.dumps([{
+        "seq": 1, "to_username": "alice", "priority": "normal",
+        "ts": 1,
+        "payload": json.dumps({"type": "message", "id": "m1"})}]).encode()
+    clipped = good[:len(good) // 2]
+    calls = []
+
+    def opener(method, url, headers, body):
+        calls.append(method)
+        if len(calls) == 1:
+            return 200, {}, clipped
+        return 200, {}, good
+
+    transport = make_transport(opener)
+    transport.username = "alice"
+    rows = transport.fetch_unacked()
+    assert [r["frame"]["id"] for r in rows] == ["m1"]
+    assert calls == ["GET", "GET"]
+
+
+def test_persistent_clip_raises_transport_error_not_decode_error():
+    calls = []
+
+    def opener(method, url, headers, body):
+        calls.append(method)
+        return 200, {}, b'[{"seq": 1, "payload": "unterminated'
+
+    transport = make_transport(opener)
+    transport.username = "alice"
+    with pytest.raises(transport_mod.TransportError):
+        transport.fetch_unacked()
+    assert calls == ["GET"] * 4  # first attempt + 3 bounded retries
+
+
+def test_clipped_write_response_raises_without_reexecuting():
+    calls = []
+
+    def opener(method, url, headers, body):
+        calls.append(method)
+        return 200, {}, b'{"id": "unterminated'
+
+    transport = make_transport(opener)
+    transport.username = "alice"
+    with pytest.raises(transport_mod.TransportError):
+        transport._rest("POST", "queue", body={"x": 1})
+    assert calls == ["POST"]  # a write is never blindly re-executed
 
 
 def test_ack_releases_only_matching_and_marks_delivered(logged_in):
@@ -785,6 +863,7 @@ def test_serverless_config_production_defaults():
     assert cfg.firebase_database_url == \
         "https://agentlink-84609-default-rtdb.firebaseio.com"
     assert cfg.anon_key  # the public, RLS-guarded anon key
+    assert cfg.firebase_api_key.startswith("AIza")
     over = ServerlessConfig.from_env(
         {"AGENTLINK_SUPABASE_URL": "https://example.invalid"})
     assert over.supabase_url == "https://example.invalid"
@@ -899,3 +978,164 @@ def test_v2_stream_opener_routes_through_proxycreds(monkeypatch):
     resp = doorbell_mod._default_stream_opener(
         "https://db.test/stream", {})
     assert resp.status == 200
+
+
+def test_activeness_mirror_failure_retries_on_slow_sync_cadence():
+    # 2.0.2 (beulah, 2026-11-06): her connect transition mirrored
+    # into a transient failure; the write is fail-soft, so she
+    # stayed invisible in al_activeness while fully active. The
+    # slow-sync cadence now re-asserts the current state whenever
+    # a mirror error is outstanding, and stops once it lands.
+    import threading as _threading
+    fake = FakeHttp()
+    transport = make_transport(fake)
+    try:
+        transport.login("alice", fake.identity.sign,
+                        client_version="2.0.2-test")
+        assert transport.last_mirror_error == ""
+        # The beulah state: an error outstanding, no row landed
+        # for it, agent steadily online (no ladder change coming).
+        transport.last_mirror_error = "simulated mirror failure"
+        fake.calls.clear()
+        stop = _threading.Event()
+        worker = _threading.Thread(
+            target=transport.run_slow_sync,
+            args=(lambda frames: None, stop), daemon=True)
+        worker.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and transport.last_mirror_error:
+            time.sleep(0.05)
+        stop.set()
+        worker.join(timeout=5)
+        assert transport.last_mirror_error == ""
+        posts = fake.find("POST", "/rest/v1/al_activeness")
+        assert len(posts) == 1
+        assert posts[0][2]["state"] == "online"
+        assert posts[0][2]["client_version"] == "2.0.2-test"
+    finally:
+        transport.logout()
+
+
+def test_slow_sync_reasserts_mirror_while_online(monkeypatch):
+    # 2.0.4 (owner catch, 2026-11-06): the Postgres activeness
+    # mirror is written on transitions, but the sweep ages rows
+    # by beat_at/last_seen — timestamps nothing advanced for a
+    # steadily online serverless agent (its 5s beats live in
+    # Firebase by design), so the sweep stamped live agents
+    # 'offline' ~1 minute after login and the dashboard's mirror
+    # floor lied forever. The slow-sync cadence now re-asserts
+    # the mirror while the state is online, keeping the Postgres
+    # record as fresh as the sweep's serverless thresholds
+    # (migration v205) require.
+    import threading as _threading
+    monkeypatch.setattr(transport_mod, "SLOW_SYNC_INTERVAL_SECONDS",
+                        0.2)
+    fake = FakeHttp()
+    transport = make_transport(fake)
+    try:
+        transport.login("alice", fake.identity.sign,
+                        client_version="2.0.4-test")
+        assert transport.last_mirror_error == ""
+        fake.calls.clear()
+        stop = _threading.Event()
+        worker = _threading.Thread(
+            target=transport.run_slow_sync,
+            args=(lambda frames: None, stop), daemon=True)
+        worker.start()
+        time.sleep(1.15)
+        stop.set()
+        worker.join(timeout=5)
+        posts = fake.find("POST", "/rest/v1/al_activeness")
+        assert len(posts) >= 3
+        assert all(p[2]["state"] == "online" for p in posts)
+        assert all(p[2]["transport"] == "rtdb" for p in posts)
+        # The backup touch rides the same write (last_seen is the
+        # sweep's other aging input).
+        assert fake.find("PATCH", "/rest/v1/al_users")
+    finally:
+        transport.logout()
+
+
+def test_mirror_backup_failure_is_fail_soft_and_recorded(logged_in):
+    # 2.0.5 (2.0.4 soak catch, 2026-11-06): _mirror_activeness
+    # documented fail-soft, but its backup leg
+    # (update_presence_backup) raised straight through — a
+    # clipped PATCH users response killed the slow-sync thread
+    # at soak minute 12. The whole mirror now honors the
+    # contract: failure recorded in last_mirror_error, never
+    # raised, and the activeness write itself still lands.
+    _fake, transport = logged_in
+    def boom(online=True):
+        raise transport_mod.TransportError("simulated backup failure")
+    transport.update_presence_backup = boom
+    transport.last_mirror_error = ""
+    transport._mirror_activeness("online")  # must not raise
+    assert transport.last_mirror_error == "simulated backup failure"
+    posts = _fake.find("POST", "/rest/v1/al_activeness")
+    assert posts and posts[-1][2]["state"] == "online"
+
+
+def test_slow_sync_thread_survives_a_failing_mirror(monkeypatch):
+    # The slow-sync loop must keep cycling (and keep retrying
+    # the mirror) even when every mirror attempt fails — a dead
+    # slow-sync thread silently removes the fallback fetch and
+    # the mirror truth-keeping with it.
+    import threading as _threading
+    monkeypatch.setattr(transport_mod, "SLOW_SYNC_INTERVAL_SECONDS",
+                        0.2)
+    fake = FakeHttp()
+    transport = make_transport(fake)
+    try:
+        transport.login("alice", fake.identity.sign)
+        def boom(online=True):
+            raise transport_mod.TransportError("simulated outage")
+        transport.update_presence_backup = boom
+        stop = _threading.Event()
+        worker = _threading.Thread(
+            target=transport.run_slow_sync,
+            args=(lambda frames: None, stop), daemon=True)
+        worker.start()
+        time.sleep(0.75)
+        alive = worker.is_alive()
+        stop.set()
+        worker.join(timeout=5)
+        assert alive
+        assert transport.last_mirror_error == "simulated outage"
+    finally:
+        transport.logout()
+
+
+def test_mark_read_409_is_first_read_wins_not_an_error():
+    # 2.0.2 (2026-11-06): a duplicate read delivery (signal +
+    # slow-sync overlap, or a retry) makes the message_reads POST
+    # answer 409. mark_read's contract is first-read-wins, so the
+    # 409 is success with the ORIGINAL timestamp — a bare raise
+    # killed the live DM read-state proof mid-run.
+    transport = make_transport(FakeHttp())
+    transport.username = "alice"
+    calls = []
+
+    def fake_rest(method, table, query="", body=None, prefer="",
+                  _retried=False):
+        calls.append((method, table))
+        if table == "audit_log":
+            return [{"kind": "message", "actor": "bob",
+                     "target": "alice", "group_id": ""}]
+        if table == "message_reads" and method == "GET":
+            # First look: nothing. After the 409: the winner's row.
+            if sum(1 for m, t in calls
+                   if t == "message_reads" and m == "GET") >= 2:
+                return [{"read_at": 424242}]
+            return []
+        if table == "message_reads" and method == "POST":
+            raise TransportError(
+                "PostgREST POST message_reads HTTP 409")
+        return None
+
+    transport._rest = fake_rest
+    transport._audit = lambda *a, **kw: None
+    transport._enqueue = lambda *a, **kw: None
+    transport._tap = lambda *a, **kw: None
+    out = transport.mark_read(["msg-x"])
+    assert out["read"] == ["msg-x"]
+    assert out["reads"] == [{"id": "msg-x", "read_at": 424242}]
