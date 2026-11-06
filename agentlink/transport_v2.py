@@ -447,7 +447,20 @@ class ServerlessTransport:
         TransportError, the error contract every caller already
         handles. A write is never re-executed over an undecodable
         response (the write may have landed); it raises
-        TransportError at once."""
+        TransportError at once.
+
+        A 200 with a ZERO-BYTE body on a read is the same fault in
+        a quieter costume (2.0.6, found live in the release
+        exercise): PostgREST answers an empty result set with
+        "[]" — it never answers a read with nothing — but this
+        VM's egress proxy returns 200 with no body at all for
+        large responses, and the empty check below used to turn
+        that into a silent None, which fetch_unacked read as
+        "queue empty": delivery stalled indefinitely with every
+        health light green. Reads therefore treat an empty body
+        exactly like an undecodable one (bounded retry, then
+        TransportError). Writes keep the empty -> None path: a
+        204 / return=minimal response is legitimately bodyless."""
         if not self.config.supabase_url:
             raise TransportError("no Supabase URL configured")
         path = f"{self.config.rest_base}/{self.config.table(table)}"
@@ -469,6 +482,15 @@ class ServerlessTransport:
             raise TransportError(
                 f"PostgREST {method} {table} HTTP {status}")
         if not raw:
+            if method == "GET":
+                if _decode_attempt < 3:
+                    time.sleep(next_backoff_s(_decode_attempt))
+                    return self._rest(
+                        method, table, query, body, prefer,
+                        _retried=_retried,
+                        _decode_attempt=_decode_attempt + 1)
+                raise TransportError(
+                    f"PostgREST GET {table} returned an empty body")
             return None
         try:
             return json.loads(raw)
@@ -485,6 +507,35 @@ class ServerlessTransport:
     @staticmethod
     def _eq(col: str, val) -> str:
         return f"{col}=eq.{urllib.parse.quote(str(val), safe='')}"
+
+    def _rpc(self, name: str, params: dict, _retried: bool = False):
+        """One PostgREST RPC call (a database function) under the
+        session JWT, with _rest's discipline: a 401 earns exactly
+        one re-login and one retry; an undecodable body raises
+        TransportError (RPC functions here are writes — a call is
+        never re-executed blind over a clipped response). Returns
+        the decoded scalar / row set the function returned."""
+        if not self.config.supabase_url:
+            raise TransportError("no Supabase URL configured")
+        path = f"{self.config.rest_base}/rpc/{name}"
+        headers = self._headers()
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(params).encode()
+        status, _h, raw = self._opener("POST", path, headers, data)
+        if status == 401 and not _retried and self._signer is not None \
+                and self.username:
+            self._login(self.username, self._signer)
+            return self._rpc(name, params, _retried=True)
+        if status >= 400:
+            raise TransportError(f"PostgREST RPC {name} HTTP {status}")
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError as exc:
+            raise TransportError(
+                f"PostgREST RPC {name} returned an undecodable body"
+            ) from exc
 
     # -- login -----------------------------------------------------------
     def _edge_post(self, suffix: str, payload: dict) -> dict:
@@ -1018,6 +1069,49 @@ class ServerlessTransport:
                 "queued": recipients}
 
     # -- receive: fetch / ack ------------------------------------------------
+    #: Custody reads page at this many rows (2.0.6). A whole-queue
+    #: read puts every pending payload into ONE response, and on
+    #: a lossy path the loss rate grows with response size — the
+    #: release exercise measured the full read (64 KB) emptied by
+    #: this VM's egress proxy on effectively every attempt, a
+    #: 10-row page (~19 KB) nearly as hopeless in a bad window,
+    #: and small reads passing throughout. Three rows keeps a
+    #: page near the sizes that survive mediocre windows; the
+    #: in-_rest retries compound per page, a page failure after
+    #: progress returns the progress instead of losing it, and
+    #: in a good window the extra small reads are negligible
+    #: (a healthy queue is shallow — pages only multiply when
+    #: draining a backlog, which is exactly when survival
+    #: matters more than request count).
+    _QUEUE_PAGE = 3
+
+    def _queue_rows(self, user: str) -> list[dict]:
+        """My custody rows in seq order, read page by page. If a
+        later page fails after earlier pages landed, the rows
+        already read are returned — partial progress the caller
+        can process and ack now (the next cycle resumes where
+        the acks left the queue). A FIRST-page failure raises:
+        nothing was learned, and the error must stay visible."""
+        rows: list[dict] = []
+        offset = 0
+        while True:
+            try:
+                page = self._rest(
+                    "GET", "queue",
+                    self._eq("to_username", user)
+                    + "&select=seq,to_username,payload,priority,ts"
+                    + "&order=seq.asc"
+                    + f"&limit={self._QUEUE_PAGE}&offset={offset}"
+                ) or []
+            except TransportError:
+                if rows:
+                    return rows
+                raise
+            rows.extend(page)
+            if len(page) < self._QUEUE_PAGE:
+                return rows
+            offset += self._QUEUE_PAGE
+
     def fetch_unacked(self, username: str | None = None) -> list[dict]:
         """Peek my custody queue WITHOUT releasing it: rows in
         seq order, each {"seq", "ts", "frame"} with the frame
@@ -1026,11 +1120,7 @@ class ServerlessTransport:
         user = str(username or self.username)
         if not user:
             raise TransportError("fetch_unacked needs a username")
-        rows = self._rest(
-            "GET", "queue",
-            self._eq("to_username", user)
-            + "&select=seq,to_username,payload,priority,ts"
-            + "&order=seq.asc") or []
+        rows = self._queue_rows(user)
         out = []
         for r in rows:
             frame = _loads(r.get("payload"), None)
@@ -1045,39 +1135,104 @@ class ServerlessTransport:
         """Release custody for durably journaled frame ids — the
         client.py ack contract ({"type": "ack", "ids": [...]})
         executed against the store directly: match MY queue rows
-        by the store's rule, delete them BY SEQ, and mark acked
-        message rows 'delivered' in al_audit_log (the relay's
-        _on_ack + set_audit_status semantics, kind-scoped exactly
-        as the store scopes it). Unknown ids retire nothing.
+        by the store's rule, mark acked message rows 'delivered'
+        in al_audit_log (the relay's _on_ack + set_audit_status
+        semantics, kind-scoped exactly as the store scopes it),
+        then delete the retired rows BY SEQ. Unknown ids retire
+        nothing.
         Returns the acked frames in seq order."""
         wanted = {str(i) for i in (ids or []) if i}
         if not wanted or not self.username:
             return []
-        rows = self._rest(
-            "GET", "queue",
-            self._eq("to_username", self.username)
-            + "&select=seq,payload&order=seq.asc") or []
-        seqs, acked = [], []
+        rows = self._queue_rows(self.username)
+        matched = []
         for r in rows:
             frame = _loads(r.get("payload"), None)
             if not isinstance(frame, dict):
                 continue
             if _ack_id_matches(frame, wanted):
-                seqs.append(r["seq"])
-                acked.append(frame)
+                matched.append((r["seq"], frame))
+        # Retirement is per frame and status-first (2.0.6): a
+        # message frame's audit row is marked 'delivered' BEFORE
+        # its queue row is deleted. The old order deleted custody
+        # first, so a status write lost to a clipped response left
+        # the row at 'sent' forever with nothing left to retry —
+        # the exact state the doorbell reconciliation then had to
+        # guess at. Now a failed status write KEEPS custody: the
+        # frame is redelivered, re-journaled (the mailbox dedupes)
+        # and the ack retried whole on the next cycle. One frame's
+        # failure never aborts the rest of the batch.
+        seqs, acked = [], []
+        for seq, frame in matched:
+            if frame.get("type") == "message" and frame.get("id"):
+                try:
+                    self._rest(
+                        "PATCH", "audit_log",
+                        self._eq("ref_id", str(frame["id"]))
+                        + "&kind=in.(message,group_message,channel_message)",
+                        body={"status": "delivered"},
+                        prefer="return=minimal")
+                except TransportError:
+                    continue
+            seqs.append(seq)
+            acked.append(frame)
         if seqs:
             self._rest("DELETE", "queue",
                        "seq=in.(" + ",".join(str(s) for s in seqs) + ")",
                        prefer="return=minimal")
-        for frame in acked:
-            if frame.get("type") == "message" and frame.get("id"):
-                self._rest(
-                    "PATCH", "audit_log",
-                    self._eq("ref_id", str(frame["id"]))
-                    + "&kind=in.(message,group_message,channel_message)",
-                    body={"status": "delivered"},
-                    prefer="return=minimal")
         return acked
+
+    def attach_oversight(self, frame: dict) -> dict:
+        """Receiver-side oversight rectification (2.0.6): attach
+        the wrap the RECEIVING agent computed for a message whose
+        sender shipped none, so the owner's dashboard can read it.
+        The database function al_attach_oversight (migration v207)
+        pins the write to the oversight column, only while the row
+        carries none, only for a party to the message — this is a
+        thin RPC pass-through. Returns {"attached": bool}."""
+        ref = str(frame.get("ref_id") or "")
+        wrap = frame.get("oversight")
+        if not ref or not isinstance(wrap, dict) or not wrap:
+            return {"attached": False}
+        ok = self._rpc("al_attach_oversight",
+                       {"p_ref_id": ref,
+                        "p_oversight": json.dumps(wrap)})
+        return {"attached": bool(ok)}
+
+    def request_group_key(self, frame: dict) -> dict:
+        """Ask the group's admins to re-issue my wrap of the
+        current epoch key (my stored wrap no longer unwraps — the
+        classic cause is an identity rotation after the wrap was
+        sealed). One group_key_request custody frame per admin;
+        an admin's client re-distributes the SAME epoch key sealed
+        to my CURRENT directory pubkey (2.0.6)."""
+        gid = str(frame.get("group_id") or "")
+        if not gid or not self.username:
+            return {"admins": []}
+        admins = [m["username"] for m in self.group_members(gid)
+                  if m.get("role") in ("admin", "superadmin")
+                  and m.get("username") != self.username]
+        req = {"type": "group_key_request", "group_id": gid,
+               "from": self.username, "id": new_id(),
+               "epoch": frame.get("epoch"), "ts": now_ts()}
+        for admin in admins:
+            self._enqueue(admin, dict(req))
+        return {"admins": admins}
+
+    def request_channel_key(self, frame: dict) -> dict:
+        """The channel twin of request_group_key."""
+        cid = str(frame.get("channel_id") or "")
+        if not cid or not self.username:
+            return {"admins": []}
+        admins = [m["username"] for m in self.channel_members(cid)
+                  if m.get("role") in ("admin", "superadmin")
+                  and m.get("username") != self.username]
+        req = {"type": "channel_key_request", "channel_id": cid,
+               "from": self.username, "id": new_id(),
+               "epoch": frame.get("epoch"), "ts": now_ts()}
+        for admin in admins:
+            self._enqueue(admin, dict(req))
+        return {"admins": admins}
 
     def fetch_conversation(self, peer: str | None = None,
                            group_id: str | None = None,
@@ -1380,13 +1535,23 @@ class ServerlessTransport:
         return self.fetch_unacked()
 
     def run_slow_sync(self, on_frames, stop_event=None) -> None:
-        """The fallback loop — the ONLY PostgREST poll in this
-        design, at SLOW_SYNC_INTERVAL_SECONDS (60s), performing a
-        fetch ONLY while slow_sync_active (the doorbell stream is
-        down). Intended for a dedicated thread for the transport's
-        lifetime; returns when stop_event is set. Beats never come
-        through here — they are RTDB-only, on the doorbell's own
-        thread, at 5s."""
+        """The reconciliation loop — the ONLY PostgREST poll in
+        this design, at SLOW_SYNC_INTERVAL_SECONDS (60s). Signals
+        are the instant wakeup path; this loop is the guarantee
+        underneath them: the custody fetch runs on EVERY cadence,
+        stream up or down, so no delivery depends on any single
+        signal arriving. (Before 2.0.6 the fetch ran only while
+        the stream was KNOWN down — slow_sync_active — so a
+        stream whose initial snapshot was lost, or a tap that
+        never landed, or a fetch that failed on a clipped body,
+        left the agent dark indefinitely with every health light
+        green: found live in the 2.0.6 exercise, when a freshly
+        booted daemon sat on a full queue and fetched nothing.)
+        One small GET a minute is the same order as the activeness
+        mirror write this loop already performs. Intended for a
+        dedicated thread for the transport's lifetime; returns
+        when stop_event is set. Beats never come through here —
+        they are RTDB-only, on the doorbell's own thread, at 5s."""
         stop = stop_event or threading.Event()
         while not stop.is_set():
             if self.last_mirror_error:
@@ -1419,13 +1584,12 @@ class ServerlessTransport:
                 # offline stops re-asserting and ages out on the
                 # sweep exactly as designed.
                 self._mirror_activeness("online")
-            if self.slow_sync_active:
-                try:
-                    frames = self.slow_sync_once()
-                    if frames:
-                        on_frames(frames)
-                except TransportError:
-                    pass  # still degraded; the next cadence retries
+            try:
+                frames = self.slow_sync_once()
+                if frames:
+                    on_frames(frames)
+            except TransportError:
+                pass  # degraded link; the next cadence retries
             stop.wait(SLOW_SYNC_INTERVAL_SECONDS)
 
     # ================================================================
