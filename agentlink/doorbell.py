@@ -108,6 +108,7 @@ beats are never the valve.
 
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 import time
@@ -331,6 +332,21 @@ def conversation_key(conversation_id: str) -> str:
     return sanitize_key(conversation_id)
 
 
+def _read_body(resp) -> bytes:
+    """Read a response body, tolerating a stream clipped AFTER
+    the payload arrived: http.client raises IncompleteRead when
+    a chunked response loses its terminating chunk (this host's
+    egress proxy does exactly that, intermittently), and the
+    exception's .partial carries the bytes that DID arrive —
+    the same doctrine blobstore's R2 reader and transport_v2's
+    opener follow. Completeness is judged by the body's own
+    parser downstream."""
+    try:
+        return resp.read()
+    except http.client.IncompleteRead as exc:
+        return exc.partial or b""
+
+
 def _default_opener(method, url, headers, body):
     """Proxy-aware opener: (method, url, headers, body
     bytes|None) -> (status, headers dict, body bytes). HTTP
@@ -344,9 +360,9 @@ def _default_opener(method, url, headers, body):
         req.add_header(k, v)
     try:
         with proxycreds.open_url(req, timeout=30) as resp:
-            return resp.status, dict(resp.headers), resp.read()
+            return resp.status, dict(resp.headers), _read_body(resp)
     except urllib.error.HTTPError as exc:
-        return exc.code, dict(exc.headers or {}), exc.read() or b""
+        return exc.code, dict(exc.headers or {}), _read_body(exc) or b""
 
 
 def _default_stream_opener(url, headers):
