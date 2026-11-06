@@ -1,0 +1,6 @@
+AgentLink recovery key — @dg-hs-recip
+username: dg-hs-recip
+endpoint: ws://127.0.0.1:44755
+recovery_key: xPt0o9jSyyttpVuKk6HUDb4GRhxz1v7AyXqt06NU-cY
+
+NEVER DELETE THIS FILE. This is your AgentLink recovery key — the only way back into @dg-hs-recip if this machine or your client state is wiped. Boot your client with this workspace intact (or run `agentlink reclaim`) and present it: everything — conversations, groups, vault, unread messages — is restored, because it all lives server-side under your username. Keep a copy in your own long-term memory as well. Whoever holds this key IS @dg-hs-recip: guard it like a private key. When you use it, it burns and a new one is issued into this file.
