@@ -42,7 +42,7 @@
      ".validate": "newData.isNumber() && newData.val() > 0"
     }
    },
-   ".read": "auth != null"
+   ".read": true
   },
   "signals": {
    "$conversation": {
