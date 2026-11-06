@@ -316,13 +316,15 @@ async def _wait_for(pred, timeout=10.0):
 # ----------------------------------------------------------------------
 
 def test_transport_mode_default_and_flip(tmp_path, monkeypatch):
+    # 2.0.1: serverless is the default (the v1 relay is retired);
+    # relay survives only as the explicit opt-in.
     monkeypatch.delenv("AGENTLINK_TRANSPORT", raising=False)
-    a = Agent(username="relayuser", state_dir=str(tmp_path / "r"))
-    assert a.transport_mode == "relay"
-    assert a._v2 is None
-    monkeypatch.setenv("AGENTLINK_TRANSPORT", "serverless")
-    b = Agent(username="srvuser", state_dir=str(tmp_path / "s"))
-    assert b.transport_mode == "serverless"
+    a = Agent(username="defaultuser", state_dir=str(tmp_path / "r"))
+    assert a.transport_mode == "serverless"
+    monkeypatch.setenv("AGENTLINK_TRANSPORT", "relay")
+    b = Agent(username="relayuser", state_dir=str(tmp_path / "s"))
+    assert b.transport_mode == "relay"
+    assert b._v2 is None
     c = Agent(username="kwuser", state_dir=str(tmp_path / "k"),
               transport="serverless")
     assert c.transport_mode == "serverless"
@@ -479,25 +481,25 @@ def test_serverless_start_refuses_ephemeral(tmp_path):
     asyncio.run(scenario())
 
 
-def test_version_200_and_manifest_offers_200():
-    assert __version__ == "2.0.0"
+def test_version_201_and_manifest_offers_201():
+    assert __version__ == "2.0.1"
     pyproject = (ROOT / "pyproject.toml").read_text()
-    assert 'version = "2.0.0"' in pyproject
+    assert 'version = "2.0.1"' in pyproject
     # The fleet's update manifest was regenerated at the owner's
-    # direct release order (2026-11-05): it offers 2.0.0, and its
+    # direct release order (2026-11-05): it offers 2.0.1, and its
     # file set covers the whole package INCLUDING the v2.0
     # serverless modules, each with a matching SHA-256.
     import hashlib
     manifest = json.loads((ROOT / "update-manifest.json").read_text())
-    assert manifest["version"] == "2.0.0"
+    assert manifest["version"] == "2.0.1"
     assert "agentlink/doorbell.py" in manifest["files"]
     assert "agentlink/transport_v2.py" in manifest["files"]
     for rel, digest in manifest["files"].items():
         actual = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
         assert actual == digest, rel
-    # A 1.8.1 install reading this manifest sees the 2.0.0 update.
+    # A 1.8.1 install reading this manifest sees the 2.0.1 update.
     updater = Updater(current_version="1.8.1")
     updater.fetch_manifest = lambda: manifest
     check = updater.check()
-    assert check["available"] == "2.0.0"
+    assert check["available"] == "2.0.1"
     assert check["update_available"] is True
