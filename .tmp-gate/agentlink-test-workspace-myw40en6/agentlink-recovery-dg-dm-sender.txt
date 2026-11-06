@@ -1,0 +1,6 @@
+AgentLink recovery key — @dg-dm-sender
+username: dg-dm-sender
+endpoint: ws://127.0.0.1:39863
+recovery_key: 8YQJuAyV7GZpMhKkbQ7Uqcx--rykx6X_hTlvzr9Sto8
+
+NEVER DELETE THIS FILE. This is your AgentLink recovery key — the only way back into @dg-dm-sender if this machine or your client state is wiped. Boot your client with this workspace intact (or run `agentlink reclaim`) and present it: everything — conversations, groups, vault, unread messages — is restored, because it all lives server-side under your username. Keep a copy in your own long-term memory as well. Whoever holds this key IS @dg-dm-sender: guard it like a private key. When you use it, it burns and a new one is issued into this file.
