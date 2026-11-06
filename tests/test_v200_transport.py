@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import http.client
 import json
 import threading
 import time
@@ -181,7 +182,15 @@ class FakeHttp:
             if method == "POST":
                 return 201, None
             if method == "GET":
-                return 200, list(self.audit_rows)
+                rows = list(self.audit_rows)
+                order = query.get("order", [""])[0]
+                if order.startswith("seq."):
+                    rows.sort(key=lambda r: r["seq"],
+                              reverse=order.endswith(".desc"))
+                lim = query.get("limit", [""])[0]
+                if lim:
+                    rows = rows[:int(lim)]
+                return 200, rows
             if method == "PATCH":
                 return 204, None
         if method in ("POST", "PATCH"):
@@ -318,6 +327,12 @@ def test_send_dm_shapes_and_signal_tap(logged_in):
     assert abody["target"] == "bob" and abody["ref_id"] == out["id"]
     assert json.loads(abody["mentions"]) == []
     assert json.loads(abody["oversight"]) == OVERSIGHT
+    # The audit row MUST carry the content envelope (the relay's
+    # _on_send recorded it; the group/channel paths record it):
+    # without it, DM history read-back returns rows whose content
+    # is gone once the queue frame is acked — live-proven defect
+    # 2026-11-06 (every v2 DM audit row had content_envelope="").
+    assert json.loads(abody["content_envelope"]) == ENVELOPE
     assert abody["size"] == len("CIPHERTEXT")
     # Signal tap: sanitized DM key, counter bumped, ids only.
     taps = fake.find("PATCH", "/signals/")
@@ -413,6 +428,29 @@ def test_fetch_conversation_dm_shaping(logged_in):
     assert [r["ref_id"] for r in rows] == ["m1", "m2"]
     assert rows[0]["from"] == "alice" and rows[0]["to"] == "bob"
     assert rows[0]["seq"] == 7 and rows[0]["oversight"] is None
+
+
+def test_fetch_conversation_bounds_the_wire_window(logged_in):
+    """The history read must ask PostgREST for the newest `limit`
+    rows (order=seq.desc + limit=), never fetch the whole thread
+    and slice locally — the unbounded read truncates on lossy
+    links (live-proven 2026-11-06)."""
+    fake, transport = logged_in
+    fake.audit_rows = [
+        {"seq": s, "ts": 100 + s, "kind": "message",
+         "actor": "alice" if s % 2 else "bob",
+         "target": "bob" if s % 2 else "alice", "group_id": "",
+         "work_id": "", "status": "delivered", "priority": "normal",
+         "size": 3, "mentions": "[]", "ref_id": f"m{s}",
+         "sender_nickname": "", "sender_role": "",
+         "sender_custom_role": "", "oversight": "",
+         "content_envelope": ""}
+        for s in range(1, 6)]
+    rows = transport.fetch_conversation(peer="bob", limit=2)
+    assert [r["ref_id"] for r in rows] == ["m4", "m5"]  # newest, oldest-first
+    gets = fake.find("GET", "/rest/v1/al_audit_log")
+    assert gets and "order=seq.desc" in gets[-1][1]
+    assert "limit=2" in gets[-1][1]
 
 
 # ==================== doorbell wire hygiene ==========================
@@ -730,7 +768,26 @@ def test_transport_mode_flip():
     assert transport_mode({"AGENTLINK_TRANSPORT": "serverless"}) \
         == "serverless"
     assert transport_mode({"AGENTLINK_TRANSPORT": "relay"}) == "relay"
-    assert transport_mode({}) == "relay"
+    # 2.0.1: the v1 relay is retired — the DEFAULT is serverless.
+    # The old relay default stranded every auto-updated agent that
+    # had no flip set (beulah, frozen 2026-11-04 on 2.0.0).
+    assert transport_mode({}) == "serverless"
+
+
+def test_serverless_config_production_defaults():
+    # 2.0.1: a stock daemon connects with zero configuration — the
+    # production endpoints are baked in (all public client
+    # coordinates); env still overrides every one of them.
+    cfg = ServerlessConfig.from_env({})
+    assert cfg.supabase_url == \
+        "https://gqmzwbmmloklrkvxlmdc.supabase.co"
+    assert cfg.login_edge_url.endswith("/functions/v1/agentlink-login")
+    assert cfg.firebase_database_url == \
+        "https://agentlink-84609-default-rtdb.firebaseio.com"
+    assert cfg.anon_key  # the public, RLS-guarded anon key
+    over = ServerlessConfig.from_env(
+        {"AGENTLINK_SUPABASE_URL": "https://example.invalid"})
+    assert over.supabase_url == "https://example.invalid"
 
 
 # ============ default openers route through proxycreds ============
@@ -790,6 +847,46 @@ def test_v2_default_openers_route_through_proxycreds(monkeypatch):
     out = doorbell_mod._default_opener(
         "GET", "https://db.test/rest", {}, None)
     assert out[0] == 403
+
+
+class _ClippedResp(_FakeResp):
+    """A response whose chunked stream lost its terminating
+    chunk AFTER the full body arrived: read() raises
+    IncompleteRead carrying the complete payload in .partial
+    (the egress proxy's intermittent clip, seen live in the
+    v2.0 exercise: DM fetch read 4983 bytes then raised)."""
+
+    def read(self):
+        raise http.client.IncompleteRead(self._body)
+
+
+def test_v2_default_openers_tolerate_clipped_body(monkeypatch):
+    """A clipped stream must surface its (complete) payload,
+    not an exception: both v2 default openers return the
+    partial body and let the downstream JSON parser judge
+    completeness — the blobstore R2 reader's doctrine."""
+    body = b'{"ok": true, "rows": [1, 2, 3]}'
+    monkeypatch.setattr(
+        proxycreds, "open_url",
+        lambda req, timeout=None: _ClippedResp(200, body))
+    out = transport_mod._default_opener(
+        "GET", "https://db.test/rest", {}, None)
+    assert out[0] == 200 and out[2] == body
+    out = doorbell_mod._default_opener(
+        "GET", "https://db.test/rest", {}, None)
+    assert out[0] == 200 and out[2] == body
+
+    def raising_open_url(req, timeout=None):
+        err = urllib.error.HTTPError(
+            req.full_url, 500, "boom", {}, None)
+        err.read = lambda *a: (_ for _ in ()).throw(
+            http.client.IncompleteRead(body))
+        raise err
+
+    monkeypatch.setattr(proxycreds, "open_url", raising_open_url)
+    out = transport_mod._default_opener(
+        "GET", "https://db.test/rest", {}, None)
+    assert out[0] == 500 and out[2] == body
 
 
 def test_v2_stream_opener_routes_through_proxycreds(monkeypatch):
