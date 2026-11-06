@@ -1105,6 +1105,9 @@ class Agent:
         # exactly-once when a queued flush, a history sync and the
         # start-of-session replay all race over the same item.
         self._takein_inflight: set[str] = set()
+        # Rooms whose admins this session has already asked to
+        # re-issue a key wrap (2.0.6 self-heal; see _ask_key_reissue).
+        self._key_reissue_asked: set = set()
         # Instance lock (v1.3.7): the OS-level lock fd this process
         # holds on instance-<username>.lock, or None. Held from the
         # first start() until close() — across every reconnect —
@@ -2871,8 +2874,19 @@ class Agent:
             return
         try:
             rows = v2.fetch_unacked()
-        except Exception:
-            log.exception("serverless signal fetch failed")
+        except Exception as exc:
+            # A transient fetch failure (the path emptied or
+            # clipped the response past its retry budget) is the
+            # designed degradation this docstring describes — the
+            # slow-sync leg retries within the minute and delivery
+            # continues. It is logged as ONE warning line, not a
+            # traceback: a traceback is the shape of a crash, and
+            # stamping one on a self-healing transient corrupts
+            # the log's signal for every operator watching it
+            # (2.0.6 soak catch, 2026-11-06 — the supervisor read
+            # this traceback as a fault while the daemon delivered
+            # on around it).
+            log.warning("serverless signal fetch failed: %s", exc)
             return
         for row in rows or []:
             frame = row.get("frame") if isinstance(row, dict) else None
@@ -3318,6 +3332,12 @@ class Agent:
             return v2.set_group_keys(frame)
         if ftype == "set_channel_keys":
             return v2.set_channel_keys(frame)
+        if ftype == "attach_oversight":
+            return v2.attach_oversight(frame)
+        if ftype == "group_key_request":
+            return v2.request_group_key(frame)
+        if ftype == "channel_key_request":
+            return v2.request_channel_key(frame)
         if ftype in ("group_create", "group_add", "group_remove",
                      "group_promote", "group_demote",
                      "group_nickname", "group_custom_role",
@@ -4452,6 +4472,99 @@ class Agent:
     def _oversight_for_key(self, key: bytes) -> dict | None:
         return self._oversight_wrap(key, "content_key")
 
+    async def _rectify_oversight(self, ref_id, *, payload=None,
+                                 room_key=None) -> None:
+        """Receiver-side oversight rectification (2.0.6): a message
+        whose sender shipped no oversight wrap would sit unreadable
+        on the owner's dashboard. The receiver — which has just
+        decrypted the message legitimately — computes the same wrap
+        the sender would have (the content wrap for a DM, the room
+        key wrap for group/channel traffic) and attaches it to the
+        audit row through the pinned database function, which only
+        ever fills an EMPTY oversight column for a party to the
+        message. Fail-soft by design: a failure leaves the row
+        unwrapped, the next history sync retries, and message
+        processing never blocks on it."""
+        if not ref_id or not self.oversight_pubkey:
+            return
+        try:
+            wrap = None
+            if room_key is not None:
+                wrap = self._oversight_for_key(room_key)
+            elif payload is not None:
+                wrap = self._oversight_for_obj(payload)
+            if not wrap:
+                return
+            await self._request({"type": "attach_oversight",
+                                 "ref_id": str(ref_id),
+                                 "oversight": wrap})
+        except Exception:
+            log.debug("oversight rectification failed for %s",
+                      ref_id, exc_info=True)
+
+    async def _ask_key_reissue(self, scope: str, scope_id: str) -> None:
+        """My stored wrap for this group/channel no longer unwraps
+        (the classic cause: my identity rotated after the wrap was
+        sealed). Ask the room's admins — at most once per room per
+        session — to re-issue the current epoch key sealed to my
+        CURRENT directory key. Fail-soft: if the ask cannot go
+        out, the next session asks again."""
+        tag = (scope, scope_id)
+        if tag in self._key_reissue_asked:
+            return
+        self._key_reissue_asked.add(tag)
+        try:
+            await self._request({"type": f"{scope}_key_request",
+                                 f"{scope}_id": scope_id})
+        except Exception:
+            log.debug("key reissue ask failed for %s %s",
+                      scope, scope_id, exc_info=True)
+
+    async def _reissue_group_key(self, frame: dict) -> None:
+        """A member's group wrap no longer unwraps: if I hold this
+        group's key, re-seal the SAME epoch key to the member's
+        CURRENT directory pubkey and re-distribute to them alone.
+        The store enforces admin rights on the write; a non-admin
+        attempt is refused there and logged here, never fatal. The
+        request frame is acked once handled — or when there is
+        nothing I can do (no key held) — and left in custody when
+        the re-distribution itself failed, so it is retried."""
+        gid = frame.get("group_id")
+        requester = frame.get("from")
+        rec = self._group_keys.get(gid) if gid else None
+        if not rec or not requester or requester == self.username:
+            if frame.get("id"):
+                await self._send_ack([frame["id"]])
+            return
+        try:
+            await self._distribute_group_key(
+                gid, int(rec["epoch"]), rec["key"], [requester])
+        except Exception:
+            log.warning("group key reissue for %s in %s failed",
+                        requester, gid, exc_info=True)
+            return
+        if frame.get("id"):
+            await self._send_ack([frame["id"]])
+
+    async def _reissue_channel_key(self, frame: dict) -> None:
+        """The channel twin of _reissue_group_key."""
+        cid = frame.get("channel_id")
+        requester = frame.get("from")
+        rec = self._channel_keys.get(cid) if cid else None
+        if not rec or not requester or requester == self.username:
+            if frame.get("id"):
+                await self._send_ack([frame["id"]])
+            return
+        try:
+            await self._distribute_channel_key(
+                cid, int(rec["epoch"]), rec["key"], [requester])
+        except Exception:
+            log.warning("channel key reissue for %s in %s failed",
+                        requester, cid, exc_info=True)
+            return
+        if frame.get("id"):
+            await self._send_ack([frame["id"]])
+
     # -- dispatch ------------------------------------------------------------------------
     async def _dispatch(self, frame: dict) -> None:
         ftype = frame.get("type")
@@ -4491,6 +4604,8 @@ class Agent:
                                       int(frame["epoch"]), key)
             except Exception:
                 log.exception("failed to unwrap group key")
+                asyncio.create_task(self._ask_key_reissue(
+                    "group", str(frame.get("group_id") or "")))
             return
         if ftype == "channel_key":
             try:
@@ -4499,6 +4614,14 @@ class Agent:
                                         int(frame["epoch"]), key)
             except Exception:
                 log.exception("failed to unwrap channel key")
+                asyncio.create_task(self._ask_key_reissue(
+                    "channel", str(frame.get("channel_id") or "")))
+            return
+        if ftype == "group_key_request":
+            asyncio.create_task(self._reissue_group_key(frame))
+            return
+        if ftype == "channel_key_request":
+            asyncio.create_task(self._reissue_channel_key(frame))
             return
         if ftype == "channel_event":
             self.channel_events.append(frame)
@@ -4760,6 +4883,7 @@ class Agent:
         try:
             key = self.identity.unwrap_key(key_rec["wrapped"])
         except Exception:
+            await self._ask_key_reissue("channel", cid)
             return None
         self._store_channel_key(cid, int(key_rec["epoch"]), key)
         return self._channel_keys[cid]
@@ -4949,10 +5073,11 @@ class Agent:
         taken=0 and replay into the intelligence. A row whose
         envelope cannot be opened here is journaled as a sealed
         stub — a row is never dropped silently. Returns
-        {"fetched", "inserted", "pages"} (plus "error" when the
-        relay could not be asked — the sync is resumable by simply
-        calling it again, and start() calls it on every connect)."""
-        out = {"fetched": 0, "inserted": 0, "pages": 0}
+        {"fetched", "inserted", "pages", "rectified"} (plus
+        "error" when the relay could not be asked — the sync is
+        resumable by simply calling it again, and start() calls it
+        on every connect)."""
+        out = {"fetched": 0, "inserted": 0, "pages": 0, "rectified": 0}
         mb = self.mailbox
         if mb is None or (self._ws is None and self._v2 is None):
             return out
@@ -4982,8 +5107,20 @@ class Agent:
                 msg = self._history_row_to_msg(row)
                 if msg is None or not msg.get("id"):
                     continue
+                rectify = msg.pop("_rectify", None)
                 if mb.put_if_absent(msg):
                     out["inserted"] += 1
+                if rectify is not None and out["rectified"] < 150:
+                    # Bounded per sync (the sync re-pages everything
+                    # on every connect, so the remainder is picked
+                    # up next time); a failed attach leaves the row
+                    # unwrapped and is retried the same way.
+                    try:
+                        await self._request(
+                            {"type": "attach_oversight", **rectify})
+                        out["rectified"] += 1
+                    except Exception:
+                        pass
             if len(rows) < page_size or smallest is None:
                 break  # short page = the beginning of history
             if before is not None and smallest >= before:
@@ -5087,6 +5224,19 @@ class Agent:
         msg["file"] = payload.get("file")
         msg["size"] = (payload.get("file") or {}).get(
             "size", len(msg["body"]))
+        if not row.get("oversight") and self.oversight_pubkey:
+            # Backfill (2.0.6): this row's sender shipped no
+            # oversight wrap. Stash the wrap on the msg (the sync
+            # loop pops it before journaling and attaches it), so
+            # the owner's dashboard can read history too, not just
+            # live traffic.
+            wrap = None
+            if (channel_id or group_id) and rec:
+                wrap = self._oversight_for_key(rec["key"])
+            elif not channel_id and not group_id:
+                wrap = self._oversight_for_obj(payload)
+            if wrap:
+                msg["_rectify"] = {"ref_id": ref, "oversight": wrap}
         return msg
 
     # -- messages ---------------------------------------------------------------------------
@@ -5105,6 +5255,7 @@ class Agent:
         try:
             key = self.identity.unwrap_key(key_rec["wrapped"])
         except Exception:
+            await self._ask_key_reissue("group", gid)
             return None
         self._store_group_key(gid, int(key_rec["epoch"]), key)
         return self._group_keys[gid]
@@ -5135,6 +5286,16 @@ class Agent:
         except Exception:
             log.exception("failed to decrypt message %s", frame.get("id"))
             return
+        if not frame.get("oversight"):
+            # The sender shipped no oversight wrap (an old client):
+            # rectify from the plaintext just decrypted, in the
+            # background — never on the delivery path's clock.
+            if frame.get("channel_id") or frame.get("group_id"):
+                asyncio.create_task(self._rectify_oversight(
+                    frame.get("id"), room_key=rec["key"]))
+            else:
+                asyncio.create_task(self._rectify_oversight(
+                    frame.get("id"), payload=payload))
         if frame.get("from_pubkey"):
             self._pubkey_cache[frame["from"]] = (
                 frame["from_pubkey"], time.time())
