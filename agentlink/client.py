@@ -79,9 +79,9 @@ from pathlib import Path
 import websockets.exceptions
 from websockets.client import connect
 
-from .config import resolve_endpoint, resolve_fallbacks, \
-    resolve_oversight_pubkey, resolve_update_check_seconds, \
-    self_update_enabled
+from .config import DEFAULT_ENDPOINT, resolve_endpoint, \
+    resolve_fallbacks, resolve_oversight_pubkey, \
+    resolve_update_check_seconds, self_update_enabled
 from .deadlines import pacific_display
 from .timing import (
     AUTO_HOURLY_BUDGET,
@@ -694,16 +694,33 @@ class Agent:
                 f"bad designation {designation!r}: expected one of "
                 f"{self.DESIGNATIONS}")
         self.designation = d
-        # Dual transport (v2.0): the daemon runs on ONE of two
-        # data paths, chosen by the AGENTLINK_TRANSPORT config
-        # flip (transport_v2.transport_mode) or the explicit
-        # transport= override — "serverless" (Supabase + Firebase
-        # via agentlink.transport_v2, no relay anywhere) or
-        # "relay" (the websocket mesh, still the default and the
-        # live fallback until the serverless cutover). The flip
-        # is configuration only: identity, state dir, mailbox,
-        # journal and handlers are identical on both paths.
-        _tm = str(transport or _env_transport_mode()).strip().lower()
+        # Dual transport: the daemon runs on ONE of two data
+        # paths — "serverless" (Supabase + Firebase via
+        # agentlink.transport_v2, no relay anywhere) or "relay"
+        # (the websocket mesh). Selection, highest first:
+        #   1. the explicit transport= override;
+        #   2. the AGENTLINK_TRANSPORT config flip, when set;
+        #   3. an explicit NON-DEFAULT endpoint: a caller pointing
+        #      this client at a specific relay (a private
+        #      deployment, a test relay) means that relay;
+        #   4. the default: serverless (2.0.1). The production
+        #      relay behind DEFAULT_ENDPOINT retired at the v2.0
+        #      cutover, so the bare default endpoint carries no
+        #      relay intent — defaulting to it stranded the fleet
+        #      (beulah, frozen 2026-11-04 on 2.0.0).
+        # The choice is configuration only: identity, state dir,
+        # mailbox, journal and handlers are identical on both
+        # paths.
+        _tm = str(transport or "").strip().lower()
+        if not _tm:
+            _env_tm = os.environ.get("AGENTLINK_TRANSPORT")
+            if _env_tm:
+                _tm = _env_tm.strip().lower()
+            elif endpoint and str(endpoint).strip() not in \
+                    ("", DEFAULT_ENDPOINT):
+                _tm = "relay"
+            else:
+                _tm = _env_transport_mode()
         self.transport_mode = "serverless" if _tm == "serverless" \
             else "relay"
         # Serverless wiring seams: a prebuilt config (else the
