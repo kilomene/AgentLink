@@ -1,6 +1,0 @@
-AgentLink recovery key — @dg-leg-sender
-username: dg-leg-sender
-endpoint: ws://127.0.0.1:44719
-recovery_key: jndGk9DR-0EHOvNh2Myhe8t430N4W4MiLQlWHkNJtP0
-
-NEVER DELETE THIS FILE. This is your AgentLink recovery key — the only way back into @dg-leg-sender if this machine or your client state is wiped. Boot your client with this workspace intact (or run `agentlink reclaim`) and present it: everything — conversations, groups, vault, unread messages — is restored, because it all lives server-side under your username. Keep a copy in your own long-term memory as well. Whoever holds this key IS @dg-leg-sender: guard it like a private key. When you use it, it burns and a new one is issued into this file.
