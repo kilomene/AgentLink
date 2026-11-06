@@ -244,6 +244,7 @@ class ServerlessConfig:
         "AGENTLINK_LOGIN_EDGE_URL":
             "https://gqmzwbmmloklrkvxlmdc.supabase.co"
             "/functions/v1/agentlink-login",
+        "AGENTLINK_FIREBASE_API_KEY": "AIzaSyDk9Ic4pbQglf0kyIBa_oLGmu5iHbnWFFI",
     }
 
     @classmethod
@@ -258,7 +259,9 @@ class ServerlessConfig:
             firebase_project_id=env.get(
                 "AGENTLINK_FIREBASE_PROJECT",
                 d["AGENTLINK_FIREBASE_PROJECT"]),
-            firebase_api_key=env.get("AGENTLINK_FIREBASE_API_KEY", ""),
+            firebase_api_key=env.get(
+                "AGENTLINK_FIREBASE_API_KEY",
+                d["AGENTLINK_FIREBASE_API_KEY"]),
             firebase_database_url=env.get(
                 "AGENTLINK_FIREBASE_DATABASE_URL",
                 d["AGENTLINK_FIREBASE_DATABASE_URL"]),
@@ -399,6 +402,13 @@ class ServerlessTransport:
         self.last_refresh_error = ""
         self.last_mirror_error = ""
         self.client_version = ""
+        #: Owner-oversight PUBLIC key advertised by the login Edge
+        #: with the session tokens (the serverless welcome frame —
+        #: the v1 relay advertised it the same way). The Agent
+        #: adopts it at login when it has no locally configured key,
+        #: so zero-config agents seal an oversight wrap on every
+        #: content send. "" until a login reply carries it.
+        self.oversight_pubkey = ""
         # Scoped presence subscriptions (counterparties only).
         self._counterparty_provider = None
         self._presence_watcher = None
@@ -423,10 +433,21 @@ class ServerlessTransport:
         return headers
 
     def _rest(self, method: str, table: str, query: str = "",
-              body=None, prefer: str = "", _retried: bool = False):
+              body=None, prefer: str = "", _retried: bool = False,
+              _decode_attempt: int = 0):
         """One PostgREST call with the agent JWT. A 401 triggers
         exactly one event-driven re-login and one retry — the ONLY
-        refresh path, and it never loops."""
+        refresh path, and it never loops.
+
+        A 200 whose body cannot be decoded is a truncated transfer
+        (an imperfect network clipping a large response — the
+        2026-11-06 soak caught one escaping fetch_unacked as a raw
+        JSONDecodeError). On a read that is a transient fault:
+        retried in place, bounded, and only then raised as
+        TransportError, the error contract every caller already
+        handles. A write is never re-executed over an undecodable
+        response (the write may have landed); it raises
+        TransportError at once."""
         if not self.config.supabase_url:
             raise TransportError("no Supabase URL configured")
         path = f"{self.config.rest_base}/{self.config.table(table)}"
@@ -442,13 +463,24 @@ class ServerlessTransport:
                 and self.username:
             self._login(self.username, self._signer)
             return self._rest(method, table, query, body, prefer,
-                              _retried=True)
+                              _retried=True,
+                              _decode_attempt=_decode_attempt)
         if status >= 400:
             raise TransportError(
                 f"PostgREST {method} {table} HTTP {status}")
         if not raw:
             return None
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except ValueError as exc:
+            if method == "GET" and _decode_attempt < 3:
+                time.sleep(next_backoff_s(_decode_attempt))
+                return self._rest(method, table, query, body, prefer,
+                                  _retried=_retried,
+                                  _decode_attempt=_decode_attempt + 1)
+            raise TransportError(
+                f"PostgREST {method} {table} returned an undecodable "
+                f"body") from exc
 
     @staticmethod
     def _eq(col: str, val) -> str:
@@ -464,7 +496,14 @@ class ServerlessTransport:
             "POST", url, {"Content-Type": "application/json",
                           "apikey": self.config.anon_key}, body)
         if status >= 400:
-            raise TransportError(f"login Edge {suffix} HTTP {status}")
+            code = ""
+            try:
+                code = str(json.loads(raw or b"{}").get("error") or "")
+            except Exception:
+                code = ""
+            raise TransportError(
+                f"login Edge {suffix} HTTP {status}"
+                + (f": {code}" if code else ""))
         try:
             return json.loads(raw or b"{}")
         except Exception as exc:
@@ -522,6 +561,13 @@ class ServerlessTransport:
         if not jwt:
             raise TransportError("login Edge verify returned no JWT")
         self._jwt = jwt
+        # Oversight welcome (2.0.4): the Edge advertises the
+        # owner-oversight public key with the tokens; keep the
+        # newest advertised value (a reply that omits it never
+        # wipes a key an earlier login already delivered).
+        _advertised_oversight = str(reply.get("oversight_pubkey") or "")
+        if _advertised_oversight:
+            self.oversight_pubkey = _advertised_oversight
         # Refresh scheduling reads the token's OWN exp claim (the
         # Edge reply's expires_at is only a fallback): the refresh
         # is armed from the credential itself, never polled for.
@@ -596,13 +642,17 @@ class ServerlessTransport:
         return True
 
     def _mirror_activeness(self, state: str) -> None:
-        """Supabase mirror of ONE transition: the al_activeness
-        row (Phase 1's table — {username, state, updated_at}; the
-        write is fail-soft until the coordinator confirms that
-        table's final column contract, and any failure is kept in
+        """Supabase mirror write: the al_activeness row (Phase 1's
+        table — {username, state, updated_at}; the write is
+        fail-soft until the coordinator confirms that table's
+        final column contract, and any failure is kept in
         last_mirror_error, never raised into the beat path) plus
         the durable backup: al_connections upsert + al_users
-        last_seen touch via update_presence_backup."""
+        last_seen touch via update_presence_backup. Called on
+        ladder transitions and, while steadily online, once per
+        slow-sync cadence as truth-keeping (see run_slow_sync —
+        the timestamps this write advances are what the
+        activeness sweep ages serverless rows by)."""
         try:
             self._rest("POST", "activeness", body={
                 "username": self.username, "state": state,
@@ -612,9 +662,23 @@ class ServerlessTransport:
                               else "rtdb"),
                 "updated_at": now_ts()},
                 prefer="return=minimal,resolution=merge-duplicates")
+            self.last_mirror_error = ""
         except TransportError as exc:
             self.last_mirror_error = str(exc)
-        self.update_presence_backup(online=(state != "offline"))
+        # The backup leg is part of the mirror, so it lives under
+        # the same fail-soft contract: its failure is recorded in
+        # last_mirror_error (the slow-sync cadence then re-asserts
+        # until the whole mirror lands) and NEVER raised into a
+        # caller. 2.0.4's soak caught the breach: the every-minute
+        # re-assertion multiplied this call's exposure, a clipped
+        # PATCH users response raised TransportError straight out
+        # of run_slow_sync, and the slow-sync thread died at
+        # minute 12 (2026-11-06). On transitions the same hole
+        # could have raised into the login and heartbeat paths.
+        try:
+            self.update_presence_backup(online=(state != "offline"))
+        except TransportError as exc:
+            self.last_mirror_error = str(exc)
 
     def _on_beat_transition(self, state: str) -> None:
         """Heartbeat-thread callback: a ladder change detected by
@@ -703,10 +767,12 @@ class ServerlessTransport:
         """Supabase presence BACKUP: upsert my al_connections row
         and touch al_users.last_seen.
 
-        Called ONLY from _mirror_activeness — i.e. ONLY on ladder
-        transitions (structure-pinned by test). Live activeness
-        is Firebase's job; periodic Supabase writes would burn
-        the egress budget for nothing.
+        Called ONLY from _mirror_activeness (structure-pinned by
+        test) — on ladder transitions and on the slow-sync
+        cadence's online truth-keeping re-assertion. Live
+        activeness is Firebase's job; this backup exists so the
+        Postgres record the sweeps and the dashboard floor read
+        never claims a live agent is offline.
         """
         if not self.username:
             return
@@ -1225,9 +1291,29 @@ class ServerlessTransport:
                 read_at = int(existing[0]["read_at"])
             else:
                 read_at = now_ts()
-                self._rest("POST", "message_reads", body={
-                    "message_id": mid, "reader": self.username,
-                    "read_at": read_at}, prefer="return=minimal")
+                try:
+                    self._rest("POST", "message_reads", body={
+                        "message_id": mid, "reader": self.username,
+                        "read_at": read_at}, prefer="return=minimal")
+                except TransportError as exc:
+                    # First-read-wins is this method's contract: a
+                    # 409 means the read is ALREADY recorded (a
+                    # duplicate delivery of the same read — the
+                    # daemon's signal + slow-sync overlap, or a
+                    # peer's retry — landed first). It is success
+                    # with the original timestamp, never an error
+                    # (2026-11-06: a bare 409 here killed the
+                    # DM read-state proof mid-run).
+                    if "HTTP 409" not in str(exc):
+                        raise
+                    landed = self._rest(
+                        "GET", "message_reads",
+                        self._eq("message_id", mid) + "&"
+                        + self._eq("reader", self.username)
+                        + "&select=read_at") or []
+                    if not landed:
+                        raise
+                    read_at = int(landed[0]["read_at"])
             recorded.append({"id": mid, "read_at": read_at})
             self._audit("message_read", target=sender, group_id=gid,
                         status="read", ref_id=mid)
@@ -1303,6 +1389,36 @@ class ServerlessTransport:
         thread, at 5s."""
         stop = stop_event or threading.Event()
         while not stop.is_set():
+            if self.last_mirror_error:
+                # A transition mirror that failed to land (the
+                # write is fail-soft by design) must never leave
+                # the agent invisible on the dashboard until its
+                # next ladder change: beulah connected on 2.0.1,
+                # read and posted for minutes, and never appeared
+                # in al_activeness, because her connect mirror
+                # failed once and nothing retried it (2026-11-06).
+                # Re-assert the CURRENT state each cadence until
+                # it lands; success clears the error and the
+                # retries stop.
+                self._mirror_activeness(self._activeness_state)
+            elif self.username and self._activeness_state == "online":
+                # Truth-keeping for the Postgres mirror (2.0.4,
+                # owner catch 2026-11-06): the mirror is written
+                # on transitions, but the activeness sweep ages
+                # rows by beat_at/last_seen — timestamps that, for
+                # a steadily online agent, only this loop can
+                # advance, since the 5s beats live in Firebase by
+                # design. Without a periodic re-assertion the
+                # sweep stamped every live agent 'offline' about
+                # a minute after login and the dashboard's mirror
+                # floor showed a false offline forever. One
+                # re-assertion per 60s cadence keeps the Postgres
+                # record as fresh as the sweep's serverless
+                # thresholds (migration v205) require — and only
+                # while genuinely online: an agent that goes
+                # offline stops re-asserting and ages out on the
+                # sweep exactly as designed.
+                self._mirror_activeness("online")
             if self.slow_sync_active:
                 try:
                     frames = self.slow_sync_once()
