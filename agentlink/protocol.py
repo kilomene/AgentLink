@@ -105,9 +105,12 @@ Relay -> Client
     error          {req_id?, reason, detail}
     message        {id, from, from_name, body, kind, file, ts,
                     in_reply_to, group_id?, queued}
-    read_receipt   {id, reader, read_at, group_id?, channel_id?}
+    read_receipt   {id, from, reader, read_at, group_id?, channel_id?}
                     (v1.1.2: pushed live to a message's sender when
-                    a validated recipient reads it)
+                    a validated recipient reads it; v2.0: the frame
+                    carries `from` - the v2 queue-insert RLS policy
+                    reads the sender from the payload, and a receipt
+                    without it is refused 403)
     group_event    {id, group_id, event, actor, target?, group_name, ts}
     work_assigned  {work: {...}}
     work_update    {work: {...}, delivery?}
