@@ -52,13 +52,26 @@ def test_firebase_json_points_at_the_rules_file():
 
 
 def test_no_public_access_anywhere():
-    """No rule may grant unauthenticated access: every .read/.write
-    expression mentions auth, none is the literal true."""
+    """No rule may grant unauthenticated access, with ONE deliberate
+    exception (2026-11-06, the dashboard-presence correction): the
+    /presence read is public. Presence holds metadata only —
+    username, state, timestamps, client_version, transport — and
+    no content ever travels through Firebase (blueprint law), while
+    the owner's dashboard is a static page with no Firebase
+    sign-in of its own; an auth-gated presence read left the
+    dashboard permanently blind (verified live: anonymous read
+    401 before the fix, 200 after, writes still denied). Every
+    other .read/.write in the file must require auth, and every
+    .write anywhere — presence included — must require auth."""
     for path, key, value in _walk(_rules()):
-        if key in (".read", ".write"):
-            assert value is not True, f"{path} grants public access"
-            assert isinstance(value, str) and "auth" in value, (
-                f"{path} does not require auth: {value!r}")
+        if key not in (".read", ".write"):
+            continue
+        if path == "/rules/presence/.read":
+            assert value is True
+            continue
+        assert value is not True, f"{path} grants public access"
+        assert isinstance(value, str) and "auth" in value, (
+            f"{path} does not require auth: {value!r}")
 
 
 def test_root_has_no_grants_default_deny():
@@ -92,7 +105,12 @@ def test_signals_shape_validation_is_exact():
 
 def test_presence_write_own_only():
     presence = _rules()["rules"]["presence"]
-    assert presence[".read"] == "auth != null"
+    # The read is the one deliberate public grant (metadata only,
+    # for the owner's static dashboard — see
+    # test_no_public_access_anywhere); the WRITE stays bound to
+    # the record's own authenticated user, which is what this
+    # test exists to pin.
+    assert presence[".read"] is True
     node = presence["$user"]
     assert "auth != null" in node[".write"]
     assert "auth.uid === $user" in node[".write"]
