@@ -45,7 +45,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 from agentlink import __version__
 from agentlink.client import Agent, RequestFailed
-from agentlink.crypto import Identity
+from agentlink.crypto import Identity, encrypt_with_key
 from agentlink.doorbell import DoorbellError, sanitize_key
 from agentlink.protocol import auth_challenge_payload
 from agentlink.transport_v2 import ServerlessConfig, ServerlessTransport
@@ -83,6 +83,7 @@ class FakeBackend:
         self.sign_pubs = {}   # username -> sign_pub b64
         self.advertise_oversight = ""   # verify-reply oversight key
         self.calls = []
+        self.attach_calls = []   # al_attach_oversight RPC params
         self._seq = 1000
 
     # -- helpers ------------------------------------------------------
@@ -104,9 +105,27 @@ class FakeBackend:
             # best-effort boot declarations honest no-ops here.
             # The coverage suite fakes them for real.
             return 404, {}, b'{"error":"not_found"}'
+        if "/rest/v1/rpc/" in url:
+            return self._rpc(url, body)
         if "/rest/v1/" in url:
             return self._rest(method, url, body)
         raise AssertionError(f"unexpected URL {url}")
+
+    def _rpc(self, url, body):
+        # Database functions (migration v207): al_attach_oversight
+        # with its real semantics — fill the oversight column only
+        # while the row carries none.
+        fn = url.rsplit("/", 1)[-1]
+        params = json.loads(body or b"{}")
+        if fn == "al_attach_oversight":
+            self.attach_calls.append(params)
+            ref = params.get("p_ref_id")
+            for row in self.tables["audit_log"]:
+                if row.get("ref_id") == ref and not row.get("oversight"):
+                    row["oversight"] = params.get("p_oversight")
+                    return 200, {}, b"true"
+            return 200, {}, b"false"
+        return 404, {}, b"{}"
 
     def _edge(self, method, url, body):
         payload = json.loads(body or b"{}")
@@ -445,6 +464,35 @@ def test_daemon_start_supervision_delivery_and_close(tmp_path):
     asyncio.run(scenario())
 
 
+def test_signal_fetch_failure_logs_one_warning_no_traceback(
+        tmp_path, caplog):
+    # 2.0.6 soak catch (2026-11-06): a transient custody-fetch
+    # failure on the signal path is the designed degradation —
+    # slow-sync retries within the minute — but _on_v2_signal
+    # logged it with log.exception, stamping a crash-shaped
+    # traceback on a self-healing event and failing the soak's
+    # stderr watch while the daemon delivered on around it. The
+    # handler now logs ONE warning line with no exception info.
+    import logging as _logging
+    backend = FakeBackend()
+    doorbell = StubDoorbell()
+    agent, _transport = _make_agent(tmp_path, backend, doorbell)
+
+    class _Boom:
+        def fetch_unacked(self):
+            raise RuntimeError("PostgREST GET queue returned "
+                               "an empty body")
+
+    agent._v2 = _Boom()
+    with caplog.at_level(_logging.WARNING, logger="agentlink.client"):
+        agent._on_v2_signal("dm:alice|bob", {"counter": 1})
+    records = [r for r in caplog.records
+               if "signal fetch failed" in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == _logging.WARNING
+    assert records[0].exc_info is None
+
+
 def test_run_loop_connects_and_close_returns(tmp_path):
     backend = FakeBackend()
     doorbell = StubDoorbell()
@@ -541,27 +589,246 @@ def test_serverless_login_never_replaces_local_oversight_key(tmp_path):
     asyncio.run(scenario())
 
 
-def test_version_205_and_manifest_offers_205():
-    assert __version__ == "2.0.5"
+def test_receiver_rectifies_unwrapped_dm_live(tmp_path):
+    # 2.0.6 (owner order: no "sealed" on the dashboard): a DM from
+    # an old client carries no oversight wrap. The receiving agent
+    # — which decrypts it legitimately — computes the sender's
+    # content wrap itself and attaches it to the audit row through
+    # the pinned database function.
+    oversight_id = Identity.ephemeral()
+    backend = FakeBackend()
+    doorbell = StubDoorbell()
+    agent, transport = _make_agent(
+        tmp_path, backend, doorbell,
+        oversight_pubkey=oversight_id.public_key_b64)
+    bob = Identity.ephemeral()
+    backend.tables["directory"].append({
+        "username": "bob", "pubkey": bob.public_key_b64,
+        "sign_pub": bob.signing_public_key_b64})
+    frame = _dm_frame(bob, agent.identity.public_key_b64, "hello alice")
+    backend.tables["audit_log"].append({
+        "seq": 9001, "ts": int(time.time()), "kind": "message",
+        "actor": "bob", "target": "alice", "group_id": "",
+        "ref_id": "msg-1", "status": "sent", "priority": "normal",
+        "size": 10, "mentions": [], "oversight": "",
+        "content_envelope": json.dumps(frame["content"])})
+    _enqueue_frame(backend, "alice", frame)
+    doorbell.signal_conversation = "dm:alice|bob"
+    received = []
+    agent.on_message(lambda msg: received.append(msg))
+
+    async def scenario():
+        await agent.start()
+        try:
+            assert await _wait_for(lambda: len(received) == 1)
+            assert await _wait_for(
+                lambda: len(backend.attach_calls) >= 1)
+            call = backend.attach_calls[0]
+            assert call["p_ref_id"] == "msg-1"
+            wrap = json.loads(call["p_oversight"])
+            assert wrap["kind"] == "content"
+            plain = json.loads(oversight_id.decrypt_envelope(wrap))
+            assert plain["body"] == "hello alice"
+            assert backend.tables["audit_log"][0]["oversight"]
+        finally:
+            await agent.close()
+
+    asyncio.run(scenario())
+
+
+def test_receiver_rectifies_unwrapped_group_message(tmp_path):
+    # The group twin: the receiver wraps the ROOM KEY (the
+    # content_key form group senders use), so the dashboard opens
+    # the whole room history with the one wrap.
+    oversight_id = Identity.ephemeral()
+    backend = FakeBackend()
+    doorbell = StubDoorbell()
+    agent, transport = _make_agent(
+        tmp_path, backend, doorbell,
+        oversight_pubkey=oversight_id.public_key_b64)
+    bob = Identity.ephemeral()
+    backend.tables["directory"].append({
+        "username": "bob", "pubkey": bob.public_key_b64,
+        "sign_pub": bob.signing_public_key_b64})
+    room_key = b"r" * 32
+    agent._store_group_key("g1", 1, room_key)
+    content = encrypt_with_key(
+        room_key, json.dumps({"body": "group hi", "kind": "text"}).encode())
+    frame = {"type": "message", "id": "gm-1", "from": "bob",
+             "from_name": "bob", "from_pubkey": bob.public_key_b64,
+             "sender_nickname": "", "sender_role": "",
+             "sender_custom_role": "", "oversight": None,
+             "mentions": [], "priority": "normal", "content": content,
+             "ts": int(time.time()), "in_reply_to": None,
+             "group_id": "g1", "group_name": "G"}
+    backend.tables["audit_log"].append({
+        "seq": 9002, "ts": int(time.time()), "kind": "group_message",
+        "actor": "bob", "target": "", "group_id": "g1",
+        "ref_id": "gm-1", "status": "sent", "priority": "normal",
+        "size": 10, "mentions": [], "oversight": "",
+        "content_envelope": json.dumps(content)})
+    _enqueue_frame(backend, "alice", frame)
+    doorbell.signal_conversation = "dm:alice|bob"
+    received = []
+    agent.on_message(lambda msg: received.append(msg))
+
+    async def scenario():
+        await agent.start()
+        try:
+            assert await _wait_for(lambda: len(received) == 1)
+            assert await _wait_for(
+                lambda: len(backend.attach_calls) >= 1)
+            wrap = json.loads(backend.attach_calls[0]["p_oversight"])
+            assert backend.attach_calls[0]["p_ref_id"] == "gm-1"
+            assert wrap["kind"] == "content_key"
+            assert oversight_id.decrypt_envelope(wrap) == room_key
+        finally:
+            await agent.close()
+
+    asyncio.run(scenario())
+
+
+def test_history_backfill_rectifies_unwrapped_rows(tmp_path):
+    # The same rectification applied to HISTORY at start(): an old
+    # unwrapped row gains its wrap during the boot history sync,
+    # so the dashboard reads back-conversations too.
+    oversight_id = Identity.ephemeral()
+    backend = FakeBackend()
+    doorbell = StubDoorbell()
+    agent, transport = _make_agent(
+        tmp_path, backend, doorbell,
+        oversight_pubkey=oversight_id.public_key_b64)
+    bob = Identity.ephemeral()
+    backend.tables["directory"].append({
+        "username": "bob", "pubkey": bob.public_key_b64,
+        "sign_pub": bob.signing_public_key_b64})
+    frame = _dm_frame(bob, agent.identity.public_key_b64,
+                      "from before", mid="old-1")
+    backend.tables["audit_log"].append({
+        "seq": 9003, "ts": int(time.time()), "kind": "message",
+        "actor": "bob", "target": "alice", "group_id": "",
+        "ref_id": "old-1", "status": "delivered", "priority": "normal",
+        "size": 10, "mentions": [], "oversight": "",
+        "content_envelope": json.dumps(frame["content"])})
+
+    async def scenario():
+        await agent.start()
+        try:
+            assert await _wait_for(
+                lambda: len(backend.attach_calls) >= 1)
+            assert backend.attach_calls[0]["p_ref_id"] == "old-1"
+            wrap = json.loads(backend.attach_calls[0]["p_oversight"])
+            plain = json.loads(oversight_id.decrypt_envelope(wrap))
+            assert plain["body"] == "from before"
+            assert agent.mailbox_sync["rectified"] >= 1
+        finally:
+            await agent.close()
+
+    asyncio.run(scenario())
+
+
+def test_unwrap_failure_asks_admins_for_reissue(tmp_path):
+    # 2.0.6 key self-heal (swift-otter-7's Nova family defect): a
+    # member whose stored wrap no longer unwraps — its identity
+    # rotated after the wrap was sealed — asks the room's admins
+    # to re-issue the wrap against its CURRENT directory key,
+    # instead of sitting on unreadable history forever.
+    backend = FakeBackend()
+    doorbell = StubDoorbell()
+    agent, transport = _make_agent(tmp_path, backend, doorbell)
+    backend.tables["group_members"] += [
+        {"group_id": "g1", "username": "alice", "role": "member"},
+        {"group_id": "g1", "username": "carol", "role": "admin"}]
+    backend.tables["groups"].append({"id": "g1", "name": "G"})
+    stranger = Identity.ephemeral()
+    bad_wrap = stranger.encrypt_for(stranger.public_key_b64, b"k" * 32)
+    backend.tables["group_keys"].append({
+        "group_id": "g1", "username": "alice", "epoch": 1,
+        "wrapped": json.dumps(bad_wrap)})
+
+    async def scenario():
+        await agent.start()
+        try:
+            rec = await agent._ensure_group_key("g1")
+            assert rec is None
+            assert await _wait_for(lambda: any(
+                r["to_username"] == "carol"
+                and json.loads(r["payload"]).get("type")
+                == "group_key_request"
+                for r in backend.rows("queue")))
+        finally:
+            await agent.close()
+
+    asyncio.run(scenario())
+
+
+def test_admin_reissues_group_key_on_request(tmp_path):
+    # The admin side of the self-heal: on a member's request, an
+    # admin who holds the room key re-seals the SAME epoch key to
+    # the requester's current directory pubkey and distributes it
+    # to them alone; the request frame is then acked away.
+    backend = FakeBackend()
+    doorbell = StubDoorbell()
+    agent, transport = _make_agent(tmp_path, backend, doorbell)
+    bob = Identity.ephemeral()
+    backend.tables["directory"].append({
+        "username": "bob", "pubkey": bob.public_key_b64,
+        "sign_pub": bob.signing_public_key_b64})
+    backend.tables["group_members"] += [
+        {"group_id": "g1", "username": "alice", "role": "superadmin"},
+        {"group_id": "g1", "username": "bob", "role": "member"}]
+    backend.tables["groups"].append({"id": "g1", "name": "G"})
+    room_key = b"g" * 32
+    agent._store_group_key("g1", 1, room_key)
+    _enqueue_frame(backend, "alice", {
+        "type": "group_key_request", "group_id": "g1",
+        "from": "bob", "id": "gkreq-1", "epoch": 1,
+        "ts": int(time.time())})
+    doorbell.signal_conversation = "dm:alice|bob"
+
+    async def scenario():
+        await agent.start()
+        try:
+            assert await _wait_for(lambda: any(
+                r.get("username") == "bob"
+                for r in backend.rows("group_keys")))
+            row = next(r for r in backend.rows("group_keys")
+                       if r.get("username") == "bob")
+            wrapped = row["wrapped"]
+            if isinstance(wrapped, str):
+                wrapped = json.loads(wrapped)
+            assert bob.unwrap_key(wrapped) == room_key
+            assert await _wait_for(lambda: all(
+                json.loads(r["payload"]).get("id") != "gkreq-1"
+                for r in backend.rows("queue")
+                if r["to_username"] == "alice"))
+        finally:
+            await agent.close()
+
+    asyncio.run(scenario())
+
+
+def test_version_206_and_manifest_offers_206():
+    assert __version__ == "2.0.6"
     pyproject = (ROOT / "pyproject.toml").read_text()
-    assert 'version = "2.0.5"' in pyproject
+    assert 'version = "2.0.6"' in pyproject
     # The fleet's update manifest was regenerated at the owner's
     # direct release order (2026-11-05): it offers 2.0.5, and its
     # file set covers the whole package INCLUDING the v2.0
     # serverless modules, each with a matching SHA-256.
     import hashlib
     manifest = json.loads((ROOT / "update-manifest.json").read_text())
-    assert manifest["version"] == "2.0.5"
+    assert manifest["version"] == "2.0.6"
     assert "agentlink/doorbell.py" in manifest["files"]
     assert "agentlink/transport_v2.py" in manifest["files"]
     for rel, digest in manifest["files"].items():
         actual = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
         assert actual == digest, rel
-    # A 1.8.1 install reading this manifest sees the 2.0.5 update.
+    # A 1.8.1 install reading this manifest sees the 2.0.6 update.
     updater = Updater(current_version="1.8.1")
     updater.fetch_manifest = lambda: manifest
     check = updater.check()
-    assert check["available"] == "2.0.5"
+    assert check["available"] == "2.0.6"
     assert check["update_available"] is True
 
 
