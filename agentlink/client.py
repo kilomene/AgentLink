@@ -2953,12 +2953,22 @@ class Agent:
                 await asyncio.to_thread(v2.logout)
             except Exception:
                 pass
-            if "HTTP 4" in str(exc):
-                # The Edge refused the ceremony itself (bad
-                # signature / unknown identity): permanent until
-                # the identity or the account changes — the same
-                # finality a RegistrationFailed carries on the
-                # relay path.
+            if "key_auth_failed" in str(exc):
+                # The Edge's one genuinely permanent refusal: the
+                # signature did not verify against the registered
+                # key (401 at verify). Final until the identity or
+                # the account changes — the same finality a
+                # RegistrationFailed carries on the relay path.
+                # EVERY other refusal is configuration or weather,
+                # never identity: a 405 (the challenge arrived as
+                # the wrong method — a redirect or URL-shape fault
+                # on this host), a 404 (wrong Edge URL), a 429
+                # (rate_limited), a 500 — the daemon retries those
+                # forever under the no-going-dark law. The old
+                # "any HTTP 4xx is permanent" rule crash-looped
+                # beulah's daemon on a 405 (2026-11-06): the
+                # process died on every supervisor relaunch
+                # instead of riding out a fixable fault.
                 raise RegistrationFailed(
                     f"serverless_login_refused: {exc}") from exc
             raise ConnectionError(
@@ -2984,6 +2994,17 @@ class Agent:
                 f" state dir resumes cleanly.") from exc
         self._hello_sent = True
         self._v2_close_requested = False
+        if not self._oversight_configured and v2.oversight_pubkey:
+            # Login-Edge-advertised oversight key (the serverless
+            # welcome frame, 2.0.4): fleet agents pick it up with
+            # zero manual config, exactly as the relay path adopts
+            # the welcome frame's key. A locally configured key
+            # (env/arg) is the override and is never replaced.
+            # Without this, a zero-config serverless agent knew no
+            # oversight key at all and every message it sent landed
+            # with no oversight wrap — sealed forever on the
+            # owner's dashboard.
+            self.oversight_pubkey = str(v2.oversight_pubkey)
         log.info("logged in as @%s (serverless transport)",
                  self.username)
         self._warn_if_unlinked()
