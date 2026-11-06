@@ -81,6 +81,7 @@ class FakeBackend:
     def __init__(self):
         self.tables = {name: [] for name in self.TABLES}
         self.sign_pubs = {}   # username -> sign_pub b64
+        self.advertise_oversight = ""   # verify-reply oversight key
         self.calls = []
         self._seq = 1000
 
@@ -128,9 +129,11 @@ class FakeBackend:
             jwt = make_jwt({"sub": username,
                             "role": "authenticated",
                             "exp": int(time.time()) + 3600})
-            return 200, {}, json.dumps({
-                "supabase_jwt": jwt,
-                "firebase_custom_token": "custom-token-1"}).encode()
+            reply = {"supabase_jwt": jwt,
+                     "firebase_custom_token": "custom-token-1"}
+            if self.advertise_oversight:
+                reply["oversight_pubkey"] = self.advertise_oversight
+            return 200, {}, json.dumps(reply).encode()
         return 404, {}, b"{}"
 
     def _rest(self, method, url, body):
@@ -481,25 +484,122 @@ def test_serverless_start_refuses_ephemeral(tmp_path):
     asyncio.run(scenario())
 
 
-def test_version_201_and_manifest_offers_201():
-    assert __version__ == "2.0.1"
+def test_serverless_login_adopts_advertised_oversight_key(tmp_path):
+    # 2.0.4 (owner catch, 2026-11-06): in v1 the relay's welcome
+    # frame advertised the owner-oversight public key and every
+    # zero-config agent adopted it, so every message carried an
+    # oversight wrap and the dashboard could read it. The v2 login
+    # ceremony originally advertised nothing, so a zero-config
+    # serverless agent knew no oversight key and EVERY message it
+    # sent landed sealed with no wrap. The login Edge now
+    # advertises the key with the session tokens; the transport
+    # surfaces it and the Agent adopts it at login.
+    oversight_id = Identity.ephemeral()
+    backend = FakeBackend()
+    backend.advertise_oversight = oversight_id.public_key_b64
+    doorbell = StubDoorbell()
+    agent, transport = _make_agent(tmp_path, backend, doorbell)
+    assert agent.oversight_pubkey == ""
+
+    async def scenario():
+        await agent.start()
+        try:
+            assert transport.oversight_pubkey == \
+                oversight_id.public_key_b64
+            assert agent.oversight_pubkey == oversight_id.public_key_b64
+            # And the adopted key actually seals: a wrap built the
+            # way sends build it decrypts under the oversight key.
+            wrap = agent._oversight_for_obj({"body": "readable"})
+            assert wrap is not None
+            plain = oversight_id.decrypt_envelope(wrap)
+            assert b"readable" in plain
+        finally:
+            await agent.close()
+
+    asyncio.run(scenario())
+
+
+def test_serverless_login_never_replaces_local_oversight_key(tmp_path):
+    # A locally configured oversight key (env/arg) is the override:
+    # the advertised key must not replace it (the welcome-frame
+    # rule, carried to the serverless ceremony).
+    local_id = Identity.ephemeral()
+    backend = FakeBackend()
+    backend.advertise_oversight = Identity.ephemeral().public_key_b64
+    doorbell = StubDoorbell()
+    agent, transport = _make_agent(
+        tmp_path, backend, doorbell,
+        oversight_pubkey=local_id.public_key_b64)
+
+    async def scenario():
+        await agent.start()
+        try:
+            assert agent.oversight_pubkey == local_id.public_key_b64
+        finally:
+            await agent.close()
+
+    asyncio.run(scenario())
+
+
+def test_version_205_and_manifest_offers_205():
+    assert __version__ == "2.0.5"
     pyproject = (ROOT / "pyproject.toml").read_text()
-    assert 'version = "2.0.1"' in pyproject
+    assert 'version = "2.0.5"' in pyproject
     # The fleet's update manifest was regenerated at the owner's
-    # direct release order (2026-11-05): it offers 2.0.1, and its
+    # direct release order (2026-11-05): it offers 2.0.5, and its
     # file set covers the whole package INCLUDING the v2.0
     # serverless modules, each with a matching SHA-256.
     import hashlib
     manifest = json.loads((ROOT / "update-manifest.json").read_text())
-    assert manifest["version"] == "2.0.1"
+    assert manifest["version"] == "2.0.5"
     assert "agentlink/doorbell.py" in manifest["files"]
     assert "agentlink/transport_v2.py" in manifest["files"]
     for rel, digest in manifest["files"].items():
         actual = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
         assert actual == digest, rel
-    # A 1.8.1 install reading this manifest sees the 2.0.1 update.
+    # A 1.8.1 install reading this manifest sees the 2.0.5 update.
     updater = Updater(current_version="1.8.1")
     updater.fetch_manifest = lambda: manifest
     check = updater.check()
-    assert check["available"] == "2.0.1"
+    assert check["available"] == "2.0.5"
     assert check["update_available"] is True
+
+
+def test_login_refusal_classification_405_retries_401_key_auth_final(
+        tmp_path, monkeypatch):
+    # 2.0.2 (beulah crash-loop, 2026-11-06): the daemon classified
+    # ANY HTTP 4xx from the login Edge as a permanent identity
+    # refusal and exited; her challenge arrived as the wrong
+    # method (405), so every supervisor relaunch died on the same
+    # fixable fault. Only key_auth_failed is permanent; a 405 /
+    # 404 / 429 is configuration or weather and must surface as a
+    # retryable ConnectionError so _run_serverless rides it out.
+    from agentlink.client import RegistrationFailed
+    from agentlink.transport_v2 import TransportError
+    backend = FakeBackend()
+    doorbell = StubDoorbell()
+    agent, transport = _make_agent(tmp_path, backend, doorbell)
+
+    def refuse_405(username, signer, *a, **kw):
+        raise TransportError(
+            "login Edge challenge HTTP 405: method_not_allowed")
+
+    monkeypatch.setattr(transport, "login", refuse_405)
+
+    async def scenario_405():
+        with pytest.raises(ConnectionError):
+            await agent.start()
+
+    asyncio.run(scenario_405())
+
+    def refuse_key(username, signer, *a, **kw):
+        raise TransportError(
+            "login Edge verify HTTP 401: key_auth_failed")
+
+    monkeypatch.setattr(transport, "login", refuse_key)
+
+    async def scenario_key():
+        with pytest.raises(RegistrationFailed):
+            await agent.start()
+
+    asyncio.run(scenario_key())
