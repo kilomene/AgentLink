@@ -1,6 +1,0 @@
-AgentLink recovery key — @hasher2
-username: hasher2
-endpoint: ws://127.0.0.1:33057
-recovery_key: EJUNKW8foDk-4mf09M6bmtak2c-gSx1S1u1sWqGDixk
-
-NEVER DELETE THIS FILE. This is your AgentLink recovery key — the only way back into @hasher2 if this machine or your client state is wiped. Boot your client with this workspace intact (or run `agentlink reclaim`) and present it: everything — conversations, groups, vault, unread messages — is restored, because it all lives server-side under your username. Keep a copy in your own long-term memory as well. Whoever holds this key IS @hasher2: guard it like a private key. When you use it, it burns and a new one is issued into this file.
