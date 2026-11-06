@@ -1,56 +1,60 @@
-"""One-time admin grant (v1.8.0, owner's proposal + adopted additions).
+"""One-time admin grant (v1.8.1 — the owner's corrected model).
 
-THE MODEL (owner's ruling, 2026-11-04): immediately after
-registration the owner gives an agent a ONE-TIME admin permission.
-From that single grant the agent works through the owner's linked
-connectors (Gmail, Outlook, and the likes) and credentials fully
-autonomously — it never begs for extra permission again. The
-analogy the owner gave: Muse's repeated browser/terminal
-permission prompts "ought not to be so".
+THE MODEL (owner's correction + expansion + refinement,
+2026-11-04 — this supersedes the v1.8.0 model, in which the
+platform operator issued scoped grants and a test mailbox stood
+in for real connectors; the owner rejected that outright):
 
-The adopted additions that make the grant complete:
-
-* SCOPES — the grant is given once, but recorded as named powers
-  (``GRANT_SCOPES``). One power can be withdrawn without stripping
-  the agent bare, and every receipt names the exact power used.
-* IDENTITY BINDING — a grant binds to the agent's username AND its
-  registered signing key. A v1.7.0 recovery reclaim re-binds it to
-  the reclaimed identity (the recovery login is itself proof of
-  possession); a different identity presenting the name gets NO
-  grant, ever.
-* KILL SWITCH — revocation is effective immediately; the broker
-  re-reads the grant on EVERY action and fails closed.
-* RED LINES — a short list of act classes stays approval-gated
-  even under an active grant (see ``red_line_reason``): changing
-  security settings on the owner's core accounts, bulk deletion,
-  granting access to third parties. Everything else in scope flows
-  free. A red-line attempt is QUEUED as an approval (the platform's
-  approval-gate pattern, ``awaiting_approval``) — never executed
-  silently, never refused-and-forgotten either.
-* RECEIPTS — every brokered attempt (executed, refused, queued,
-  rate-limited) writes a signed, append-only receipt the agent
-  cannot edit or delete: there is no update or delete path for
-  receipts anywhere in the stores, and each receipt is signed with
-  the platform's receipt key and chained to the previous receipt's
-  hash, so any later tampering fails verification. The owner's
-  "what did you do in the last few hours" is answered FROM the
-  receipts (``activity_report``), never from the agent's memory of
-  itself.
-* RATE LIMITS — per-scope counters counted from the receipts
-  themselves over the trailing window; tripping one fails closed
-  AND raises a fleet alert. Work is never silently stopped.
+* THE ASK IS AGENT-INITIATED. The agent asks ITS user for the
+  one-time permission, agent-side; the user allows it ONCE,
+  there, on the agent's own side. The allow (and the request,
+  the revoke, and every red-line decision) is a statement SIGNED
+  with the agent's identity key and presented BY THE AGENT over
+  its authenticated connection (protocol.grant_statement_payload).
+  The platform operator has no role at any step: there is no
+  operator issuance path in the CLI, none in the dashboard, and
+  none in the stores.
+* THE SUBSTANCE IS THE CONNECTOR VAULT. A connector is an
+  OAuth-constituted link: it exists because the user completed
+  an OAuth authorization to that service (agentlink.connectors).
+  The grant covers the agent's ENTIRE connector inventory — "if
+  the agent has like 50 connected connectors, it will connect to
+  all the connectors" — as the owner maintains it: coverage is
+  judged against the CURRENT declared inventory on every action,
+  never against a subset the platform picked.
+* THE GATE (per action, fail-closed, re-read every time):
+  (a) the grant is active and bound to the identity presenting
+  the name; (b) the target connector is in the agent's current
+  inventory AND linked, and declares the action; (c) the action
+  is not a red line — red lines queue for THE AGENT'S OWNER
+  (agent-side queue, agent-side decision), never for the
+  platform; (d) the per-action-class rate limit has room.
+* EXECUTION IS THE AGENT'S HOST'S. The relay broker AUTHORIZES:
+  it mints a single-use, short-lived authorization bound to the
+  exact (agent, connector, action, params); the client executes
+  through its host connector bridge and REPORTS the outcome;
+  only then is the execution receipted. Every refusal, queue and
+  rate trip is receipted at authorize time. Receipts remain
+  signed, hash-chained and append-only — the agent cannot edit
+  or delete them, and the activity document
+  (``activity_report``) is built from receipts alone.
+* IDENTITY BINDING — a grant binds to the agent's username AND
+  its registered signing key. A v1.7.0 recovery reclaim re-binds
+  it (the recovery login is itself proof of possession); a
+  different identity presenting the name gets NO grant, ever.
+* KILL SWITCH — revocation by the agent's owner, agent-side,
+  signed; the broker re-reads the grant on EVERY authorization,
+  so it is effective on the very next action.
 * HARD EXCLUSION (owner's words): anything to do with credit
-  cards or ATM cards is never touched, never used. There is no
-  payment scope, no payment adapter, and no code path anywhere in
-  the grant system that can reach a payment instrument.
+  cards or ATM cards is never touched, never used. Enforced at
+  the declaration boundary (connectors.lawful_action_class): a
+  payment-shaped action class can never be declared, so no
+  payment scope, adapter or code path can exist.
 
-CONNECTORS: the broker executes through ``ConnectorAdapter``
-implementations registered by name. This release ships ONE
-reference adapter — ``TestMailboxAdapter``, a Gmail-shaped test
-double — wired end-to-end so the whole machinery is proven. The
-owner's real Gmail/Outlook are NOT wired here and no real
-connector credential is handled: real connectors attach later, by
-the owner's own action, as further adapters.
+ACTION CLASSES: the v1.8.0 scope names survive as the
+per-connector ACTION TAXONOMY — every connector action maps to
+exactly one class, and receipts + rate limits key on it. They
+classify actions; they no longer delimit coverage.
 """
 
 from __future__ import annotations
@@ -60,16 +64,19 @@ import json
 import threading
 import time
 
+from .connectors import Connector, ConnectorError, lawful_action_class
 from .protocol import new_id, now_ts
-from .timing import GRANT_RATE_WINDOW_SECONDS
+from .timing import (GRANT_AUTHZ_TTL_SECONDS,
+                     GRANT_RATE_WINDOW_SECONDS)
 
-# The named powers a grant can carry (v1.8.0). Deliberately
-# connector-shaped, not vendor-shaped: "mail" is mail whichever
-# provider the owner attaches later. THERE IS NO PAYMENT SCOPE —
-# see the module docstring's hard exclusion.
-GRANT_SCOPES = (
+# The well-known action classes (v1.8.0's scope names, kept as
+# the taxonomy's canonical core). A connector may declare other
+# well-formed classes (connectors.lawful_action_class governs);
+# these are the ones with tuned rate limits and capability maps.
+ACTION_CLASSES = (
     "mail.read",
     "mail.send",
+    "mail.draft",
     "calendar.read",
     "calendar.write",
     "drive.read",
@@ -86,43 +93,14 @@ GRANT_RATE_LIMITS = {
     "drive.read": 600,
     "drive.write": 300,
 }
-
-# Connectors the dashboard lists as OWNER-ATTACHABLE. They are
-# listed so the owner sees where real connectors will plug in;
-# nothing here attaches them, and no credential for them is ever
-# requested or handled by this release.
-OWNER_ATTACHABLE_CONNECTORS = (
-    {"name": "gmail", "label": "Gmail", "attached": False,
-     "note": "owner-attachable — not attached"},
-    {"name": "outlook", "label": "Outlook", "attached": False,
-     "note": "owner-attachable — not attached"},
-)
-
-
-def valid_scopes(scopes) -> list[str] | None:
-    """Normalise a requested scope set against GRANT_SCOPES:
-    known scopes only, in canonical order, no duplicates.
-    FAIL CLOSED: a request naming ANY scope outside the lawful
-    set — or no scope at all — returns None (refuse the whole
-    request), never a silently trimmed grant: the owner must
-    never believe he granted a set different from the one on
-    record. This is also the hard-exclusion enforcement point:
-    no payment-instrument scope exists in GRANT_SCOPES, so none
-    can ever validate."""
-    wanted = [str(s).strip() for s in (scopes or []) if str(s).strip()]
-    if not wanted:
-        return None
-    if any(s not in GRANT_SCOPES for s in wanted):
-        return None
-    return [s for s in GRANT_SCOPES if s in set(wanted)]
+DEFAULT_RATE_LIMIT = 300
 
 
 def red_line_reason(connector: str, action: str) -> str | None:
-    """The red lines (v1.8.0): act classes that stay
-    approval-gated EVEN under an active grant. Returns the reason
-    string when the action is a red line, else None. The classes
-    are the owner's fence around the few moves that cannot be
-    undone; everything else in scope flows free.
+    """The red lines: act classes that stay approval-gated EVEN
+    under an active grant — the decision belongs to THE AGENT'S
+    OWNER. Returns the reason string when the action is a red
+    line, else None.
 
     * security.*            — changing security settings on the
                               owner's core accounts
@@ -147,6 +125,8 @@ def red_line_reason(connector: str, action: str) -> str | None:
 
 # ----------------------------------------------------------------------
 # Receipts — canonical form, signing, verification
+# (UNCHANGED from v1.8.0: the signed bytes of existing receipts
+# must keep verifying, so the canonical field set is frozen.)
 # ----------------------------------------------------------------------
 
 _RECEIPT_FIELDS = ("id", "username", "ts", "scope", "connector",
@@ -189,7 +169,7 @@ def verify_receipt(pub_b64: str, receipt: dict) -> bool:
 
 class GrantRefused(Exception):
     """A brokered action was refused, fail-closed. ``status`` is
-    the receipt status that was recorded for the attempt, and
+    the receipt status recorded for the attempt, and
     ``receipt_id`` names that refusal receipt — EVERY outcome of
     the broker carries its receipt id, refusals included, so an
     agent (or an auditor) can always point at the exact signed
@@ -209,46 +189,29 @@ class GrantRefused(Exception):
         return out
 
 
-class AdapterError(Exception):
-    """A connector adapter could not complete an action. The
-    broker records the attempt as an error receipt — never as an
-    execution."""
+# Back-compat name (v1.8.0): adapter failures are connector
+# failures under the bridge; one exception family.
+AdapterError = ConnectorError
 
 
-class ConnectorAdapter:
-    """The connector interface (v1.8.0): a named connector with a
-    fixed action table mapping every action to the ONE grant scope
-    it consumes. ``execute`` performs the action and returns a
-    JSON-safe result dict; failures raise AdapterError."""
-
-    name = ""
-    actions: dict[str, str] = {}
-
-    def scope_for(self, action: str) -> str | None:
-        return self.actions.get(str(action or ""))
-
-    def execute(self, action: str, params: dict,
-                account: str) -> dict:  # pragma: no cover - interface
-        raise NotImplementedError
-
-
-class TestMailboxAdapter(ConnectorAdapter):
-    """The reference adapter (v1.8.0): a Gmail-shaped TEST
-    mailbox. In-memory, per-account mailboxes; sending to any
-    address creates/uses that address's test mailbox. It exists
-    so the grant machinery — scopes, red lines, receipts, rates —
-    is proven end-to-end against a real action surface. It is NOT
-    connected to any real mail service and holds no credentials.
-
-    Actions: list / get (mail.read), send (mail.send), plus the
-    three red-line demonstrations — security.update (security
-    settings), delete_all (bulk deletion), access.share (third
-    party access) — which the broker never lets through without
-    an approval; they exist so the approval path has something
-    real to execute once approved.
+class TestMailboxAdapter(Connector):
+    """TEST FIXTURE ONLY (v1.8.1): a Gmail-shaped in-memory test
+    mailbox. In v1.8.0 this was wired into the relay as the
+    reference adapter — the exact substitution the owner
+    rejected. It now exists ONLY so tests and proofs can bridge
+    a deterministic connector through a test CLIENT's host
+    bridge; it is never registered relay-side, never presented
+    as a live connector, and holds no credentials and no real
+    mail. Actions: list / get (mail.read), send (mail.send),
+    plus the red-line demonstrations security.update,
+    delete_all, access.share, which exist so the approval path
+    has something real to execute once the owner approves.
     """
 
     name = "testmail"
+    service = "testmail"
+    label = "Test mailbox (fixture)"
+    __test__ = False  # a fixture, not a test class (pytest)
     actions = {
         "list": "mail.read",
         "get": "mail.read",
@@ -337,27 +300,72 @@ class TestMailboxAdapter(ConnectorAdapter):
 
 
 # ----------------------------------------------------------------------
-# The broker
+# The broker — authorization + receipting (execution is the
+# agent host's, through its connector bridge)
 # ----------------------------------------------------------------------
 
-class GrantBroker:
-    """Executes agent actions through connectors UNDER the
-    owner's one-time grant. One ``execute`` call = one grant
-    check + one receipt, always. The broker holds no grant state
-    of its own: every check re-reads the store, so a revocation
-    or a rebind is effective on the very next action.
+def _params_hash(params: dict) -> str:
+    return hashlib.sha256(json.dumps(
+        params or {}, sort_keys=True,
+        separators=(",", ":")).encode()).hexdigest()
 
-    ``alert_fn(kind, subject, detail)`` and ``audit_fn(...)`` are
-    the relay's surfaces, injected so the broker stays store-only
-    in tests. Both are optional and best-effort.
+
+def _bounded_result(result) -> dict:
+    """Receipt detail for an executed action: the result itself
+    when it is small; a marked summary when it is not — a
+    receipt is an accountability record, not a data channel."""
+    try:
+        raw = json.dumps(result, sort_keys=True)
+    except Exception:
+        raw = str(result)
+    if len(raw) <= 4096:
+        return {"result": result}
+    return {"result_summary": raw[:1000], "truncated": True}
+
+
+class GrantBroker:
+    """The relay-side grant gate. It NEVER executes connector
+    actions (connectors live on the agent's host); it
+    AUTHORIZES them and RECEIPTS every outcome:
+
+    * authorize() runs the full fail-closed gate and either
+      receipts a refusal / approval-queue / rate-trip, or mints
+      a single-use authorization bound to the exact ask.
+    * report() consumes an authorization and receipts the
+      outcome the agent's host reports (executed / error).
+    * authorize_decided() re-gates an owner-approved red-line
+      action and mints its authorization.
+
+    The broker holds no grant state of its own: every check
+    re-reads the store, so a revocation or a rebind is effective
+    on the very next action. Authorizations live only in this
+    process's memory, briefly (GRANT_AUTHZ_TTL_SECONDS).
+
+    PER-AGENT ISOLATION (invariant, owner's doctrine
+    2026-11-04): a brokered action is authorized against the
+    ACTING agent's own grant and its own declared inventory,
+    and executed only through that same agent's own host
+    bridge. Authorization is bound to the acting peer's
+    identity — there is no frame, parameter or API by which
+    one agent invokes, names into, or borrows another agent's
+    connector, inventory or grant. An agent that lacks a
+    capability gets help the platform's ordinary way: work is
+    assigned to the capable agent, which executes through ITS
+    OWN connector under ITS OWN grant and delivers with signed
+    proof. No connector-sharing, connector-proxying or
+    credential-passing path exists.
+
+    ``alert_fn(kind, subject, detail)`` and ``audit_fn(...)``
+    are the relay's surfaces, injected so the broker stays
+    store-only in tests. Both are optional and best-effort.
     """
 
-    def __init__(self, store, adapters: dict | None = None,
-                 alert_fn=None, audit_fn=None):
+    def __init__(self, store, alert_fn=None, audit_fn=None):
         self.store = store
-        self.adapters = dict(adapters or {})
         self._alert = alert_fn
         self._audit = audit_fn
+        self._authz: dict[str, dict] = {}
+        self._authz_lock = threading.Lock()
 
     # -- receipt plumbing ---------------------------------------------
 
@@ -392,38 +400,64 @@ class GrantBroker:
     def _gate(self, username: str, connector: str, action: str,
               target: str = "", work_ref: str = ""):
         """The fail-closed grant checks, in order. Returns
-        (adapter, scope, grant_row). Raises GrantRefused with the
-        receipt already written for every refusal EXCEPT the ones
-        the caller must receipt with more context (red line /
-        rate) — those come back as markers on the tuple:
-        scope == '__redline__' / '__ratelimit__'."""
-        adapter = self.adapters.get(connector)
-        if adapter is None:
+        (entry, action_class, grant_row) for a covered ask.
+        Raises GrantRefused with the receipt ALREADY WRITTEN for
+        every refusal."""
+        inventory = []
+        try:
+            inventory = self.store.connector_inventory_of(
+                username) or []
+        except Exception:
+            inventory = []
+        entry = next((e for e in inventory
+                      if e.get("name") == connector), None)
+        if entry is None:
             rec = self._receipt(
                 username, "", connector, action, target, work_ref,
                 "refused",
-                {"reason": f"unknown connector {connector!r}"})
+                {"reason": f"connector {connector!r} is not in "
+                           f"@{username}'s connector vault"})
             raise GrantRefused(
-                "refused", f"unknown connector {connector!r}",
+                "refused",
+                f"connector {connector!r} is not in "
+                f"@{username}'s connector vault — the grant "
+                f"covers the connectors the owner has linked, "
+                f"and this is not one of them",
                 receipt_id=rec["id"])
-        scope = adapter.scope_for(action)
-        if scope is None:
+        if not entry.get("linked", True):
             rec = self._receipt(
                 username, "", connector, action, target, work_ref,
                 "refused",
-                {"reason": f"connector {connector!r} has "
+                {"reason": f"connector {connector!r} is not "
+                           f"linked"})
+            raise GrantRefused(
+                "refused",
+                f"connector {connector!r} is in the vault but "
+                f"not linked", receipt_id=rec["id"])
+        scope = (entry.get("actions") or {}).get(action)
+        if scope is None or not lawful_action_class(scope):
+            rec = self._receipt(
+                username, "", connector, action, target, work_ref,
+                "refused",
+                {"reason": f"connector {connector!r} declares "
                            f"no action {action!r}"})
             raise GrantRefused(
                 "refused",
-                f"connector {connector!r} has no action {action!r}",
-                receipt_id=rec["id"])
+                f"connector {connector!r} declares no action "
+                f"{action!r}", receipt_id=rec["id"])
         grant = self.store.grant_of(username)
         if grant is None or grant.get("status") != "active":
+            state = "no grant on record" if grant is None else \
+                f"grant status is {grant.get('status')!r}"
             rec = self._receipt(username, scope, connector, action,
                                 target, work_ref, "refused",
-                                {"reason": "no active grant"})
+                                {"reason": f"no active grant "
+                                           f"({state})"})
             raise GrantRefused(
-                "refused", f"@{username} holds no active grant",
+                "refused",
+                f"@{username} holds no active grant ({state}); "
+                f"the agent must ask its owner for the one-time "
+                f"permission and the owner must allow it",
                 receipt_id=rec["id"])
         current = ""
         try:
@@ -442,39 +476,46 @@ class GrantBroker:
                 "the grant is bound to a different identity than "
                 "the one presenting this name",
                 receipt_id=rec["id"])
-        if scope not in (grant.get("scopes") or []):
-            rec = self._receipt(username, scope, connector, action,
-                                target, work_ref, "refused",
-                                {"reason": f"scope {scope} not "
-                                           "granted"})
-            raise GrantRefused(
-                "refused",
-                f"the grant for @{username} does not carry scope "
-                f"{scope}", receipt_id=rec["id"])
-        return adapter, scope, grant
+        return entry, scope, grant
 
     def _rate_tripped(self, username: str, scope: str) -> bool:
-        limit = GRANT_RATE_LIMITS.get(scope)
-        if limit is None:
-            return False
+        limit = GRANT_RATE_LIMITS.get(scope, DEFAULT_RATE_LIMIT)
         since = now_ts() - GRANT_RATE_WINDOW_SECONDS
         used = self.store.receipt_count(username, scope, since,
                                         status="executed")
         return used >= limit
 
-    # -- execution ------------------------------------------------------
+    def _mint(self, username: str, connector: str, action: str,
+              scope: str, params: dict, work_ref: str,
+              approval_id: str = "") -> str:
+        token = new_id("authz-")
+        now = time.time()
+        with self._authz_lock:
+            self._authz = {k: v for k, v in self._authz.items()
+                           if v["expires"] > now}
+            self._authz[token] = {
+                "username": username, "connector": connector,
+                "action": action, "scope": scope,
+                "params_hash": _params_hash(params),
+                "work_ref": work_ref, "approval_id": approval_id,
+                "expires": now + GRANT_AUTHZ_TTL_SECONDS}
+        return token
 
-    def execute(self, username: str, connector: str, action: str,
-                params: dict | None = None, work_ref: str = "") \
-            -> dict:
-        """Run one brokered action for ``username``. Returns a
-        result dict whose "status" is one of: executed, refused,
-        awaiting_approval, rate_limited, error. EVERY outcome is
-        receipted exactly once."""
+    # -- authorization ---------------------------------------------------
+
+    def authorize(self, username: str, connector: str,
+                  action: str, params: dict | None = None,
+                  work_ref: str = "") -> dict:
+        """Gate ONE brokered action. Returns an outcome dict:
+        {"status": "authorized", "authorization": token, ...}
+        when the action may proceed on the agent's host, or a
+        receipted refusal / awaiting_approval / rate_limited
+        outcome. Every non-authorized outcome is receipted
+        exactly once, here."""
         params = params or {}
         target = self._target_of(params)
         try:
-            adapter, scope, _grant = self._gate(
+            _entry, scope, _grant = self._gate(
                 username, connector, action, target, work_ref)
         except GrantRefused as exc:
             return exc.outcome()
@@ -493,87 +534,102 @@ class GrantBroker:
                     "approval_id": approval["id"],
                     "receipt_id": rec["id"], "reason": reason}
         if self._rate_tripped(username, scope):
+            limit = GRANT_RATE_LIMITS.get(
+                scope, DEFAULT_RATE_LIMIT)
             rec = self._receipt(
                 username, scope, connector, action, target,
                 work_ref, "rate_limited",
-                {"reason": f"platform rate limit for scope "
-                           f"{scope} reached",
-                 "limit": GRANT_RATE_LIMITS.get(scope),
+                {"reason": f"platform rate limit for action "
+                           f"class {scope} reached",
+                 "limit": limit,
                  "window_seconds": GRANT_RATE_WINDOW_SECONDS})
             if self._alert is not None:
                 try:
                     self._alert(
                         "grant_rate_limit", f"{username}:{scope}",
                         f"@{username} tripped the platform rate "
-                        f"limit for scope {scope} "
-                        f"({GRANT_RATE_LIMITS.get(scope)} actions / "
+                        f"limit for action class {scope} "
+                        f"({limit} actions / "
                         f"{GRANT_RATE_WINDOW_SECONDS}s) — further "
-                        f"actions in this scope fail closed until "
+                        f"actions in this class fail closed until "
                         f"the window clears")
                 except Exception:
                     pass
             return {"status": "rate_limited",
                     "receipt_id": rec["id"],
                     "reason": "platform rate limit reached for "
-                              f"scope {scope}; the action failed "
-                              "closed and the owner was alerted"}
-        return self._run(username, adapter, scope, connector,
-                         action, params, target, work_ref)
+                              f"action class {scope}; the action "
+                              "failed closed and a fleet alert "
+                              "was raised"}
+        token = self._mint(username, connector, action, scope,
+                           params, work_ref)
+        return {"status": "authorized", "authorization": token,
+                "scope": scope}
 
-    def _run(self, username: str, adapter, scope: str,
-             connector: str, action: str, params: dict,
-             target: str, work_ref: str,
-             approval_id: str = "") -> dict:
-        try:
-            result = adapter.execute(action, params,
-                                     account=username)
-        except AdapterError as exc:
-            rec = self._receipt(
-                username, scope, connector, action, target,
-                work_ref, "error", {"reason": str(exc)})
-            return {"status": "error", "receipt_id": rec["id"],
-                    "reason": str(exc)}
-        except Exception as exc:  # adapter defect: fail closed
-            rec = self._receipt(
-                username, scope, connector, action, target,
-                work_ref, "error",
-                {"reason": f"{type(exc).__name__}: {exc}"})
-            return {"status": "error", "receipt_id": rec["id"],
-                    "reason": f"adapter error: {exc}"}
-        detail = {"result": result}
-        if approval_id:
-            detail["approval_id"] = approval_id
-        rec = self._receipt(username, scope, connector, action,
-                            target, work_ref, "executed", detail)
-        return {"status": "executed", "receipt_id": rec["id"],
-                "result": result}
-
-    def execute_approved(self, approval: dict) -> dict:
-        """Execute an approval the owner has APPROVED. The grant
-        gate runs again in full — approval lifts the red line, it
-        does not resurrect a revoked grant or an unbound
-        identity."""
+    def authorize_decided(self, approval: dict) -> dict:
+        """Mint the authorization for a red-line action THE
+        AGENT'S OWNER has approved. The gate runs again in full
+        (inventory, grant, identity) — approval lifts the red
+        line, it does not resurrect a revoked grant, an unlinked
+        connector or an unbound identity. The client executes
+        on its host and reports; the report ties the execution
+        receipt to this approval."""
         username = approval["username"]
         connector = approval["connector"]
         action = approval["action"]
         params = approval.get("params") or {}
         target = approval.get("target") or self._target_of(params)
         try:
-            adapter, scope, _g = self._gate(
+            _entry, scope, _g = self._gate(
                 username, connector, action, target,
                 approval.get("work_ref") or "")
         except GrantRefused as exc:
             return exc.outcome()
-        out = self._run(username, adapter, scope, connector,
-                        action, params, target,
-                        approval.get("work_ref") or "",
-                        approval_id=approval["id"])
-        if out.get("receipt_id"):
+        token = self._mint(username, connector, action, scope,
+                           params, approval.get("work_ref") or "",
+                           approval_id=approval["id"])
+        return {"status": "authorized", "authorization": token,
+                "scope": scope, "approval_id": approval["id"]}
+
+    # -- outcome reporting -------------------------------------------------
+
+    def report(self, username: str, token: str, status: str,
+               result=None, error: str = "") -> dict:
+        """Consume ONE authorization and receipt the outcome the
+        agent's host reports. Single-use: a consumed or unknown
+        or expired authorization receipts NOTHING and refuses —
+        the receipt record stays exactly as truthful as what was
+        proven to the platform."""
+        with self._authz_lock:
+            rec = self._authz.pop(str(token or ""), None)
+        if rec is None or rec["username"] != username \
+                or rec["expires"] <= time.time():
+            return {"status": "refused",
+                    "reason": "unknown, consumed or expired "
+                              "authorization — no receipt written"}
+        if status not in ("executed", "error"):
+            status = "error"
+            error = error or f"bad reported status {status!r}"
+        if status == "executed":
+            detail = _bounded_result(result)
+        else:
+            detail = {"reason": str(error or "connector error")}
+        if rec["approval_id"]:
+            detail["approval_id"] = rec["approval_id"]
+        saved = self._receipt(
+            username, rec["scope"], rec["connector"],
+            rec["action"], "", rec["work_ref"], status, detail)
+        if rec["approval_id"]:
             try:
                 self.store.set_approval_receipt(
-                    approval["id"], out["receipt_id"])
+                    rec["approval_id"], saved["id"])
             except Exception:
                 pass
+        out = {"status": status, "receipt_id": saved["id"]}
+        if status == "executed":
+            out["result"] = result
+        else:
+            out["reason"] = detail["reason"]
         return out
 
 
@@ -638,7 +694,7 @@ def render_activity_markdown(report: dict) -> str:
         lines.append(
             f"- {_stamp(r['ts'])} — **{r['status']}** — "
             f"{r['connector']}.{r['action']} "
-            f"(scope {r['scope'] or '—'}, receipt {r['id']})"
+            f"(class {r['scope'] or '—'}, receipt {r['id']})"
             + (f" → {r['target']}" if r.get("target") else "")
             + (f" [work {r['work_ref']}]" if r.get("work_ref")
                else "")

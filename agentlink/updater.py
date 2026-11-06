@@ -58,7 +58,12 @@ class UpdateError(Exception):
 
 def _fetch(url: str, timeout: float = 30.0) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "agentlink-updater"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    # Dial-time proxy-credential resolution + racing
+    # (proxycreds.open_url): urllib's default opener takes the
+    # proxy from the process environment — pinned at process
+    # start, dead after a token rotation.
+    from .proxycreds import open_url
+    with open_url(req, timeout=timeout) as resp:
         return resp.read()
 
 

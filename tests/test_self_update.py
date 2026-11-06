@@ -651,9 +651,20 @@ def test_e_update_mid_work_preserves_everything(tmp_path):
                   if w["id"] == wid and w.get("proof_verified")]
     assert len(deliveries) == 1, boss.work_updates
     assert deliveries[0]["status"] in ("delivered", "completed")
-    # Queued message: arrived exactly once.
-    queued = [m for m in boss.messages
-              if m.get("body") == "queued-note-survives-update"]
+    # Queued message: arrived exactly once. Delivery to the
+    # boss's handler is asynchronous (journal-ACK delivery):
+    # OUTBOX_SENT above proves the send, so poll the boss's
+    # inbox briefly instead of snapshotting it mid-flight —
+    # the count assertion itself is unchanged. (Full-gate
+    # runs under load starved this snapshot twice; standalone
+    # the message always lands.)
+    queued = []
+    for _ in range(120):
+        queued = [m for m in boss.messages
+                  if m.get("body") == "queued-note-survives-update"]
+        if len(queued) == 1:
+            break
+        time.sleep(0.25)
     assert len(queued) == 1, boss.messages
     # Upload: finished byte-exact (SHA-256 of the fetched blob).
     data = _boss_call(loop, boss._request(

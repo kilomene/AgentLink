@@ -40,6 +40,7 @@ from .timing import (
     ALERT_OFFLINE_SECONDS,
     ALERT_REMINDER_SECONDS,
     ALERT_URGENT_SECONDS,
+    GRANT_STATEMENT_TTL_SECONDS,
     CARRY_HANDBACK_SECONDS,
     CARRY_LEASE_SECONDS,
     CARRY_WATCH_SECONDS,
@@ -73,11 +74,8 @@ from .timing import (
     UPDATE_CHECK_SECONDS,
 )
 from .store import GroupFull, NotFound, RemovalBlocked, Store, UsernameTaken
-from .grants import (
-    OWNER_ATTACHABLE_CONNECTORS,
-    GrantBroker,
-    TestMailboxAdapter,
-)
+from .connectors import derived_capabilities, validate_inventory
+from .grants import GrantBroker
 
 log = logging.getLogger("agentlink.relay")
 
@@ -354,21 +352,19 @@ class Relay:
     # a guessing campaign against a name is visible in the log).
     _recovery_attempts: dict = field(default_factory=dict, repr=False)
 
-    # One-time admin grant (v1.8.0): the connector broker + its
-    # adapter registry. The registry ships with ONE reference
-    # adapter — the Gmail-shaped test mailbox — wired end-to-end;
-    # the owner's real connectors attach later, by his own
-    # action, as further adapters. No payment instrument exists
-    # anywhere in this surface (owner's hard exclusion).
+    # One-time admin grant (v1.8.1, owner's corrected model): the
+    # broker AUTHORIZES and RECEIPTS; execution happens on the
+    # agent's host through its connector bridge. The relay holds
+    # NO adapters and NO issuance path: grants arrive only as the
+    # agent's signed statements over its authenticated connection
+    # (requested by the agent, allowed by the agent's own owner).
     _grant_broker: object = field(default=None, repr=False)
-    _grant_adapters: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self.store = self.backend_store or \
             Store(os.path.expanduser(self.db_path))
-        self._grant_adapters = {"testmail": TestMailboxAdapter()}
         self._grant_broker = GrantBroker(
-            self.store, self._grant_adapters,
+            self.store,
             alert_fn=lambda kind, subject, detail:
                 self.store.open_alert(kind, subject, detail),
             audit_fn=lambda *a, **kw: self.store.audit(*a, **kw))
@@ -1783,6 +1779,13 @@ class Relay:
             return None, ""
 
         riding_now: dict[str, list] = {}
+        # Connector vaults (v1.8.1): every agent's declared
+        # inventory, fetched once for the whole payload — the
+        # linkage facts the oversight dashboard renders.
+        try:
+            _inventories = self.store.all_connector_inventories()
+        except Exception:
+            _inventories = {}
         for u in users:
             name = u["username"]
             peer = self.peers.get(name)
@@ -1897,10 +1900,13 @@ class Relay:
             # same honesty pattern as the delivery guarantee above.
             u["auth_legacy"] = (u.get("auth_method") or "") in (
                 "secret", "resume")
-            # One-time admin grant (v1.8.0): the agent's grant
-            # summary — status + scopes only, never anything a
-            # receipt would carry. Bound-key material stays in
-            # the store; surfaces state powers, not keys.
+            # One-time admin grant (v1.8.1, owner's corrected
+            # model): the agent's grant state + grantor
+            # attestation, and its connector vault with explicit
+            # per-connector LINKED state and the capabilities the
+            # vault confers. Oversight facts only — nothing here
+            # can change a grant; issuance lives agent-side.
+            # Bound-key material stays in the store.
             _gr = None
             try:
                 _gr = self.store.grant_of(name)
@@ -1908,10 +1914,15 @@ class Relay:
                 _gr = None
             u["grant"] = {
                 "status": _gr.get("status"),
-                "scopes": _gr.get("scopes") or [],
+                "grantor": _gr.get("grantor") or "",
                 "granted_by": _gr.get("granted_by") or "",
                 "granted_at": _gr.get("granted_at") or 0,
+                "requested_at": _gr.get("requested_at") or 0,
+                "coverage": "connector_vault",
             } if _gr is not None else None
+            u["connectors"] = _inventories.get(name) or []
+            u["derived_capabilities"] = derived_capabilities(
+                u["connectors"])
             # Credentials vault (v1.4.0): presence, entry count and
             # the OVERSIGHT-SEALED labels envelope — still sealed
             # here; the dashboard server opens it inside the owner's
@@ -2154,17 +2165,13 @@ class Relay:
             "work": prod_work,
             "test_work": test_work,
             "alerts": self.store.list_alerts(limit=50),
-            # One-time admin grant (v1.8.0): connectors the owner
-            # can attach (reference adapter live; real connectors
-            # attach by the owner's own action — none is attached
-            # by this release), the receipt feed, and the
-            # red-line approval queue.
-            "grant_connectors": (
-                [{"name": "testmail", "label": "Test mailbox "
-                  "(reference adapter)", "attached": True,
-                  "note": "Gmail-shaped test double — no real "
-                          "mail, no credentials"}]
-                + [dict(c) for c in OWNER_ATTACHABLE_CONNECTORS]),
+            # One-time admin grant (v1.8.1): the receipt feed and
+            # the red-line approvals, DISPLAY ONLY (approvals are
+            # decided by each agent's own owner, agent-side).
+            # Per-agent linkage (grant state, grantor, connector
+            # vault) rides each user row above — there is no
+            # platform connector list, because connectors are the
+            # agents' own OAuth links, not the platform's.
             "grant_activity": prod_grant_activity,
             "test_grant_activity": test_grant_activity,
             "grant_approvals": prod_grant_approvals,
@@ -3184,9 +3191,16 @@ class Relay:
                 secret.encode(), body, _hl.sha256).hexdigest()
         req = urllib.request.Request(self.alert_webhook, data=body,
                                      headers=headers, method="POST")
+
+        def _deliver():
+            # Dial-time proxy-credential racing (proxycreds),
+            # never the process env's pinned credential.
+            from .proxycreds import open_url as _open
+            with _open(req, timeout=10) as resp:
+                return resp.read()
+
         try:
-            await asyncio.to_thread(
-                lambda: urllib.request.urlopen(req, timeout=10).read())
+            await asyncio.to_thread(_deliver)
         except Exception:
             log.exception("alert webhook delivery failed")
 
@@ -3579,6 +3593,20 @@ class Relay:
                     await self._on_grant_action(ws, frame, peer)
                 elif ftype == "grant_query":
                     await self._on_grant_query(ws, frame, peer)
+                elif ftype == "grant_request":
+                    await self._on_grant_request(ws, frame, peer)
+                elif ftype == "grant_allow":
+                    await self._on_grant_allow(ws, frame, peer)
+                elif ftype == "grant_revoke":
+                    await self._on_grant_revoke_stmt(ws, frame, peer)
+                elif ftype == "grant_report":
+                    await self._on_grant_report(ws, frame, peer)
+                elif ftype == "grant_approvals":
+                    await self._on_grant_approvals(ws, frame, peer)
+                elif ftype == "grant_decide":
+                    await self._on_grant_decide(ws, frame, peer)
+                elif ftype == "connector_update":
+                    await self._on_connector_update(ws, frame, peer)
                 elif ftype == "group_create":
                     await self._on_group_create(ws, frame, peer)
                 elif ftype == "group_add":
@@ -3895,11 +3923,14 @@ class Relay:
             except Exception:
                 pass
 
-    # -- one-time admin grant (v1.8.0) --------------------------------
-    # The brokered-action surface. An agent acts ONLY for itself:
-    # the frame carries no username — the peer IS the actor, and
-    # the grant checked is the peer's own. Execution is store
-    # work (SQLite local / REST), so it runs off the event loop.
+    # -- one-time admin grant (v1.8.1, owner's corrected model) -------
+    # The whole surface is the AGENT's own: the frame carries no
+    # username — the peer IS the actor. Grant statements (request /
+    # allow / revoke / owner decisions) are SIGNED with the agent's
+    # identity key and verified here against the registered signing
+    # key; there is no other way a grant state can change. The
+    # broker authorizes + receipts; execution happens on the
+    # agent's host. Store work runs off the event loop.
 
     def _grant_summary(self, username: str) -> dict | None:
         try:
@@ -3909,12 +3940,135 @@ class Relay:
         if g is None:
             return None
         return {"status": g.get("status"),
-                "scopes": g.get("scopes") or [],
+                "grantor": g.get("grantor") or "",
                 "granted_by": g.get("granted_by") or "",
-                "granted_at": g.get("granted_at") or 0}
+                "granted_at": g.get("granted_at") or 0,
+                "ceremony_at": g.get("ceremony_at") or 0,
+                "requested_at": g.get("requested_at") or 0,
+                "request_reason":
+                    str(g.get("request_reason") or "")[:200],
+                "coverage": "connector_vault"}
+
+    def _verify_statement(self, peer: Peer, frame,
+                          kind: str) -> dict | None:
+        """Verify a signed grant statement from this peer.
+        Returns the statement dict on success, None on ANY defect
+        (missing/malformed statement, stale timestamp, signature
+        that does not verify against the registered signing key).
+        Fail-closed: a statement that cannot be proven is treated
+        as never presented."""
+        from .crypto import Identity
+        from .protocol import grant_statement_payload
+        stmt = frame.get("statement")
+        sig = frame.get("sig")
+        if not isinstance(stmt, dict) or not sig:
+            return None
+        if str(stmt.get("kind") or "") != kind:
+            return None
+        try:
+            ts = int(stmt.get("ts") or 0)
+        except Exception:
+            return None
+        if abs(now_ts() - ts) > GRANT_STATEMENT_TTL_SECONDS:
+            return None
+        fields = {k: v for k, v in stmt.items()
+                  if k not in ("kind", "ts")}
+        payload = grant_statement_payload(kind, peer.username,
+                                          ts, fields)
+        sign_pub = ""
+        try:
+            sign_pub = self.store.sign_pub_of(peer.username) or ""
+        except Exception:
+            sign_pub = ""
+        if not sign_pub:
+            return None
+        try:
+            if not Identity.verify_signature(sign_pub, payload,
+                                             str(sig)):
+                return None
+        except Exception:
+            return None
+        return stmt
+
+    async def _on_grant_request(self, ws, frame,
+                                peer: Peer) -> None:
+        """The agent ASKS (v1.8.1): a signed request statement
+        records the pending permission request. Nothing is
+        granted by this — the request awaits the agent's owner's
+        allow, agent-side."""
+        stmt = self._verify_statement(peer, frame, "request")
+        if stmt is None:
+            await self._error(ws, "grant statement did "
+                                         "not verify", frame.get("req_id"))
+            return
+        request_id = str(stmt.get("request_id") or "")[:64]
+        if not request_id:
+            await self._error(ws, "request statement "
+                                         "carries no request id", frame.get("req_id"))
+            return
+        await asyncio.to_thread(
+            self.store.record_grant_request, peer.username,
+            request_id, str(stmt.get("reason") or "")[:500])
+        summary = await asyncio.to_thread(self._grant_summary,
+                                          peer.username)
+        await self._result(ws, frame.get("req_id"), True,
+                           {"grant": summary})
+
+    async def _on_grant_allow(self, ws, frame,
+                              peer: Peer) -> None:
+        """The owner's ALLOW (v1.8.1): a signed statement naming
+        the pending request it allows. Activation lands ONLY on
+        a recorded request with a matching id (the store guards
+        it) — an allow with no request behind it, or a statement
+        that does not verify, changes nothing."""
+        stmt = self._verify_statement(peer, frame, "allow")
+        if stmt is None:
+            await self._error(ws, "grant statement did "
+                                         "not verify", frame.get("req_id"))
+            return
+        request_id = str(stmt.get("request_id") or "")[:64]
+        grantor = str(stmt.get("grantor") or "agent-owner")[:80]
+        sign_pub = ""
+        try:
+            sign_pub = self.store.sign_pub_of(peer.username) or ""
+        except Exception:
+            sign_pub = ""
+        grant = await asyncio.to_thread(
+            self.store.activate_grant, peer.username, grantor,
+            sign_pub, request_id, int(stmt.get("ts") or 0))
+        if grant is None:
+            await self._error(ws, "no pending permission request matches "
+                          "this allow — the agent must ask first", frame.get("req_id"))
+            return
+        summary = await asyncio.to_thread(self._grant_summary,
+                                          peer.username)
+        await self._result(ws, frame.get("req_id"), True,
+                           {"grant": summary})
+
+    async def _on_grant_revoke_stmt(self, ws, frame,
+                                    peer: Peer) -> None:
+        """The owner's kill switch (v1.8.1): a signed revoke
+        statement from the agent's own connection. Effective on
+        the very next authorization — the broker re-reads the
+        grant every time."""
+        stmt = self._verify_statement(peer, frame, "revoke")
+        if stmt is None:
+            await self._error(ws, "grant statement did "
+                                         "not verify", frame.get("req_id"))
+            return
+        revoked = await asyncio.to_thread(
+            self.store.revoke_grant, peer.username, "agent-owner")
+        summary = await asyncio.to_thread(self._grant_summary,
+                                          peer.username)
+        await self._result(ws, frame.get("req_id"), True,
+                           {"grant": summary, "revoked": revoked})
 
     async def _on_grant_action(self, ws, frame,
                                peer: Peer) -> None:
+        """AUTHORIZE one brokered action (v1.8.1). The relay
+        gates and receipts; it never executes — the agent's host
+        executes through its connector bridge under the returned
+        single-use authorization and reports the outcome."""
         connector = str(frame.get("connector") or "")
         action = str(frame.get("action") or "")
         params = frame.get("params")
@@ -3922,24 +4076,140 @@ class Relay:
             params = {}
         work_ref = str(frame.get("work_ref") or "")
         out = await asyncio.to_thread(
-            self._grant_broker.execute, peer.username, connector,
+            self._grant_broker.authorize, peer.username, connector,
             action, params, work_ref)
         # Always an ok=True ANSWER: the outcome dict carries the
-        # verdict (executed / refused / awaiting_approval /
-        # rate_limited / error). A refusal is a successful answer
-        # to the query, not a protocol failure — agent code reads
-        # the status; it does not catch its own grant refusals.
+        # verdict (authorized / refused / awaiting_approval /
+        # rate_limited). A refusal is a successful answer to the
+        # query, not a protocol failure — agent code reads the
+        # status; it does not catch its own grant refusals.
+        await self._result(ws, frame.get("req_id"), True, out)
+
+    async def _on_grant_report(self, ws, frame,
+                               peer: Peer) -> None:
+        """Receipt the outcome of an authorized action, reported
+        by the agent's host after executing it locally."""
+        out = await asyncio.to_thread(
+            self._grant_broker.report, peer.username,
+            str(frame.get("authorization") or ""),
+            str(frame.get("status") or ""),
+            frame.get("result"),
+            str(frame.get("error") or ""))
         await self._result(ws, frame.get("req_id"), True, out)
 
     async def _on_grant_query(self, ws, frame,
                               peer: Peer) -> None:
-        """'Show my grant' over the wire (v1.8.0): the agent
-        states its exact current scopes and grant state —
-        truthfully, from the store, never from a cache."""
+        """'Show my grant' over the wire (v1.8.1): the agent
+        states its exact grant state, its grantor attestation
+        and its declared connector vault — truthfully, from the
+        store, never from a cache."""
         summary = await asyncio.to_thread(self._grant_summary,
                                           peer.username)
+        inventory = await asyncio.to_thread(
+            self.store.connector_inventory_of, peer.username)
         await self._result(ws, frame.get("req_id"), True,
-                           {"grant": summary})
+                           {"grant": summary,
+                            "connectors": inventory,
+                            "derived_capabilities":
+                                derived_capabilities(inventory)})
+
+    async def _on_grant_approvals(self, ws, frame,
+                                  peer: Peer) -> None:
+        """The agent's OWN red-line approval queue (v1.8.1): the
+        approvals awaiting THE AGENT'S OWNER live agent-side —
+        this is where the agent's tooling shows them to its
+        owner. The platform dashboard only displays them."""
+        rows = await asyncio.to_thread(
+            self.store.list_approvals, None, peer.username, 50)
+        await self._result(ws, frame.get("req_id"), True,
+                           {"approvals": rows})
+
+    async def _on_grant_decide(self, ws, frame,
+                               peer: Peer) -> None:
+        """The agent owner's red-line decision (v1.8.1): a signed
+        decide statement on the agent's OWN queued approval. On
+        approval the broker re-gates and returns the single-use
+        authorization; the client executes on its host and
+        reports, tying the execution receipt to the approval."""
+        stmt = self._verify_statement(peer, frame, "decide")
+        if stmt is None:
+            await self._error(ws, "grant statement did "
+                                         "not verify", frame.get("req_id"))
+            return
+        approval_id = str(stmt.get("approval_id") or "")
+        approved = bool(stmt.get("approved"))
+        decided_by = str(stmt.get("decided_by")
+                         or "agent-owner")[:80]
+        approval = await asyncio.to_thread(
+            self.store.get_approval, approval_id)
+        if approval is None \
+                or approval.get("username") != peer.username:
+            await self._error(ws, "no such approval in "
+                                         "this agent's queue", frame.get("req_id"))
+            return
+        if approval.get("status") != "awaiting_approval":
+            await self._error(
+                ws, "approval already decided "
+                    f"({approval.get('status')})",
+                frame.get("req_id"))
+            return
+        decided = await asyncio.to_thread(
+            self.store.decide_approval, approval_id, approved,
+            decided_by)
+        if decided is None:
+            await self._error(ws, "approval already "
+                                         "decided", frame.get("req_id"))
+            return
+        if not approved:
+            await self._result(ws, frame.get("req_id"), True,
+                               {"status": "rejected",
+                                "approval_id": approval_id})
+            return
+        approval = await asyncio.to_thread(
+            self.store.get_approval, approval_id)
+        out = await asyncio.to_thread(
+            self._grant_broker.authorize_decided, approval)
+        out["approval_id"] = approval_id
+        await self._result(ws, frame.get("req_id"), True, out)
+
+    async def _on_connector_update(self, ws, frame,
+                                   peer: Peer) -> None:
+        """A mid-session connector-vault change (v1.8.1): the
+        agent re-declares its inventory (owner connected or
+        disconnected a connector agent-side) under a signed
+        statement binding the inventory digest. Validated whole;
+        an unlawful inventory is refused and the stored one
+        stands."""
+        stmt = self._verify_statement(peer, frame,
+                                      "connector_update")
+        if stmt is None:
+            await self._error(ws, "connector statement "
+                                         "did not verify", frame.get("req_id"))
+            return
+        from .protocol import inventory_digest
+        inventory = validate_inventory(frame.get("connectors"))
+        if inventory is None:
+            await asyncio.to_thread(
+                self.store.audit, "connector_inventory_refused",
+                peer.username, target=peer.username,
+                status="connector_update inventory failed "
+                       "validation (fail-closed)")
+            await self._error(ws, "connector inventory "
+                                         "failed validation", frame.get("req_id"))
+            return
+        if str(stmt.get("inventory_digest") or "") != \
+                inventory_digest(inventory):
+            await self._error(ws, "inventory digest does "
+                                         "not match the signed "
+                                         "statement", frame.get("req_id"))
+            return
+        await asyncio.to_thread(
+            self.store.set_connector_inventory, peer.username,
+            inventory)
+        await self._result(ws, frame.get("req_id"), True,
+                           {"connectors": len(inventory),
+                            "derived_capabilities":
+                                derived_capabilities(inventory)})
 
 
     async def _on_ack(self, ws, frame, peer: Peer) -> None:
@@ -4239,6 +4509,21 @@ class Relay:
         declared_ack = None
         if "delivery_ack" in frame:
             declared_ack = self._ack_value(frame.get("delivery_ack"))
+        # Connector vault (v1.8.1): the client declares its
+        # inventory of OAuth-linked connectors with the hello.
+        # Validated WHOLE (connectors.validate_inventory): an
+        # unlawful declaration — a payment-shaped action class
+        # included — is refused as an inventory (the connection
+        # stands; the stored inventory stands), and the refusal
+        # is audit-logged, so a declaration can never smuggle an
+        # unlawful connector into the broker's world.
+        declared_inventory = None
+        inventory_refused = False
+        if "connectors" in frame:
+            declared_inventory = validate_inventory(
+                frame.get("connectors"))
+            if declared_inventory is None:
+                inventory_refused = True
         client_version = str(frame.get("client_version") or "")[:64]
         # Mesh admission (v1.2.0, owner's rules) — checked BEFORE
         # identity claim/verification (v1.3.0 root-cause fix): a
@@ -4441,6 +4726,19 @@ class Relay:
                         ("delivery_ack",
                          lambda: self._record_delivery_ack(
                              username, declared_ack)))
+                if declared_inventory is not None:
+                    hello_records.append(
+                        ("connector_inventory",
+                         lambda: self.store.set_connector_inventory(
+                             username, declared_inventory)))
+                elif inventory_refused:
+                    hello_records.append(
+                        ("connector_inventory_refused",
+                         lambda: self.store.audit(
+                             "connector_inventory_refused", username,
+                             target=username,
+                             status="hello inventory failed "
+                                    "validation (fail-closed)")))
                 # The auth record stays synchronous (pre-welcome):
                 # which path authenticated this identity — and the
                 # legacy-secret flag riding it — is a security
@@ -4584,6 +4882,19 @@ class Relay:
                 hello_records.append(
                     ("delivery_ack", lambda: self._record_delivery_ack(
                         username, declared_ack)))
+            if declared_inventory is not None:
+                hello_records.append(
+                    ("connector_inventory",
+                     lambda: self.store.set_connector_inventory(
+                         username, declared_inventory)))
+            elif inventory_refused:
+                hello_records.append(
+                    ("connector_inventory_refused",
+                     lambda: self.store.audit(
+                         "connector_inventory_refused", username,
+                         target=username,
+                         status="hello inventory failed "
+                                "validation (fail-closed)")))
             # The claiming hello itself: the one unauthenticated
             # hello an identity ever makes — its welcome carries
             # the bootstrap secret ONCE, and every later hello from
@@ -4669,9 +4980,11 @@ class Relay:
         if _g is not None:
             welcome_grant = {
                 "status": _g.get("status"),
-                "scopes": _g.get("scopes") or [],
+                "grantor": _g.get("grantor") or "",
                 "granted_by": _g.get("granted_by") or "",
-                "granted_at": _g.get("granted_at") or 0}
+                "granted_at": _g.get("granted_at") or 0,
+                "requested_at": _g.get("requested_at") or 0,
+                "coverage": "connector_vault"}
         welcome_error: Exception | None = None
         try:
             if peer.delivery_ack:

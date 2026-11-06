@@ -484,6 +484,20 @@ select cron.schedule('agentlink-deadline-sweep', '* * * * *',
 select cron.schedule('agentlink-reassignment-sweep', '* * * * *',
                      'select al_sweep_reassignment()');
 
+-- ------------------------------------------------- grant vault (v1.8.1)
+-- The grant, corrected: grantor attestation + the agent-initiated
+-- request record on al_grants, and the per-agent connector vault.
+-- The applied-to-live form is supabase/migration-grant-vault.sql.
+alter table al_grants add column if not exists grantor text not null default '';
+alter table al_grants add column if not exists ceremony_at bigint not null default 0;
+alter table al_grants add column if not exists request_id text not null default '';
+alter table al_grants add column if not exists requested_at bigint not null default 0;
+alter table al_grants add column if not exists request_reason text not null default '';
+create table if not exists al_agent_connectors (
+    username text primary key,
+    inventory text not null default '[]',
+    updated_at bigint not null default 0
+);
 -- ------------------------------------------------------- onboarding (v1.8.0)
 -- Auto decision link detail (on al_users above) + the one-time
 -- admin grant: grants, the signed append-only receipt chain,

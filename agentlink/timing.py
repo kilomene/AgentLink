@@ -133,6 +133,19 @@ DECISION_CONVENTION_URL = "http://127.0.0.1:18799/decide"
 # is global to the grant system.
 GRANT_RATE_WINDOW_SECONDS = 3600     # trailing rate window
 
+# One-time admin grant, corrected model (v1.8.1, owner's
+# correction + expansion + refinement, 2026-11-04): the grant is
+# requested BY THE AGENT and allowed once BY THE AGENT'S OWN
+# OWNER, agent-side; the signed statement travels the agent's
+# authenticated connection. A statement is accepted only inside
+# a short freshness window (replay of an old ceremony must never
+# resurrect a grant), and a broker authorization — the relay's
+# single-use permission for ONE client-side execution — lives
+# briefly: long enough for one connector call, never long enough
+# to become a reusable pass.
+GRANT_STATEMENT_TTL_SECONDS = 300   # signed grant statement freshness
+GRANT_AUTHZ_TTL_SECONDS = 120       # one broker authorization's life
+
 # Delivery custody (v1.3.7): for a client that declares
 # delivery_ack in its hello, the offline queue is a CUSTODY
 # OUTBOX, not a flush-and-forget pile — the relay OFFERs queued

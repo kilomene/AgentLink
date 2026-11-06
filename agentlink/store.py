@@ -512,7 +512,12 @@ class Store:
                     granted_at INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'active',
                     bound_sign_pub TEXT NOT NULL DEFAULT '',
-                    updated_at INTEGER NOT NULL DEFAULT 0
+                    updated_at INTEGER NOT NULL DEFAULT 0,
+                    grantor TEXT NOT NULL DEFAULT '',
+                    ceremony_at INTEGER NOT NULL DEFAULT 0,
+                    request_id TEXT NOT NULL DEFAULT '',
+                    requested_at INTEGER NOT NULL DEFAULT 0,
+                    request_reason TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS grant_receipts (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -548,6 +553,11 @@ class Store:
                 CREATE TABLE IF NOT EXISTS grant_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS agent_connectors (
+                    username TEXT PRIMARY KEY,
+                    inventory TEXT NOT NULL DEFAULT '[]',
+                    updated_at INTEGER NOT NULL DEFAULT 0
                 );
                 """
             )
@@ -685,6 +695,24 @@ class Store:
         # honestly instead of letting them pass as current.
         _add("users", "auth_method",
              "auth_method TEXT NOT NULL DEFAULT ''")
+        # Grant, corrected model (v1.8.1): the grant row carries
+        # the agent-initiated flow's record — the agent's pending
+        # REQUEST (request_id / requested_at / request_reason;
+        # status 'requested') and, once the agent's OWN owner
+        # allows it agent-side, the grantor ATTESTATION (grantor)
+        # and ceremony timestamp. The agent's connector vault is
+        # stored per agent in agent_connectors (created with the
+        # schema; _add covers the grant columns on older DBs).
+        _add("grants", "grantor",
+             "grantor TEXT NOT NULL DEFAULT ''")
+        _add("grants", "ceremony_at",
+             "ceremony_at INTEGER NOT NULL DEFAULT 0")
+        _add("grants", "request_id",
+             "request_id TEXT NOT NULL DEFAULT ''")
+        _add("grants", "requested_at",
+             "requested_at INTEGER NOT NULL DEFAULT 0")
+        _add("grants", "request_reason",
+             "request_reason TEXT NOT NULL DEFAULT ''")
         # Credentials vault (v1.4.0): the relay-side POINTER to an
         # agent's vault — never vault content. vault_labels is the
         # agent-published OVERSIGHT-SEALED label envelope (service +
@@ -2266,46 +2294,83 @@ class Store:
             d["scopes"] = []
         return d
 
-    def set_grant(self, username: str, scopes: list,
-                  granted_by: str, bound_sign_pub: str) -> dict:
-        """Issue (or re-issue) the one-time admin grant for an
-        agent, bound to the identity key presented. Recorded in
-        the audit log by the store itself, like set_designation —
-        a grant existing without an audit row must be impossible.
-        The scope set is validated HERE as well as at every
-        issuing surface (grants.valid_scopes): an out-of-law set
-        — any scope outside GRANT_SCOPES, payment instruments
-        included by their absence — can never be persisted."""
-        from .grants import valid_scopes
-        checked = valid_scopes(scopes)
-        if checked is None:
-            raise ValueError(
-                f"unlawful grant scope set {scopes!r}")
-        scopes = checked
+    def record_grant_request(self, username: str, request_id: str,
+                             reason: str = "") -> dict | None:
+        """Record the AGENT-initiated permission request (v1.8.1):
+        the agent asked its owner for the one-time permission;
+        the request now awaits the owner's allow, agent-side.
+        There is deliberately NO store method that creates an
+        active grant — activation exists only as
+        ``activate_grant`` acting on a recorded request, driven
+        by the relay's verified signed-statement path. An agent
+        with an ACTIVE grant keeps it (a new request changes
+        nothing); a revoked or absent grant may be re-requested
+        (the owner's one-time permission, asked again)."""
         ts = now_ts()
         with self._lock:
+            row = self._db.execute(
+                "SELECT status FROM grants WHERE username = ?",
+                (username,)).fetchone()
+            if row is not None and row["status"] == "active":
+                return self.grant_of(username)
             self._db.execute(
                 "INSERT INTO grants (username, scopes, granted_by,"
-                " granted_at, status, bound_sign_pub, updated_at)"
-                " VALUES (?, ?, ?, ?, 'active', ?, ?)"
+                " granted_at, status, bound_sign_pub, updated_at,"
+                " request_id, requested_at, request_reason)"
+                " VALUES (?, '[]', '', 0, 'requested', '', ?,"
+                " ?, ?, ?)"
                 " ON CONFLICT(username) DO UPDATE SET"
-                " scopes = excluded.scopes,"
-                " granted_by = excluded.granted_by,"
-                " granted_at = excluded.granted_at,"
-                " status = 'active',"
-                " bound_sign_pub = excluded.bound_sign_pub,"
+                " status = 'requested',"
+                " request_id = excluded.request_id,"
+                " requested_at = excluded.requested_at,"
+                " request_reason = excluded.request_reason,"
                 " updated_at = excluded.updated_at",
-                (username, json.dumps(list(scopes)), granted_by,
-                 ts, bound_sign_pub, ts))
+                (username, ts, request_id, ts, reason))
             self._db.commit()
-        self.audit("grant_issued", granted_by or "operator",
+        self.audit("grant_requested", username, target=username,
+                   status=f"request {request_id} awaits the "
+                          f"agent's owner")
+        return self.grant_of(username)
+
+    def activate_grant(self, username: str, grantor: str,
+                       bound_sign_pub: str, request_id: str,
+                       ceremony_at: int) -> dict | None:
+        """The owner's ALLOW, recorded (v1.8.1): activates the
+        grant ONLY from a recorded REQUESTED state whose request
+        id matches the signed statement — an allow with no
+        pending request behind it lands NOWHERE. The grantor
+        attestation (WHO allowed it: the agent's own owner) and
+        the ceremony timestamp are part of the record. The grant
+        covers the agent's whole connector inventory (scopes
+        stay [] — coverage is inventory-wide by design), bound
+        to the identity key the signed statement verified
+        against. Called ONLY from the relay's verified
+        grant-allow path."""
+        ts = now_ts()
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE grants SET status = 'active', scopes = '[]',"
+                " granted_by = ?, grantor = ?, granted_at = ?,"
+                " ceremony_at = ?, bound_sign_pub = ?,"
+                " updated_at = ? WHERE username = ?"
+                " AND status = 'requested' AND request_id = ?",
+                (grantor, grantor, ts, int(ceremony_at or ts),
+                 bound_sign_pub, ts, username, request_id))
+            self._db.commit()
+        if not cur.rowcount:
+            return None
+        self.audit("grant_allowed", "agent-owner",
                    target=username,
-                   status="scopes=" + ",".join(scopes))
+                   status=f"grantor={grantor} "
+                          f"request={request_id}")
         return self.grant_of(username)
 
     def revoke_grant(self, username: str, by: str = "") -> bool:
         """The kill switch: effective immediately — the broker
-        re-reads the grant on every action."""
+        re-reads the grant on every action. In the corrected
+        model this is driven ONLY by the agent-side signed
+        revoke statement (the agent's owner's act); the store
+        method itself stays actor-agnostic and audit-logged."""
         with self._lock:
             cur = self._db.execute(
                 "UPDATE grants SET status = 'revoked',"
@@ -2314,7 +2379,7 @@ class Store:
                 (now_ts(), username))
             self._db.commit()
         if cur.rowcount:
-            self.audit("grant_revoked", by or "operator",
+            self.audit("grant_revoked", by or "agent-owner",
                        target=username)
         return bool(cur.rowcount)
 
@@ -2337,6 +2402,55 @@ class Store:
             self.audit("grant_rebound", "relay", target=username,
                        status="identity rebound by recovery login")
         return cur.rowcount
+
+    # -- the connector vault (v1.8.1) ------------------------------
+    # The agent's declared inventory of OAuth-linked connectors,
+    # stored per agent. Declarations arrive only over the agent's
+    # own authenticated connection (hello / signed
+    # connector_update) and are validated before they reach here
+    # (connectors.validate_inventory): the store keeps exactly
+    # what was lawfully declared. The broker gates on this; the
+    # dashboard renders linkage from this.
+
+    def set_connector_inventory(self, username: str,
+                                inventory: list) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO agent_connectors (username, inventory,"
+                " updated_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(username) DO UPDATE SET"
+                " inventory = excluded.inventory,"
+                " updated_at = excluded.updated_at",
+                (username, json.dumps(list(inventory or [])),
+                 now_ts()))
+            self._db.commit()
+
+    def connector_inventory_of(self, username: str) -> list:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT inventory FROM agent_connectors"
+                " WHERE username = ?", (username,)).fetchone()
+        if row is None:
+            return []
+        try:
+            inv = json.loads(row["inventory"] or "[]")
+        except Exception:
+            return []
+        return inv if isinstance(inv, list) else []
+
+    def all_connector_inventories(self) -> dict:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT username, inventory FROM agent_connectors"
+            ).fetchall()
+        out = {}
+        for r in rows:
+            try:
+                inv = json.loads(r["inventory"] or "[]")
+            except Exception:
+                inv = []
+            out[r["username"]] = inv if isinstance(inv, list) else []
+        return out
 
     def _grant_keypair_nolock(self) -> tuple[str, str]:
         """(seed_b64, pub_b64) of the receipt keypair, minting it
@@ -2801,6 +2915,7 @@ class Store:
             ("grant_approvals", "username = ?", (u,)),
             ("grant_receipts", "username = ?", (u,)),
             ("grants", "username = ?", (u,)),
+            ("agent_connectors", "username = ?", (u,)),
             ("users", "username = ?", (u,)),
         ]
 

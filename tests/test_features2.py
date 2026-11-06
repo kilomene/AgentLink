@@ -21,10 +21,24 @@ from pathlib import Path
 
 import pytest
 
+import agentlink.client as client_module
 from agentlink.client import Agent, RequestFailed, unpack_folder
 from agentlink.deadlines import pacific_display, parse_deadline
 from agentlink.protocol import file_bytes
 from agentlink.relay import Relay
+
+
+@pytest.fixture(autouse=True)
+def dead_convention(monkeypatch):
+    """Hermetic convention (v1.8.1 arbitration): see
+    tests/test_decision_link.py — this VM hosts a REAL decision
+    endpoint on the convention port (deploy-probe's, production)
+    which an unwired test agent would otherwise adopt; its
+    reference decisions (e.g. a mid-work progress report) then
+    leak into assertions about the test's OWN agents. Point the
+    convention at a dead address."""
+    monkeypatch.setattr(client_module, "DECISION_CONVENTION_URL",
+                        "http://127.0.0.1:1/decide")
 
 HOST = "127.0.0.1"
 

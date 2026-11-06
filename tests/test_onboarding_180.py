@@ -17,14 +17,28 @@ registration the decision link verifies and wires ITSELF —
   A5. A mid-session self-check failure flips the state to
       pending truthfully — and recovery flips it back.
 
-PART B — ONE-TIME ADMIN GRANT (owner's proposal, adopted whole):
+PART B — ONE-TIME ADMIN GRANT. As shipped in v1.8.0 these pins
+covered the OPERATOR-issued, named-scope model; the owner
+REJECTED that model the same day (2026-11-04) and v1.8.1
+rebuilt it: the grant is requested by the agent and allowed by
+THE AGENT'S OWN OWNER, agent-side, over the agent's whole
+connector vault. The pins below were updated DELIBERATELY to
+the corrected model (each change flagged in
+drill-evidence/v181/observations.md); the full corrected-model
+pin set lives in tests/test_onboarding_181.py.
   B1. Action without a grant is refused (and receipted).
-  B2. Action with grant + scope succeeds against the test
-      mailbox and writes a VERIFIED signed receipt.
-  B3. A scope the grant lacks is refused.
-  B4. A revoked grant refuses immediately.
-  B5. A red-line action queues for approval instead of
-      executing; approval executes it; the queue is auditable.
+  B2. Action under an owner-allowed grant succeeds through the
+      agent's own host bridge (the test mailbox as a bridged
+      fixture) and writes a VERIFIED signed receipt.
+  B3. An action the connector does not declare — and a
+      connector outside the agent's vault — is refused. (The
+      v1.8.0 narrowed-scope refusal no longer exists: coverage
+      is inventory-wide by the owner's design.)
+  B4. An owner-side signed revoke refuses the next action
+      immediately.
+  B5. A red-line action queues for THE AGENT'S OWNER; the
+      owner's agent-side decision executes it; the queue is
+      auditable and the receipt ties to the approval.
   B6. A rate trip fails closed AND raises a fleet alert.
   B7. The activity report covers EXACTLY the receipts in the
       window (and renders as the owner's document).
@@ -33,6 +47,9 @@ PART B — ONE-TIME ADMIN GRANT (owner's proposal, adopted whole):
       reads).
   B9. A recovery reclaim re-binds the grant to the fresh key.
   B10. A different identity presenting the name gets no grant.
+  B11. The dashboard has NO grant actions: the v1.8.0 POST
+      endpoints answer 404, logged out AND logged in, and no
+      grant can materialise through them.
 
 Harness: the staging relay (SQLite, in-process) reused from
 tests/test_decision_link.py.
@@ -56,7 +73,8 @@ import agentlink.client as client_module
 import agentlink.grants as grants_module
 from agentlink.client import Agent
 from agentlink.crypto import Identity
-from agentlink.grants import activity_report, render_activity_markdown
+from agentlink.grants import (TestMailboxAdapter, activity_report,
+                              render_activity_markdown)
 from agentlink.protocol import auth_challenge_payload
 from agentlink.relay import Relay
 from agentlink.timing import DECISION_CONVENTION_URL
@@ -452,35 +470,47 @@ def test_a5_mid_session_failure_flips_and_recovers(
 # PART B
 # ---------------------------------------------------------------------
 
-def _grant(relay_env, username, scopes):
-    store = relay_env["relay"].store
-    row = store_row(relay_env, username)
-    return store.set_grant(username, scopes, "test-operator",
-                           row.get("sign_pub") or "")
+async def _ceremony(a, grantor="the agent's owner"):
+    """The corrected grant flow (v1.8.1), driven end-to-end the
+    way the owner's design prescribes: the AGENT asks
+    (request_permission), its OWNER allows (allow_permission,
+    the agent-side ceremony entry point), and only then does a
+    grant exist. Returns the active grant summary."""
+    out = await a.request_permission("pin ceremony")
+    assert out["status"] == "requested", out
+    out = await a.allow_permission(grantor)
+    grant = (out or {}).get("grant") or {}
+    assert grant.get("status") == "active", out
+    return grant
 
 
 def test_b1_to_b4_grant_flow(relay_env, state_root, dead_convention):
     async def _t():
         relay = relay_env["relay"]
         store = relay.store
+        mail = TestMailboxAdapter()
         a = await make(relay_env, state_root, "gflow",
-                       decision_link=lambda ctx: None)
+                       decision_link=lambda ctx: None,
+                       connectors=[mail])
         try:
             # B1: no grant -> refused (and the refusal is receipted).
             out = await a.grant_action("testmail", "list", {})
             assert out["status"] == "refused", out
             assert out.get("receipt_id"), out
             assert await a.my_grant() is None
-            # Grant mail.read + mail.send.
-            _grant(relay_env, "gflow", ["mail.read", "mail.send"])
+            # The agent asks; its owner allows. The grantor
+            # attestation is on the record.
+            grant = await _ceremony(a)
+            assert grant["grantor"] == "the agent's owner", grant
+            assert grant["coverage"] == "connector_vault", grant
             mine = await a.my_grant()
             assert mine and mine["status"] == "active", mine
-            assert sorted(mine["scopes"]) == ["mail.read", "mail.send"]
             assert a.whoami()["grant"]["status"] == "active"
-            # Seed + B2: read succeeds and writes a verified receipt.
-            relay._grant_adapters["testmail"].seed(
-                "gflow", [{"from": "owner@example", "subject": "hi",
-                           "body": "seeded"}])
+            # Seed the BRIDGED fixture + B2: read succeeds through
+            # the agent's own host bridge and writes a verified
+            # receipt.
+            mail.seed("gflow", [{"from": "owner@example",
+                                 "subject": "hi", "body": "seeded"}])
             out = await a.grant_action("testmail", "list", {})
             assert out["status"] == "executed", out
             assert out["result"]["count"] == 1, out
@@ -495,20 +525,21 @@ def test_b1_to_b4_grant_flow(relay_env, state_root, dead_convention):
                 "testmail", "send",
                 {"to": "peer@example", "subject": "s", "body": "b"})
             assert out["status"] == "executed", out
-            # B3: a scope the grant lacks is refused.
+            # B3 (corrected model): an action the connector does
+            # not declare is refused — and so is a connector that
+            # is not in the agent's vault at all, even under the
+            # active grant. (v1.8.0's narrowed-scope refusal is
+            # gone by design: coverage is inventory-wide.)
             out = await a.grant_action("testmail", "securityish",
                                        {})
             assert out["status"] == "refused", out  # unknown action
-            store.set_grant("gflow", ["mail.read"], "test-operator",
-                            store_row(relay_env, "gflow")
-                            .get("sign_pub") or "")
-            out = await a.grant_action(
-                "testmail", "send",
-                {"to": "peer@example", "subject": "s", "body": "b"})
+            out = await a.grant_action("outlook", "list", {})
             assert out["status"] == "refused", out
-            assert "mail.send" in (out.get("reason") or ""), out
-            # B4: revoke -> the very next action refuses.
-            assert store.revoke_grant("gflow", "test-operator")
+            assert "connector vault" in (out.get("reason") or ""), out
+            # B4: the owner's agent-side signed revoke -> the very
+            # next action refuses.
+            out = await a.revoke_permission()
+            assert (out.get("grant") or {})["status"] == "revoked", out
             out = await a.grant_action("testmail", "list", {})
             assert out["status"] == "refused", out
             assert "no active grant" in (out.get("reason") or ""), out
@@ -523,34 +554,40 @@ def test_b5_red_line_queues_then_approval_executes(
     async def _t():
         relay = relay_env["relay"]
         store = relay.store
+        mail = TestMailboxAdapter()
         a = await make(relay_env, state_root, "gred",
-                       decision_link=lambda ctx: None)
+                       decision_link=lambda ctx: None,
+                       connectors=[mail])
         try:
-            _grant(relay_env, "gred", ["mail.read", "mail.send"])
-            relay._grant_adapters["testmail"].seed(
-                "gred", [{"from": "x@example", "subject": "1",
-                          "body": "one"},
-                         {"from": "y@example", "subject": "2",
-                          "body": "two"}])
+            await _ceremony(a)
+            mail.seed("gred", [{"from": "x@example", "subject": "1",
+                                "body": "one"},
+                               {"from": "y@example", "subject": "2",
+                                "body": "two"}])
             out = await a.grant_action("testmail", "delete_all", {})
             assert out["status"] == "awaiting_approval", out
             assert out.get("approval_id"), out
             # NOT executed: both messages are still there.
-            box = relay._grant_adapters["testmail"]._boxes["gred"]
+            box = mail._boxes["gred"]
             assert len(box["inbox"]) == 2
             appr = store.get_approval(out["approval_id"])
             assert appr["status"] == "awaiting_approval"
             assert "bulk deletion" in appr["reason"]
-            # The owner approves: the full gate re-runs, the
-            # action executes, the approval carries the receipt.
-            row = store.decide_approval(appr["id"], True,
-                                        "test-operator")
-            done = relay._grant_broker.execute_approved(row)
+            # The approval waits in THE AGENT'S OWN queue — the
+            # agent owner's surface, not the platform's.
+            queue = await a.pending_approvals()
+            assert [q["id"] for q in queue] == [appr["id"]], queue
+            # The agent's owner approves, agent-side: the gate
+            # re-runs, the action executes through the agent's
+            # bridge, the approval carries the receipt.
+            done = await a.decide_approval(appr["id"], True,
+                                           "the agent's owner")
             assert done["status"] == "executed", done
             assert len(box["inbox"]) == 0
             appr2 = store.get_approval(appr["id"])
             assert appr2["status"] == "executed"
             assert appr2["receipt_id"] == done["receipt_id"]
+            assert appr2["decided_by"] == "the agent's owner"
         finally:
             await a.close()
 
@@ -567,9 +604,10 @@ def test_b6_rate_trip_fails_closed_and_alerts(relay_env, state_root,
         relay = relay_env["relay"]
         store = relay.store
         a = await make(relay_env, state_root, "grate",
-                       decision_link=lambda ctx: None)
+                       decision_link=lambda ctx: None,
+                       connectors=[TestMailboxAdapter()])
         try:
-            _grant(relay_env, "grate", ["mail.read"])
+            await _ceremony(a)
             for _ in range(2):
                 out = await a.grant_action("testmail", "list", {})
                 assert out["status"] == "executed", out
@@ -591,9 +629,10 @@ def test_b7_activity_report_exact_window(relay_env, state_root,
     async def _t():
         store = relay_env["relay"].store
         a = await make(relay_env, state_root, "greport",
-                       decision_link=lambda ctx: None)
+                       decision_link=lambda ctx: None,
+                       connectors=[TestMailboxAdapter()])
         try:
-            _grant(relay_env, "greport", ["mail.read", "mail.send"])
+            await _ceremony(a)
             t0 = int(time.time())
             await a.grant_action("testmail", "list", {})
             await a.grant_action(
@@ -647,17 +686,21 @@ def test_b9_recovery_reclaim_rebinds_grant(relay_env, state_root,
         ws2 = state_root / "ws-b9-2"
         a = await make(relay_env, state_root, "grebind",
                        workspace=str(ws1),
-                       decision_link=lambda ctx: None)
+                       decision_link=lambda ctx: None,
+                       connectors=[TestMailboxAdapter()])
         key = a.recovery_key
         assert key, "registration must issue a recovery key"
         old_pub = store_row(relay_env, "grebind")["sign_pub"]
-        _grant(relay_env, "grebind", ["mail.read"])
+        await _ceremony(a)
         await a.close()
-        # Fresh machine, fresh keys, the recovery key only.
+        # Fresh machine, fresh keys, the recovery key only. The
+        # fresh client bridges its own fixture connector; the
+        # grant follows the IDENTITY through the reclaim.
         b = Agent("grebind", endpoint=relay_env["url"],
                   state_dir=str(state_root / "grebind-fresh"),
                   workspace=str(ws2), recovery_key=key,
-                  decision_link=lambda ctx: None)
+                  decision_link=lambda ctx: None,
+                  connectors=[TestMailboxAdapter()])
         await b.start()
         try:
             row = store_row(relay_env, "grebind")
@@ -678,8 +721,9 @@ def test_b10_different_identity_gets_no_grant(relay_env, state_root,
     async def _t():
         store = relay_env["relay"].store
         a = await make(relay_env, state_root, "gtaken",
-                       decision_link=lambda ctx: None)
-        _grant(relay_env, "gtaken", ["mail.read"])
+                       decision_link=lambda ctx: None,
+                       connectors=[TestMailboxAdapter()])
+        await _ceremony(a)
         await a.close()
         # The operator removes the dead identity entirely; a
         # DIFFERENT identity then claims the name. The grant must
@@ -701,12 +745,13 @@ def test_b10_different_identity_gets_no_grant(relay_env, state_root,
     run(_t())
 
 
-def test_b11_dashboard_grant_actions_are_session_gated(
+def test_b11_dashboard_has_no_grant_actions(
         relay_env, state_root, dead_convention):
-    """The dashboard grant actions live INSIDE the owner's
-    authenticated session: logged out they refuse (401, nothing
-    changes); logged in they issue/revoke for real, bound to the
-    agent row's current identity key."""
+    """The corrected model (v1.8.1): the dashboard is OVERSIGHT
+    ONLY — the v1.8.0 grant write endpoints are GONE. Logged out
+    AND logged in, POST /api/grant/* answers 404, no grant can
+    materialise through the dashboard, and the served page
+    carries no grant controls at all."""
     import urllib.error
     import urllib.request
 
@@ -724,6 +769,17 @@ def test_b11_dashboard_grant_actions_are_session_gated(
         except urllib.error.HTTPError as exc:
             return exc.code, exc.headers, exc.read()
 
+    def get(path, cookie=None):
+        req = urllib.request.Request(base + path, method="GET")
+        if cookie:
+            req.add_header("Cookie", cookie)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, resp.read().decode(
+                    "utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8", "replace")
+
     async def _t():
         a = await make(relay_env, state_root, "gdash",
                        decision_link=lambda ctx: None)
@@ -731,14 +787,14 @@ def test_b11_dashboard_grant_actions_are_session_gated(
 
     run(_t())
     store = relay_env["relay"].store
-    # Logged out: refused, and no grant materialises.
+    # Logged out: 404 (the path does not exist as an action),
+    # and no grant materialises.
     code, _, _ = post("/api/grant/issue",
                       {"username": "gdash", "scopes": "mail.read"})
-    assert code == 401, code
+    assert code == 404, code
     assert store.grant_of("gdash") is None
-    # Login (the staging dashboard password), then issue +
-    # revoke. The login answers 302 + Set-Cookie — read it with
-    # a no-redirect opener so the cookie header survives.
+    # Login (the staging dashboard password) — 302 + Set-Cookie,
+    # read with a no-redirect opener so the cookie survives.
     class _NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *a, **kw):
             return None
@@ -756,23 +812,20 @@ def test_b11_dashboard_grant_actions_are_session_gated(
     assert code == 302, code
     cookie = headers.get("Set-Cookie", "").split(";")[0]
     assert cookie, headers
-    code, _, body = post("/api/grant/issue",
-                         {"username": "gdash",
-                          "scopes": "mail.read,mail.send"},
-                         cookie=cookie)
-    assert code == 200, (code, body)
-    grant = store.grant_of("gdash")
-    assert grant["status"] == "active", grant
-    assert grant["granted_by"] == "operator-dashboard", grant
-    assert grant["bound_sign_pub"] == \
-        store_row(relay_env, "gdash")["sign_pub"], grant
-    code, _, body = post("/api/grant/revoke",
-                         {"username": "gdash"}, cookie=cookie)
-    assert code == 200, (code, body)
-    assert store.grant_of("gdash")["status"] == "revoked"
-    # A payment scope can never be issued, even logged in.
-    code, _, _ = post("/api/grant/issue",
-                      {"username": "gdash", "scopes": "card.charge"},
-                      cookie=cookie)
-    assert code == 400, code
-    assert store.grant_of("gdash")["status"] == "revoked"
+    # Logged in: STILL 404 on every v1.8.0 grant action — the
+    # platform cannot issue, revoke or decide. Nothing changes.
+    for path, fields in (
+            ("/api/grant/issue",
+             {"username": "gdash", "scopes": "mail.read,mail.send"}),
+            ("/api/grant/revoke", {"username": "gdash"}),
+            ("/api/grant/approve", {"id": "appr-nope"}),
+            ("/api/grant/reject", {"id": "appr-nope"})):
+        code, _, body = post(path, fields, cookie=cookie)
+        assert code == 404, (path, code, body)
+    assert store.grant_of("gdash") is None
+    # The served page itself carries no grant controls.
+    code, page = get("/", cookie=cookie)
+    assert code == 200, code
+    assert "data-gact" not in page
+    assert "/api/grant/" not in page
+    assert "Issue grant" not in page

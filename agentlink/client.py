@@ -72,6 +72,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -109,9 +110,19 @@ from .protocol import (
     make_file_payload,
     new_id,
     normalize_username,
+    now_ts,
     verify_file,
 )
 from .vault import CredentialsVault, VaultAccess, VaultError
+from .transport_v2 import (
+    SERVERLESS_ENDPOINT,
+    Refusal,
+    ServerlessConfig,
+    ServerlessTransport,
+    TransportError,
+)
+from .transport_v2 import transport_mode as _env_transport_mode
+from .doorbell import build_counterparty_set
 
 log = logging.getLogger("agentlink.client")
 
@@ -179,6 +190,75 @@ def _env_proxy_applies(host: str, scheme: str) -> bool:
         if entry == "*" or host_l == entry or host_l.endswith("." + entry):
             return False
     return True
+
+
+async def _dial_via_proxy_candidates(url: str, _connect=None):
+    """Dial a websocket through the egress proxy, racing the
+    freshly resolved credential candidates in parallel —
+    first success wins (the canonical proxycreds pattern).
+    The pre-1.8.1 fallback let the websockets library honour
+    the PROCESS ENVIRONMENT's proxy: a value pinned at process
+    start, dead the moment the runtime rotates the token.
+    Here every candidate is passed explicitly, the winner is
+    cached by proxycreds, and a library too old for a
+    per-dial proxy falls back to the env-honoured connect —
+    never worse than the old behaviour."""
+    from .proxycreds import candidate_proxies, note_proxy_result
+    if _connect is None:
+        from websockets.asyncio.client import (
+            connect as _connect)
+    candidates = candidate_proxies()
+    if not candidates:
+        return await _connect(url, max_size=MAX_FRAME)
+
+    async def _attempt(proxy):
+        try:
+            ws = await _connect(url, max_size=MAX_FRAME,
+                                proxy=proxy)
+        except Exception:
+            note_proxy_result(proxy, False)
+            raise
+        note_proxy_result(proxy, True)
+        return ws
+
+    pending = {asyncio.ensure_future(_attempt(p))
+               for p in candidates}
+    winner = None
+    last: Exception | None = None
+    type_errors = 0
+    try:
+        while pending and winner is None:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                exc = t.exception()
+                if exc is not None:
+                    last = exc
+                    if isinstance(exc, TypeError):
+                        type_errors += 1
+                elif winner is None:
+                    winner = t.result()
+                else:
+                    try:
+                        await t.result().close()
+                    except Exception:
+                        pass
+        if winner is not None:
+            return winner
+        if type_errors and type_errors >= len(candidates):
+            # The installed library cannot take a per-dial
+            # proxy at all: env-honoured connect is the only
+            # door (the pre-1.8.1 behaviour).
+            return await _connect(url, max_size=MAX_FRAME)
+        raise last if last is not None else ConnectionError(
+            f"cannot reach {url} via any egress proxy")
+    finally:
+        def _reap(t):
+            if not t.cancelled():
+                t.exception()
+        for t in pending:
+            t.cancel()
+            t.add_done_callback(_reap)
 
 
 async def doh_lookup(host: str) -> list[str]:
@@ -595,6 +675,10 @@ class Agent:
         media: bool = False,
         workspace: str | None = None,
         recovery_key: str | None = None,
+        connectors: list | None = None,
+        transport: str | None = None,
+        serverless_config: ServerlessConfig | None = None,
+        serverless_transport: ServerlessTransport | None = None,
     ):
         u = normalize_username(username)
         if u is None and not ephemeral:
@@ -610,6 +694,24 @@ class Agent:
                 f"bad designation {designation!r}: expected one of "
                 f"{self.DESIGNATIONS}")
         self.designation = d
+        # Dual transport (v2.0): the daemon runs on ONE of two
+        # data paths, chosen by the AGENTLINK_TRANSPORT config
+        # flip (transport_v2.transport_mode) or the explicit
+        # transport= override — "serverless" (Supabase + Firebase
+        # via agentlink.transport_v2, no relay anywhere) or
+        # "relay" (the websocket mesh, still the default and the
+        # live fallback until the serverless cutover). The flip
+        # is configuration only: identity, state dir, mailbox,
+        # journal and handlers are identical on both paths.
+        _tm = str(transport or _env_transport_mode()).strip().lower()
+        self.transport_mode = "serverless" if _tm == "serverless" \
+            else "relay"
+        # Serverless wiring seams: a prebuilt config (else the
+        # transport builds ServerlessConfig.from_env() at start)
+        # and a prebuilt transport (tests / embeddings inject
+        # one; the daemon builds its own at start otherwise).
+        self._serverless_config = serverless_config
+        self._serverless_injected = serverless_transport
         # The DECISION LINK (v1.3.5): the link between this line
         # connection and the agent's OWN decision-making. The agent
         # is its own intelligence — this client is never its mind;
@@ -667,12 +769,26 @@ class Agent:
         self._link_checked_at = 0
         self._link_task = None
         self._declared_detail_sent = ""
-        # One-time admin grant (v1.8.0): the grant summary the
-        # last welcome carried (None = no grant / not yet known).
-        # my_grant() refreshes it live over the wire; whoami()
-        # states it. The agent's exact scopes are always one
-        # query away and never guessed.
+        # One-time admin grant (v1.8.1, owner's corrected model):
+        # the grant summary the last welcome carried (None = no
+        # grant on record / not yet known); my_grant() refreshes
+        # it live. The grant is requested BY THIS AGENT and
+        # allowed by THE AGENT'S OWN OWNER, agent-side — the
+        # pending request is local state (below), mirrored at the
+        # relay by a signed statement; nothing about it can be
+        # created from the platform side.
         self.grant: dict | None = None
+        # The CONNECTOR BRIDGE (v1.8.1): the host's registered
+        # OAuth-linked connectors (agentlink.connectors), keyed
+        # by name. The declared inventory derives from these;
+        # broker-authorized actions execute through them, here,
+        # on the agent's own host.
+        self._connectors: dict = {}
+        # The pending permission request (v1.8.1): created by
+        # request_permission(), persisted in the state dir so the
+        # owner's allow — whenever it comes — acts on a request
+        # that visibly exists. Loaded after state_dir resolves.
+        self._permission_request: dict | None = None
         self.username = u or ""
         self.display_name = display_name or self.username
         self.capabilities = list(capabilities or [])
@@ -758,6 +874,11 @@ class Agent:
         self.recovery_key: str | None = None
         self.recovery_file: str | None = None
         self.ephemeral = ephemeral
+        # Connector bridge (v1.8.1): register the host's
+        # connectors and restore any pending permission request.
+        for _conn in connectors or []:
+            self._register_connector_local(_conn)
+        self._load_permission_request()
         self.identity: Identity | None = None
         if not ephemeral and self.username:
             try:
@@ -807,6 +928,26 @@ class Agent:
         # site); everywhere else the secret never travels.
         self._legacy_auth_endpoints: set[str] = set()
         self._ws = None
+        # Serverless session state (v2.0 daemon port): the live
+        # ServerlessTransport while a serverless session runs
+        # (None on the relay path and while disconnected), the
+        # stop event its supervision threads obey, the threads
+        # themselves, the event serve() waits on, the loop the
+        # transport threads deliver frames into, and the local
+        # heartbeat-stamp task (the watchdog contract the relay
+        # path's _ping_loop maintains — see _v2_stamp_loop).
+        self._v2: ServerlessTransport | None = None
+        self._v2_stop: threading.Event | None = None
+        self._v2_threads: list[threading.Thread] = []
+        self._v2_down: asyncio.Event | None = None
+        self._v2_loop: asyncio.AbstractEventLoop | None = None
+        self._v2_stamp_task: asyncio.Task | None = None
+        self._v2_close_requested = False
+        # Counterparty activeness as the scoped presence watcher
+        # reports it (v2.0): username -> ladder state, plus the
+        # event log ({"username", "state", "ts"} per change).
+        self.presence_peers: dict[str, str] = {}
+        self.presence_events: list[dict] = []
         # Close-code telemetry (v1.6.2): the last session socket's
         # close code/reason, captured by the read loop when the
         # connection dies, so the session-end log can name WHY the
@@ -1375,7 +1516,7 @@ class Agent:
         already happened — sync is replication, never a gate — so a
         failure here is logged and retried on the next connect,
         never raised into the caller's operation."""
-        if self._ws is None:
+        if self._ws is None and self._v2 is None:
             return
         try:
             await self._vault_publish()
@@ -1755,24 +1896,310 @@ class Agent:
                 # the grant live. No grant is ever implied:
                 # absent is None.
                 "decision_link": self.decision_link_state,
-                "grant": self.grant}
+                # Grant + connector vault (v1.8.1): the grant
+                # summary, the PENDING permission request when
+                # one exists (the local surface the owner's allow
+                # acts on), the declared connector inventory with
+                # linked states, and the capabilities the vault
+                # confers.
+                "grant": self.grant,
+                "permission_request": self._permission_request,
+                "connectors": self.connector_inventory(),
+                "derived_capabilities":
+                    self.derived_capabilities()}
 
-    # -- one-time admin grant (v1.8.0) --------------------------------
-    # 'Show my grant': the agent states its exact current scopes
-    # and grant state truthfully — read live from the relay's
-    # store on every call, never from a stale cache alone.
-    # grant_action() is the brokered door: the relay checks the
-    # grant (identity-bound, scope, red lines, rate) on EVERY
-    # action and writes a signed receipt for every outcome.
-    # Payment instruments are outside this surface entirely —
-    # no scope, adapter or code path here touches them.
+    # -- connector bridge + one-time admin grant (v1.8.1) --------
+    # The owner's corrected model, end to end:
+    # * THE AGENT ASKS. request_permission() creates a pending
+    #   permission REQUEST — local state, visible in whoami() —
+    #   and presents it to the relay under the agent's signature.
+    # * THE AGENT'S OWNER ALLOWS, agent-side. allow_permission()
+    #   is the owner's ceremony entry (driven by the owner's own
+    #   tooling in this agent's environment — e.g. `agentlink
+    #   grant allow`): it signs the ALLOW statement over the
+    #   pending request with the agent's identity key and
+    #   presents it; only then does the grant exist. The
+    #   platform operator has no path into this flow at all.
+    # * THE SUBSTANCE IS THE CONNECTOR VAULT: OAuth-linked
+    #   connectors the host bridges in (connectors= /
+    #   register_connector). The grant covers the whole vault;
+    #   the advertised capability profile is synthesized from it.
+    # * ACTIONS: connector_action() asks the relay broker to
+    #   AUTHORIZE (grant active x connector in the vault and
+    #   linked x not a red line x rate room), executes HERE
+    #   through the bridge, and reports the outcome for
+    #   receipting. Red lines queue for THE AGENT'S OWNER
+    #   (pending_approvals / decide_approval), never the
+    #   platform. Payment instruments are outside this surface
+    #   entirely — a payment-shaped action class cannot even be
+    #   declared (connectors.lawful_action_class).
+
+    # -- the bridge registry -------------------------------------
+
+    def _register_connector_local(self, connector) -> None:
+        name = str(getattr(connector, "name", "") or "").strip()
+        if not name:
+            raise ValueError("a bridged connector needs a name")
+        self._connectors[name] = connector
+
+    def connector_inventory(self) -> list[dict]:
+        """The declared inventory of the agent's connector
+        vault: one entry per bridged connector — name, service,
+        label, LINKED state, the OAuth scopes the user granted
+        the service, its action table, its explicit
+        capabilities. This is what the hello declares and what
+        connector_update re-declares."""
+        return [c.inventory_entry()
+                for c in self._connectors.values()]
+
+    def derived_capabilities(self) -> list[str]:
+        """The capabilities the connector vault confers
+        (connectors.derived_capabilities over the inventory —
+        linked connectors only)."""
+        from .connectors import derived_capabilities as _derived
+        return _derived(self.connector_inventory())
+
+    def advertised_capabilities(self) -> list[str]:
+        """The capability profile the line sees: the declared
+        capabilities UNION the connector-derived set (declared
+        first, platform cap 32 — the same bound the relay
+        enforces on capability updates)."""
+        out = list(self.capabilities)
+        for tag in self.derived_capabilities():
+            if tag not in out:
+                out.append(tag)
+        return [str(c)[:40] for c in out][:32]
+
+    async def register_connector(self, connector) -> dict:
+        """Bridge a connector in (the owner connected a service
+        on this agent's side). The inventory is re-declared to
+        the relay under signature and the advertised profile
+        re-synthesized — the new connector's derived
+        capabilities appear on the line, and the grant covers
+        the connector from this moment."""
+        self._register_connector_local(connector)
+        return await self._declare_connectors()
+
+    async def unregister_connector(self, name: str) -> dict:
+        """Bridge a connector OUT (the owner disconnected it).
+        Its derived capabilities leave the advertised profile
+        and the grant stops covering it — both on the next
+        declaration, which this call makes immediately."""
+        self._connectors.pop(str(name or ""), None)
+        return await self._declare_connectors()
+
+    async def _declare_connectors(self) -> dict:
+        """Re-declare the vault + the synthesized profile to the
+        relay (signed connector_update + signed
+        update_capabilities). Offline: returns the local truth;
+        the next hello re-declares everything anyway."""
+        inventory = self.connector_inventory()
+        if (self._ws is None and self._v2 is None) \
+                or self.identity is None:
+            return {"connectors": len(inventory),
+                    "derived_capabilities":
+                        self.derived_capabilities(),
+                    "declared": False}
+        from .protocol import inventory_digest
+        out = await self._statement_request(
+            "connector_update", "connector_update",
+            {"inventory_digest": inventory_digest(inventory)},
+            extra={"connectors": inventory})
+        await self.update_capabilities(self.capabilities,
+                                       self.cap_description)
+        if isinstance(out, dict):
+            out["declared"] = True
+        return out
+
+    # -- the permission request (agent-initiated) ------------------
+
+    def _permission_request_path(self) -> Path:
+        return self.state_dir / \
+            f"permission-request-{self.username}.json"
+
+    def _load_permission_request(self) -> None:
+        if self.ephemeral or not self.username:
+            return
+        try:
+            p = self._permission_request_path()
+            if p.exists():
+                data = json.loads(p.read_text())
+                if isinstance(data, dict) and data.get("id"):
+                    self._permission_request = {
+                        "id": str(data["id"]),
+                        "reason": str(data.get("reason") or ""),
+                        "ts": int(data.get("ts") or 0)}
+        except Exception:
+            self._permission_request = None
+
+    def _save_permission_request(self) -> None:
+        if self.ephemeral or not self.username \
+                or self._permission_request is None:
+            return
+        try:
+            p = self._permission_request_path()
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self._permission_request))
+            os.replace(tmp, p)
+            try:
+                os.chmod(p, 0o600)
+            except OSError:
+                pass
+        except Exception:
+            log.exception("could not persist the permission "
+                          "request for @%s", self.username)
+
+    def _clear_permission_request(self) -> None:
+        self._permission_request = None
+        if self.ephemeral or not self.username:
+            return
+        try:
+            self._permission_request_path().unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    @property
+    def permission_request(self) -> dict | None:
+        """The pending permission request, if one exists — the
+        agent's own ask, awaiting its owner's allow."""
+        return self._permission_request
+
+    # -- signed statements ------------------------------------------
+
+    def _sign_statement(self, kind: str,
+                        fields: dict) -> tuple[dict, str]:
+        from .protocol import grant_statement_payload
+        stmt = {"kind": kind, "ts": now_ts()}
+        stmt.update(fields)
+        payload = grant_statement_payload(
+            kind, self.username, stmt["ts"], fields)
+        return stmt, self.identity.sign(payload)
+
+    async def _statement_request(self, ftype: str, kind: str,
+                                 fields: dict,
+                                 extra: dict | None = None) -> dict:
+        """Present a signed grant statement and return the
+        relay's answer; a refusal comes back as an outcome dict
+        ({"status": "refused", "reason": ...}) rather than an
+        exception — a refused statement is a fact to state, not
+        a crash."""
+        stmt, sig = self._sign_statement(kind, fields)
+        frame = {"type": ftype, "statement": stmt, "sig": sig}
+        if extra:
+            frame.update(extra)
+        try:
+            return await self._request(frame, timeout=15.0)
+        except RequestFailed as exc:
+            return {"status": "refused", "reason": exc.reason}
+        except Exception as exc:
+            return {"status": "refused",
+                    "reason": f"statement not delivered: {exc}"}
+
+    async def request_permission(self, reason: str = "") -> dict:
+        """THE AGENT ASKS (v1.8.1): create the one-time
+        permission request and present it to the relay under the
+        agent's signature. The request is durable local state —
+        it survives restarts and stays visible in whoami() —
+        until the agent's owner allows it (allow_permission) or
+        it is superseded. Returns {"status": "requested",
+        "request": {...}} (or the active grant, if one already
+        stands)."""
+        if self.grant and self.grant.get("status") == "active":
+            return {"status": "active", "grant": self.grant}
+        if self._permission_request is None:
+            self._permission_request = {
+                "id": new_id("greq-"),
+                "reason": str(reason or "")[:500],
+                "ts": now_ts()}
+            self._save_permission_request()
+        req = self._permission_request
+        if self._ws is not None or self._v2 is not None:
+            out = await self._statement_request(
+                "grant_request", "request",
+                {"request_id": req["id"],
+                 "reason": req["reason"]})
+            if isinstance(out, dict) and out.get("grant"):
+                self.grant = out["grant"]
+        log.warning(
+            "PERMISSION REQUESTED by @%s (request %s): this "
+            "agent has asked its owner for the one-time admin "
+            "permission over its connector vault. The OWNER "
+            "allows it on this agent's side — `agentlink grant "
+            "allow` in this agent's environment — once; the "
+            "platform cannot allow it and cannot issue it.",
+            self.username, req["id"])
+        return {"status": "requested", "request": dict(req)}
+
+    async def allow_permission(self, grantor: str = "") -> dict:
+        """THE OWNER'S ALLOW (v1.8.1) — the one-time permission
+        itself. This is the owner's ceremony entry point, driven
+        by the owner's own tooling in the agent's environment
+        (`agentlink grant allow --by <owner>`): it signs the
+        ALLOW statement over the agent's pending request with
+        the agent's identity key and presents it; the relay
+        activates the grant ONLY against a recorded request.
+        `grantor` attests WHO allowed it (the agent's owner) —
+        recorded on the grant for the oversight dashboard."""
+        req = self._permission_request
+        if req is None:
+            return {"status": "refused",
+                    "reason": "no pending permission request — "
+                              "the agent must ask first "
+                              "(request_permission)"}
+        from .protocol import inventory_digest
+        out = await self._statement_request(
+            "grant_allow", "allow",
+            {"request_id": req["id"],
+             "grantor": str(grantor or "agent-owner")[:80],
+             "inventory_digest": inventory_digest(
+                 self.connector_inventory())})
+        if isinstance(out, dict) and out.get("grant"):
+            self.grant = out["grant"]
+            self._clear_permission_request()
+        return out
+
+    async def revoke_permission(self) -> dict:
+        """THE OWNER'S KILL SWITCH (v1.8.1), agent-side: a
+        signed revoke statement; the broker refuses the very
+        next action. (Agent-side like the allow — the platform
+        has no revoke button either.)"""
+        out = await self._statement_request(
+            "grant_revoke", "revoke", {})
+        if isinstance(out, dict) and "grant" in out:
+            self.grant = out["grant"]
+        return out
+
+    async def _resend_permission_request(self) -> None:
+        """After a (re)connect: if a pending request exists
+        locally but the relay holds no grant record, present the
+        request again so the relay's requested state — and the
+        dashboard's — is the truth."""
+        try:
+            if self._permission_request is None:
+                return
+            if self.grant and self.grant.get("status") in (
+                    "requested", "active"):
+                return
+            req = self._permission_request
+            out = await self._statement_request(
+                "grant_request", "request",
+                {"request_id": req["id"],
+                 "reason": req["reason"]})
+            if isinstance(out, dict) and out.get("grant"):
+                self.grant = out["grant"]
+        except Exception:
+            pass
+
+    # -- grant state + brokered actions ------------------------------
 
     async def my_grant(self) -> dict | None:
-        """The agent's exact current grant: {"status", "scopes",
-        "granted_by", "granted_at"} or None when no grant is on
-        record. Read live from the relay (the welcome cache is
-        only the fallback when the query cannot complete)."""
-        if self._ws is not None:
+        """The agent's exact current grant: {"status",
+        "grantor", "granted_at", "requested_at", "coverage"} or
+        None when no grant is on record. Read live from the
+        relay (the welcome cache is only the fallback when the
+        query cannot complete). 'Show my grant' also carries the
+        declared vault: see my_connectors()."""
+        if self._ws is not None or self._v2 is not None:
             try:
                 out = await self._request(
                     {"type": "grant_query"}, timeout=10.0)
@@ -1782,24 +2209,138 @@ class Agent:
                 pass
         return self.grant
 
-    async def grant_action(self, connector: str, action: str,
-                           params: dict | None = None,
-                           work_ref: str = "") -> dict:
-        """Run ONE brokered connector action under the grant.
-        Returns the outcome dict: {"status": "executed", ...}
-        on success; {"status": "refused", "reason", ...} when
-        the grant does not cover it; {"status":
-        "awaiting_approval", "approval_id", ...} when the
-        action crosses a red line (it queues for the owner's
-        decision instead of executing); {"status":
-        "rate_limited", ...} when a blast-radius limit trips.
-        Every outcome carries a receipt_id — the signed,
-        append-only receipt the relay wrote for it."""
+    async def my_connectors(self) -> dict:
+        """The agent's connector vault as the RELAY holds it:
+        {"grant", "connectors", "derived_capabilities"} — the
+        linkage truth both sides agree on."""
+        if self._ws is not None or self._v2 is not None:
+            out = await self._request({"type": "grant_query"},
+                                      timeout=10.0)
+            self.grant = out.get("grant")
+            return out
+        return {"grant": self.grant,
+                "connectors": self.connector_inventory(),
+                "derived_capabilities":
+                    self.derived_capabilities()}
+
+    async def connector_action(self, connector: str, action: str,
+                               params: dict | None = None,
+                               work_ref: str = "") -> dict:
+        """Run ONE brokered connector action under the grant:
+        the relay AUTHORIZES (grant active x connector in the
+        vault and linked x not a red line x rate room), this
+        host EXECUTES through the bridge, and the outcome is
+        reported back for its signed receipt. Returns the
+        outcome dict: {"status": "executed", "receipt_id",
+        "result", ...} on success; "refused" (with the refusal
+        receipt_id) when the gate says no; "awaiting_approval"
+        (with approval_id) when the action crosses a red line —
+        it then waits for THE AGENT'S OWNER, not the platform;
+        "rate_limited"; "error" (executed locally, failed —
+        still receipted).
+
+        ISOLATION: this door reaches ONLY this agent's own
+        bridged connectors under this agent's own grant. There
+        is deliberately no way to name another agent here —
+        cross-agent help travels as assigned work, executed by
+        the capable agent through its own connector."""
+        params = dict(params or {})
         out = await self._request(
             {"type": "grant_action", "connector": connector,
-             "action": action, "params": dict(params or {}),
+             "action": action, "params": params,
              "work_ref": work_ref}, timeout=30.0)
-        return out
+        if not isinstance(out, dict) \
+                or out.get("status") != "authorized":
+            return out
+        token = out.get("authorization") or ""
+        return await self._execute_authorized(
+            token, connector, action, params)
+
+    # Back-compat name (v1.8.0): the brokered door, same call.
+    grant_action = connector_action
+
+    async def _execute_authorized(self, token: str, connector: str,
+                                  action: str,
+                                  params: dict) -> dict:
+        """Execute one authorized action through the local
+        bridge and report its outcome for receipting. A
+        connector the relay authorized but this host does not
+        bridge is reported as an error — never silently dropped,
+        never fabricated as executed."""
+        conn = self._connectors.get(connector)
+        if conn is None:
+            rep = await self._request(
+                {"type": "grant_report", "authorization": token,
+                 "status": "error",
+                 "error": f"connector {connector!r} is not "
+                          f"bridged on this host"},
+                timeout=15.0)
+            rep.setdefault("status", "error")
+            return rep
+        try:
+            result = conn.execute(action, params, self.username)
+            if inspect.isawaitable(result):
+                result = await result
+            if result is None:
+                result = {}
+            if not isinstance(result, dict):
+                result = {"value": result}
+        except Exception as exc:
+            rep = await self._request(
+                {"type": "grant_report", "authorization": token,
+                 "status": "error", "error": str(exc)[:500]},
+                timeout=15.0)
+            rep.setdefault("status", "error")
+            rep.setdefault("reason", str(exc)[:500])
+            return rep
+        rep = await self._request(
+            {"type": "grant_report", "authorization": token,
+             "status": "executed", "result": result},
+            timeout=15.0)
+        rep.setdefault("status", "executed")
+        rep.setdefault("result", result)
+        return rep
+
+    async def pending_approvals(self) -> list[dict]:
+        """The agent's OWN red-line approval queue (v1.8.1):
+        the actions waiting for THE AGENT'S OWNER's decision,
+        read live from the relay."""
+        out = await self._request({"type": "grant_approvals"},
+                                  timeout=10.0)
+        return (out or {}).get("approvals") or []
+
+    async def decide_approval(self, approval_id: str,
+                              approved: bool,
+                              decided_by: str = "") -> dict:
+        """THE AGENT OWNER'S red-line decision (v1.8.1),
+        presented from the agent's side under the agent's
+        signature. On approval the relay re-gates and returns
+        the authorization; this host then executes the stored
+        action through the bridge and reports it — the
+        execution receipt ties back to the approval. On
+        rejection the action simply never executes."""
+        out = await self._statement_request(
+            "grant_decide", "decide",
+            {"approval_id": str(approval_id),
+             "approved": bool(approved),
+             "decided_by": str(decided_by or "agent-owner")[:80]})
+        if not isinstance(out, dict) \
+                or out.get("status") != "authorized":
+            return out
+        approval = None
+        for row in await self.pending_approvals():
+            if row.get("id") == approval_id:
+                approval = row
+                break
+        if approval is None:
+            return {"status": "error",
+                    "reason": "approved but the approval record "
+                              "could not be re-read; nothing "
+                              "executed"}
+        return await self._execute_authorized(
+            out.get("authorization") or "",
+            approval["connector"], approval["action"],
+            approval.get("params") or {})
 
     # -- peer discovery (v1.2.0) ---------------------------------------------
     # The mesh is learned, never configured by hand: every relay's
@@ -2052,12 +2593,12 @@ class Agent:
         # it — an agent on such a network still auto-connects.
         if _env_proxy_applies(host, p.scheme):
             try:
-                # The asyncio client honours the environment proxy;
-                # the legacy connect() used above has no proxy
-                # support, so the fallback goes through it instead.
-                from websockets.asyncio.client import (
-                    connect as _proxied_connect)
-                return await _proxied_connect(url, max_size=MAX_FRAME)
+                # The legacy connect() used above has no proxy
+                # support, so the fallback dials through the
+                # asyncio client — racing the freshly resolved
+                # proxy credentials (proxycreds), never just the
+                # process env a rotation strands.
+                return await _dial_via_proxy_candidates(url)
             except Exception as exc:
                 last = exc
         raise last if last else ConnectionError(f"cannot reach {url}")
@@ -2188,10 +2729,644 @@ class Agent:
             for t in tasks:
                 t.cancel()
 
+    # -- serverless transport (v2.0 daemon port) ----------------------------
+    # The daemon loop on agentlink.transport_v2: same Agent, same
+    # identity / mailbox / journal / handlers — only the wire
+    # changes. start() branches here when the AGENTLINK_TRANSPORT
+    # flip (or transport=) selects "serverless"; run()/serve()/
+    # close() branch with it, and _request/_send_ack route the
+    # data path onto the transport. The relay path above/below is
+    # untouched and remains the default + live fallback until the
+    # serverless cutover.
+
+    def _serverless(self) -> bool:
+        return self.transport_mode == "serverless"
+
+    def _make_v2_transport(self) -> ServerlessTransport:
+        if self._serverless_injected is not None:
+            return self._serverless_injected
+        return ServerlessTransport(
+            self._serverless_config or ServerlessConfig.from_env())
+
+    def _v2_fanout(self) -> str:
+        """Presence subscription fan-out for the daemon wiring:
+        "digest" by default (the Phase 1 quota valve — peer
+        records ride 30s-coalesced digest nodes; activeness-
+        critical work counterparties stay on raw presence).
+        AGENTLINK_PRESENCE_FANOUT=presence selects raw streams
+        for every counterparty (small-fleet mode)."""
+        mode = str(os.environ.get("AGENTLINK_PRESENCE_FANOUT")
+                   or "digest").strip().lower()
+        return mode if mode in ("presence", "digest") else "digest"
+
+    def _v2_critical_set(self) -> set:
+        """Activeness-critical counterparties (the watcher's raw-
+        presence class): my current work's assigners + assignees."""
+        out = set()
+        for w in self.assigned_work:
+            for k in ("assigner", "assignee"):
+                if w.get(k):
+                    out.add(str(w[k]))
+        out.discard(self.username)
+        return out
+
+    def _v2_counterparty_set(self) -> set:
+        """The scoped-subscription set, built from the membership
+        data this client already holds: DM peers from the local
+        mailbox, group/channel co-members read through the
+        transport for the groups/channels I belong to, and my
+        work counterparties. Fail-soft per source — a partial set
+        re-scopes on the next refresh; the agent NEVER subscribes
+        fleet-wide."""
+        dm_peers: set = set()
+        group_members: set = set()
+        channel_members: set = set()
+        mb = self.mailbox
+        if mb is not None:
+            try:
+                for row in mb.list_items(limit=200):
+                    # list_items rows are wrapped: {"msg", ...}.
+                    item = row.get("msg") if isinstance(row, dict) \
+                        else None
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("group_id") or item.get("channel_id"):
+                        continue
+                    for k in ("from", "to"):
+                        u = item.get(k)
+                        if u and u != self.username:
+                            dm_peers.add(str(u))
+            except Exception:
+                pass
+        v2 = self._v2
+        if v2 is not None:
+            for gid in list(self.memberships):
+                try:
+                    group_members.update(
+                        m["username"] for m in v2.group_members(gid))
+                except Exception:
+                    pass
+            for cid in list(self.channel_roles):
+                try:
+                    channel_members.update(
+                        m["username"] for m in v2.channel_members(cid))
+                except Exception:
+                    pass
+        crit = self._v2_critical_set()
+        return build_counterparty_set(
+            dm_peers=dm_peers, group_members=group_members,
+            channel_members=channel_members,
+            assignees=crit, assigners=crit, exclude={self.username})
+
+    def _on_v2_presence(self, username, record, state) -> None:
+        """Scoped-watcher callback (transport thread): record the
+        counterparty's ladder state. Display/diagnostics state —
+        reassignment decisions live server-side (pg_cron off the
+        activeness mirror), never on this cache."""
+        self.presence_peers[str(username)] = str(state)
+        self.presence_events.append({
+            "username": str(username), "state": str(state),
+            "ts": int(time.time())})
+
+    def _v2_deliver(self, frame: dict) -> None:
+        """Hand one fetched custody frame to the SAME dispatch
+        the relay read loop feeds — journaling, decryption,
+        handler invocation and the ack all happen in _dispatch /
+        _process_message exactly as on the relay path (the
+        mailbox claim makes signal + slow-sync double-delivery
+        exactly-once, as the relay's re-offer already was)."""
+        loop = self._v2_loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._dispatch(dict(frame)), loop)
+        except RuntimeError:
+            pass
+
+    def _on_v2_signal(self, conversation_key, signal) -> None:
+        """Signal-stream callback (transport thread): a tap means
+        the custody queue may hold new frames — fetch and deliver
+        them. A fetch failure is the slow-sync leg's cue, not an
+        error worth raising into the stream thread."""
+        v2 = self._v2
+        if v2 is None:
+            return
+        try:
+            rows = v2.fetch_unacked()
+        except Exception:
+            log.exception("serverless signal fetch failed")
+            return
+        for row in rows or []:
+            frame = row.get("frame") if isinstance(row, dict) else None
+            if isinstance(frame, dict):
+                self._v2_deliver(frame)
+
+    def _on_v2_frames(self, rows) -> None:
+        """Slow-sync callback (transport thread): the fallback
+        fetch's frames take the identical delivery path."""
+        for row in rows or []:
+            frame = row.get("frame") if isinstance(row, dict) else None
+            if isinstance(frame, dict):
+                self._v2_deliver(frame)
+
+    async def _v2_stamp_loop(self) -> None:
+        """The local heartbeat stamp, serverless edition: the
+        relay path's _ping_loop writes heartbeat-<username>.txt
+        every HEARTBEAT_SECONDS — the stamp the host watchdog
+        reads (a stale stamp = a hung process = death). The
+        NETWORK heartbeat is the doorbell's own thread (5s beats,
+        started by transport login, independent of every loop
+        here); this task maintains only the local stamp contract
+        so host supervision behaves identically on both
+        transports."""
+        stamp = self.state_dir / f"heartbeat-{self.username}.txt"
+        while True:
+            await asyncio.sleep(HEARTBEAT_SECONDS)
+            try:
+                stamp.write_text(str(int(time.time())))
+            except Exception:
+                return
+
+    async def _start_serverless(self) -> str:
+        """start(), serverless edition: Edge login ceremony
+        (key-signed challenge -> scoped JWT + Firebase token)
+        instead of the websocket hello, then the supervision
+        bundle the Phase 6 drills require the daemon to own:
+        the supervised signal stream, the 60s slow-sync loop and
+        the scoped presence watcher — plus the doorbell heartbeat
+        the login itself starts, on its own thread, independent
+        of the message/work loops (hardcoded law). The boot
+        sequence mirrors the relay path's order and guards."""
+        if self.ephemeral or not self.username:
+            raise RegistrationFailed(
+                "serverless_requires_identity: the serverless "
+                "transport logs in with a registered identity key; "
+                "ephemeral dial clients stay on the relay path")
+        self.current_endpoint = SERVERLESS_ENDPOINT
+        # Same instance claim as the relay path, before anything
+        # network-shaped happens.
+        self._acquire_instance_lock()
+        # Decision-link auto-wiring is local (config / in-process
+        # / convention probe) — identical on both transports. The
+        # declaration has a serverless home (v2.0 coverage): it
+        # rides the login ceremony's verify as an additive field
+        # and the Edge persists it to my al_users row with the
+        # relay setters' validation, so the dashboard-visible
+        # state is the same truth on both transports; mid-session
+        # changes go through update_decision_link (the
+        # decision_link_update frame's serverless home), and the
+        # transport re-declares the newest state on every token
+        # refresh.
+        await self._autowire_decision_link()
+        self._declared_link_sent = self._decision_declaration()
+        self._declared_detail_sent = json.dumps(
+            self._decision_detail(), sort_keys=True)
+        v2 = self._make_v2_transport()
+        self._v2 = v2
+        try:
+            await asyncio.to_thread(
+                v2.login, self.username, self.identity.sign,
+                _package_version(),
+                decision_link=self._declared_link_sent,
+                decision_link_detail=self._decision_detail())
+        except TransportError as exc:
+            self._v2 = None
+            try:
+                await asyncio.to_thread(v2.logout)
+            except Exception:
+                pass
+            if "HTTP 4" in str(exc):
+                # The Edge refused the ceremony itself (bad
+                # signature / unknown identity): permanent until
+                # the identity or the account changes — the same
+                # finality a RegistrationFailed carries on the
+                # relay path.
+                raise RegistrationFailed(
+                    f"serverless_login_refused: {exc}") from exc
+            raise ConnectionError(
+                f"registration failed at step 'serverless-login':"
+                f" the login Edge did not answer for"
+                f" @{self.username} ({exc}). Nothing was"
+                f" registered. Retry: check the serverless"
+                f" configuration (AGENTLINK_SUPABASE_URL /"
+                f" AGENTLINK_LOGIN_EDGE_URL / Firebase settings)"
+                f" and that the endpoints are reachable from this"
+                f" machine.") from exc
+        except Exception as exc:
+            self._v2 = None
+            try:
+                await asyncio.to_thread(v2.logout)
+            except Exception:
+                pass
+            raise ConnectionError(
+                f"registration failed at step 'serverless-login':"
+                f" @{self.username} could not complete the login"
+                f" ceremony ({type(exc).__name__}: {exc})."
+                f" Nothing was registered; a retry with this same"
+                f" state dir resumes cleanly.") from exc
+        self._hello_sent = True
+        self._v2_close_requested = False
+        log.info("logged in as @%s (serverless transport)",
+                 self.username)
+        self._warn_if_unlinked()
+        # Supervision bundle (Phase 6 finding 2 — the daemon MUST
+        # start all three): the heartbeat already runs (login
+        # started it, doorbell-owned thread). The stamp task
+        # maintains the local watchdog contract.
+        self._v2_loop = asyncio.get_running_loop()
+        self._v2_stop = threading.Event()
+        self._v2_down = asyncio.Event()
+        if self._v2_stamp_task is None or self._v2_stamp_task.done():
+            self._v2_stamp_task = asyncio.create_task(
+                self._v2_stamp_loop())
+        v2.set_counterparty_provider(self._v2_counterparty_set)
+        try:
+            v2.start_presence_watch(
+                self._on_v2_presence, fanout=self._v2_fanout(),
+                critical=self._v2_critical_set())
+        except Exception:
+            log.exception("serverless presence watch failed to"
+                          " start; the line stays up (signals +"
+                          " slow-sync still deliver)")
+        self._v2_threads = [
+            threading.Thread(
+                target=v2.listen_supervised,
+                args=(self._on_v2_signal,),
+                kwargs={"stop_event": self._v2_stop},
+                name="agentlink-v2-signals", daemon=True),
+            threading.Thread(
+                target=v2.run_slow_sync,
+                args=(self._on_v2_frames,),
+                kwargs={"stop_event": self._v2_stop},
+                name="agentlink-v2-slowsync", daemon=True),
+        ]
+        for t in self._v2_threads:
+            t.start()
+        # Owner-seat control channel: the lock holder serves
+        # forwarded one-shot commands, as on the relay path.
+        await self._start_control_server()
+        # BOOT SEQUENCE, same order and guards as the relay path:
+        # resume from checkpoints -> membership resync -> self
+        # check, with work handlers gated until the resume pass
+        # has run.
+        if not self.ephemeral:
+            self._boot_gate.clear()
+            try:
+                await self._resume_open_work()
+                await self._resync_memberships()
+                await self.self_check()
+            except Exception:
+                log.exception("resume/resync pass failed")
+            finally:
+                self._boot_gate.set()
+            # Memberships are fresh now: re-scope the presence
+            # subscriptions onto the real counterparty set.
+            try:
+                v2.refresh_presence_subscriptions()
+            except Exception:
+                pass
+        self._load_pending_reads()
+        if self._pending_reads:
+            self._queue_read(next(iter(self._pending_reads)))
+        # Mailbox: the history backfill runs through the same
+        # _request("history") surface — serverless, it pages the
+        # audit log under RLS (transport.fetch_history_page) and
+        # merges through the identical journal path; the replay
+        # is local and runs exactly as on the relay path.
+        if self.mailbox is not None:
+            try:
+                self.mailbox_sync = await self.sync_history()
+            except Exception:
+                log.exception("mailbox history sync failed")
+            try:
+                await self._replay_mailbox()
+            except Exception:
+                log.exception("mailbox replay failed")
+        if not self.ephemeral:
+            asyncio.create_task(self._vault_sync_guarded())
+        # The relay hello carries the connector inventory and
+        # the capability declaration; the login ceremony does
+        # not, so the boot declares them here — the same
+        # connector_update + signed update_capabilities the
+        # relay path presents, plus the pending-permission
+        # resend the relay path runs after its hello. All
+        # best-effort: the declarations re-present on the next
+        # login exactly as they re-present on the next hello.
+        try:
+            await self._declare_connectors()
+        except Exception:
+            log.exception("serverless connector declaration "
+                          "failed; it re-presents on next login")
+        try:
+            await self._resend_permission_request()
+        except Exception:
+            pass
+        # The grant state the welcome would have carried:
+        # refresh the local cache from the broker so whoami /
+        # 'show my grant' speak the current truth from boot.
+        try:
+            await self.my_grant()
+        except Exception:
+            pass
+        self.connection_state = "connected"
+        return self.username
+
+    async def _stop_v2_session(self) -> None:
+        """End the serverless session: stop the supervision
+        threads, then log out (Firebase offline write + offline
+        mirror transition + refresh-timer cancel, inside
+        transport.logout). Idempotent — close() and run()'s
+        teardown may both call it; the first caller wins the
+        transport, the second finds None."""
+        v2, self._v2 = self._v2, None
+        if self._v2_stamp_task is not None:
+            self._v2_stamp_task.cancel()
+            self._v2_stamp_task = None
+        if self._v2_stop is not None:
+            self._v2_stop.set()
+        if self._v2_down is not None:
+            self._v2_down.set()
+        threads = list(self._v2_threads)
+        self._v2_threads = []
+        if v2 is not None:
+            def _teardown():
+                for t in threads:
+                    t.join(timeout=5)
+                try:
+                    v2.logout()
+                except Exception:
+                    pass
+            await asyncio.to_thread(_teardown)
+
+    async def _run_serverless(self, reconnect_delay: float = 2.0) -> None:
+        """run(), serverless edition: login, supervise, and on a
+        login-level failure retry with the same capped pacing as
+        the relay loop (backoff cap RECONNECT_BACKOFF_CAP_SECONDS,
+        no long sleep exists in this system). Stream-level
+        failure never reaches this loop — listen_supervised
+        reconnects the signal stream without limit and slow-sync
+        covers the gap. A RegistrationFailed is final, exactly as
+        on the relay path. Cancellation is terminal."""
+        while True:
+            self.connection_state = "connecting"
+            try:
+                await self.start()
+            except RegistrationFailed:
+                raise
+            except Exception as exc:
+                log.warning("serverless login attempt failed (%s);"
+                            " retrying", exc)
+                await asyncio.sleep(min(
+                    reconnect_delay, RECONNECT_BACKOFF_CAP_SECONDS))
+                reconnect_delay = max(reconnect_delay, 0.5)
+                continue
+            self.connection_state = "connected"
+            heal = asyncio.create_task(self._self_heal_loop())
+            try:
+                await self.serve()
+            finally:
+                heal.cancel()
+                await self._stop_v2_session()
+            if self._v2_close_requested:
+                return
+            # serve() returned without a close: the session ended
+            # underneath us — re-login immediately (the instant
+            # first retry), pacing applies to failed attempts.
+            reconnect_delay = 0.0
+
+    def _v2_request_sync(self, frame: dict) -> dict:
+        """The _request surface, serverless edition (sync; called
+        via to_thread from _request). FULL COVERAGE (v2.0
+        coverage phase): every request type the client speaks
+        has a serverless path with the relay's contract — the
+        transport executes it against PostgREST under the
+        Phase 1 RLS policies where they can express it, and
+        against the Edge functions (agentlink-work / -groups /
+        -grants / -blobs / -library / -account) where the
+        contract needs a service-role writer or server-side
+        compute. Refusals arrive as transport Refusals carrying
+        the relay's reason strings and are mapped to
+        RequestFailed by _request.
+
+        Two deliberate exceptions, both documented in the
+        coverage evidence:
+
+        * ``servers`` answers ``{"servers": []}`` — TRUTHFULLY.
+          Server-carrying is a server-era concept: in serverless
+          mode there are no peer relays to ride, health to
+          publish or capacity to race for; the platform
+          (Supabase + Firebase + R2) is the server, and presence /
+          health truth is the activeness ladder. An empty mesh
+          is the same answer a relay with zero registered peers
+          gives, and the client's mesh machinery learns nothing
+          from it — which is the correct state.
+        * The room types (room_open / room_join / room_leave /
+          room_close / room_signal) still fail CLOSED: they are
+          the voice leg's signalling surface, and the voice leg
+          is parked by the owner's standing ruling — there is no
+          media path to signal for, on either transport's
+          roadmap, until he un-parks it."""
+        v2 = self._v2
+        if v2 is None:
+            raise RequestFailed("serverless_down",
+                                "no live serverless session")
+        ftype = frame.get("type")
+        pub = self.identity.public_key_b64 if self.identity else ""
+        if ftype == "send":
+            return v2.send_dm(
+                frame["to"], frame["content"],
+                message_id=frame.get("id"),
+                mentions=frame.get("mentions"),
+                priority=frame.get("priority") or "normal",
+                in_reply_to=frame.get("in_reply_to"),
+                oversight=frame.get("oversight"),
+                from_name=self.display_name, from_pubkey=pub)
+        if ftype == "group_send":
+            gid = frame["group_id"]
+            members = [m["username"] for m in v2.group_members(gid)]
+            mine = self.memberships.get(gid) or {}
+            return v2.send_group_frame(
+                gid, frame["content"], members=members,
+                message_id=frame.get("id"),
+                mentions=frame.get("mentions"),
+                priority=frame.get("priority") or "normal",
+                in_reply_to=frame.get("in_reply_to"),
+                oversight=frame.get("oversight"),
+                from_name=self.display_name, from_pubkey=pub,
+                group_name=mine.get("name", ""),
+                sender_nickname=mine.get("nickname", ""),
+                sender_role=mine.get("role", "") or "",
+                sender_custom_role=mine.get("custom_role", ""))
+        if ftype == "channel_send":
+            cid = frame["channel_id"]
+            members = [m["username"]
+                       for m in v2.channel_members(cid)]
+            ch_name = ""
+            try:
+                ch_name = next(
+                    (c["name"] for c in
+                     v2.my_memberships()["channels"]
+                     if c["channel_id"] == cid), "")
+            except Exception:
+                pass
+            return v2.send_channel_frame(
+                cid, frame["content"], members=members,
+                message_id=frame.get("id"),
+                mentions=frame.get("mentions"),
+                priority=frame.get("priority") or "normal",
+                oversight=frame.get("oversight"),
+                from_name=self.display_name, from_pubkey=pub,
+                channel_name=ch_name,
+                sender_role=self.channel_roles.get(cid, ""))
+        if ftype == "get_key":
+            row = v2.directory_entry(frame["username"])
+            if not row:
+                return {"pubkey": ""}
+            return {"pubkey": row.get("pubkey") or "",
+                    "sign_pub": row.get("sign_pub") or ""}
+        if ftype == "get_group_key":
+            return {"group_id": frame["group_id"],
+                    "key": v2.group_key_for(frame["group_id"],
+                                            self.username)}
+        if ftype == "get_channel_key":
+            return {"channel_id": frame["channel_id"],
+                    "key": v2.channel_key_for(frame["channel_id"],
+                                              self.username)}
+        if ftype == "my_groups":
+            return v2.my_memberships()
+        if ftype == "read":
+            return v2.mark_read(frame.get("ids") or [])
+        if ftype == "history":
+            # Mailbox backfill: the relay's history pages, from
+            # the audit log under RLS — sync_history merges them
+            # through the identical _history_row_to_msg ->
+            # put_if_absent path, so exactly-once is one rule on
+            # both transports.
+            return {"rows": v2.fetch_history_page(
+                frame.get("limit") or 200, frame.get("before_seq"))}
+        # -- work lifecycle -------------------------------------------------
+        if ftype == "work_inbox":
+            return v2.work_inbox(frame.get("status"),
+                                 frame.get("group_id"))
+        if ftype == "assign":
+            return v2.work_assign(frame)
+        if ftype == "deliver_work":
+            return v2.work_deliver(frame)
+        if ftype == "work_action":
+            return v2.work_action(frame)
+        if ftype == "work_progress":
+            return v2.work_progress(frame)
+        if ftype == "work_checkpoint":
+            return v2.work_checkpoint(frame)
+        if ftype == "work_resume_failed":
+            return v2.work_resume_failed(frame)
+        if ftype == "chain_create":
+            return v2.chain_create(frame)
+        if ftype == "chain_cancel":
+            return v2.chain_cancel(frame)
+        if ftype == "chain_list":
+            return v2.chain_list()
+        if ftype == "chain_get":
+            return v2.chain_get(frame)
+        if ftype == "chain_context":
+            return v2.chain_context(frame)
+        # -- groups / channels ------------------------------------------------
+        if ftype == "group_members":
+            return v2.group_members_view(frame)
+        if ftype == "channel_members":
+            return v2.channel_members_view(frame)
+        if ftype == "set_group_keys":
+            return v2.set_group_keys(frame)
+        if ftype == "set_channel_keys":
+            return v2.set_channel_keys(frame)
+        if ftype in ("group_create", "group_add", "group_remove",
+                     "group_promote", "group_demote",
+                     "group_nickname", "group_custom_role",
+                     "group_settings", "group_join_link",
+                     "group_join", "channel_create", "channel_add",
+                     "channel_remove", "channel_promote",
+                     "channel_join_link", "channel_join",
+                     "vault_pin", "vault_remove"):
+            return v2.group_admin(ftype, frame)
+        # -- vault --------------------------------------------------------------
+        if ftype == "vault_add":
+            return v2.vault_add(frame)
+        if ftype == "vault_list":
+            return v2.vault_list(frame)
+        if ftype == "vault_publish":
+            return v2.vault_publish(frame)
+        if ftype == "vault_fetch_meta":
+            return v2.vault_fetch_meta()
+        # -- blobs ----------------------------------------------------------------
+        if ftype == "blob_put":
+            return v2.blob_put(frame)
+        if ftype == "blob_get":
+            return v2.blob_get(frame)
+        if ftype == "blob_delete":
+            return v2.blob_delete(frame)
+        if ftype == "blob_session_start":
+            return v2.blob_session_start(frame)
+        if ftype == "blob_session_status":
+            return v2.blob_session_status(frame)
+        if ftype == "blob_chunk":
+            return v2.blob_chunk(frame)
+        if ftype == "blob_session_finish":
+            return v2.blob_session_finish(frame)
+        # -- grants + connectors (the Edge broker) --------------------------------
+        if ftype == "grant_request":
+            return v2.grant_edge("request", frame)
+        if ftype == "grant_allow":
+            return v2.grant_edge("allow", frame)
+        if ftype == "grant_revoke":
+            return v2.grant_edge("revoke", frame)
+        if ftype == "grant_query":
+            return v2.grant_edge("query", frame)
+        if ftype == "grant_action":
+            return v2.grant_edge("action", frame)
+        if ftype == "grant_report":
+            return v2.grant_edge("report", frame)
+        if ftype == "grant_approvals":
+            return v2.grant_edge("approvals", frame)
+        if ftype == "grant_decide":
+            return v2.grant_edge("decide", frame)
+        if ftype == "connector_update":
+            return v2.grant_edge("connector_update", frame)
+        # -- library ---------------------------------------------------------------
+        if ftype == "library_search":
+            return v2.library_edge("search", frame)
+        if ftype == "library_fetch":
+            return v2.library_edge("fetch", frame)
+        # -- account -----------------------------------------------------------------
+        if ftype == "directory":
+            return v2.account_edge("directory", frame)
+        if ftype == "update_capabilities":
+            return v2.account_edge("capabilities", frame)
+        if ftype == "deregister":
+            return v2.account_edge("deregister", frame)
+        if ftype == "self_report":
+            return v2.self_report(frame)
+        if ftype == "whoami":
+            return v2.whoami()
+        # -- the mesh question, answered truthfully --------------------------------
+        if ftype == "servers":
+            # Deliberate (see the docstring): no peer servers
+            # exist in serverless mode; the empty mesh is the
+            # truth, not a failure.
+            return {"servers": []}
+        raise RequestFailed(
+            "serverless_unsupported",
+            f"request type {ftype!r} has no serverless data path"
+            f" (the room/voice signalling types remain relay-only"
+            f" while the voice leg is parked); the daemon remains"
+            f" on the relay transport for that operation")
+
     async def start(self, endpoint: str | None = None,
                     _force_recovery: bool = False) -> str:
         if self.identity is None:  # ephemeral dial client
             self.identity = Identity.ephemeral()
+        if self._serverless():
+            return await self._start_serverless()
         url = endpoint or self.endpoint
         self.current_endpoint = url
         # Instance collision (v1.3.7): claim this identity's state
@@ -2266,7 +3441,13 @@ class Agent:
             "display_name": self.display_name,
             "pubkey": self.identity.public_key_b64,
             "sign_pub": self.identity.signing_public_key_b64,
-            "capabilities": self.capabilities,
+            "capabilities": self.advertised_capabilities(),
+            # Connector vault (v1.8.1): the declared inventory of
+            # OAuth-linked connectors rides the hello; the relay
+            # validates it whole (a payment-shaped action class
+            # refuses the inventory) and stores it as the
+            # coverage source for the grant gate.
+            "connectors": self.connector_inventory(),
             "cap_description": self.cap_description,
             "mode": self.mode,
             # Probe/test segregation (v1.6.0): declared at
@@ -2434,6 +3615,15 @@ class Agent:
                 # whoami(); my_grant() refreshes it live.
                 if "grant" in frame:
                     self.grant = frame.get("grant")
+                if self._permission_request is not None:
+                    # A pending permission request the relay has
+                    # no record of (requested while offline, or
+                    # the relay's store is fresh): present it now
+                    # so the requested state is true on both
+                    # sides. Spawned — the read loop must stay
+                    # free to deliver the answer.
+                    asyncio.create_task(
+                        self._resend_permission_request())
                 if frame.get("updates_enabled") is not None:
                     # The relay operator's switch (hardened core):
                     # the ONLY sanctioned way the checker is off.
@@ -2636,6 +3826,13 @@ class Agent:
                 return
 
     async def close(self) -> None:
+        # Serverless session (v2.0): stop the supervision bundle
+        # and log out FIRST — no frame may be delivered into
+        # handlers while the rest of the teardown runs, and the
+        # offline presence write is the clean-close signal.
+        if self._v2 is not None:
+            self._v2_close_requested = True
+            await self._stop_v2_session()
         # Owner-seat control channel (v1.3.9): stop serving
         # forwarded commands before the socket and lock go away.
         await self._stop_control_server()
@@ -2674,6 +3871,17 @@ class Agent:
             self._ws = None
 
     async def serve(self) -> None:
+        if self._serverless():
+            # Serverless session: there is no socket to await —
+            # the session lives in the transport's supervision
+            # threads (signal stream, slow-sync, heartbeat) and
+            # ends when close() (or run()'s teardown) stops them.
+            # Cancellation stays terminal, as on the relay path.
+            assert self._v2 is not None and self._v2_down is not None, \
+                "call start() first"
+            self._ensure_update_checker()
+            await self._v2_down.wait()
+            return
         assert self._ws is not None, "call start() first"
         self._ensure_update_checker()
         if self._reader is not None:
@@ -2941,6 +4149,10 @@ class Agent:
         answers. Because relays share one backend, queued messages and
         work follow the agent — nothing is lost or duplicated.
         """
+        if self._serverless():
+            await self._run_serverless(reconnect_delay)
+            return
+
         async def _home_probe():
             while True:
                 await asyncio.sleep(min(home_probe_interval,
@@ -3121,6 +4333,20 @@ class Agent:
 
     # -- requests ------------------------------------------------------------------
     async def _request(self, frame: dict, timeout: float = 15.0) -> dict:
+        if self._v2 is not None:
+            # Serverless session: the request surface executes
+            # against the transport (see _v2_request_sync for the
+            # routing). The transport's own HTTP timeouts govern;
+            # `timeout` is the relay contract's and does not
+            # apply here. A transport Refusal carries the relay's
+            # own reason string and surfaces as the identical
+            # RequestFailed the relay path would have raised.
+            try:
+                return await asyncio.to_thread(
+                    self._v2_request_sync, frame)
+            except Refusal as exc:
+                raise RequestFailed(exc.reason,
+                                    exc.detail) from exc
         req_id = new_id()
         frame = {**frame, "req_id": req_id}
         fut = asyncio.get_running_loop().create_future()
@@ -3315,6 +4541,13 @@ class Agent:
         if frame.get("settings"):
             cur = self.memberships.setdefault(gid, {})
             cur["settings"] = frame["settings"]
+        if self._v2 is not None:
+            # Membership moved: the scoped presence subscriptions
+            # re-derive from the new counterparty set.
+            try:
+                self._v2.refresh_presence_subscriptions()
+            except Exception:
+                pass
 
     async def _resync_memberships(self) -> None:
         """Full role/permission resync from the backend (43e) — also
@@ -3507,7 +4740,18 @@ class Agent:
         delivered. Best-effort on a dying socket — an unacked item
         simply stays in the relay's custody and is redelivered."""
         ids = [str(i) for i in (ids or []) if i]
-        if not ids or self._ws is None:
+        if not ids:
+            return
+        if self._v2 is not None:
+            # Serverless custody: the ack deletes my queue rows
+            # and marks the audit rows delivered, store-side —
+            # the same contract, executed by the transport.
+            try:
+                await asyncio.to_thread(self._v2.ack, ids)
+            except Exception:
+                pass
+            return
+        if self._ws is None:
             return
         try:
             await self._send_raw({"type": "ack", "ids": ids})
@@ -3672,7 +4916,7 @@ class Agent:
         calling it again, and start() calls it on every connect)."""
         out = {"fetched": 0, "inserted": 0, "pages": 0}
         mb = self.mailbox
-        if mb is None or self._ws is None:
+        if mb is None or (self._ws is None and self._v2 is None):
             return out
         from . import timing as _timing
         page_size = int(getattr(_timing, "DELIVERY_HISTORY_PAGE", 200)
@@ -4304,7 +5548,8 @@ class Agent:
         detail_json = json.dumps(detail, sort_keys=True)
         if (current == self._declared_link_sent
                 and detail_json == self._declared_detail_sent) \
-                or self._ws is None or not self._hello_sent:
+                or (self._ws is None and self._v2 is None) \
+                or not self._hello_sent:
             return
         try:
             loop = asyncio.get_running_loop()
@@ -4321,6 +5566,14 @@ class Agent:
     async def _send_link_update(self, value: str,
                                 detail: dict) -> None:
         try:
+            if self._v2 is not None:
+                # Serverless: the update's home is my own al_users
+                # row (the transport validates + cleans exactly as
+                # the relay's setters do, and the stored
+                # declaration rides every later token refresh).
+                await asyncio.to_thread(
+                    self._v2.update_decision_link, value, detail)
+                return
             await self._send_raw(
                 {"type": "decision_link_update",
                  "decision_link": value,
@@ -6095,14 +7348,21 @@ class Agent:
         # exactly what the relay will rebuild (a longer description
         # used to make every such update fail bad_signature).
         description = str(description or "")[:200]
-        canonical = "caps|{}|{}|{}".format(
-            self.username, ",".join(caps), description).encode()
-        data = await self._request({
-            "type": "update_capabilities", "capabilities": caps,
-            "description": description,
-            "sig": self.identity.sign(canonical)})
         self.capabilities = caps
         self.cap_description = description
+        # Connector-derived synthesis (v1.8.1): what the line
+        # advertises is the declared set UNION what the agent's
+        # connector vault confers — the signature covers the
+        # SYNTHESIZED set, exactly what the relay will store.
+        advertised = self.advertised_capabilities()
+        canonical = "caps|{}|{}|{}".format(
+            self.username, ",".join(advertised),
+            description).encode()
+        data = await self._request({
+            "type": "update_capabilities",
+            "capabilities": advertised,
+            "description": description,
+            "sig": self.identity.sign(canonical)})
         return data
 
     # -- work chains (point 41) ------------------------------------------------------

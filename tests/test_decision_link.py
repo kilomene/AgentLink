@@ -65,6 +65,21 @@ ENV_REPLY = "env endpoint reply 4d2: wired by environment, verbatim"
 # Harness — reused exactly as in tests/test_autonomous.py
 # ---------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def dead_convention(monkeypatch):
+    """Hermetic convention (v1.8.1 arbitration): this VM hosts a
+    REAL decision endpoint on the convention port (deploy-probe's,
+    production) which — correctly, per the auto-link law — a
+    nothing-backed test agent would ADOPT, flipping 'pending'
+    assertions to 'linked'. The onboarding suites carry this same
+    fixture; these older files assumed a dead port, which was
+    only ever true while that production endpoint mishandled
+    link_check probes. Point the convention at a dead address so
+    the tests judge the client, not the host's ambient services."""
+    monkeypatch.setattr(client_module, "DECISION_CONVENTION_URL",
+                        "http://127.0.0.1:1/decide")
+
+
 @pytest.fixture()
 def relay_env():
     tmp = tempfile.mkdtemp(prefix="agentlink-auto-")

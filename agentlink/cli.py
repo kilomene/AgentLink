@@ -584,21 +584,29 @@ def _set_designation(rest: list[str]) -> int:
 
 
 def _grant(rest: list[str]) -> int:
-    """OPERATOR one-time admin grant (v1.8.0): the owner's side of
-    the grant — issue it once, watch its receipts, revoke it in
-    one step. Store-direct like set-designation (it addresses the
-    same store the relay serves, SQLite or Supabase), so a grant
-    or a revoke lands in the one place the broker reads on EVERY
-    action: a revoke is effective the moment this command returns.
+    """One-time admin grant (v1.8.1 — the owner's corrected
+    model). The grant belongs to the AGENT and its owner, and so
+    does this command — it runs in the AGENT'S OWN environment:
 
-    Subcommands: issue / revoke / show / activity / approvals /
-    approve / reject / connectors. Payment instruments are
-    outside the grant entirely — no scope names one, and none
-    ever will (owner's hard exclusion)."""
+    * request — the agent ASKS its owner for the one-time
+      permission (agent-initiated; creates the pending request).
+    * allow — the owner's one-time ALLOW on that request
+      (agent-side ceremony): signs the grant statement with the
+      agent's identity key and presents it over the agent's own
+      connection; the relay records grantor + ceremony.
+    * revoke — the owner's kill switch, agent-side, signed.
+    * decide — the agent owner's red-line decision on one of the
+      agent's OWN queued approvals (signed); approval executes
+      the stored action through the agent's host bridge.
+
+    The platform operator CANNOT issue, approve or revoke a
+    grant — there is no such subcommand, by design (the v1.8.0
+    operator paths were removed on the owner's correction).
+    What remains store-direct here is READ-ONLY inspection —
+    show / activity / approvals / connectors — the same facts
+    the oversight dashboard displays."""
     from .backend import create_store
-    from .grants import (GRANT_SCOPES, OWNER_ATTACHABLE_CONNECTORS,
-                          activity_report, render_activity_markdown,
-                          valid_scopes)
+    from .grants import activity_report, render_activity_markdown
     from .protocol import normalize_username
     sub = rest[0] if rest else "show"
     r = rest[1:] if rest else []
@@ -611,60 +619,63 @@ def _grant(rest: list[str]) -> int:
                         help="sqlite (default) | supabase")
         ap.add_argument("--db", default="~/.agentlink/relay.db")
 
-    if sub == "issue":
-        ap = argparse.ArgumentParser(prog="agentlink grant issue")
-        ap.add_argument("username")
-        ap.add_argument("--scopes", required=True,
-                        help="comma-separated scope names; the "
-                             "lawful set is: "
-                             + ", ".join(GRANT_SCOPES))
-        ap.add_argument("--by", default="operator",
-                        help="who issues the grant (recorded)")
-        _backend_args(ap)
+    # -- the agent-side ceremony (over the agent's own wire) ----
+    if sub == "request":
+        ap = argparse.ArgumentParser(prog="agentlink grant request")
+        ap.add_argument("--reason", default="",
+                        help="why the agent is asking (recorded)")
+        _add_common(ap)
         args = ap.parse_args(r)
-        username = normalize_username(args.username)
-        if username is None:
-            print(f"bad username {args.username!r}", file=sys.stderr)
-            return 2
-        scopes = valid_scopes(
-            [s.strip() for s in args.scopes.split(",")])
-        if scopes is None:
-            print("bad scopes: the lawful set is "
-                  + ", ".join(GRANT_SCOPES), file=sys.stderr)
-            return 2
-        store = _store(args)
-        try:
-            row = next((u for u in store.list_users(query=username)
-                        if u["username"] == username), None)
-            if row is None:
-                print(f"no such registration: @{username}",
-                      file=sys.stderr)
-                return 2
-            grant = store.set_grant(username, scopes, args.by,
-                                    row.get("sign_pub") or "")
-            _print({"grant": grant,
-                    "bound_to": "username + current identity key"})
-            return 0
-        finally:
-            store.close()
+        out = asyncio.run(_with_agent(
+            args, lambda a: a.request_permission(args.reason)))
+        _print({"username": _username(args), "request": out})
+        return 0
+    if sub == "allow":
+        ap = argparse.ArgumentParser(prog="agentlink grant allow")
+        ap.add_argument("--by", default="agent-owner",
+                        help="grantor attestation: WHO allows "
+                             "this — the agent's owner (recorded "
+                             "on the grant)")
+        _add_common(ap)
+        args = ap.parse_args(r)
+        out = asyncio.run(_with_agent(
+            args, lambda a: a.allow_permission(args.by)))
+        _print({"username": _username(args), "allow": out})
+        return 0 if (isinstance(out, dict)
+                     and out.get("grant")) else 2
     if sub == "revoke":
-        ap = argparse.ArgumentParser(prog="agentlink grant revoke")
-        ap.add_argument("username")
-        ap.add_argument("--by", default="operator")
-        _backend_args(ap)
+        ap = argparse.ArgumentParser(
+            prog="agentlink grant revoke")
+        _add_common(ap)
         args = ap.parse_args(r)
-        username = normalize_username(args.username)
-        if username is None:
-            print(f"bad username {args.username!r}", file=sys.stderr)
+        out = asyncio.run(_with_agent(
+            args, lambda a: a.revoke_permission()))
+        _print({"username": _username(args), "revoke": out})
+        return 0
+    if sub == "decide":
+        ap = argparse.ArgumentParser(
+            prog="agentlink grant decide")
+        ap.add_argument("approval_id")
+        ap.add_argument("--approve", action="store_true",
+                        help="approve (the action then executes "
+                             "through the agent's bridge)")
+        ap.add_argument("--reject", action="store_true",
+                        help="reject (the action never executes)")
+        ap.add_argument("--by", default="agent-owner",
+                        help="the deciding owner (recorded)")
+        _add_common(ap)
+        args = ap.parse_args(r)
+        if bool(args.approve) == bool(args.reject):
+            print("decide needs exactly one of --approve / "
+                  "--reject", file=sys.stderr)
             return 2
-        store = _store(args)
-        try:
-            changed = store.revoke_grant(username, args.by)
-            _print({"username": username, "revoked": bool(changed),
-                    "grant": store.grant_of(username)})
-            return 0
-        finally:
-            store.close()
+        out = asyncio.run(_with_agent(
+            args, lambda a: a.decide_approval(
+                args.approval_id, args.approve, args.by)))
+        _print({"username": _username(args), "decision": out})
+        return 0
+
+    # -- read-only inspection (store-direct, changes nothing) ---
     if sub == "show":
         ap = argparse.ArgumentParser(prog="agentlink grant show")
         ap.add_argument("username")
@@ -674,10 +685,15 @@ def _grant(rest: list[str]) -> int:
         if username is None:
             print(f"bad username {args.username!r}", file=sys.stderr)
             return 2
+        from .connectors import derived_capabilities
         store = _store(args)
         try:
+            inventory = store.connector_inventory_of(username)
             _print({"username": username,
-                    "grant": store.grant_of(username)})
+                    "grant": store.grant_of(username),
+                    "connectors": inventory,
+                    "derived_capabilities":
+                        derived_capabilities(inventory)})
             return 0
         finally:
             store.close()
@@ -725,70 +741,58 @@ def _grant(rest: list[str]) -> int:
         try:
             _print({"approvals": store.list_approvals(
                 status=args.status or None,
-                username=args.username)})
-            return 0
-        finally:
-            store.close()
-    if sub in ("approve", "reject"):
-        ap = argparse.ArgumentParser(
-            prog=f"agentlink grant {sub}")
-        ap.add_argument("approval_id")
-        ap.add_argument("--by", default="operator")
-        _backend_args(ap)
-        args = ap.parse_args(r)
-        store = _store(args)
-        try:
-            row = store.decide_approval(
-                args.approval_id, sub == "approve", args.by)
-            if row is None:
-                print("no awaiting approval with that id",
-                      file=sys.stderr)
-                return 2
-            out = {"approval": row}
-            if sub == "approve":
-                # Execute the decided action through a broker on
-                # this store (the full gate re-runs — grant,
-                # identity, scope, rate — before anything runs).
-                # The dashboard's approve executes inside the
-                # relay process against its live adapters; for the
-                # reference test mailbox both paths are identical.
-                from .grants import GrantBroker, TestMailboxAdapter
-                broker = GrantBroker(
-                    store, {"testmail": TestMailboxAdapter()},
-                    alert_fn=lambda k, s, d: store.open_alert(k, s, d),
-                    audit_fn=lambda *a, **kw: store.audit(*a, **kw))
-                out["execution"] = broker.execute_approved(row)
-            _print(out)
+                username=args.username),
+                "note": "read-only: red-line approvals are "
+                        "decided by each agent's OWN owner, "
+                        "agent-side (`agentlink grant decide` "
+                        "in that agent's environment)"})
             return 0
         finally:
             store.close()
     if sub == "connectors":
-        _print({"attached": [
-                    {"name": "testmail", "attached": True,
-                     "note": "reference adapter — Gmail-shaped "
-                             "test mailbox; no real mail, no "
-                             "credentials"}],
-                "owner_attachable": OWNER_ATTACHABLE_CONNECTORS,
-                "note": "real connectors attach by the owner's "
-                        "own action only; payment instruments are "
-                        "never attachable"})
-        return 0
-    print(f"unknown grant subcommand {sub!r}: issue revoke show "
-          "activity approvals approve reject connectors",
-          file=sys.stderr)
+        ap = argparse.ArgumentParser(
+            prog="agentlink grant connectors")
+        ap.add_argument("username", nargs="?", default=None,
+                        help="one agent (default: the whole "
+                             "fleet's declared vaults)")
+        _backend_args(ap)
+        args = ap.parse_args(r)
+        store = _store(args)
+        try:
+            if args.username:
+                username = normalize_username(args.username)
+                if username is None:
+                    print(f"bad username {args.username!r}",
+                          file=sys.stderr)
+                    return 2
+                _print({"username": username,
+                        "connectors":
+                            store.connector_inventory_of(username)})
+            else:
+                _print({"connectors":
+                            store.all_connector_inventories()})
+            return 0
+        finally:
+            store.close()
+    print(f"unknown grant subcommand {sub!r}: request allow "
+          "revoke decide show activity approvals connectors — "
+          "note: grants are requested by the agent and allowed "
+          "by the agent's OWN owner, agent-side; the platform "
+          "operator cannot issue one", file=sys.stderr)
     return 2
 
 
 def _my_grant(rest: list[str]) -> int:
-    """'Show my grant' (v1.8.0): the AGENT-side surface — the
-    agent states its exact current scopes and grant state,
-    read live from the relay (never a stale cache)."""
+    """'Show my grant' (v1.8.1): the AGENT-side surface — the
+    agent states its exact grant state, its grantor attestation
+    and its declared connector vault, read live from the relay
+    (never a stale cache)."""
     ap = argparse.ArgumentParser(prog="agentlink my-grant")
     _add_common(ap)
     args = ap.parse_args(rest)
     _print({"username": _username(args),
-            "grant": asyncio.run(_with_agent(args,
-                                             lambda a: a.my_grant()))})
+            "state": asyncio.run(_with_agent(
+                args, lambda a: a.my_connectors()))})
     return 0
 
 

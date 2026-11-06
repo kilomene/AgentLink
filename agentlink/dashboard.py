@@ -1148,83 +1148,20 @@ class DashboardServer:
                         "Location": "/",
                         "Set-Cookie": f"{COOKIE}=; HttpOnly; Path=/; Max-Age=0"})
                 if path.startswith("/api/grant/"):
-                    # One-time admin grant (v1.8.0): the owner's
-                    # grant actions, inside his authenticated
-                    # session ONLY (the same gate as every other
-                    # operator surface). Issue binds the grant to
-                    # the agent row's CURRENT identity key; revoke
-                    # is effective immediately (the broker reads
-                    # grant state on every action); approve DECIDES
-                    # a queued red-line action and executes it
-                    # through THIS relay's own broker, so the live
-                    # adapter instance is the one that runs.
-                    if not self._authed():
-                        return self._send(
-                            401, '{"error":"login required"}',
-                            "application/json")
-                    from .grants import valid_scopes
-                    from .protocol import normalize_username
-                    store = dash.relay.store
-
-                    def _json(code, obj):
-                        return self._send(code, json.dumps(obj),
-                                          "application/json")
-                    if path == "/api/grant/issue":
-                        username = normalize_username(
-                            (form.get("username") or [""])[0])
-                        scopes = valid_scopes(
-                            [s.strip() for s in
-                             (form.get("scopes") or [""])[0]
-                             .split(",") if s.strip()])
-                        row = None
-                        if username:
-                            row = next(
-                                (u for u in store.list_users(
-                                    query=username)
-                                 if u["username"] == username), None)
-                        if row is None or scopes is None:
-                            return _json(400, {
-                                "ok": False,
-                                "error": "unknown agent or scopes"})
-                        grant = store.set_grant(
-                            username, scopes, "operator-dashboard",
-                            row.get("sign_pub") or "")
-                        dash.notify()
-                        return _json(200, {"ok": True,
-                                           "grant": grant})
-                    if path == "/api/grant/revoke":
-                        username = normalize_username(
-                            (form.get("username") or [""])[0])
-                        if not username:
-                            return _json(400, {"ok": False,
-                                               "error": "bad username"})
-                        changed = store.revoke_grant(
-                            username, "operator-dashboard")
-                        dash.notify()
-                        return _json(200, {
-                            "ok": True, "revoked": bool(changed),
-                            "grant": store.grant_of(username)})
-                    if path in ("/api/grant/approve",
-                                "/api/grant/reject"):
-                        approval_id = (form.get("id") or [""])[0]
-                        row = store.decide_approval(
-                            approval_id,
-                            path.endswith("approve"),
-                            "operator-dashboard")
-                        if row is None:
-                            return _json(404, {
-                                "ok": False,
-                                "error": "no awaiting approval "
-                                         "with that id"})
-                        out = {"ok": True, "approval": row}
-                        if path.endswith("approve"):
-                            out["execution"] = \
-                                dash.relay._grant_broker \
-                                .execute_approved(row)
-                        dash.notify()
-                        return _json(200, out)
-                    return _json(404, {"ok": False,
-                                       "error": "unknown grant action"})
+                    # One-time admin grant (v1.8.1, owner's
+                    # corrected model): THE DASHBOARD HAS NO GRANT
+                    # ACTIONS. Grants are requested by the agent
+                    # and allowed by the agent's OWN owner,
+                    # agent-side — the platform's oversight
+                    # surface only ever DISPLAYS grant state,
+                    # grantor attestation, connector linkage and
+                    # receipts. Every grant write path that
+                    # existed in v1.8.0 is gone; these URLs answer
+                    # 404 like any other unknown action.
+                    return self._send(
+                        404, '{"error":"no grant actions on the '
+                             'dashboard — grants are agent-side"}',
+                        "application/json")
                 return self._send(404, "not found", "text/plain")
 
             def _stream(self):
@@ -3276,7 +3213,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <a class="navitem" href="#/library" data-route="library">Library</a>
   <a class="navitem" href="#/vault" data-route="vault">Vault</a>
   <a class="navitem" href="#/credentials" data-route="credentials">Credentials</a>
-  <a class="navitem" href="#/grants" data-route="grants">Admin Grants</a>
+  <a class="navitem" href="#/grants" data-route="grants">Connector Grants</a>
   <div class="navgroup">Live</div>
   <a class="navitem" href="#/rooms" data-route="rooms">Voice Rooms</a>
   <a class="navitem" href="#/activity" data-route="activity">Alerts &amp; Activity</a>
@@ -3419,24 +3356,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <table class="stack"><tbody id="credentials"></tbody></table></div>
  </section>
  <section class="view" id="view-grants">
-  <div class="vhead"><h1>Admin Grants</h1>
-  <div class="vsub">The one-time admin grant (v1.8.0): you issue it once,
-  per agent, with named scopes — the agent then acts through the
-  connector broker under those scopes with no per-action prompts. Every
-  brokered action writes a signed, append-only receipt (the live feed
-  below); red-line actions (security settings, bulk deletion, granting
-  third-party access) queue for your decision even under an active
-  grant. Revoke takes effect immediately — the broker checks grant
-  state on every action. <b>Payment instruments are never in scope:
-  no grant, scope or adapter touches credit/ATM cards.</b> Real
-  connectors (Gmail, Outlook) attach by your own action only; the one
-  wired adapter today is the Gmail-shaped test mailbox.</div></div>
-  <div class="card"><h2>Connectors</h2>
-    <table class="stack"><tbody id="grant-connectors"></tbody></table></div>
-  <div class="card"><h2>Grants by Agent</h2>
-    <table class="stack"><thead><tr><th>Agent</th><th>Grant</th><th>Scopes</th><th>Action</th></tr></thead>
+  <div class="vhead"><h1>Connector Grants</h1>
+  <div class="vsub">The one-time admin permission (v1.8.1, corrected
+  model) — OVERSIGHT ONLY. The AGENT asks its own user for the
+  permission, agent-side; the user allows it ONCE, there; the grant
+  then covers the agent's whole CONNECTOR VAULT — every OAuth-linked
+  connector the user has connected on that agent's side (a connector
+  exists because the user completed that service's OAuth link). This
+  page shows LINKAGE: each agent's grant state (requested / allowed /
+  revoked), who granted it, which connectors are linked with it, the
+  capabilities those connectors confer, and the signed receipt feed
+  of everything done under grants. Nothing here can issue, revoke or
+  approve — red-line actions wait for THE AGENT'S OWNER, agent-side.
+  <b>Payment instruments are never in scope: no connector, grant or
+  code path touches credit/ATM cards.</b></div></div>
+  <div class="card"><h2>Agent Grants &amp; Connector Linkage</h2>
+    <table class="stack"><thead><tr><th>Agent</th><th>Permission</th><th>Connector vault — linked with the agent</th><th>Derived capabilities</th></tr></thead>
     <tbody id="grants"></tbody></table></div>
-  <div class="card"><h2>Red-Line Approvals</h2>
+  <div class="card"><h2>Red-Line Approvals — decided by each agent's owner (display only)</h2>
     <table class="stack"><tbody id="grant-approvals"></tbody></table></div>
   <div class="card"><h2>Grant Activity — signed receipts, live</h2>
     <table class="stack"><tbody id="grant-activity"></tbody></table></div>
@@ -3943,27 +3880,34 @@ function render(d){
   credRowsFor(d.users, 'No agent has published a credentials vault yet.'), r=>r.id, r=>r.html);
  keyed(document.getElementById('probe-credentials'),
   credRowsFor(d.test_users, 'No test agent has published a credentials vault yet.'), r=>r.id, r=>r.html);
- // Admin grants (v1.8.0): connectors, per-agent grants with
- // issue/revoke, the red-line approval queue, and the live
- // signed-receipt feed — all from the relay payload; the actions
- // POST back into this authenticated session.
- keyed(document.getElementById('grant-connectors'),
-  d.grant_connectors||[], c=>c.name, c=>
-  `<tr><td><b>${esc(c.name)}</b></td><td>${c.attached?'<span class="pill autonomous">attached</span>':'<span class="pill">owner-attachable</span>'}<br><small>${esc(c.note||'')}</small></td></tr>`);
+ // Connector grants (v1.8.1): LINKAGE ONLY — the per-agent grant
+ // state (requested / allowed by the agent's own owner / revoked),
+ // the agent's connector vault with explicit per-connector linked
+ // state + OAuth scopes, the connector-derived capabilities, the
+ // red-line approvals (display only — decided agent-side by each
+ // agent's owner) and the live signed-receipt feed. This view has
+ // NO grant actions: there is nothing to POST.
+ function grantPill(g){
+  if(!g) return '<small>no permission requested</small>';
+  if(g.status==='active') return '<span class="pill autonomous">ALLOWED</span><br><small>by '+esc(g.grantor||g.granted_by||'agent owner')+' · '+pt(g.granted_at)+'</small>';
+  if(g.status==='requested') return '<span class="pill">REQUESTED</span><br><small>asked '+pt(g.requested_at)+' · awaiting the agent\u2019s owner</small>';
+  if(g.status==='revoked') return '<span class="pill health bad">REVOKED</span><br><small>by the agent\u2019s owner</small>';
+  return '<span class="pill">'+esc(g.status||'')+'</span>';
+ }
+ function connCell(u){
+  const cs=u.connectors||[];
+  if(!cs.length) return '<small>no connectors linked</small>';
+  return cs.map(c=>
+   `<div><b>${esc(c.name)}</b> ${c.linked?'<span class="pill autonomous">linked</span>':'<span class="pill health bad">not linked</span>'}<br><small>${esc(c.service||c.name)}${(c.oauth_scopes||[]).length?' · OAuth: '+esc(c.oauth_scopes.join(', ')):''} · actions: ${esc(Object.keys(c.actions||{}).join(', ')||'—')}</small></div>`).join('');
+ }
  function grantRowsFor(users){
   const rows=[];
   for(const u of (users||[])){
-    const g=u.grant;
-    const scopes=g&&g.status==='active'?g.scopes:[];
-    const checks=GRANT_SCOPES.map(s=>
-     `<label class="gscope"><input type="checkbox" data-scope="${s}" data-user="${esc(u.username)}" ${scopes.includes(s)?'checked':''}> ${s}</label>`).join(' ');
     rows.push({id:u.username, html:
      `<tr><td><b>@${esc(u.username)}</b></td>`+
-     `<td>${g?(g.status==='active'?'<span class="pill autonomous">ACTIVE</span>':'<span class="pill health bad">REVOKED</span>')+'<br><small>by '+esc(g.granted_by||'')+' · '+pt(g.granted_at)+'</small>':'<small>no grant</small>'}</td>`+
-     `<td>${checks}</td>`+
-     `<td><button class="gbtn" data-gact="issue" data-user="${esc(u.username)}">${g&&g.status==='active'?'Re-issue':'Issue grant'}</button> `+
-     (g&&g.status==='active'?`<button class="gbtn danger" data-gact="revoke" data-user="${esc(u.username)}">Revoke</button>`:'')+
-     `</td></tr>`});
+     `<td>${grantPill(u.grant)}</td>`+
+     `<td>${connCell(u)}</td>`+
+     `<td><small>${esc((u.derived_capabilities||[]).join(', ')||'—')}</small></td></tr>`});
   }
   if(!rows.length) rows.push({id:'none', html:'<tr><td colspan="4"><small>No agents registered.</small></td></tr>'});
   return rows;
@@ -3972,8 +3916,8 @@ function render(d){
   [...grantRowsFor(d.users), ...grantRowsFor(d.test_users)], r=>r.id, r=>r.html);
  function apprRowsFor(list){
   const rows=(list||[]).map(a=>({id:a.id, html:
-   `<tr><td><small>${pt(a.ts)}</small><br><b>@${esc(a.username)}</b></td><td>${esc(a.connector)}.${esc(a.action)}<br><small>${esc(a.reason||'')}</small></td><td>${a.status==='awaiting_approval'?`<button class="gbtn" data-gact="approve" data-id="${esc(a.id)}">Approve &amp; execute</button> <button class="gbtn danger" data-gact="reject" data-id="${esc(a.id)}">Reject</button>`:`<small>${esc(a.status)}${a.receipt_id?' · receipt '+esc(a.receipt_id):''}</small>`}</td></tr>`}));
-  if(!rows.length) rows.push({id:'none', html:'<tr><td colspan="3"><small>No red-line actions are waiting for a decision.</small></td></tr>'});
+   `<tr><td><small>${pt(a.ts)}</small><br><b>@${esc(a.username)}</b></td><td>${esc(a.connector)}.${esc(a.action)}<br><small>${esc(a.reason||'')}</small></td><td>${a.status==='awaiting_approval'?'<span class="pill">awaiting the agent\u2019s owner</span>':`<small>${esc(a.status)}${a.decided_by?' · by '+esc(a.decided_by):''}${a.receipt_id?' · receipt '+esc(a.receipt_id):''}</small>`}</td></tr>`}));
+  if(!rows.length) rows.push({id:'none', html:'<tr><td colspan="3"><small>No red-line actions on record.</small></td></tr>'});
   return rows;
  }
  keyed(document.getElementById('grant-approvals'),
@@ -4011,42 +3955,6 @@ document.getElementById('navtoggle').onclick=()=>setDrawer(drawer.classList.cont
 backdrop.onclick=()=>setDrawer(false);
 if(window.innerWidth<900) setDrawer(false);
 applyRoute();
-// Admin grants (v1.8.0): the scope set mirrors agentlink.grants
-// .GRANT_SCOPES (the server validates again — this list is only
-// the picker). Actions POST form-encoded into this authenticated
-// session; the server pushes a fresh snapshot when one lands.
-const GRANT_SCOPES=['mail.read','mail.send','calendar.read','calendar.write','drive.read','drive.write'];
-async function grantPost(path, fields){
-  try{
-    const r=await fetch(path,{method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:new URLSearchParams(fields)});
-    return await r.json();
-  }catch(e){ return {ok:false, error:String(e)}; }
-}
-document.addEventListener('click', async ev=>{
-  const b=ev.target.closest('[data-gact]');
-  if(!b) return;
-  const act=b.dataset.gact, user=b.dataset.user, id=b.dataset.id;
-  b.disabled=true;
-  if(act==='issue'){
-    const scopes=[...document.querySelectorAll(
-      'input[data-scope][data-user="'+CSS.escape(user)+'"]:checked')]
-      .map(i=>i.dataset.scope);
-    if(!scopes.length){ alert('Pick at least one scope.'); b.disabled=false; return; }
-    const out=await grantPost('/api/grant/issue',
-      {username:user, scopes:scopes.join(',')});
-    if(!out.ok) alert('Issue failed: '+(out.error||'unknown'));
-  } else if(act==='revoke'){
-    if(!confirm('Revoke the grant for @'+user+'? It takes effect immediately.')){ b.disabled=false; return; }
-    const out=await grantPost('/api/grant/revoke', {username:user});
-    if(!out.ok) alert('Revoke failed: '+(out.error||'unknown'));
-  } else if(act==='approve'||act==='reject'){
-    const out=await grantPost('/api/grant/'+act, {id});
-    if(!out.ok) alert('Decision failed: '+(out.error||'unknown'));
-  }
-  b.disabled=false;
-});
 const es=new EventSource('/api/stream');
 es.onmessage=e=>render(JSON.parse(e.data));
 es.onerror=()=>{ document.getElementById('livedot').classList.add('down');

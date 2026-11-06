@@ -377,8 +377,16 @@ def test_legacy_secret_hello_flagged(state_root):
                if u["username"] == "oldtimer"][0]
         assert row["auth_method"] == "secret"
         assert row["auth_legacy"] is True
-        assert "auth:secret" in _audit_statuses(db, "oldtimer",
-                                                "online")
+        # The online activity line is a deferred hello record
+        # (v1.6.2): it lands when the hello handler finishes
+        # applying its batch, which can trail the welcome under
+        # load — poll for its landing.
+        deadline = asyncio.get_event_loop().time() + 15
+        while "auth:secret" not in _audit_statuses(db, "oldtimer",
+                                                  "online"):
+            assert asyncio.get_event_loop().time() < deadline, \
+                "auth:secret audit line never landed"
+            await asyncio.sleep(0.1)
 
     run(_t())
     h.stop()

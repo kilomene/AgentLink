@@ -969,6 +969,20 @@ alter table al_users add column if not exists vault_entries integer not null def
 -- only — one new column with a default.
 alter table al_users add column if not exists vault_content text not null default '';
 
+-- ------------------------------------------------- grant vault (v1.8.1)
+-- The grant, corrected: grantor attestation + the agent-initiated
+-- request record on al_grants, and the per-agent connector vault.
+-- The applied-to-live form is supabase/migration-grant-vault.sql.
+alter table al_grants add column if not exists grantor text not null default '';
+alter table al_grants add column if not exists ceremony_at bigint not null default 0;
+alter table al_grants add column if not exists request_id text not null default '';
+alter table al_grants add column if not exists requested_at bigint not null default 0;
+alter table al_grants add column if not exists request_reason text not null default '';
+create table if not exists al_agent_connectors (
+    username text primary key,
+    inventory text not null default '[]',
+    updated_at bigint not null default 0
+);
 -- ------------------------------------------------------- onboarding (v1.8.0)
 -- Auto decision link detail + the one-time admin grant (grants,
 -- signed append-only receipts, red-line approvals, grant meta).

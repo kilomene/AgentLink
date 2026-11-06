@@ -635,3 +635,18 @@ def test_manual_recovery_key_path(state_root):
 
     run(_t())
     h.stop()
+
+
+def test_suite_workspace_isolated_from_real_workspace():
+    """Suite hygiene (2026-11-05): a client built WITHOUT an
+    explicit workspace= must land in the suite's scratch
+    workspace (conftest points AGENTLINK_WORKSPACE at a temp
+    dir), never the developer's real ~/workspace — otherwise
+    every gate run scatters agentlink-recovery-<user>.txt files
+    for scratch identities across the real workspace."""
+    import os
+    env_ws = os.environ.get("AGENTLINK_WORKSPACE")
+    assert env_ws, "conftest must set AGENTLINK_WORKSPACE"
+    assert Path(env_ws) != Path("~/workspace").expanduser()
+    probe = Agent("wsisolationprobe", state_dir=tempfile.mkdtemp())
+    assert probe.workspace == Path(env_ws)

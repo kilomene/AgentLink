@@ -686,7 +686,8 @@ def test_first_contact_refusal_never_strands_identity(state_root):
     async def _t():
         agent = Agent("newcomer", endpoint="ws://127.0.0.1:9",
                       fallbacks=[peer_url],
-                      state_dir=str(state_root / "newcomer"))
+                      state_dir=str(state_root / "newcomer"),
+                      workspace=str(state_root))
         # The peer is still UNRATED: the rider hello is refused...
         from agentlink.client import RegistrationFailed
         with pytest.raises(RegistrationFailed) as ei:

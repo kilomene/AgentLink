@@ -193,6 +193,43 @@ def auth_challenge_payload(nonce, relay, username, expires) -> bytes:
             + "\n" + str(username) + "\n" + str(expires)).encode()
 
 
+def grant_statement_payload(kind: str, username: str, ts: int,
+                            fields: dict | None = None) -> bytes:
+    """The exact bytes of a grant statement (v1.8.1): the
+    agent-initiated permission flow signs its statements with the
+    agent's identity (signing) key — the permission REQUEST, the
+    owner's ALLOW, the owner's REVOKE, and the owner's red-line
+    DECISION are each a signed statement the relay verifies
+    against the registered signing key. Canonical form: protocol
+    tag, statement kind, username, statement timestamp, then the
+    kind's own fields as sorted key=value lines. Built
+    identically by client and relay from the frame's own values,
+    so what is verified is exactly what was presented."""
+    lines = ["agentlink-grant-v1", str(kind), str(username),
+             str(int(ts))]
+    for k in sorted((fields or {}).keys()):
+        v = (fields or {})[k]
+        if isinstance(v, bool):
+            v = "true" if v else "false"
+        lines.append(f"{k}={v}")
+    return ("\n".join(lines)).encode()
+
+
+def inventory_digest(inventory) -> str:
+    """A stable digest of a connector inventory (v1.8.1): the
+    owner's ALLOW statement binds the digest of the inventory the
+    agent declared at ceremony time, so the record shows exactly
+    which connector vault the permission was given over — while
+    the grant's LIVE coverage always follows the agent's current
+    inventory (the owner connects/disconnects connectors on their
+    own side; the grant follows the vault, not a snapshot)."""
+    import hashlib
+    import json as _json
+    canon = _json.dumps(inventory or [], sort_keys=True,
+                        separators=(",", ":"))
+    return hashlib.sha256(canon.encode()).hexdigest()
+
+
 def new_id(prefix: str = "") -> str:
     return prefix + uuid.uuid4().hex
 

@@ -113,18 +113,83 @@ class SupabaseStore:
     # for the identity-sequenced append tables (a retry there could
     # double-apply); a 409 on a POST retry means the first attempt
     # landed and its response was lost — treated as success.
-    @staticmethod
-    def _proxy_url() -> str:
-        import os as _os
-        for k in ("https_proxy", "HTTPS_PROXY", "http_proxy",
-                  "HTTP_PROXY"):
-            v = _os.environ.get(k)
-            if v:
-                return v
-        return ""
-
     def _open_conn(self):
-        proxy = self._proxy_url()
+        # Dial-time proxy-credential resolution + racing
+        # (proxycreds): candidates are resolved FRESH on every
+        # (re)connect — override file, current proxy.env,
+        # process env, harvested /proc candidates — and raced
+        # until one completes the CONNECT. A rotated credential
+        # is adopted with no restart; the process env alone (the
+        # pre-1.8.1 behaviour) pinned the credential from
+        # process start and stranded the store on rotation.
+        from .proxycreds import (candidate_proxies,
+                                 note_proxy_result)
+        candidates = candidate_proxies()
+        if not candidates:
+            return self._try_open("")
+        if len(candidates) == 1:
+            proxy = candidates[0]
+            try:
+                conn = self._try_open(proxy)
+            except Exception:
+                note_proxy_result(proxy, False)
+                raise
+            note_proxy_result(proxy, True)
+            return conn
+        # Parallel first-success-wins race (the canonical
+        # pattern): every candidate dials at once on its own
+        # thread; the first completed CONNECT is the connection,
+        # late finishers are closed by the reaper, and failures
+        # are noted as they land. A field of dead credentials
+        # therefore costs one dial timeout, not one per corpse.
+        import queue as _queue
+        import threading as _threading
+        results: _queue.Queue = _queue.Queue()
+
+        def _attempt(proxy_url):
+            try:
+                results.put((proxy_url,
+                             self._try_open(proxy_url), None))
+            except Exception as exc:
+                results.put((proxy_url, None, exc))
+
+        for p in candidates:
+            _threading.Thread(target=_attempt, args=(p,),
+                              daemon=True).start()
+
+        def _reap(n):
+            # Close any success that lands after the race was
+            # decided — an unclosed tunnel socket per rotation
+            # would leak for the life of the process.
+            for _ in range(n):
+                _p, _c, _e = results.get()
+                if _c is not None:
+                    try:
+                        _c[0].close()
+                    except Exception:
+                        pass
+
+        winner_conn = None
+        last: Exception | None = None
+        remaining = len(candidates)
+        while remaining > 0 and winner_conn is None:
+            proxy, conn, exc = results.get()
+            remaining -= 1
+            if conn is not None:
+                note_proxy_result(proxy, True)
+                winner_conn = conn
+            else:
+                note_proxy_result(proxy, False)
+                last = exc
+        if winner_conn is not None:
+            if remaining > 0:
+                _threading.Thread(target=_reap, args=(remaining,),
+                                  daemon=True).start()
+            return winner_conn
+        raise last if last is not None else ConnectionError(
+            "no egress proxy candidate completed")
+
+    def _try_open(self, proxy: str):
         if proxy:
             p = urllib.parse.urlparse(proxy)
             raw = socket.create_connection((p.hostname, p.port or 3128),
@@ -957,10 +1022,13 @@ class SupabaseStore:
                   body={"decision_link_detail": json.dumps(clean)},
                   prefer="return=minimal")
 
-    # -- one-time admin grant (v1.8.0), SQLite parity ----------------
-    # See store.py for the doctrine. Receipts are append-only:
-    # this class grows insert/read methods for them and NO
-    # update/delete path, exactly like the SQLite store.
+    # -- one-time admin grant (v1.8.1 — owner's corrected model),
+    # SQLite parity. See store.py / grants.py for the doctrine:
+    # the grant is agent-requested and owner-allowed, agent-side;
+    # NO method here creates an active grant except
+    # activate_grant acting on a recorded request. Receipts are
+    # append-only: this class grows insert/read methods for them
+    # and NO update/delete path, exactly like the SQLite store.
 
     @staticmethod
     def _shape_grant(row):
@@ -978,28 +1046,53 @@ class SupabaseStore:
                         + "&select=*")
         return self._shape_grant(row)
 
-    def set_grant(self, username, scopes, granted_by,
-                  bound_sign_pub):
-        # Scope law enforced in the store too (SQLite parity):
-        # an out-of-law set can never be persisted.
-        from .grants import valid_scopes
-        checked = valid_scopes(scopes)
-        if checked is None:
-            raise ValueError(
-                f"unlawful grant scope set {scopes!r}")
-        scopes = checked
+    def record_grant_request(self, username, request_id,
+                             reason=""):
+        # SQLite parity: an ACTIVE grant is untouched by a new
+        # request; anything else records the pending request.
+        current = self.grant_of(username)
+        if current is not None \
+                and current.get("status") == "active":
+            return current
         ts = now_ts()
-        body = {"username": username,
-                "scopes": json.dumps(list(scopes)),
-                "granted_by": granted_by, "granted_at": ts,
-                "status": "active",
-                "bound_sign_pub": bound_sign_pub, "updated_at": ts}
+        body = {"username": username, "scopes": "[]",
+                "granted_by": "", "granted_at": 0,
+                "status": "requested", "bound_sign_pub": "",
+                "updated_at": ts, "request_id": request_id,
+                "requested_at": ts, "request_reason": reason}
         self._req("POST", "grants", body=body,
                   prefer="resolution=merge-duplicates,"
                          "return=representation")
-        self.audit("grant_issued", granted_by or "operator",
+        self.audit("grant_requested", username, target=username,
+                   status=f"request {request_id} awaits the "
+                          f"agent's owner")
+        return self.grant_of(username)
+
+    def activate_grant(self, username, grantor, bound_sign_pub,
+                       request_id, ceremony_at):
+        # SQLite parity: activation lands ONLY from the recorded
+        # REQUESTED state with a matching request id (the PATCH
+        # filter does the guard; zero rows = no such request).
+        ts = now_ts()
+        rows = self._req(
+            "PATCH", "grants",
+            self._eq("username", username)
+            + "&status=eq.requested"
+            + "&" + self._eq("request_id", request_id),
+            body={"status": "active", "scopes": "[]",
+                  "granted_by": grantor, "grantor": grantor,
+                  "granted_at": ts,
+                  "ceremony_at": int(ceremony_at or ts),
+                  "bound_sign_pub": bound_sign_pub,
+                  "updated_at": ts},
+            prefer="return=representation")
+        n = len(rows) if isinstance(rows, list) else 0
+        if not n:
+            return None
+        self.audit("grant_allowed", "agent-owner",
                    target=username,
-                   status="scopes=" + ",".join(scopes))
+                   status=f"grantor={grantor} "
+                          f"request={request_id}")
         return self.grant_of(username)
 
     def revoke_grant(self, username, by=""):
@@ -1010,9 +1103,44 @@ class SupabaseStore:
             prefer="return=representation")
         n = len(rows) if isinstance(rows, list) else 0
         if n:
-            self.audit("grant_revoked", by or "operator",
+            self.audit("grant_revoked", by or "agent-owner",
                        target=username)
         return bool(n)
+
+    # -- the connector vault (v1.8.1), SQLite parity --------------
+
+    def set_connector_inventory(self, username, inventory):
+        body = {"username": username,
+                "inventory": json.dumps(list(inventory or [])),
+                "updated_at": now_ts()}
+        self._req("POST", "agent_connectors", body=body,
+                  prefer="resolution=merge-duplicates,"
+                         "return=minimal")
+
+    def connector_inventory_of(self, username):
+        row = self._one("agent_connectors",
+                        self._eq("username", username)
+                        + "&select=inventory")
+        if not row:
+            return []
+        try:
+            inv = json.loads(row.get("inventory") or "[]")
+        except Exception:
+            return []
+        return inv if isinstance(inv, list) else []
+
+    def all_connector_inventories(self):
+        rows = self._get("agent_connectors",
+                         "select=username,inventory")
+        out = {}
+        for r in rows:
+            try:
+                inv = json.loads(r.get("inventory") or "[]")
+            except Exception:
+                inv = []
+            out[r["username"]] = inv if isinstance(inv, list) \
+                else []
+        return out
 
     def rebind_grants(self, username, new_sign_pub):
         rows = self._req(
@@ -1452,17 +1580,20 @@ class SupabaseStore:
         ("alerts", "subject"),
         # One-time admin grant (v1.8.0): grant, receipts and
         # approvals die with the registration — a name re-claimed
-        # by a different identity never inherits them.
+        # by a different identity never inherits them. The
+        # connector vault declaration (v1.8.1) dies with it too.
         ("grant_approvals", "username"),
         ("grant_receipts", "username"),
         ("grants", "username"),
+        ("agent_connectors", "username"),
     )
     _REMOVAL_ORDER = (
         "work_deliveries", "work_checkpoints", "work", "chain_steps",
         "chains", "queue", "message_reads", "group_keys",
         "group_members", "channel_keys", "channel_members", "invites",
         "upload_sessions", "alerts", "blobs", "library",
-        "grant_approvals", "grant_receipts", "grants", "users")
+        "grant_approvals", "grant_receipts", "grants",
+        "agent_connectors", "users")
 
     def removal_blockers(self, username):
         blockers = []

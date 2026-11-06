@@ -40,11 +40,23 @@ from pathlib import Path
 import pytest
 
 from agentlink import timing
+import agentlink.client as client_module
 from agentlink.client import Agent
 from agentlink.relay import Relay
 
 HOST = "127.0.0.1"
 DASH_PW = "autonomy-test-pw"
+
+
+@pytest.fixture(autouse=True)
+def dead_convention(monkeypatch):
+    """Hermetic convention (v1.8.1 arbitration): see
+    tests/test_decision_link.py — this VM hosts a REAL decision
+    endpoint on the convention port (deploy-probe's, production)
+    which a nothing-backed test agent would otherwise adopt,
+    flipping 'pending' assertions. Point it at a dead address."""
+    monkeypatch.setattr(client_module, "DECISION_CONVENTION_URL",
+                        "http://127.0.0.1:1/decide")
 
 
 @pytest.fixture()

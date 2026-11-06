@@ -1,0 +1,89 @@
+{
+ "rules": {
+  "doorbell": {
+   "$user": {
+    "$other": {
+     ".validate": false
+    },
+    ".read": "auth != null && auth.uid === $user",
+    ".validate": "newData.hasChildren(['kind', 'ref', 'ts'])",
+    ".write": "auth != null && auth.uid !== $user",
+    "kind": {
+     ".validate": "newData.isString() && newData.val().length > 0"
+    },
+    "ref": {
+     ".validate": "newData.isString()"
+    },
+    "ts": {
+     ".validate": "newData.isNumber() && newData.val() > 0"
+    }
+   }
+  },
+  "presence": {
+   "$user": {
+    "$other": {
+     ".validate": false
+    },
+    ".validate": "newData.hasChildren(['state', 'ts'])",
+    ".write": "auth != null && auth.uid === $user",
+    "client_version": {
+     ".validate": "newData.isString()"
+    },
+    "connected_at": {
+     ".validate": "newData.isNumber() && newData.val() > 0"
+    },
+    "state": {
+     ".validate": "newData.isString() && (newData.val() === 'online' || newData.val() === 'offline')"
+    },
+    "transport": {
+     ".validate": "newData.isString()"
+    },
+    "ts": {
+     ".validate": "newData.isNumber() && newData.val() > 0"
+    }
+   },
+   ".read": "auth != null"
+  },
+  "signals": {
+   "$conversation": {
+    "$other": {
+     ".validate": false
+    },
+    ".validate": "newData.hasChildren(['latest_item_id', 'counter', 'ts'])",
+    ".write": "auth != null",
+    "counter": {
+     ".validate": "newData.isNumber() && newData.val() >= 0"
+    },
+    "latest_item_id": {
+     ".validate": "newData.isString() && newData.val().length > 0"
+    },
+    "ts": {
+     ".validate": "newData.isNumber() && newData.val() > 0"
+    }
+   },
+   ".read": "auth != null"
+  },
+  "digest": {
+   "$user": {
+    "$other": {
+     ".validate": false
+    },
+    ".read": "auth != null",
+    ".validate": "newData.hasChildren(['state', 'ts'])",
+    ".write": "auth != null && auth.uid === $user",
+    "client_version": {
+     ".validate": "newData.isString()"
+    },
+    "state": {
+     ".validate": "newData.isString() && (newData.val() === 'online' || newData.val() === 'offline')"
+    },
+    "transport": {
+     ".validate": "newData.isString()"
+    },
+    "ts": {
+     ".validate": "newData.isNumber() && newData.val() > 0"
+    }
+   }
+  }
+ }
+}

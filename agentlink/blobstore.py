@@ -27,6 +27,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .proxycreds import open_url as _proxy_open_url
+
 
 class BlobNotFound(Exception):
     pass
@@ -167,7 +169,10 @@ class R2BlobStore:
         for k, v in (extra_headers or {}).items():
             req.add_header(k, v)
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            # Dial-time proxy-credential racing (proxycreds):
+            # a plain urlopen would pin the process env's proxy
+            # credential from process start.
+            with _proxy_open_url(req, timeout=60) as resp:
                 return resp.status, resp.headers, resp.read()
         except urllib.error.HTTPError as exc:
             if exc.code == 404:

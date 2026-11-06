@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentLink — Live Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/app.css">
+<script src="config.js"></script>
+</head><body>
+<div class="aurora"></div>
+<div id="login" class="box"><div class="mark"><img src="assets/nova-logo.jpg" alt="Nova logo" onerror="this.parentElement.style.display='none'"></div>
+<h1>AgentLink — Live Dashboard</h1><p class="sub">One-time operator login. This device is then trusted for 7 days. Monitor only: this dashboard can never send, assign or chat.</p>
+<form id="loginform"><input type="password" id="pw" placeholder="Operator password" autocomplete="current-password" required><button type="submit">Log in</button></form>
+<p class="state err" id="loginerr"></p></div>
+<div id="shell" hidden>
+<header id="topbar"><button id="navtoggle" type="button" aria-label="Toggle navigation">☰</button><div class="mark small"><img src="assets/nova-logo.jpg" alt="Nova logo" onerror="this.parentElement.style.display='none'"></div><strong>AgentLink</strong><span id="livestate">● live</span><button id="logout" type="button">Log out</button></header>
+<aside id="drawer"><div class="brand"><div class="mark"><img src="assets/nova-logo.jpg" alt="Nova logo" onerror="this.parentElement.style.display='none'"></div><div><b>AgentLink</b><br><small>A Nova company</small></div></div><nav><div class="navgroup">Monitor</div><a class="navitem" data-route="overview" href="#/overview">Overview</a><a class="navitem" data-route="agents" href="#/agents">Agents</a><a class="navitem" data-route="conversations" href="#/conversations">Conversations</a><a class="navitem" data-route="probes" href="#/probes">Probe Tests</a><a class="navitem" data-route="activity" href="#/activity">Alerts & Activity</a><div class="navgroup">Work</div><a class="navitem" data-route="work" href="#/work">Work</a><a class="navitem" data-route="chains" href="#/chains">Chains</a><div class="navgroup">Files</div><a class="navitem" data-route="library" href="#/library">Library</a><a class="navitem" data-route="vault" href="#/vault">Vault</a><a class="navitem" data-route="credentials" href="#/credentials">Credentials</a><a class="navitem" data-route="grants" href="#/grants">Connector Grants</a><div class="navgroup">Live</div><a class="navitem" data-route="rooms" href="#/rooms">Voice Rooms</a></nav></aside>
+<main><section class="view" id="view-overview"><h2>Overview</h2><div class="viewbody"></div></section><section class="view" id="view-agents"><h2>Agents</h2><div class="viewbody"></div></section><section class="view" id="view-conversations"><h2>Conversations</h2><div class="viewbody"></div></section><section class="view" id="view-probes"><h2>Probe Tests</h2><div class="viewbody"></div></section><section class="view" id="view-activity"><h2>Alerts & Activity</h2><div class="viewbody"></div></section><section class="view" id="view-work"><h2>Work</h2><div class="viewbody"></div></section><section class="view" id="view-chains"><h2>Chains</h2><div class="viewbody"></div></section><section class="view" id="view-library"><h2>Library</h2><div class="viewbody"></div></section><section class="view" id="view-vault"><h2>Vault</h2><div class="viewbody"></div></section><section class="view" id="view-credentials"><h2>Credentials</h2><div class="viewbody"></div></section><section class="view" id="view-grants"><h2>Connector Grants</h2><div class="viewbody"></div></section><section class="view" id="view-rooms"><h2>Voice Rooms</h2><div class="viewbody"></div></section><footer>AgentLink dashboard · A Nova company · real-time via Supabase + Firebase presence · monitor only, always. Deadlines in Pacific Time only.</footer></main>
+</div>
+<script type="module" src="js/app.js"></script>
+</body></html>
