@@ -4,6 +4,13 @@
 // ever reads: it never writes any Firebase path, and no content
 // ever travels through Firebase (blueprint law).
 //
+// The stream below is a server-push subscription (RTDB REST
+// streaming): beats arrive the moment agents write them. There is
+// NO polling fallback - if the stream drops it reconnects with
+// backoff, and the Postgres activeness mirror (al_activeness,
+// pushed over Supabase Realtime) keeps a transition-level truth on
+// screen in the meantime.
+//
 // Display truth is the staleness ladder in js/activeness.js (the
 // single source of truth): each user gets a per-user ladder state
 // ("online" | "suspect" | "offline") plus its beat age in seconds,
@@ -21,15 +28,26 @@ export async function fetchPresence(){
   return (await r.json()) || {};
 }
 export function streamPresence(onUpdate, onError){
-  // RTDB REST streaming via EventSource; falls back to 15s polling.
-  try{
-    const es = new EventSource(presenceUrl());
-    es.addEventListener("put", e=>{ try{ onUpdate(JSON.parse(e.data).data || {}); }catch(_){} });
-    es.onerror = ()=>{ es.close(); poll(onUpdate); };
-    return ()=>es.close();
-  }catch(e){ return poll(onUpdate); }
+  let stopped = false, es = null, backoff = 2000, retry = null;
+  const connect = () => {
+    if(stopped) return;
+    try{
+      es = new EventSource(presenceUrl());
+      es.addEventListener("put", e => { backoff = 2000; try{ onUpdate(JSON.parse(e.data).data || {}); }catch(_){} });
+      es.addEventListener("patch", e => { try{ const d = JSON.parse(e.data); if(d && d.data) onUpdate({ ...lastPresence, ...d.data }); }catch(_){} });
+      es.onerror = () => {
+        if(es){ es.close(); es = null; }
+        if(onError) onError(new Error("presence stream interrupted"));
+        if(!stopped){ retry = setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 30000); }
+      };
+    }catch(err){
+      if(onError) onError(err);
+      if(!stopped){ retry = setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 30000); }
+    }
+  };
+  connect();
+  return () => { stopped = true; if(retry) clearTimeout(retry); if(es) es.close(); };
 }
-function poll(onUpdate){ const tick=()=>fetchPresence().then(onUpdate).catch(()=>{}); tick(); const id=setInterval(tick,15000); return ()=>clearInterval(id); }
 
 export function applyPresence(data, presence, nowSeconds){
   const now = (nowSeconds === undefined ? Date.now()/1000 : nowSeconds);
@@ -40,6 +58,12 @@ export function applyPresence(data, presence, nowSeconds){
     u.activeness = activenessState(p, now);
     u.beat_age_s = p ? beatAgeSeconds(p, now) : null;
     u.online = u.activeness === "online";
+    // Postgres transition mirror as the floor: if the RTDB node is
+    // missing entirely but the mirror says the agent transitioned
+    // to online moments ago, do not show a false offline.
+    if(!p && u.activenessMirror && u.activenessMirror.state === "online" && u.activeness === "offline"){
+      u.activeness = "suspect";
+    }
   }
   data.online = (data.users||[]).filter(u=>u.activeness==="online").map(u=>u.username);
   data.suspect = (data.users||[]).filter(u=>u.activeness==="suspect").map(u=>u.username);
@@ -50,8 +74,8 @@ export function applyPresence(data, presence, nowSeconds){
 }
 
 // Local 5s UI tick: re-evaluates ladder states from the presence
-// snapshot already in memory. Ages advance locally — beats already
-// arrive via the stream/poll above; the tick only recomputes
+// snapshot already in memory. Ages advance locally - beats already
+// arrive via the stream above; the tick only recomputes
 // display state, so it creates NO new network traffic of any kind.
 export function startActivenessTick(onTick){
   const tick = ()=>{
