@@ -22,6 +22,50 @@ export const UI_TICK_MS = 5000;
 let lastData = null;
 let lastPresence = {};
 
+// Merge one RTDB REST-streaming "patch" event into the presence
+// map. A patch carries a PATH and only the changed subtree at
+// that path: a beat arrives as path "/<user>" with data
+// {ts: ...} — NOT as a top-level map. The pre-2.0.4 handler
+// spread that data over the top level, so every beat after the
+// initial snapshot was discarded, the displayed beat age grew
+// from the page-load value forever, and the ladder decayed every
+// live agent to "offline" 15 seconds after page load (owner
+// catch, 2026-11-06). This merge applies the change where the
+// path says it belongs:
+//   "/"            -> partial top-level map, merged per user
+//   "/<user>"      -> partial node, merged into that user
+//   "/<user>/<f>"  -> one leaf field set (or deleted when null)
+export function mergePresencePatch(presence, path, data){
+  const base = { ...(presence || {}) };
+  const segs = String(path || "/").split("/").filter(Boolean);
+  if(segs.length === 0){
+    if(data && typeof data === "object"){
+      for(const k of Object.keys(data)) base[k] = data[k];
+    }
+    return base;
+  }
+  const head = segs[0];
+  if(segs.length === 1){
+    if(data === null){ delete base[head]; return base; }
+    if(data && typeof data === "object"){
+      base[head] = { ...(base[head] || {}), ...data };
+    } else {
+      base[head] = data;
+    }
+    return base;
+  }
+  const node = { ...(base[head] || {}) };
+  let cursor = node;
+  for(let i = 1; i < segs.length - 1; i++){
+    cursor[segs[i]] = { ...(cursor[segs[i]] || {}) };
+    cursor = cursor[segs[i]];
+  }
+  const leaf = segs[segs.length - 1];
+  if(data === null) delete cursor[leaf]; else cursor[leaf] = data;
+  base[head] = node;
+  return base;
+}
+
 export function presenceUrl(){ return (window.AGENTLINK_CONFIG||{}).firebaseDbUrl + "/presence.json"; }
 export async function fetchPresence(){
   const r = await fetch(presenceUrl()); if(!r.ok) throw new Error("presence read failed ("+r.status+")");
@@ -34,7 +78,7 @@ export function streamPresence(onUpdate, onError){
     try{
       es = new EventSource(presenceUrl());
       es.addEventListener("put", e => { backoff = 2000; try{ onUpdate(JSON.parse(e.data).data || {}); }catch(_){} });
-      es.addEventListener("patch", e => { try{ const d = JSON.parse(e.data); if(d && d.data) onUpdate({ ...lastPresence, ...d.data }); }catch(_){} });
+      es.addEventListener("patch", e => { try{ const d = JSON.parse(e.data); if(d && d.data !== undefined) onUpdate(mergePresencePatch(lastPresence, d.path, d.data)); }catch(_){} });
       es.onerror = () => {
         if(es){ es.close(); es = null; }
         if(onError) onError(new Error("presence stream interrupted"));
