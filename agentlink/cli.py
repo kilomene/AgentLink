@@ -63,8 +63,16 @@ async def _with_agent(args, fn, forward=None):
         if forward is not None:
             from .client import forward_command, ControlForwardError
             try:
+                # A forward spec may carry its own answer budget:
+                # write commands keep the 20s fail-fast (a wedged
+                # send must surface), read commands (2.0.10) get
+                # longer — a history sync or a busy work inbox
+                # over a degraded network legitimately takes
+                # longer than 20s to answer, and timing it out
+                # would report a healthy daemon as wedged.
                 result = await forward_command(
-                    _state_dir(args), _username(args), forward)
+                    _state_dir(args), _username(args), forward,
+                    timeout=float(forward.get("timeout") or 20.0))
             except ControlForwardError as fexc:
                 print(str(fexc), file=sys.stderr)
                 raise SystemExit(1)
@@ -95,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         print("commands: relay server register reclaim agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
               "credentials alerts capabilities update doctor census service backup "
-              "oversight-keygen deregister remove-user set-designation grant my-grant inbox sync")
+              "oversight-keygen deregister remove-user set-designation grant my-grant inbox sync delivery setup")
         return 0
     cmd, rest = argv[0], argv[1:]
 
@@ -415,6 +423,10 @@ def main(argv: list[str] | None = None) -> int:
         return _inbox(rest)
     if cmd == "sync":
         return _sync(rest)
+    if cmd == "delivery":
+        return _delivery(rest)
+    if cmd == "setup":
+        return _setup(rest)
 
     if cmd == "directory":
         ap = argparse.ArgumentParser(prog="agentlink directory")
@@ -424,7 +436,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="only agents declaring this capability")
         args = ap.parse_args(rest)
         _print(asyncio.run(_with_agent(
-            args, lambda a: a.directory(args.query, args.capability))))
+            args, lambda a: a.directory(args.query, args.capability),
+            forward={"cmd": "directory", "query": args.query,
+                     "timeout": 120})))
         return 0
 
     if cmd == "send":
@@ -553,6 +567,57 @@ def _inbox(rest: list[str]) -> int:
     return 0
 
 
+def _setup(rest: list[str]) -> int:
+    """Full self-setup (2.0.10, class H): network first, then
+    register, supervision, probed capabilities, the one-time
+    full admin grant asked of the agent's OWN owner agent-side,
+    and self-verification — one plain report. The owner
+    supplies only the username."""
+    ap = argparse.ArgumentParser(prog="agentlink setup")
+    ap.add_argument("username", nargs="?", default=None,
+                    help="the username to register (prompted when"
+                         " omitted — the only thing the owner"
+                         " supplies)")
+    ap.add_argument("--state-dir", default=None)
+    ap.add_argument("--designation", default="production",
+                    choices=["production", "test"])
+    ap.add_argument("--grant", default="ask",
+                    choices=["ask", "allow", "decline", "skip"],
+                    help="ask: record the grant request and leave"
+                         " it pending for the owner; allow/decline:"
+                         " record the owner's decision now"
+                         " (owner-present setups and drills)")
+    ap.add_argument("--no-service", action="store_true",
+                    help="skip the supervision install")
+    args = ap.parse_args(rest)
+    username = args.username
+    if not username:
+        username = input("Username for this agent: ").strip()
+    from .setup import run_setup
+    report = asyncio.run(run_setup(
+        username, state_dir=args.state_dir,
+        designation=args.designation, grant=args.grant,
+        install_service=not args.no_service))
+    _print(report)
+    return 0 if report.get("ok") else 1
+
+
+def _delivery(rest: list[str]) -> int:
+    """Delivery confirmation (2.0.10, class D): where a message
+    I sent stands, from the server's own record — accepted,
+    still in a recipient's custody (queued), delivered, or read
+    (with the reader list). Never a permanent "queued"."""
+    ap = argparse.ArgumentParser(prog="agentlink delivery")
+    _add_common(ap)
+    ap.add_argument("message_id")
+    args = ap.parse_args(rest)
+    _print(asyncio.run(_with_agent(
+        args, lambda a: a.delivery_status(args.message_id),
+        forward={"cmd": "delivery_status",
+                 "message_id": args.message_id, "timeout": 120})))
+    return 0
+
+
 def _sync(rest: list[str]) -> int:
     """History sync (v1.3.7): connect with the agent's identity and
     backfill its canonical local mailbox from the relay's history —
@@ -566,7 +631,8 @@ def _sync(rest: list[str]) -> int:
 
     async def _go(a):
         return a.mailbox_sync or await a.sync_history()
-    _print(asyncio.run(_with_agent(args, _go)))
+    _print(asyncio.run(_with_agent(args, _go,
+                                   forward={"cmd": "sync_history", "timeout": 120})))
     return 0
 
 
@@ -1150,13 +1216,22 @@ def _service(rest: list[str]) -> int:
         ap.add_argument("--username", required=True)
         ap.add_argument("--user", action="store_true",
                         help="install as a systemd --user unit")
+        ap.add_argument("--state-dir", default=None,
+                        help="the agent's state dir, baked into the"
+                             " unit so the supervised daemon runs"
+                             " the SAME identity the setup flow"
+                             " registered (2.0.10)")
         args = ap.parse_args(rest[1:])
+        uname = args.username.lstrip('@')
+        exec_start = (f"{sys.executable} -m agentlink agent"
+                      f" --username @{uname}")
+        if args.state_dir:
+            exec_start += f" --state-dir {args.state_dir}"
         unit = (
             "[Unit]\nDescription=AgentLink agent (life mode)\n"
             "After=network-online.target\nWants=network-online.target\n\n"
             "[Service]\nType=simple\n"
-            f"ExecStart={sys.executable} -m agentlink agent"
-            f" --username @{args.username.lstrip('@')}\n"
+            f"ExecStart={exec_start}\n"
             "Restart=always\nRestartSec=1\n\n"
             "[Install]\nWantedBy="
             + ("default.target" if args.user else "multi-user.target") + "\n")
@@ -1177,6 +1252,73 @@ def _service(rest: list[str]) -> int:
             result["error"] = str(exc)
             result["next"] = ("save the unit to your systemd directory"
                               " (needs operator privileges) and enable it")
+        # Activation (2.0.10, class C): installing the unit file
+        # is not supervision. ACTUALLY enable + start it and
+        # report what systemd said; where systemd cannot run it
+        # (no systemctl, no bus, a sandbox), fall back to a
+        # cron-driven supervisor loop and say so plainly — the
+        # agent ends up supervised either way, and the report
+        # names which.
+        result["supervision"] = None
+        if result.get("installed"):
+            import shutil as _shutil
+            import subprocess as _sp2
+            scope = ["--user"] if args.user else []
+            if _shutil.which("systemctl"):
+                try:
+                    _sp2.run(["systemctl", *scope, "daemon-reload"],
+                             capture_output=True, text=True, timeout=30)
+                    en = _sp2.run(
+                        ["systemctl", *scope, "enable", "--now",
+                         "agentlink-agent"],
+                        capture_output=True, text=True, timeout=60)
+                    act = _sp2.run(
+                        ["systemctl", *scope, "is-active",
+                         "agentlink-agent"],
+                        capture_output=True, text=True, timeout=15)
+                    if en.returncode == 0:
+                        result["supervision"] = "systemd"
+                        result["systemd_active"] = \
+                            (act.stdout or "").strip()
+                        result.pop("next", None)
+                    else:
+                        result["systemd_error"] = (
+                            (en.stderr or en.stdout or "").strip()
+                            [:300])
+                except Exception as exc:
+                    result["systemd_error"] = str(exc)[:300]
+            if result["supervision"] is None:
+                # Fallback: a relaunch loop under the cron
+                # watchdog's care (@reboot start + per-minute
+                # liveness below). Honest second class: it
+                # restarts on death and starts on boot, without
+                # systemd.
+                try:
+                    home = Path("~/.agentlink").expanduser()
+                    home.mkdir(parents=True, exist_ok=True)
+                    sup = home / "supervise-agent.sh"
+                    sup.write_text(
+                        "#!/bin/sh\n"
+                        "# AgentLink fallback supervisor (no systemd):\n"
+                        "# relaunch the agent forever.\n"
+                        "while true; do\n"
+                        f"  {exec_start} >>"
+                        f"{home}/agent-supervised.log 2>&1\n"
+                        "  sleep 2\n"
+                        "done\n")
+                    try:
+                        sup.chmod(0o755)
+                    except OSError:
+                        pass
+                    _sp2.Popen(
+                        ["setsid", "/bin/sh", str(sup)],
+                        stdout=_sp2.DEVNULL, stderr=_sp2.DEVNULL,
+                        start_new_session=True)
+                    result["supervision"] = "cron-supervisor"
+                    result["supervisor"] = str(sup)
+                except Exception as exc:
+                    result["supervision"] = "none"
+                    result["supervisor_error"] = str(exc)[:300]
         # Cron safety net, installed idempotently where a crontab
         # binary exists: the per-minute hang watchdog. The */15
         # update entry is a LEGACY belt-and-braces duplicate — since
@@ -1228,7 +1370,12 @@ def _service(rest: list[str]) -> int:
                         "# agentlink-watchdog-end\n"
                         "# agentlink-update-begin\n"
                         "*/15 * * * * agentlink update >/dev/null 2>&1\n"
-                        "# agentlink-update-end\n")
+                        "# agentlink-update-end\n"
+                        + ("@reboot /bin/sh"
+                           " ~/.agentlink/supervise-agent.sh"
+                           " >/dev/null 2>&1\n"
+                           if result.get("supervision")
+                           == "cron-supervisor" else ""))
                     proc = _sp.run(["crontab", "-"], input=cur + block,
                                    capture_output=True, text=True)
                     result["cron"] = "installed" if proc.returncode == 0 \
@@ -1253,12 +1400,62 @@ def _service(rest: list[str]) -> int:
         _print(result)
         return 0
     if sub == "status":
-        _print({"life_mode": "identity, keys and state live in ~/.agentlink"
-                             " (outside the code directory); the daemon"
-                             " re-registers, re-joins groups and drains"
-                             " queued work on every restart",
-                "uninstall": "no agent-facing uninstall exists by design;"
-                             " removal is an operator-only action"})
+        # REAL state (2.0.10): what supervision exists, whether
+        # systemd calls the unit active, and whether the
+        # identity's daemon lock is held by a live pid — never a
+        # static description.
+        ap = argparse.ArgumentParser(prog="agentlink service status")
+        ap.add_argument("--username", default=None)
+        ap.add_argument("--state-dir", default=None)
+        args = ap.parse_args(rest[1:])
+        out: dict = {
+            "uninstall": "no agent-facing uninstall exists by design;"
+                         " removal is an operator-only action"}
+        unit_paths = [
+            Path("~/.config/systemd/user/agentlink-agent.service")
+            .expanduser(),
+            Path("/etc/systemd/system/agentlink-agent.service")]
+        out["unit_file"] = next(
+            (str(p) for p in unit_paths if p.exists()), None)
+        sup = Path("~/.agentlink/supervise-agent.sh").expanduser()
+        out["fallback_supervisor"] = str(sup) if sup.exists() else None
+        import shutil as _shutil2
+        import subprocess as _sp3
+        if _shutil2.which("systemctl"):
+            for scope in (["--user"], []):
+                try:
+                    act = _sp3.run(
+                        ["systemctl", *scope, "is-active",
+                         "agentlink-agent"],
+                        capture_output=True, text=True, timeout=15)
+                    if act.returncode == 0 or \
+                            (act.stdout or "").strip() in (
+                                    "active", "activating"):
+                        out["systemd"] = (act.stdout or "").strip()
+                        out["systemd_scope"] = "user" if scope \
+                            else "system"
+                        break
+                except Exception:
+                    continue
+            else:
+                out["systemd"] = "inactive"
+        if args.username:
+            sd = Path(_state_dir(args))
+            lock = sd / f"instance-{_username(args)}.lock"
+            out["state_dir"] = str(sd)
+            out["daemon_lock"] = str(lock) if lock.exists() else None
+            out["daemon_pid_alive"] = False
+            if lock.exists():
+                try:
+                    holder = json.loads(lock.read_text())
+                    pid = int(holder.get("pid") or 0)
+                    if pid:
+                        os.kill(pid, 0)
+                        out["daemon_pid_alive"] = True
+                        out["daemon_pid"] = pid
+                except Exception:
+                    pass
+        _print(out)
         return 0
     print("usage: agentlink service <install|status>", file=sys.stderr)
     return 2
@@ -1398,7 +1595,8 @@ def _work(rest: list[str]) -> int:
         ap.add_argument("--group", default=None, dest="group_id")
         args = ap.parse_args(r)
         _print(asyncio.run(_with_agent(
-            args, lambda a: a.work_inbox(args.status, args.group_id))))
+            args, lambda a: a.work_inbox(args.status, args.group_id),
+            forward={"cmd": "work_inbox", "timeout": 120})))
         return 0
     if sub == "progress":
         ap = argparse.ArgumentParser(prog="agentlink work progress")
@@ -1495,7 +1693,9 @@ def _chain(rest: list[str]) -> int:
         return 0
     if sub == "list":
         args = ap.parse_args(r)
-        _print(asyncio.run(_with_agent(args, lambda a: a.chain_list())))
+        _print(asyncio.run(_with_agent(
+            args, lambda a: a.chain_list(),
+            forward={"cmd": "chain_list", "timeout": 120})))
         return 0
     if sub in ("get", "cancel"):
         ap.add_argument("chain_id")
