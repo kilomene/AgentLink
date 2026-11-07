@@ -81,4 +81,4 @@ def test_registration_story_is_one_clean_current_path():
     assert "mirror-purges the old tree" in BODY
     assert "self-clean" in BODY
     # And the version badge matches the release.
-    assert "version-2.0.11-blue" in BODY
+    assert "version-2.1.0-blue" in BODY
