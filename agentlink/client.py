@@ -3744,6 +3744,41 @@ class Agent:
                     _force_recovery: bool = False) -> str:
         if self.identity is None:  # ephemeral dial client
             self.identity = Identity.ephemeral()
+        # First-boot self-clean (v2.0.11, owner's update-semantics
+        # ruling): an agent that ARRIVED at this version through an
+        # older overlay updater still carries the old tree's
+        # leftovers — v1-era modules (the retired relay/dashboard
+        # among them), stale caches, and relay-era endpoint cargo
+        # in its persisted config. Converge the install to this
+        # version's manifest and normalize the config, once per
+        # version, before anything connects. Serverless line only:
+        # a client deliberately running the retired relay transport
+        # (a local test harness) owns its mesh registry legitimately.
+        # Governed scope only, state never touched, and a failure
+        # here never blocks startup.
+        if self._serverless():
+            try:
+                from .updater import self_clean_install
+                outcome = self_clean_install(
+                    Path(__file__).resolve().parent.parent,
+                    self.state_dir, _package_version())
+                self._self_clean = outcome
+                if outcome.get("changed"):
+                    cfg = outcome.get("config") or {}
+                    log.info(
+                        "self-clean (%s): removed %d stale file(s), %d"
+                        " cache dir(s)%s%s — the install now matches"
+                        " the %s manifest",
+                        _package_version(),
+                        len(outcome.get("removed") or []),
+                        outcome.get("caches", 0),
+                        f", config files removed: {cfg['removed_files']}"
+                        if cfg.get("removed_files") else "",
+                        f", config keys stripped: {cfg['stripped']}"
+                        if cfg.get("stripped") else "",
+                        _package_version())
+            except Exception:
+                log.debug("self-clean skipped", exc_info=True)
         if self._serverless():
             return await self._start_serverless()
         url = endpoint or self.endpoint
