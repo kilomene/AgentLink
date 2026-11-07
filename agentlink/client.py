@@ -2919,6 +2919,101 @@ class Agent:
             except Exception:
                 return
 
+    async def _serverless_first_contact(self, v2) -> bool:
+        """The first-contact suite (v2.0.8), run when the key
+        login refuses with key_auth_failed — the Edge's single
+        refusal for BOTH a name with no account yet and an
+        account whose keys this machine does not hold. The suite
+        separates the two by acting, never by guessing:
+
+        1. RECLAIM — a recovery key is held (handed in, or found
+           in the stored copies): present it; the account rebinds
+           to this machine's identity keys and the session opens.
+           A key handed in explicitly that does not verify is a
+           final refusal (RegistrationFailed) — its owner asked
+           for exactly this account. A merely DISCOVERED key that
+           no longer verifies (the account moved on) falls
+           through to registration, which will refuse truthfully.
+        2. REGISTER — no usable recovery key: claim the name
+           first-come for this machine's keys. The account is
+           created and the session opens in the same step; the
+           recovery key the Edge issues is persisted under the
+           storage contract at once.
+        3. TAKEN — the name is registered to other keys and no
+           recovery key is held: return False; the caller raises
+           the permanent refusal with the way forward.
+
+        Weather (any other TransportError) raises ConnectionError
+        — the retry class — never a false identity verdict.
+        Returns True when a ceremony opened the session."""
+        manual_key = self._recovery_key_manual
+        held_key = manual_key or self._find_recovery_key()
+        pubs = {"sign_pub": self.identity.signing_public_key_b64,
+                "pubkey": self.identity.public_key_b64}
+        if held_key:
+            try:
+                result = await asyncio.to_thread(
+                    v2.recover_and_login, self.username,
+                    self.identity.sign, held_key,
+                    pubs["sign_pub"], pubs["pubkey"],
+                    _package_version(),
+                    decision_link=self._declared_link_sent,
+                    decision_link_detail=self._decision_detail())
+            except TransportError as exc:
+                if "recovery_failed" in str(exc):
+                    if manual_key:
+                        raise RegistrationFailed(
+                            f"serverless_recovery_refused: {exc} — "
+                            f"the recovery key handed in did not "
+                            f"verify for @{self.username}; the "
+                            f"account is untouched.") from exc
+                    # A discovered key that no longer verifies:
+                    # fall through — registration gives the
+                    # truthful taken/registered answer.
+                else:
+                    raise ConnectionError(
+                        f"registration failed at step "
+                        f"'serverless-recovery': the login Edge "
+                        f"did not answer for @{self.username} "
+                        f"({exc}). Retry when the endpoints are "
+                        f"reachable from this machine.") from exc
+            else:
+                issued = str(result.get("recovery_key") or "")
+                if issued:
+                    self._save_recovery_key(issued)
+                log.warning(
+                    "recovered @%s by recovery key — account "
+                    "rebound to this machine's keys; the used key "
+                    "is burned and its successor is saved.",
+                    self.username)
+                return True
+        try:
+            result = await asyncio.to_thread(
+                v2.register_and_login, self.username,
+                self.identity.sign,
+                pubs["sign_pub"], pubs["pubkey"],
+                _package_version(),
+                decision_link=self._declared_link_sent,
+                decision_link_detail=self._decision_detail(),
+                designation=self.designation)
+        except TransportError as exc:
+            if "username_taken" in str(exc):
+                return False
+            raise ConnectionError(
+                f"registration failed at step 'serverless-register':"
+                f" the login Edge did not answer for"
+                f" @{self.username} ({exc}). Retry when the"
+                f" endpoints are reachable from this machine."
+            ) from exc
+        issued = str(result.get("recovery_key") or "")
+        if issued:
+            self._save_recovery_key(issued)
+        log.warning(
+            "registered @%s — first-come account created and "
+            "session opened; the recovery key is saved in the "
+            "client state and the workspace file.", self.username)
+        return True
+
     async def _start_serverless(self) -> str:
         """start(), serverless edition: Edge login ceremony
         (key-signed challenge -> scoped JWT + Firebase token)
@@ -2962,16 +3057,25 @@ class Agent:
                 decision_link=self._declared_link_sent,
                 decision_link_detail=self._decision_detail())
         except TransportError as exc:
-            self._v2 = None
-            try:
-                await asyncio.to_thread(v2.logout)
-            except Exception:
+            if "key_auth_failed" in str(exc) and \
+                    await self._serverless_first_contact(v2):
+                # First contact (v2.0.8): the ceremony — a
+                # recovery reclaim or a first-come registration —
+                # opened the session on this same transport. Fall
+                # through to the post-login sequence below.
                 pass
-            if "key_auth_failed" in str(exc):
-                # The Edge's one genuinely permanent refusal: the
-                # signature did not verify against the registered
-                # key (401 at verify). Final until the identity or
-                # the account changes — the same finality a
+            elif "key_auth_failed" in str(exc):
+                self._v2 = None
+                try:
+                    await asyncio.to_thread(v2.logout)
+                except Exception:
+                    pass
+                # key_auth_failed with the first-contact suite
+                # exhausted is the Edge's one genuinely permanent
+                # refusal: the name is registered to keys this
+                # machine does not hold, and no recovery key is
+                # held either. Final until the identity or the
+                # account changes — the same finality a
                 # RegistrationFailed carries on the relay path.
                 # EVERY other refusal is configuration or weather,
                 # never identity: a 405 (the challenge arrived as
@@ -2984,16 +3088,29 @@ class Agent:
                 # process died on every supervisor relaunch
                 # instead of riding out a fixable fault.
                 raise RegistrationFailed(
-                    f"serverless_login_refused: {exc}") from exc
-            raise ConnectionError(
-                f"registration failed at step 'serverless-login':"
-                f" the login Edge did not answer for"
-                f" @{self.username} ({exc}). Nothing was"
-                f" registered. Retry: check the serverless"
-                f" configuration (AGENTLINK_SUPABASE_URL /"
-                f" AGENTLINK_LOGIN_EDGE_URL / Firebase settings)"
-                f" and that the endpoints are reachable from this"
-                f" machine.") from exc
+                    f"serverless_login_refused: {exc} — "
+                    f"@{self.username} is registered to other "
+                    f"keys and no recovery key is held on this "
+                    f"machine. If this name is yours, restore "
+                    f"your recovery file (agentlink-recovery-"
+                    f"{self.username}.txt in your workspace) and "
+                    f"boot again to reclaim it; otherwise pick a "
+                    f"new username.") from exc
+            else:
+                self._v2 = None
+                try:
+                    await asyncio.to_thread(v2.logout)
+                except Exception:
+                    pass
+                raise ConnectionError(
+                    f"registration failed at step 'serverless-login':"
+                    f" the login Edge did not answer for"
+                    f" @{self.username} ({exc}). Nothing was"
+                    f" registered. Retry: check the serverless"
+                    f" configuration (AGENTLINK_SUPABASE_URL /"
+                    f" AGENTLINK_LOGIN_EDGE_URL / Firebase settings)"
+                    f" and that the endpoints are reachable from this"
+                    f" machine.") from exc
         except Exception as exc:
             self._v2 = None
             try:
@@ -3068,6 +3185,16 @@ class Agent:
                 await self._resume_open_work()
                 await self._resync_memberships()
                 await self.self_check()
+            except TransportError as exc:
+                # A transient transport failure (the path emptied
+                # or clipped a response past its retry budget) is a
+                # designed degradation: the slow-sync pass retries
+                # within the minute. ONE warning line, not a
+                # traceback — the signal-fetch hygiene doctrine
+                # (2.0.6): a traceback is the shape of a crash, and
+                # stamping one on a self-healing transient corrupts
+                # the log's signal.
+                log.warning("resume/resync pass deferred: %s", exc)
             except Exception:
                 log.exception("resume/resync pass failed")
             finally:
@@ -3732,6 +3859,13 @@ class Agent:
                         # missed while down or riding another server.
                         await self._resync_memberships()
                         await self.self_check()
+                    except TransportError as exc:
+                        # Transient transport failure: designed
+                        # degradation, retried by the sync passes —
+                        # one warning line, not a traceback (the
+                        # signal-fetch hygiene doctrine, 2.0.6).
+                        log.warning("resume/resync pass deferred: %s",
+                                    exc)
                     except Exception:
                         log.exception("resume/resync pass failed")
                     finally:
@@ -5198,6 +5332,7 @@ class Agent:
                 envelope = val
                 break
         payload = None
+        via_identity = False
         if envelope is not None and self.identity is not None:
             try:
                 if channel_id:
@@ -5214,6 +5349,15 @@ class Agent:
                     payload = self._decrypt_obj(envelope)
             except Exception:
                 payload = None
+            if payload is None and (channel_id or group_id):
+                # 2.0.7 fallback: room traffic mis-sealed to my
+                # identity key (see _process_message) — readable by
+                # me, and rectified below with a CONTENT wrap.
+                try:
+                    payload = self._decrypt_obj(envelope)
+                    via_identity = payload is not None
+                except Exception:
+                    payload = None
         if payload is None:
             msg["sealed"] = True
             return msg
@@ -5231,7 +5375,9 @@ class Agent:
             # the owner's dashboard can read history too, not just
             # live traffic.
             wrap = None
-            if (channel_id or group_id) and rec:
+            if via_identity:
+                wrap = self._oversight_for_obj(payload)
+            elif (channel_id or group_id) and rec:
                 wrap = self._oversight_for_key(rec["key"])
             elif not channel_id and not group_id:
                 wrap = self._oversight_for_obj(payload)
@@ -5261,25 +5407,31 @@ class Agent:
         return self._group_keys[gid]
 
     async def _process_message(self, frame: dict) -> None:
+        via_identity = False
         try:
-            if frame.get("channel_id"):
-                rec = await self._ensure_channel_key(frame["channel_id"])
-                if rec is None:
-                    log.warning("no channel key for %s; cannot decrypt",
-                                frame["channel_id"])
-                    return
-                payload = json.loads(decrypt_with_key(
-                    rec["key"], frame["content"]))
-                to = frame["channel_id"]
-            elif frame.get("group_id"):
-                rec = await self._ensure_group_key(frame["group_id"])
-                if rec is None:
-                    log.warning("no group key for %s; cannot decrypt",
-                                frame["group_id"])
-                    return
-                payload = json.loads(decrypt_with_key(
-                    rec["key"], frame["content"]))
-                to = frame["group_id"]
+            if frame.get("channel_id") or frame.get("group_id"):
+                if frame.get("channel_id"):
+                    rec = await self._ensure_channel_key(frame["channel_id"])
+                    to = frame["channel_id"]
+                else:
+                    rec = await self._ensure_group_key(frame["group_id"])
+                    to = frame["group_id"]
+                payload = None
+                if rec is not None:
+                    try:
+                        payload = json.loads(decrypt_with_key(
+                            rec["key"], frame["content"]))
+                    except Exception:
+                        payload = None
+                if payload is None:
+                    # 2.0.7 fallback: a sender whose client mis-seals
+                    # room traffic to a member's identity key can
+                    # still be read by that member (the retired drill
+                    # injector sealed Nova family posts exactly this
+                    # way). The oversight rectification below then
+                    # wraps the CONTENT, not the room key.
+                    payload = self._decrypt_obj(frame["content"])
+                    via_identity = True
             else:
                 payload = self._decrypt_obj(frame["content"])
                 to = self.username
@@ -5290,7 +5442,10 @@ class Agent:
             # The sender shipped no oversight wrap (an old client):
             # rectify from the plaintext just decrypted, in the
             # background — never on the delivery path's clock.
-            if frame.get("channel_id") or frame.get("group_id"):
+            if via_identity:
+                asyncio.create_task(self._rectify_oversight(
+                    frame.get("id"), payload=payload))
+            elif frame.get("channel_id") or frame.get("group_id"):
                 asyncio.create_task(self._rectify_oversight(
                     frame.get("id"), room_key=rec["key"]))
             else:
