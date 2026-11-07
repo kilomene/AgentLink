@@ -364,6 +364,13 @@ def _read_body(resp) -> bytes:
         return exc.partial or b""
 
 
+def _sleep(seconds: float) -> None:
+    """The doorbell's own sleep hook (see transport_v2._sleep
+    for why this indirection exists: never patch time.sleep
+    itself — it is shared by every thread in the process)."""
+    time.sleep(seconds)
+
+
 def _default_opener(method, url, headers, body):
     """Proxy-aware opener: (method, url, headers, body
     bytes|None) -> (status, headers dict, body bytes). HTTP
@@ -476,7 +483,7 @@ class DoorbellClient:
         url = f"{_IDENTITY_URL}?key={urllib.parse.quote(self.api_key)}"
         body = json.dumps({"token": self._custom_token,
                            "returnSecureToken": True}).encode()
-        status, _h, raw = self._opener(
+        status, _h, raw = self._call(
             "POST", url, {"Content-Type": "application/json"}, body)
         if status >= 400:
             raise DoorbellError(f"custom-token exchange HTTP {status}")
@@ -498,7 +505,7 @@ class DoorbellClient:
         body = urllib.parse.urlencode(
             {"grant_type": "refresh_token",
              "refresh_token": self._refresh_token}).encode()
-        status, _h, raw = self._opener(
+        status, _h, raw = self._call(
             "POST", url,
             {"Content-Type": "application/x-www-form-urlencoded"}, body)
         if status >= 400:
@@ -521,6 +528,43 @@ class DoorbellClient:
             return self._refresh_id_token()
         return self.exchange_custom_token()
 
+    def _call(self, method, url, headers, body):
+        """One opener call with the PROXY-class ride-out
+        (2.0.10): the presence/token legs ride the same egress
+        credential rotation as the transport's calls, so they
+        get the same doctrine — on an HTTP 407 or a connection
+        failure carrying the proxy's refusal, abdicate the
+        resolver's cached winner, back off, and retry inside a
+        bounded budget (credential resolution is fresh at every
+        dial). Any other outcome returns / raises at once. This
+        is the read/write path for presence beats and the
+        activeness mirror's RTDB leg: a desync window degrades
+        them to a delay, never to a dark agent."""
+        attempt = 0
+        while True:
+            try:
+                status, resp_headers, raw = self._opener(
+                    method, url, headers, body)
+            except Exception as exc:
+                low = str(exc).lower()
+                if attempt + 1 < 5 and (
+                        "407" in low
+                        or "proxy authentication" in low
+                        or "tunnel connection failed" in low):
+                    proxycreds.reset_winner()
+                    _sleep(min(5.0, float(2 ** attempt))
+                           if attempt else 0.0)
+                    attempt += 1
+                    continue
+                raise
+            if status == 407 and attempt + 1 < 5:
+                proxycreds.reset_winner()
+                _sleep(min(5.0, float(2 ** attempt))
+                       if attempt else 0.0)
+                attempt += 1
+                continue
+            return status, resp_headers, raw
+
     # -- REST plumbing ---------------------------------------------------
     def _url(self, path: str) -> str:
         if not self.database_url:
@@ -531,12 +575,12 @@ class DoorbellClient:
     def _rest(self, method: str, path: str, payload=None):
         body = json.dumps(payload).encode() if payload is not None else None
         headers = {"Content-Type": "application/json"} if body else {}
-        status, _h, raw = self._opener(method, self._url(path), headers, body)
+        status, _h, raw = self._call(method, self._url(path), headers, body)
         if status == 401:
             # Stale token: force one re-exchange and retry once.
             self._id_token = ""
             self._id_token_expires_at = 0.0
-            status, _h, raw = self._opener(
+            status, _h, raw = self._call(
                 method, self._url(path), headers, body)
         if status >= 400:
             raise DoorbellError(f"RTDB {method} {path} HTTP {status}")
