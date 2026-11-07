@@ -904,6 +904,33 @@ class ServerlessTransport:
         self.start_activeness()
         return result
 
+    def rectify_and_login(self, username: str, signer, rectify_code: str,
+                          sign_pub: str, pubkey: str,
+                          client_version: str = "",
+                          decision_link: str | None = None,
+                          decision_link_detail: dict | None = None) -> dict:
+        """Operator rectification (v2.0.9): present the one-time
+        code the operator issued for this username and rebind the
+        stranded account to THIS machine's identity keys. The
+        code burns in the same step; the Edge mints a NEW
+        recovery key and returns it ONCE in the reply, carried
+        as ``recovery_key`` for the client to persist — the
+        transport keeps no copy, and the code's value is never
+        stored anywhere by the client either. A wrong, spent or
+        expired code (or an unknown name) refuses with
+        ``rectify_failed`` and the account is untouched."""
+        self._session_preamble(username, signer, client_version,
+                               decision_link, decision_link_detail)
+        payload = {"username": self.username,
+                   "rectify_code": rectify_code,
+                   "new_sign_pub": sign_pub, "new_pubkey": pubkey}
+        payload.update(self._declaration_payload())
+        reply = self._edge_post("rectify", payload)
+        result = self._adopt_tokens(self.username, reply)
+        result["recovery_key"] = str(reply.get("recovery_key") or "")
+        self.start_activeness()
+        return result
+
     def logout(self) -> None:
         """Clean disconnect: activeness shutdown (Firebase
         offline write + offline mirror transition), refresh timer
