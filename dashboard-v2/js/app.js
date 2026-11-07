@@ -11,14 +11,15 @@ import * as v_vault from "./views/vault.js";
 import * as v_credentials from "./views/credentials.js";
 import * as v_grants from "./views/grants.js";
 import * as v_rooms from "./views/rooms.js";
+import * as v_support from "./views/support.js";
 import { session, login, clearSession, loadAll, oversightOpen, oversightCredentials, oversightFile, oversightVaultFile, oversightLibraryFile, ensureFreshJwt } from "./data.js";
 import { streamPresence, applyPresence, startActivenessTick } from "./presence.js";
 import { startRealtime, onRtState, rtState, setRealtimeJwt, stopRealtime } from "./realtime.js";
 import { store, on as busOn } from "./store.js";
 import { activenessLabel } from "./activeness.js";
 import { toast } from "./util.js";
-const VIEWS = { overview: v_overview,agents: v_agents,conversations: v_conversations,probes: v_probes,activity: v_activity,work: v_work,chains: v_chains,library: v_library,vault: v_vault,credentials: v_credentials,grants: v_grants,rooms: v_rooms };
-const ORDER = ["overview","agents","conversations","probes","activity","work","chains","library","vault","credentials","grants","rooms"];
+const VIEWS = { overview: v_overview,agents: v_agents,conversations: v_conversations,probes: v_probes,activity: v_activity,work: v_work,chains: v_chains,library: v_library,vault: v_vault,credentials: v_credentials,grants: v_grants,rooms: v_rooms,support: v_support };
+const ORDER = ["overview","agents","conversations","probes","activity","work","chains","library","vault","credentials","grants","rooms","support"];
 let cache = null, inflight = null, currentView = null, booted = false;
 const ctx = { store, bus: { on: busOn },
   getData: async () => { if(store.data) return store.data; if(!inflight) inflight = loadAll().then(d => { store.setData(d); cache = d; inflight = null; return d; }).catch(e => { inflight = null; throw e; }); return inflight; },
