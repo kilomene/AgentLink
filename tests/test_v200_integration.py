@@ -55,7 +55,7 @@ def test_oversight_accepts_operator_jwt_and_dashboard_contracts():
     assert "Array.isArray(body.items)" in ts
     assert 'typeof body.credentials_for === "string"' in ts
     # _content_fields mirror: body -> instructions -> note precedence
-    assert 'obj.body || obj.instructions || obj.note' in ts
+    assert 'obj.body || obj.text || obj.instructions || obj.note' in ts
 
 
 def test_ladder_constants_agree_across_client_and_dashboard():
@@ -99,3 +99,16 @@ def test_dashboard_agents_roster_shows_version():
     assert "<th>Version</th>" in js
     assert "activenessMirror" in js  # mirror is a version source
     assert "not reported" in js      # honest state for silent agents
+
+
+def test_resume_pass_transient_logs_one_warning_line():
+    # Log hygiene (2.0.6 doctrine, extended 2.0.8): a transient
+    # TransportError in the boot/reconnect resume pass is a designed
+    # degradation — it must be caught BEFORE the generic handler and
+    # logged as one warning line, never as a traceback (a traceback
+    # is the shape of a crash; the 2.0.8 soak supervisor reads it as
+    # a fault while the daemon delivers on around it). Both boot
+    # sequences (serverless + relay reconnect) carry the guard.
+    client = (ROOT / "agentlink/client.py").read_text()
+    assert client.count('log.warning("resume/resync pass deferred') == 2
+    assert client.count('log.exception("resume/resync pass failed")') == 2
