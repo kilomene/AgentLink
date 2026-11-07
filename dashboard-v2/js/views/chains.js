@@ -18,7 +18,7 @@ function chainHtml(c){
       esc(s.target_type || "user") + " " + esc(s.target || (s.assignees || []).join(", ")) + '</div><div class="sub">' +
       (s.work_id ? 'work <span class="mono">' + esc(s.work_id) + "</span><br>" : "") +
       (s.deadline ? "deadline " + pt(s.deadline) + "<br>" : "") +
-      (s.require_approval ? "🔒 approval gate" : "") + "</div></div>").join("") + "</div>"
+      (s.require_approval ? "approval gate" : "") + "</div></div>").join("") + "</div>"
       : '<p class="state">No steps recorded.</p>') + "</div>";
 }
 
