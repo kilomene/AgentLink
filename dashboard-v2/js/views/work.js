@@ -27,7 +27,7 @@ function cardHtml(w){
     '<div class="progressbar"><i style="width:' + (w.progress_percent ?? 0) + '%"></i></div>' +
     '<div class="wmeta">' + pill((w.progress_percent ?? 0) + "%", "grey") +
     (w.deadline ? '<span class="pill ' + (w.deadline < Date.now() / 1000 && w.status !== "completed" ? "red" : "grey") + '" data-countdown="' + esc(w.id) + '">' + countdown(w) + "</span>" : "") +
-    proofPill(w) + (w.require_approval ? pill("🔒 approval gate", "gate") : "") +
+    proofPill(w) + (w.require_approval ? pill("approval gate", "gate") : "") +
     (w.priority && w.priority !== "normal" ? pill(w.priority, "pink") : "") + "</div></div>";
 }
 
@@ -54,7 +54,7 @@ export async function render(root, ctx){
        ["Status", w => pill(w.status, w.status === "completed" ? "green" : w.status === "awaiting_approval" ? "amber" : "blue")],
        ["Progress", w => '<span class="progressbar"><i style="width:' + (w.progress_percent ?? 0) + '%"></i></span> ' + (w.progress_percent ?? 0) + "%"],
        ["Deadline (PT)", w => pt(w.deadline)], ["Countdown", w => countdown(w)], ["Proof", w => proofPill(w)],
-       ["Approval", w => w.require_approval ? pill("🔒 gate", "gate") : "—"]], dd.work)
+       ["Approval", w => w.require_approval ? pill("gate", "gate") : "—"]], dd.work)
       : '<p class="state">No work yet.</p>';
     const byWork = {}; dd.work.forEach(w => { byWork[w.id] = w; });
     delHost.innerHTML = dd.deliveries.length ? table(
