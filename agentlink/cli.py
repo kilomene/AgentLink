@@ -102,9 +102,20 @@ def main(argv: list[str] | None = None) -> int:
         print("commands: relay server register reclaim agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
               "credentials alerts capabilities update doctor census service backup "
-              "oversight-keygen deregister remove-user set-designation grant my-grant inbox sync delivery setup")
+              "oversight-keygen deregister remove-user set-designation grant my-grant inbox sync delivery setup support")
         return 0
     cmd, rest = argv[0], argv[1:]
+
+    # Support hook fallback (2.1.0): on hosts where the hook got
+    # no scheduler at all, every agentlink command gives due
+    # hooks one poll — cheap, silent, and never fatal.
+    if cmd != "support":
+        try:
+            from .support_hook import maybe_tick
+            maybe_tick(os.environ.get("AGENTLINK_STATE_DIR")
+                       or "~/.agentlink")
+        except Exception:
+            pass
 
     if cmd in ("relay", "server"):
         # 'server' is the v1.3.0 one-word form: standing up your
@@ -439,6 +450,8 @@ def main(argv: list[str] | None = None) -> int:
         return _delivery(rest)
     if cmd == "setup":
         return _setup(rest)
+    if cmd == "support":
+        return _support(rest)
 
     if cmd == "directory":
         ap = argparse.ArgumentParser(prog="agentlink directory")
@@ -606,12 +619,95 @@ def _setup(rest: list[str]) -> int:
     if not username:
         username = input("Username for this agent: ").strip()
     from .setup import run_setup
-    report = asyncio.run(run_setup(
-        username, state_dir=args.state_dir,
-        designation=args.designation, grant=args.grant,
-        install_service=not args.no_service))
+    try:
+        report = asyncio.run(run_setup(
+            username, state_dir=args.state_dir,
+            designation=args.designation, grant=args.grant,
+            install_service=not args.no_service))
+    except Exception as exc:
+        support = getattr(exc, "support", None)
+        if support is None:
+            raise
+        _print({"ok": False, "username": username,
+                "error": str(exc)[:500], "support": support})
+        return 1
     _print(report)
     return 0 if report.get("ok") else 1
+
+
+def _support(rest: list[str]) -> int:
+    """Customer support for signup/login (2.1.0): lodge a
+    complaint with NO account, check Phoenix's answer, and the
+    hook machinery that registers a stranded agent on its own
+    once the fix ships."""
+    sub = rest[0] if rest else ""
+    if sub == "lodge":
+        ap = argparse.ArgumentParser(prog="agentlink support lodge")
+        ap.add_argument("--username", required=True,
+                        help="the username you want to register")
+        ap.add_argument("--message", required=True,
+                        help="the problem, in your own words")
+        ap.add_argument("--attach", action="append", default=[],
+                        help="a proof file (image, log, json, zip);"
+                             " repeat for several")
+        ap.add_argument("--state-dir", default=None)
+        ap.add_argument("--designation", default="production",
+                        choices=["production", "test"])
+        ap.add_argument("--grant", default="ask",
+                        choices=["ask", "allow", "decline", "skip"],
+                        help="the grant decision the hook records"
+                             " for its post-fix setup run")
+        args = ap.parse_args(rest[1:])
+        from .support import lodge
+        sd = args.state_dir or "~/.agentlink"
+        out = lodge(args.username, args.message, sd,
+                    attachments=args.attach,
+                    designation=args.designation,
+                    hook_grant=args.grant)
+        print(f"support ticket {out['ticket_id']} lodged for "
+              f"@{out['username']}"
+              + (" (that username is currently registered — "
+                 "Phoenix will see it)" if out["name_taken"] else "")
+              + f"; {(out.get('hook') or {}).get('supervision', 'no')}"
+                " hook is watching it. Check the answer with: "
+                "agentlink support status")
+        _print(out)
+        return 0
+    if sub == "status":
+        ap = argparse.ArgumentParser(prog="agentlink support status")
+        ap.add_argument("--state-dir", default=None)
+        args = ap.parse_args(rest[1:])
+        from .support import my_tickets
+        _print(my_tickets(args.state_dir or "~/.agentlink"))
+        return 0
+    if sub in ("hook-run", "hook-check"):
+        ap = argparse.ArgumentParser(prog=f"agentlink support {sub}")
+        ap.add_argument("--ticket", required=True)
+        ap.add_argument("--state-dir", default=None)
+        args = ap.parse_args(rest[1:])
+        from pathlib import Path as _P
+        from . import support_hook
+        sd = _P(args.state_dir or "~/.agentlink").expanduser()
+        if sub == "hook-run":
+            return support_hook.run_loop(sd, args.ticket)
+        _print({"ticket": args.ticket,
+                "outcome": support_hook.run_cycle(sd, args.ticket)})
+        return 0
+    if sub == "hooks":
+        ap = argparse.ArgumentParser(prog="agentlink support hooks")
+        ap.add_argument("--state-dir", default=None)
+        args = ap.parse_args(rest[1:])
+        from pathlib import Path as _P
+        from .support_hook import list_records
+        sd = _P(args.state_dir or "~/.agentlink").expanduser()
+        _print([{k: r.get(k) for k in
+                 ("ticket_id", "username", "supervision",
+                  "attempts", "created_at")}
+                for r in list_records(sd)])
+        return 0
+    print("usage: agentlink support "
+          "{lodge|status|hooks|hook-run|hook-check} ...")
+    return 2
 
 
 def _delivery(rest: list[str]) -> int:
