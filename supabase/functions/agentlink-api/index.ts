@@ -80,8 +80,17 @@ Deno.serve(async (req: Request) => {
   }
 
   // Directory / capability search (point 33): online agents first.
+  // The client's directory() rides the ACCOUNT Edge (routeDirectory
+  // there is the fleet's search path); this operator view honors
+  // the same query contract (2.0.10 alignment): `q`/`query` match
+  // CASE-INSENSITIVELY over username AND display_name — the old
+  // handler ignored the query entirely, and the account Edge's
+  // case-sensitive includes() made "Phoenix" find nothing.
   if (path === "/directory") {
     const capability = url.searchParams.get("capability") ?? "";
+    const q = (url.searchParams.get("q") ??
+      url.searchParams.get("query") ?? "")
+      .trim().replace(/^@+/, "").toLowerCase();
     const { data } = await supabase.from("al_users")
       .select("username, display_name, capabilities, cap_desc, last_seen")
       .order("username");
@@ -89,6 +98,12 @@ Deno.serve(async (req: Request) => {
       ...u,
       online: !isOffline(u.last_seen as number, now),
     }));
+    if (q) {
+      users = users.filter((u) =>
+        String(u.username ?? "").toLowerCase().includes(q) ||
+        String(u.display_name ?? "").toLowerCase().includes(q)
+      );
+    }
     if (capability) {
       users = users.filter((u) =>
         (u.capabilities as string[]).some(
