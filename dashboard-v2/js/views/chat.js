@@ -20,8 +20,8 @@ function previewOf(item){
   if(!item) return "no messages yet";
   if(item.opened && item.opened.text) return item.opened.text.slice(0, 90);
   if(item.opened && item.opened.file_name) return "📎 " + item.opened.file_name;
-  if(item.kind === "message") return "🔒 message";
-  if(item.kind === "group_message" || item.kind === "channel_message") return "🔒 " + kindLabel(item.kind);
+  if(item.kind === "message") return "message";
+  if(item.kind === "group_message" || item.kind === "channel_message") return kindLabel(item.kind);
   return kindLabel(item.kind) + (item.status ? " · " + item.status : "");
 }
 
@@ -55,19 +55,18 @@ export function bubbleHtml(item, reads){
   const name = item.sender_nickname ? item.sender_nickname + " (@" + item.from + ")" : (item.from || "");
   const chip = item.kind !== "message" && item.kind !== "group_message" && item.kind !== "channel_message"
     ? '<span class="kindchip">' + esc(kindLabel(item.kind)) + (item.status ? " · " + esc(item.status) : "") + "</span><br>" : "";
-  let body;
-  if(item.opened){
-    const o = item.opened;
-    body = (o.title ? "<b>" + esc(o.title) + "</b><br>" : "") +
-      (o.text ? '<span class="btxt">' + esc(o.text) + "</span>" : "") +
-      (o.file_name ? fileHtml(item, o) : "");
-    if(!o.text && !o.file_name) body = '<span class="btext sealed">🔒 envelope opened — no text payload</span>';
-    body = '<div class="btext" data-open-for="' + esc(item.id) + '">' + body + "</div>";
-  }else if(item.oversight){
-    body = '<div class="btext sealed" data-open-for="' + esc(item.id) + '">🔒 sealed — opening via oversight…</div>';
-  }else{
-    body = '<div class="btext sealed" data-open-for="' + esc(item.id) + '">🔒 sealed — no oversight wrap on this item</div>';
-  }
+  // NO-PLACEHOLDER LAW (owner, 2026-11-06): a bubble exists
+  // only with its opened content — the operator sees the detail
+  // of every message, never a loading label, never a blank.
+  // Unopened items are not painted at all; the painters below
+  // render opened items only, and the open pass runs before and
+  // during painting until every item lands.
+  if(!item.opened) return "";
+  const o = item.opened;
+  let body = (o.title ? "<b>" + esc(o.title) + "</b><br>" : "") +
+    (o.text ? '<span class="btxt">' + esc(o.text) + "</span>" : "") +
+    (o.file_name ? fileHtml(item, o) : "");
+  body = '<div class="btext" data-open-for="' + esc(item.id) + '">' + body + "</div>";
   return '<div class="msgrow' + (mine ? " mine" : "") + '" data-msgrow="' + esc(item.id) + '">' +
     '<div class="bubble">' + (name ? '<div class="sender" style="color:' + senderColor(item.from) + '">' + esc(name) + "</div>" : "") +
     chip + body +
@@ -163,6 +162,29 @@ export function createChat(root, ctx, opts){
     rowsHost.querySelectorAll(".chatrow").forEach(row => row.onclick = () => openConv(row.dataset.key, true));
   }
 
+  // Paint the open thread from OPENED items only, in order —
+  // the open-before-paint half of the no-placeholder law. An
+  // item whose content has not opened yet simply is not on
+  // screen; when its open lands, the next paint carries its
+  // words. There is no placeholder state to rest in.
+  function paintThread(stick){
+    if(destroyed || !openKey) return;
+    const conv = store.findConv(openKey);
+    const msgs = pane.querySelector(".chatmsgs");
+    if(!conv || !msgs) return;
+    const nearBottom = msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight < 160;
+    let html = "", lastDay = "";
+    for(const m of conv.items){
+      if(!m.opened) continue;
+      const dk = dayKey(m.ts);
+      if(dk !== lastDay){ html += '<div class="daysep">' + esc(pday(m.ts)) + "</div>"; lastDay = dk; }
+      html += bubbleHtml(m, store.data.reads);
+    }
+    msgs.innerHTML = html || (conv.items.length ? "" : '<div class="chatempty">No messages yet — this conversation is seeded and being watched live.</div>');
+    hydrateMedia(msgs);
+    if(stick || nearBottom) msgs.scrollTop = msgs.scrollHeight;
+  }
+
   async function openItems(items){
     const todo = items.filter(m => m.oversight && !m.opened && !opening.has(m.id));
     for(let i = 0; i < todo.length; i += 40){
@@ -173,20 +195,19 @@ export function createChat(root, ctx, opts){
         for(const m of chunk){
           opening.delete(m.id);
           const o = opened ? opened[m.id] : null;
-          if(o){ m.opened = o; m.sealed = false; }
-          if(!destroyed) paintOpened(m);
+          // An open that comes back with no words and no file is NOT
+          // an open: the item stays unopened (so it is never painted)
+          // and the convergence pass keeps retrying it. NO-PLACEHOLDER
+          // LAW: a bubble may only ever appear with its content in it.
+          if(o && (o.text || o.title || o.file_name)){ m.opened = o; m.sealed = false; }
         }
-        if(!destroyed) renderList();
+        if(!destroyed){ renderList(); paintThread(); }
       }catch(_){
-        chunk.forEach(m => { opening.delete(m.id); const el = pane.querySelector('[data-open-for="' + CSS.escape(m.id) + '"]'); if(el && !m.opened) el.textContent = "🔒 sealed (oversight unavailable)"; });
+        // No final failure state: the ids are released and the
+        // convergence pass below retries until the text lands.
+        chunk.forEach(m => opening.delete(m.id));
       }
     }
-  }
-  function paintOpened(m){
-    const el = pane.querySelector('[data-open-for="' + CSS.escape(m.id) + '"]');
-    if(!el) return;
-    const row = el.closest(".msgrow");
-    if(row){ const fresh = document.createElement("div"); fresh.innerHTML = bubbleHtml(m, store.data.reads); const node = fresh.firstChild; row.replaceWith(node); hydrateMedia(node); }
   }
 
   // Reload persistence: the open thread is remembered per chat
@@ -211,40 +232,23 @@ export function createChat(root, ctx, opts){
       '<div><div class="ttl">' + esc(convTitle(conv)) + '</div><div class="sub2">' + esc(people.join(", ") || conv.key) + esc(peerState) + " · live</div></div></div>" +
       '<div class="chatmsgs"></div>';
     pane.querySelector(".chatback").onclick = () => { wrap.classList.remove("open"); openKey = null; store.openConvKey = null; try{ sessionStorage.removeItem(persistKey); }catch(_){} };
-    const msgs = pane.querySelector(".chatmsgs");
-    let html = "", lastDay = "";
-    for(const m of conv.items){
-      const dk = dayKey(m.ts);
-      if(dk !== lastDay){ html += '<div class="daysep">' + esc(pday(m.ts)) + "</div>"; lastDay = dk; }
-      html += bubbleHtml(m, store.data.reads);
-    }
-    msgs.innerHTML = html || '<div class="chatempty">No messages yet — this conversation is seeded and being watched live.</div>';
-    msgs.scrollTop = msgs.scrollHeight;
-    hydrateMedia(msgs);
-    openItems(conv.items.slice(-80));
-    if(focus) msgs.scrollTop = msgs.scrollHeight;
+    paintThread(true);
+    openItems(conv.items);
+    if(focus){ const msgs = pane.querySelector(".chatmsgs"); if(msgs) msgs.scrollTop = msgs.scrollHeight; }
   }
 
   function appendLive(key, item){
     if(key !== openKey) { renderList(key); return; }
     const msgs = pane.querySelector(".chatmsgs");
     if(!msgs) { renderList(key); return; }
-    const empty = msgs.querySelector(".chatempty"); if(empty) empty.remove();
-    const nearBottom = msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight < 160;
-    const conv = store.findConv(key);
-    const prev = conv && conv.items.length > 1 ? conv.items[conv.items.length - 2] : null;
-    if(!prev || dayKey(prev.ts) !== dayKey(item.ts)){
-      msgs.insertAdjacentHTML("beforeend", '<div class="daysep">' + esc(pday(item.ts)) + "</div>");
-    }
-    msgs.insertAdjacentHTML("beforeend", bubbleHtml(item, store.data.reads));
-    const row = msgs.querySelector('[data-msgrow="' + CSS.escape(item.id) + '"]');
-    if(row) row.classList.add("flash");
-    if(item.oversight) openItems([item]);
-    if(nearBottom) msgs.scrollTop = msgs.scrollHeight;
-    else if(!msgs.querySelector(".newjump")){
-      const j = document.createElement("button"); j.className = "newjump"; j.textContent = "↓ new message";
-      j.onclick = () => { msgs.scrollTop = msgs.scrollHeight; j.remove(); };
-      msgs.appendChild(j);
+    // Open-before-paint for live arrivals too: an item is drawn
+    // only once its content is in hand — never as a placeholder.
+    if(item.opened){
+      paintThread();
+      const row = msgs.querySelector('[data-msgrow="' + CSS.escape(item.id) + '"]');
+      if(row) row.classList.add("flash");
+    }else if(item.oversight){
+      openItems([item]);
     }
     renderList();
   }
@@ -264,8 +268,18 @@ export function createChat(root, ctx, opts){
   else { let k = null; try{ k = sessionStorage.getItem(persistKey); }catch(_){} if(k && store.findConv(k)) openConv(k, false); }
   renderList();
 
+  // Convergence: an item whose open batch hung, failed or was
+  // omitted upstream must still arrive at its text. Re-run the
+  // open pass for the open conversation until every wrapped item
+  // is opened — a bubble never rests on a placeholder.
+  const convergeTimer = setInterval(() => {
+    if(destroyed || !openKey) return;
+    const conv = store.findConv(openKey);
+    if(conv) openItems(conv.items.filter(m => m.oversight && !m.opened));
+  }, 8000);
+
   return {
-    destroy(){ destroyed = true; unsubs.forEach(u => u && u()); fileUrls.forEach(u => URL.revokeObjectURL(u)); fileUrls.clear(); fileBlobs.clear(); if(store.openConvKey === openKey) store.openConvKey = null; },
+    destroy(){ destroyed = true; clearInterval(convergeTimer); unsubs.forEach(u => u && u()); fileUrls.forEach(u => URL.revokeObjectURL(u)); fileUrls.clear(); fileBlobs.clear(); if(store.openConvKey === openKey) store.openConvKey = null; },
     refresh(){ renderList(); if(openKey && store.findConv(openKey)) openConv(openKey, false); }
   };
 }
