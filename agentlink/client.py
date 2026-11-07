@@ -105,6 +105,7 @@ from .timing import (
 from .crypto import Identity, decrypt_with_key, encrypt_to_pubkey, \
     encrypt_with_key, new_group_key
 from .mailbox import Mailbox
+from .outbox import Outbox
 from .protocol import (
     MAX_FRAME,
     make_file_payload,
@@ -901,6 +902,12 @@ class Agent:
         for _conn in connectors or []:
             self._register_connector_local(_conn)
         self._load_permission_request()
+        # Unreadable park journal (2.0.10): message ids whose
+        # decryption has failed, with attempt counts and the
+        # next retry time — the backoff state that keeps a bad
+        # envelope from being retried in a hot loop (class A).
+        self._unreadable: dict[str, dict] = {}
+        self._load_unreadable()
         self.identity: Identity | None = None
         if not ephemeral and self.username:
             try:
@@ -1105,6 +1112,17 @@ class Agent:
                 except Exception:
                     self.mailbox = None
             self._mailbox = self.mailbox
+        # Persistent send outbox (2.0.10, class B): sends that
+        # meet a dead network window queue here and flush until
+        # the server confirms — a proxy window can delay a send,
+        # never lose it or wedge the daemon.
+        self._outbox: Outbox | None = None
+        if not ephemeral and self.username:
+            try:
+                self._outbox = Outbox(
+                    self.state_dir / f"outbox-{self.username}.json")
+            except Exception:
+                self._outbox = None
         # Ids claimed by a live dispatch (or a replay) in this
         # process: the guard that makes journal-then-dispatch
         # exactly-once when a queued flush, a history sync and the
@@ -1428,6 +1446,26 @@ class Agent:
             elif cmd == "vault_remove":
                 result = await self.vault.remove(
                     str(spec["entry_id"]))
+            elif cmd == "work_inbox":
+                # Read-only one-shots forward too (2.0.10,
+                # class E): a read must never die with
+                # instance_collision just because the daemon
+                # holds the state dir — the daemon IS the
+                # reader. (Beulah's `agentlink work inbox`
+                # refused on every check since 1.3.7 while her
+                # daemon ran.) Write commands keep the
+                # existing send/group_add/vault discipline.
+                result = {"items": await self.work_inbox()}
+            elif cmd == "directory":
+                result = await self.directory(
+                    query=str(spec.get("query") or ""))
+            elif cmd == "sync_history":
+                result = await self.sync_history()
+            elif cmd == "delivery_status":
+                result = await self.delivery_status(
+                    str(spec["message_id"]))
+            elif cmd == "chain_list":
+                result = {"chains": await self.chain_list()}
             else:
                 raise ValueError(f"unknown control command {cmd!r}")
             writer.write((json.dumps(
@@ -3403,10 +3441,12 @@ class Agent:
                 continue
             self.connection_state = "connected"
             heal = asyncio.create_task(self._self_heal_loop())
+            flush = asyncio.create_task(self._outbox_flush_loop())
             try:
                 await self.serve()
             finally:
                 heal.cancel()
+                flush.cancel()
                 await self._stop_v2_session()
             if self._v2_close_requested:
                 return
@@ -3414,6 +3454,59 @@ class Agent:
             # underneath us — re-login immediately (the instant
             # first retry), pacing applies to failed attempts.
             reconnect_delay = 0.0
+
+    async def _send_request(self, frame: dict) -> dict:
+        """A message-plane send (DM / group / channel) with the
+        outbox discipline (2.0.10, class B): a TRANSPORT failure
+        — the network window, never a server verdict — journals
+        the sealed frame in the persistent outbox and returns an
+        honest ``queued`` result carrying the frame's own id
+        (the server honours client ids, so the flush can never
+        double-post). The flusher retries until the server
+        confirms; delivery state matures via delivery_status
+        (class D). Refusals propagate unchanged: they are about
+        the send itself, not the weather."""
+        try:
+            return await self._request(frame)
+        except (TransportError, ConnectionError) as exc:
+            if self._v2 is None or self._outbox is None:
+                raise
+            self._outbox.add(frame)
+            log.warning(
+                "send %s queued in the outbox (transport failure: "
+                "%s) — it flushes automatically when the path "
+                "recovers", frame.get("id"), exc)
+            return {"id": frame.get("id"),
+                    "delivery_status": "queued", "queued": True,
+                    "outbox": True}
+
+    async def _outbox_flush_loop(self) -> None:
+        """Flush due outbox entries until the server confirms
+        each one. Runs for the life of a serverless session:
+        every few seconds, and so effectively on every
+        (re)connect — a send queued in a dead window lands as
+        soon as any window opens."""
+        while True:
+            try:
+                await asyncio.sleep(5)
+                if self._v2 is None or self._outbox is None:
+                    continue
+                for entry in self._outbox.due():
+                    frame = entry["frame"]
+                    try:
+                        await asyncio.to_thread(
+                            self._v2_request_sync, frame)
+                    except Exception as exc:
+                        self._outbox.mark_failed(
+                            entry["id"], str(exc))
+                        continue
+                    self._outbox.mark_sent(entry["id"])
+                    log.info("outbox: queued send %s confirmed by "
+                             "the server", entry["id"])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("outbox flush pass failed")
 
     def _v2_request_sync(self, frame: dict) -> dict:
         """The _request surface, serverless edition (sync; called
@@ -5312,7 +5405,8 @@ class Agent:
         "error" when the relay could not be asked — the sync is
         resumable by simply calling it again, and start() calls it
         on every connect)."""
-        out = {"fetched": 0, "inserted": 0, "pages": 0, "rectified": 0}
+        out = {"fetched": 0, "inserted": 0, "pages": 0, "rectified": 0,
+               "healed": 0}
         mb = self.mailbox
         if mb is None or (self._ws is None and self._v2 is None):
             return out
@@ -5343,7 +5437,26 @@ class Agent:
                 if msg is None or not msg.get("id"):
                     continue
                 rectify = msg.pop("_rectify", None)
-                if mb.put_if_absent(msg):
+                if not msg.get("sealed"):
+                    # Envelope reconciliation (2.0.10, class A):
+                    # the server's copy of this id OPENS here, so
+                    # it supersedes any local stub — a sealed
+                    # history stub or a parked-unreadable entry —
+                    # whose envelope never did. The journal heals
+                    # from the canonical record instead of the
+                    # local copy being wrong forever (the 31
+                    # re-sealed family messages reached beulah's
+                    # server record long before her client stopped
+                    # failing on its pre-repair local copies).
+                    existing = mb.get(str(msg["id"]))
+                    if existing and (existing.get("sealed")
+                                     or existing.get("unreadable")):
+                        if mb.replace_msg(msg):
+                            out["healed"] += 1
+                            self._clear_unreadable(str(msg["id"]))
+                    elif mb.put_if_absent(msg):
+                        out["inserted"] += 1
+                elif mb.put_if_absent(msg):
                     out["inserted"] += 1
                 if rectify is not None and out["rectified"] < 150:
                     # Bounded per sync (the sync re-pages everything
@@ -5487,6 +5600,34 @@ class Agent:
         return msg
 
     # -- messages ---------------------------------------------------------------------------
+    async def delivery_status(self, message_id: str) -> dict:
+        """Where one of MY sent messages stands (2.0.10,
+        class D): the server's record — acceptance, per-recipient
+        custody, read receipts — merged with the local outbox
+        (a message still flushing locally reports ``queued``
+        until the server knows it). Recipients come from the
+        local sent journal: the DM peer, or the group's member
+        list for a room post."""
+        if self._v2 is None:
+            raise TransportError(
+                "delivery_status needs the serverless transport")
+        recipients = None
+        group_id = None
+        if self.mailbox is not None:
+            sent = self.mailbox.get(str(message_id))
+            if sent and sent.get("from") == self.username:
+                group_id = sent.get("group_id") or None
+                if not group_id and sent.get("to"):
+                    recipients = [str(sent["to"])]
+        state = await asyncio.to_thread(
+            self._v2.delivery_state, str(message_id), recipients,
+            group_id)
+        if self._outbox is not None \
+                and self._outbox.get(str(message_id)) is not None \
+                and state["state"] == "unknown":
+            state = dict(state, state="queued", local_outbox=True)
+        return state
+
     async def _ensure_group_key(self, gid: str) -> dict | None:
         rec = self._group_keys.get(gid)
         if rec:
@@ -5507,38 +5648,205 @@ class Agent:
         self._store_group_key(gid, int(key_rec["epoch"]), key)
         return self._group_keys[gid]
 
-    async def _process_message(self, frame: dict) -> None:
-        via_identity = False
-        try:
-            if frame.get("channel_id") or frame.get("group_id"):
-                if frame.get("channel_id"):
-                    rec = await self._ensure_channel_key(frame["channel_id"])
-                    to = frame["channel_id"]
-                else:
-                    rec = await self._ensure_group_key(frame["group_id"])
-                    to = frame["group_id"]
-                payload = None
-                if rec is not None:
-                    try:
-                        payload = json.loads(decrypt_with_key(
-                            rec["key"], frame["content"]))
-                    except Exception:
-                        payload = None
-                if payload is None:
-                    # 2.0.7 fallback: a sender whose client mis-seals
-                    # room traffic to a member's identity key can
-                    # still be read by that member (the retired drill
-                    # injector sealed Nova family posts exactly this
-                    # way). The oversight rectification below then
-                    # wraps the CONTENT, not the room key.
-                    payload = self._decrypt_obj(frame["content"])
-                    via_identity = True
-            else:
-                payload = self._decrypt_obj(frame["content"])
-                to = self.username
-        except Exception:
-            log.exception("failed to decrypt message %s", frame.get("id"))
+    # -- unreadable park journal (2.0.10, class A) ------------------
+    #
+    # A message that cannot be decrypted used to be dropped by
+    # _process_message with nothing journaled and nothing acked:
+    # the custody row stayed on the server, every fetch offered
+    # it again, and the client retried the same failing decrypt
+    # forever — beulah's log recorded 7,863 InvalidTag retries
+    # against 31 messages whose SERVER copies had already been
+    # repaired (her local journal predated the repair, and
+    # nothing anywhere replaced a bad local copy with the good
+    # server one). The discipline now:
+    #
+    # * one fresh-key retry on the live path (a stale cached
+    #   room key is the common transient);
+    # * then PARK: journal an honest sealed stub marked
+    #   ``unreadable`` and ACK the custody row, so redelivery
+    #   stops dead;
+    # * re-attempts ride an exponential backoff recorded in
+    #   unreadable-<username>.json (30s doubling, capped at 1h);
+    # * self-healing: whenever a copy of the same id DOES open
+    #   (a later live delivery, or the history sync's server
+    #   copy), it replaces the stub in place and the park record
+    #   clears — the journal heals itself from the server's
+    #   canonical record.
+
+    def _unreadable_path(self) -> Path:
+        return Path(self.state_dir) / f"unreadable-{self.username}.json"
+
+    def _load_unreadable(self) -> None:
+        if self.ephemeral or not self.username:
             return
+        try:
+            data = json.loads(self._unreadable_path().read_text())
+            if isinstance(data, dict):
+                self._unreadable = {
+                    str(k): {"attempts": int(v.get("attempts") or 0),
+                             "next_ts": int(v.get("next_ts") or 0)}
+                    for k, v in data.items() if isinstance(v, dict)}
+        except FileNotFoundError:
+            pass
+        except Exception:
+            log.exception("loading the unreadable park journal failed")
+
+    def _save_unreadable(self) -> None:
+        if self.ephemeral or not self.username:
+            return
+        try:
+            path = self._unreadable_path()
+            if not self._unreadable:
+                path.unlink(missing_ok=True)
+                return
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._unreadable))
+            os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        except Exception:
+            log.exception("persisting the unreadable park journal "
+                          "failed")
+
+    def _park_unreadable(self, mid: str) -> dict:
+        """Record one more failed opening of ``mid`` and return
+        its park record (attempts + the next permitted retry)."""
+        rec = self._unreadable.get(str(mid)) or {"attempts": 0,
+                                                 "next_ts": 0}
+        rec["attempts"] = int(rec.get("attempts") or 0) + 1
+        wait = min(3600, 30 * (2 ** min(rec["attempts"] - 1, 7)))
+        rec["next_ts"] = int(time.time()) + wait
+        self._unreadable[str(mid)] = rec
+        self._save_unreadable()
+        return rec
+
+    def _clear_unreadable(self, mid: str) -> None:
+        if self._unreadable.pop(str(mid), None) is not None:
+            self._save_unreadable()
+
+    def _unreadable_due(self, mid: str) -> bool:
+        """True when a parked id may be attempted again (no park
+        record, or its backoff has elapsed)."""
+        rec = self._unreadable.get(str(mid))
+        if not rec:
+            return True
+        return int(time.time()) >= int(rec.get("next_ts") or 0)
+
+    async def _open_frame_payload(self, frame: dict):
+        """Open one delivered frame's content: the room key for
+        group/channel traffic (with the 2.0.7 identity fallback),
+        the identity for DMs. Returns (payload, via_identity,
+        room_key_rec, to). Raises when nothing opens it."""
+        via_identity = False
+        rec = None
+        if frame.get("channel_id") or frame.get("group_id"):
+            if frame.get("channel_id"):
+                rec = await self._ensure_channel_key(frame["channel_id"])
+                to = frame["channel_id"]
+            else:
+                rec = await self._ensure_group_key(frame["group_id"])
+                to = frame["group_id"]
+            payload = None
+            if rec is not None:
+                try:
+                    payload = json.loads(decrypt_with_key(
+                        rec["key"], frame["content"]))
+                except Exception:
+                    payload = None
+            if payload is None:
+                # 2.0.7 fallback: a sender whose client mis-seals
+                # room traffic to a member's identity key can
+                # still be read by that member (the retired drill
+                # injector sealed Nova family posts exactly this
+                # way). The oversight rectification below then
+                # wraps the CONTENT, not the room key.
+                payload = self._decrypt_obj(frame["content"])
+                via_identity = True
+        else:
+            payload = self._decrypt_obj(frame["content"])
+            to = self.username
+        return payload, via_identity, rec, to
+
+    async def _process_message(self, frame: dict) -> None:
+        mid = frame.get("id")
+        if mid and self.mailbox is not None:
+            existing = self.mailbox.get(str(mid))
+            if existing and existing.get("unreadable") \
+                    and not self._unreadable_due(str(mid)):
+                # Parked and still inside its backoff: ack the
+                # re-offer and stop — no decrypt attempt, no log
+                # line, no spin (class A).
+                await self._send_ack([mid])
+                return
+        via_identity = False
+        rec = None
+        try:
+            payload, via_identity, rec, to = \
+                await self._open_frame_payload(frame)
+        except Exception:
+            # One fresh-key retry: a stale cached room key is
+            # the common transient (the room re-wrapped while
+            # this client held the old wrap).
+            retried = False
+            if frame.get("channel_id"):
+                self._channel_keys.pop(frame["channel_id"], None)
+                retried = True
+            elif frame.get("group_id"):
+                self._group_keys.pop(frame["group_id"], None)
+                retried = True
+            if retried:
+                try:
+                    payload, via_identity, rec, to = \
+                        await self._open_frame_payload(frame)
+                except Exception:
+                    retried = False
+            if not retried:
+                # PARK (class A): journal the honest stub, ack
+                # the custody row, record the backoff. The item
+                # is never dropped silently and never retried in
+                # a hot loop; a later opening copy heals it.
+                park = self._park_unreadable(str(mid)) if mid \
+                    else {"attempts": 1}
+                if mid and self.mailbox is not None:
+                    stub = {
+                        "id": mid,
+                        "from": frame.get("from"),
+                        "from_name": frame.get("from_name"),
+                        "sender_nickname":
+                            frame.get("sender_nickname") or "",
+                        "sender_role": frame.get("sender_role") or "",
+                        "sender_custom_role":
+                            frame.get("sender_custom_role") or "",
+                        "to": frame.get("group_id")
+                            or frame.get("channel_id")
+                            or self.username,
+                        "group_id": frame.get("group_id"),
+                        "group_name": frame.get("group_name"),
+                        "channel_id": frame.get("channel_id"),
+                        "channel_name": frame.get("channel_name"),
+                        "priority": frame.get("priority") or "normal",
+                        "ts": frame.get("ts"),
+                        "time": frame.get("ts"),
+                        "kind": "text", "body": "", "meta": {},
+                        "file": None, "size": 0,
+                        "mentions": frame.get("mentions") or [],
+                        "in_reply_to": frame.get("in_reply_to"),
+                        "delivery_status": "unreadable",
+                        "queued": bool(frame.get("queued")),
+                        "encrypted": True,
+                        "sealed": True,
+                        "unreadable": True,
+                    }
+                    self.mailbox.put_if_absent(stub)
+                    await self._send_ack([mid])
+                log.warning(
+                    "message %s could not be decrypted — parked as "
+                    "unreadable (attempt %s); it heals automatically "
+                    "when an opening copy syncs from the server",
+                    mid, park.get("attempts"))
+                return
         if not frame.get("oversight"):
             # The sender shipped no oversight wrap (an old client):
             # rectify from the plaintext just decrypted, in the
@@ -5614,8 +5922,11 @@ class Agent:
                     # A sealed history stub stood in for this item;
                     # the real content has now arrived live and was
                     # never taken in — upgrade the journal in place
-                    # and process the real item.
+                    # and process the real item. A parked-unreadable
+                    # stub heals the same way (2.0.10, class A):
+                    # its park record clears with the replacement.
                     self.mailbox.replace_msg(msg)
+                    self._clear_unreadable(str(mid))
                     self._takein_inflight.add(str(mid))
                     await self._send_ack([mid])
                 else:
@@ -6687,7 +6998,7 @@ class Agent:
         ov = self._oversight_for_obj(obj)
         if ov:
             frame["oversight"] = ov
-        result = await self._request(frame)
+        result = await self._send_request(frame)
         self._mailbox_record_sent({
             "id": result.get("id") or frame["id"], "from": self.username,
             "to": u, "group_id": None, "channel_id": None,
@@ -6978,7 +7289,7 @@ class Agent:
         ov = self._oversight_for_key(rec["key"])
         if ov:
             frame["oversight"] = ov
-        result = await self._request(frame)
+        result = await self._send_request(frame)
         self._mailbox_record_sent({
             "id": result.get("id") or frame["id"], "from": self.username,
             "to": group_id, "group_id": group_id, "channel_id": None,
@@ -7673,7 +7984,7 @@ class Agent:
         ov = self._oversight_for_key(rec["key"])
         if ov:
             frame["oversight"] = ov
-        result = await self._request(frame)
+        result = await self._send_request(frame)
         self._mailbox_record_sent({
             "id": result.get("id") or frame["id"], "from": self.username,
             "to": channel_id, "group_id": None, "channel_id": channel_id,
