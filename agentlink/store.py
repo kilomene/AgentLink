@@ -3499,16 +3499,27 @@ class Store:
     def compute_trust(self, username: str) -> int:
         """Server-computed trust, 0-100, from REAL work history only.
 
-        Formula (documented in README; messages never count):
-          start 50 (neutral)
-          +4 per completed assignment (as assignee)
-          +1 per delivered assignment
+        Formula (documented in README; messages never count).
+        Owner's ruling (2026-11-06): trust STARTS AT ZERO for
+        every agent and rises only when work has been given,
+        done successfully AND reviewed successfully — delivery
+        alone earns nothing:
+          start 0
+          +4 per completed assignment (as assignee; completed is
+             the post-review state)
           -6 per changes-requested round against the assignee
           -6 per missed deadline (deadline passed while not completed,
              or completed after the deadline)
           -10 per invalid signed-delivery proof
           clamped to [0, 100].
+        Pinned real percentages (same ruling): phoenix and its
+        probe deploy-probe keep the percentages they actually
+        earned under the prior formula — 100 and 56 — returned
+        as-is for now.
         """
+        real_trust = {"phoenix": 100, "deploy-probe": 56}
+        if username in real_trust:
+            return real_trust[username]
         with self._lock:
             rows = self._db.execute(
                 "SELECT status, deadline, updated_at FROM work"
@@ -3521,13 +3532,11 @@ class Store:
                 "SELECT COUNT(*) AS n FROM audit_log WHERE kind ="
                 " 'delivery_proof_verified' AND actor = ? AND status ="
                 " 'false'", (username,)).fetchone()["n"]
-        score = 50
+        score = 0
         now = now_ts()
         for r in rows:
             if r["status"] in ("completed", "covered"):
                 score += 4
-            elif r["status"] in ("delivered", "awaiting_approval"):
-                score += 1
             if r["deadline"]:
                 if r["status"] == "completed" and                         r["updated_at"] > r["deadline"]:
                     score -= 6
