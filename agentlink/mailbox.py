@@ -197,9 +197,18 @@ class Mailbox:
         out = []
         for r in rows:
             try:
-                out.append(json.loads(r[0]))
+                item = json.loads(r[0])
             except Exception:
                 continue
+            # Parked-unreadable stubs (2.0.10) are journal
+            # placeholders, not take-in work: the intelligence
+            # must never be handed a body-less item as if it were
+            # a message. When an opening copy replaces the stub,
+            # the replacement is an ordinary item and replays
+            # normally.
+            if item.get("unreadable"):
+                continue
+            out.append(item)
         return out
 
     def list_items(self, limit: int = 50, before_ts: int | None = None,
