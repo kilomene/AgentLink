@@ -688,6 +688,97 @@ def test_receiver_rectifies_unwrapped_group_message(tmp_path):
     asyncio.run(scenario())
 
 
+def test_receiver_rectifies_identity_sealed_group_message(tmp_path):
+    # 2.0.7 (the Nova family drill defect, found live 2026-11-06):
+    # a sender whose client mis-seals GROUP traffic to a member's
+    # identity key instead of the room key. The member can still
+    # read it — via the identity fallback — and the rectification
+    # wraps the CONTENT (a room-key wrap would open nothing: the
+    # envelope was never sealed under the room key).
+    oversight_id = Identity.ephemeral()
+    backend = FakeBackend()
+    doorbell = StubDoorbell()
+    agent, transport = _make_agent(
+        tmp_path, backend, doorbell,
+        oversight_pubkey=oversight_id.public_key_b64)
+    bob = Identity.ephemeral()
+    backend.tables["directory"].append({
+        "username": "bob", "pubkey": bob.public_key_b64,
+        "sign_pub": bob.signing_public_key_b64})
+    room_key = b"r" * 32
+    agent._store_group_key("g1", 1, room_key)
+    content = bob.encrypt_for(
+        agent.identity.public_key_b64,
+        json.dumps({"body": "mis-sealed group hi",
+                    "kind": "text"}).encode())
+    frame = {"type": "message", "id": "gm-2", "from": "bob",
+             "from_name": "bob", "from_pubkey": bob.public_key_b64,
+             "sender_nickname": "", "sender_role": "",
+             "sender_custom_role": "", "oversight": None,
+             "mentions": [], "priority": "normal", "content": content,
+             "ts": int(time.time()), "in_reply_to": None,
+             "group_id": "g1", "group_name": "G"}
+    backend.tables["audit_log"].append({
+        "seq": 9004, "ts": int(time.time()), "kind": "group_message",
+        "actor": "bob", "target": "", "group_id": "g1",
+        "ref_id": "gm-2", "status": "sent", "priority": "normal",
+        "size": 10, "mentions": [], "oversight": "",
+        "content_envelope": json.dumps(content)})
+    _enqueue_frame(backend, "alice", frame)
+    doorbell.signal_conversation = "dm:alice|bob"
+    received = []
+    agent.on_message(lambda msg: received.append(msg))
+
+    async def scenario():
+        await agent.start()
+        try:
+            assert await _wait_for(lambda: len(received) == 1)
+            assert received[0]["body"] == "mis-sealed group hi"
+            assert await _wait_for(
+                lambda: len(backend.attach_calls) >= 1)
+            call = backend.attach_calls[0]
+            assert call["p_ref_id"] == "gm-2"
+            wrap = json.loads(call["p_oversight"])
+            assert wrap["kind"] == "content"
+            plain = json.loads(oversight_id.decrypt_envelope(wrap))
+            assert plain["body"] == "mis-sealed group hi"
+        finally:
+            await agent.close()
+
+    asyncio.run(scenario())
+
+
+def test_history_row_identity_sealed_group_opens_and_rectifies(tmp_path):
+    # The history twin of the 2.0.7 fallback: a stored group row
+    # whose envelope was sealed to my identity key opens in history
+    # (no sealed stub) and backfills a CONTENT wrap.
+    oversight_id = Identity.ephemeral()
+    backend = FakeBackend()
+    doorbell = StubDoorbell()
+    agent, transport = _make_agent(
+        tmp_path, backend, doorbell,
+        oversight_pubkey=oversight_id.public_key_b64)
+    bob = Identity.ephemeral()
+    agent._store_group_key("g1", 1, b"r" * 32)
+    content = bob.encrypt_for(
+        agent.identity.public_key_b64,
+        json.dumps({"body": "old drill post", "kind": "text"}).encode())
+    row = {"kind": "group_message", "ref_id": "gm-old",
+           "group_id": "g1", "from": "bob", "to": "",
+           "ts": int(time.time()), "size": 10, "mentions": [],
+           "oversight": "", "content_envelope": content}
+    msg = agent._history_row_to_msg(row)
+    assert msg is not None
+    assert not msg.get("sealed")
+    assert msg["body"] == "old drill post"
+    rect = msg.get("_rectify")
+    assert rect and rect["ref_id"] == "gm-old"
+    wrap = rect["oversight"]
+    assert wrap["kind"] == "content"
+    plain = json.loads(oversight_id.decrypt_envelope(wrap))
+    assert plain["body"] == "old drill post"
+
+
 def test_history_backfill_rectifies_unwrapped_rows(tmp_path):
     # The same rectification applied to HISTORY at start(): an old
     # unwrapped row gains its wrap during the boot history sync,
@@ -808,27 +899,27 @@ def test_admin_reissues_group_key_on_request(tmp_path):
     asyncio.run(scenario())
 
 
-def test_version_206_and_manifest_offers_206():
-    assert __version__ == "2.0.6"
+def test_version_208_and_manifest_offers_208():
+    assert __version__ == "2.0.8"
     pyproject = (ROOT / "pyproject.toml").read_text()
-    assert 'version = "2.0.6"' in pyproject
+    assert 'version = "2.0.8"' in pyproject
     # The fleet's update manifest was regenerated at the owner's
     # direct release order (2026-11-05): it offers 2.0.5, and its
     # file set covers the whole package INCLUDING the v2.0
     # serverless modules, each with a matching SHA-256.
     import hashlib
     manifest = json.loads((ROOT / "update-manifest.json").read_text())
-    assert manifest["version"] == "2.0.6"
+    assert manifest["version"] == "2.0.8"
     assert "agentlink/doorbell.py" in manifest["files"]
     assert "agentlink/transport_v2.py" in manifest["files"]
     for rel, digest in manifest["files"].items():
         actual = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
         assert actual == digest, rel
-    # A 1.8.1 install reading this manifest sees the 2.0.6 update.
+    # A 1.8.1 install reading this manifest sees the 2.0.8 update.
     updater = Updater(current_version="1.8.1")
     updater.fetch_manifest = lambda: manifest
     check = updater.check()
-    assert check["available"] == "2.0.6"
+    assert check["available"] == "2.0.8"
     assert check["update_available"] is True
 
 
@@ -864,6 +955,17 @@ def test_login_refusal_classification_405_retries_401_key_auth_final(
             "login Edge verify HTTP 401: key_auth_failed")
 
     monkeypatch.setattr(transport, "login", refuse_key)
+
+    # 2.0.8 refinement: key_auth_failed first runs the
+    # first-contact suite — a FREE name would register and a held
+    # recovery key would reclaim. Here the name is taken and no
+    # key is held, so the suite exhausts and the refusal stands
+    # as the permanent identity verdict it always was.
+    def refuse_register(*a, **kw):
+        raise TransportError(
+            "login Edge register HTTP 409: username_taken")
+
+    monkeypatch.setattr(transport, "register_and_login", refuse_register)
 
     async def scenario_key():
         with pytest.raises(RegistrationFailed):
