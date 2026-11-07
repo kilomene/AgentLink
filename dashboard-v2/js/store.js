@@ -168,7 +168,7 @@ export const store = {
     const list = r.designation === "test" ? d.testUsers : d.users;
     const existing = list.find(x => x.username === r.username);
     if(existing) Object.assign(existing, r);
-    else list.push({ ...r, trust_score: 50, online: false, connectors: [], grant: null });
+    else list.push({ ...r, trust_score: 0, online: false, connectors: [], grant: null });
     emit("users", r);
   },
 
