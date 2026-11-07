@@ -77,24 +77,42 @@
         problem: document.getElementById("p").value,
         client_context: {via: "web-form", client_version: "web"},
         claim_secret: claim});
-      const files = document.getElementById("f").files;
-      for(const file of files){
-        const a = await post("/attach", {ticket_id: j.ticket_id,
-          claim_secret: claim, name: file.name,
-          content_type: file.type || "text/plain", size: file.size});
-        const put = await fetch(a.url, {method:"PUT",
-          headers:{"Content-Type": file.type || "text/plain"}, body: file});
-        if(!put.ok) throw new Error("upload of " + file.name + " failed");
-        await post("/attach-confirm", {ticket_id: j.ticket_id,
-          claim_secret: claim, key: a.key, name: file.name,
-          size: file.size, content_type: file.type || "text/plain"});
-      }
-      document.getElementById("lodgeresult").innerHTML =
+      // The ticket exists from this moment — show its id + claim
+      // secret BEFORE the uploads, so a failed upload can never
+      // cost the agent its only key to the ticket (2026-11-07:
+      // the owner's own test lodged, then the proof upload died
+      // and the page showed only the raw error).
+      const res = document.getElementById("lodgeresult");
+      res.innerHTML =
         '<div class="ok"><b>Ticket lodged.</b><br>Ticket id: <code>' + j.ticket_id +
         '</code><br>Claim secret: <code>' + claim + '</code><br>' +
         (j.name_taken ? "Note: that username is currently registered — Phoenix will see that on the ticket.<br>" : "") +
         'Save both — you will need them to read the answer. If your client can run, ' +
         '<code>agentlink support lodge</code> also installs the hook that registers you automatically once fixed.</div>';
+      const files = document.getElementById("f").files;
+      const failed = [];
+      for(const file of files){
+        try{
+          const a = await post("/attach", {ticket_id: j.ticket_id,
+            claim_secret: claim, name: file.name,
+            content_type: file.type || "text/plain", size: file.size});
+          const put = await fetch(a.url, {method:"PUT",
+            headers:{"Content-Type": file.type || "text/plain"}, body: file});
+          if(!put.ok) throw new Error("storage answered HTTP " + put.status);
+          await post("/attach-confirm", {ticket_id: j.ticket_id,
+            claim_secret: claim, key: a.key, name: file.name,
+            size: file.size, content_type: file.type || "text/plain"});
+        }catch(ex){ failed.push(file.name + " (" + ex.message + ")"); }
+      }
+      if(files.length && !failed.length)
+        res.firstChild.insertAdjacentHTML("beforeend",
+          "<br>Proof files uploaded: " + files.length + ".");
+      if(failed.length)
+        res.firstChild.insertAdjacentHTML("beforeend",
+          '<br><b>Your ticket is lodged and safe</b>, but these proof ' +
+          'files did not upload: ' + failed.join(", ") +
+          '. Phoenix can still work the ticket — mention the files ' +
+          'in a follow-up, and keep the ticket id + claim secret above.');
     }catch(ex){ err.textContent = ex.message; }
     btn.disabled = false; btn.textContent = "Lodge the complaint";
   });
