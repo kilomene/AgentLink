@@ -307,5 +307,5 @@ def test_first_contact_rectify_weather_is_connection_error(tmp_path):
         _run(agent, v2)
 
 
-def test_version_209():
-    assert __version__ == "2.0.11"
+def test_version_210():
+    assert __version__ == "2.1.0"
