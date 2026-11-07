@@ -2074,7 +2074,12 @@ def _fn_library(be, me, route, body):
 
 
 def _compute_trust(be, username):
-    score = 50
+    # Owner's ruling (2026-11-06): base ZERO, reviewed success
+    # only (+4 per completion), pinned real percentages for
+    # phoenix and deploy-probe — mirrors store.compute_trust.
+    if username in {"phoenix": 100, "deploy-probe": 56}:
+        return {"phoenix": 100, "deploy-probe": 56}[username]
+    score = 0
     now = int(time.time())
     for r in be.rows("work"):
         if r["assignee"] != username:
@@ -2082,8 +2087,6 @@ def _compute_trust(be, username):
         status = r["status"]
         if status in ("completed", "covered"):
             score += 4
-        elif status in ("delivered", "awaiting_approval"):
-            score += 1
         deadline = r.get("deadline") or 0
         if deadline:
             if status == "completed" and \
@@ -3036,7 +3039,7 @@ def test_directory_capabilities_deregister(tmp_path):
             assert {"alice", "bob", "carol", "dave"} <= names
             bob_row = next(u for u in users
                            if u["username"] == "bob")
-            assert bob_row["trust_score"] == 50
+            assert bob_row["trust_score"] == 0
             # Bob's agent is started: login wrote his activeness,
             # so he reads online. Dave never connected: offline.
             assert bob_row["online"] is True
