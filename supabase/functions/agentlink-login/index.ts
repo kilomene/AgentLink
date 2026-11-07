@@ -9,6 +9,20 @@
 //   POST {method:"recovery", username, recovery_key,
 //         new_sign_pub, new_pubkey}
 //     -> {supabase_jwt, firebase_token, expires_in, recovery_key}
+//   POST {method:"register", username, sign_pub, pubkey}
+//     -> {supabase_jwt, firebase_token, expires_in, recovery_key}
+//
+// Registration (v2.0.8) is FIRST-COME and fully automatic — the
+// v1 relay's claiming hello, restored: a well-formed username
+// nobody holds is claimed on the spot, bound to the identity
+// keys the agent generated on its own machine. No password, no
+// approval, no operator involvement exists anywhere in this
+// ceremony. The account's recovery key is minted here, returned
+// ONCE in this response, and stored only as its SHA-256 — the
+// same issuance contract as the recovery method's rotation. A
+// name that already has a row is refused {error:"username_taken"}
+// and NOTHING is written: a taken name can only be re-entered
+// through the recovery method with the key its owner holds.
 //
 // The challenge is STATELESS (no table needed): nonce =
 // HMAC-SHA256-hex(AGENTLINK_LOGIN_HMAC, "<username>|<sign_pub>|<exp>")
@@ -62,6 +76,7 @@ import {
   env,
   errorResponse,
   hmacSha256Hex,
+  insertRow,
   jsonResponse,
   methodGuard,
   mintFirebaseCustomToken,
@@ -96,6 +111,7 @@ const LIMITS: Record<string, number> = {
   challenge: 30,
   verify: 20,
   recovery: 10,
+  register: 10,
 };
 const attempts = new Map<string, { window: number; count: number }>();
 
@@ -336,9 +352,118 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ ...tokens, recovery_key: newRecoveryKey });
     }
 
+    // ------------------------------------------------- register
+    if (method === "register") {
+      if (rateLimited("register", username, ip)) {
+        return errorResponse("rate_limited", "too many registration attempts; retry shortly", 429);
+      }
+      // First-come claim of an unheld name (v2.0.8 — see the
+      // header). Key material is validated exactly as the
+      // recovery method validates a rebind: raw 32-byte keys in
+      // crypto.py's standard base64.
+      const signPub = String(body.sign_pub ?? "");
+      const pubkey = String(body.pubkey ?? "");
+      if (!isRawKey32(signPub) || !isRawKey32(pubkey)) {
+        return errorResponse(
+          "invalid_key_material",
+          "sign_pub and pubkey must be base64 raw 32-byte keys",
+          400,
+        );
+      }
+      const existing = await selectOne(
+        supabase,
+        "al_users",
+        "username",
+        { username },
+      );
+      if (existing) {
+        // A taken name is never re-issued and nothing is
+        // written: the only way back into it is the recovery
+        // method with the key the account's owner holds.
+        return errorResponse(
+          "username_taken",
+          "that username is already registered; if it is yours, " +
+            "reclaim it with your recovery key",
+          409,
+        );
+      }
+      const now = nowSeconds();
+      // The recovery key is minted here and returned ONCE in
+      // this response; only its SHA-256 is stored — the
+      // recovery method's issuance contract. The legacy account
+      // secret is born hashed the same way (v2 never uses or
+      // returns it).
+      const newRecoveryKey = randomTokenUrlSafe(32);
+      const bornSecret = randomTokenUrlSafe(24);
+      // The decision-link declaration rides registration with
+      // the verify step's exact validation (additive fields;
+      // anything unlawful is ignored, never an error).
+      const secret = await sha256Hex(bornSecret);
+      const row: Record<string, unknown> = {
+        username,
+        secret,
+        sign_pub: signPub,
+        pubkey,
+        created_at: now,
+        last_seen: now,
+        auth_method: "register",
+        recovery_hash: await sha256Hex(newRecoveryKey),
+      };
+      if (body.decision_link === "linked" || body.decision_link === "pending") {
+        row.decision_link = body.decision_link;
+      }
+      // Registration designation (v1.6.0 contract): declared at
+      // registration only — 'test' files the identity under the
+      // dashboard's probe segregation; anything else is the
+      // column default (production). After registration only
+      // the operator path changes it.
+      if (body.designation === "test" || body.designation === "production") {
+        row.designation = body.designation;
+      }
+      const declaredDetail = body.decision_link_detail;
+      if (declaredDetail && typeof declaredDetail === "object" &&
+          !Array.isArray(declaredDetail)) {
+        const d = declaredDetail as Record<string, unknown>;
+        const mode = String(d.mode ?? "");
+        if (["config", "in_process", "handlers", "convention",
+             "none"].includes(mode)) {
+          row.decision_link_detail = JSON.stringify({
+            mode,
+            verified: Boolean(d.verified),
+            checked_at: Number.isFinite(Number(d.checked_at))
+              ? Math.trunc(Number(d.checked_at)) : 0,
+          });
+        }
+      }
+      try {
+        await insertRow(supabase, "al_users", row);
+      } catch (e) {
+        // A simultaneous claim of the same name: the loser's
+        // insert fails on the key — report the truth (taken),
+        // never a fake internal error.
+        const raced = await selectOne(
+          supabase,
+          "al_users",
+          "username",
+          { username },
+        );
+        if (raced) {
+          return errorResponse(
+            "username_taken",
+            "that username is already registered; if it is yours, " +
+              "reclaim it with your recovery key",
+            409,
+          );
+        }
+        throw e;
+      }
+      const tokens = await issueTokens(username);
+      return jsonResponse({ ...tokens, recovery_key: newRecoveryKey });
+    }
+
     return errorResponse(
       "unknown_method",
-      "method must be challenge, verify or recovery",
+      "method must be challenge, verify, recovery or register",
       400,
     );
   } catch (e) {
