@@ -432,6 +432,28 @@ class ServerlessTransport:
             headers["Prefer"] = prefer
         return headers
 
+    def _call_opener(self, method, url, headers, body):
+        """The one door every HTTP call in this transport leaves
+        by. The opener contract is (status, headers, raw) for any
+        HTTP response — but a CONNECTION-level failure (proxy
+        tunnel refused with a 407 during a credential rotation,
+        a socket reset mid-response, a DNS miss) raises out of
+        the opener instead, and every caller in this module is
+        written against TransportError as the single transport-
+        failure type. Normalize here, at the source. The hole
+        this closes was found live in the 2.0.8 soak prep
+        (2026-11-06): a raw URLError escaped _rest, slipped
+        _mirror_activeness's TransportError guard, and killed
+        the slow-sync thread outright — the agent went dark
+        with its process alive and every beat stopped."""
+        try:
+            return self._opener(method, url, headers, body)
+        except TransportError:
+            raise
+        except Exception as exc:
+            raise TransportError(
+                f"HTTP {method} connection failed: {exc}") from exc
+
     def _rest(self, method: str, table: str, query: str = "",
               body=None, prefer: str = "", _retried: bool = False,
               _decode_attempt: int = 0):
@@ -471,7 +493,7 @@ class ServerlessTransport:
         if body is not None:
             data = json.dumps(body).encode()
             headers["Content-Type"] = "application/json"
-        status, _h, raw = self._opener(method, path, headers, data)
+        status, _h, raw = self._call_opener(method, path, headers, data)
         if status == 401 and not _retried and self._signer is not None \
                 and self.username:
             self._login(self.username, self._signer)
@@ -521,7 +543,7 @@ class ServerlessTransport:
         headers = self._headers()
         headers["Content-Type"] = "application/json"
         data = json.dumps(params).encode()
-        status, _h, raw = self._opener("POST", path, headers, data)
+        status, _h, raw = self._call_opener("POST", path, headers, data)
         if status == 401 and not _retried and self._signer is not None \
                 and self.username:
             self._login(self.username, self._signer)
@@ -543,7 +565,7 @@ class ServerlessTransport:
             raise TransportError("no login Edge URL configured")
         url = f"{self.config.login_edge_url}/{suffix}"
         body = json.dumps(payload).encode()
-        status, _h, raw = self._opener(
+        status, _h, raw = self._call_opener(
             "POST", url, {"Content-Type": "application/json",
                           "apikey": self.config.anon_key}, body)
         if status >= 400:
@@ -605,12 +627,20 @@ class ServerlessTransport:
         if isinstance(self._decision_detail, dict):
             verify["decision_link_detail"] = self._decision_detail
         reply = self._edge_post("verify", verify)
+        return self._adopt_tokens(username, reply)
+
+    def _adopt_tokens(self, username: str, reply: dict) -> dict:
+        """Adopt a login-Edge token reply (verify / recovery /
+        register all answer the same shape): store the JWT,
+        take the advertised oversight key, arm the refresh
+        from the token's own exp, and exchange the Firebase
+        custom token. Returns the login result dict."""
         jwt = str(reply.get("supabase_jwt") or reply.get("access_token")
                   or reply.get("jwt") or "")
         custom = str(reply.get("firebase_custom_token")
                      or reply.get("firebase_token") or "")
         if not jwt:
-            raise TransportError("login Edge verify returned no JWT")
+            raise TransportError("login Edge returned no JWT")
         self._jwt = jwt
         # Oversight welcome (2.0.4): the Edge advertises the
         # owner-oversight public key with the tokens; keep the
@@ -782,6 +812,20 @@ class ServerlessTransport:
         this ceremony's verify AND on every later refresh
         re-login, so the declaration the dashboard reads from
         al_users is always the client's current truth."""
+        self._session_preamble(username, signer, client_version,
+                               decision_link, decision_link_detail)
+        result = self._login(self.username, signer)
+        self.start_activeness()
+        return result
+
+    def _session_preamble(self, username: str, signer,
+                          client_version: str = "",
+                          decision_link: str | None = None,
+                          decision_link_detail: dict | None = None) -> None:
+        """The session fields every login ceremony (key login,
+        registration, recovery reclaim) establishes before its
+        Edge call: identity, signer, the decision-link declaration
+        the ceremony carries, and the client version."""
         self.username = str(username)
         self._signer = signer
         if decision_link is not None:
@@ -796,7 +840,67 @@ class ServerlessTransport:
                 self.client_version = str(__version__)
             except Exception:
                 self.client_version = ""
-        result = self._login(self.username, signer)
+
+    def _declaration_payload(self) -> dict:
+        """The decision-link declaration as ceremony payload
+        fields (the verify step's additive contract, carried by
+        every first-contact ceremony the same way)."""
+        payload: dict = {}
+        if self._decision_link in ("linked", "pending"):
+            payload["decision_link"] = self._decision_link
+        if isinstance(self._decision_detail, dict):
+            payload["decision_link_detail"] = self._decision_detail
+        return payload
+
+    def register_and_login(self, username: str, signer, sign_pub: str,
+                           pubkey: str, client_version: str = "",
+                           decision_link: str | None = None,
+                           decision_link_detail: dict | None = None,
+                           designation: str = "") -> dict:
+        """First-come registration (v2.0.8): claim an unheld
+        username for the identity keys this agent generated on
+        its own machine, and open the session in the same step.
+        The Edge mints the account's recovery key and returns it
+        ONCE in the reply; the result dict carries it as
+        ``recovery_key`` for the client to persist under its
+        storage contract — the transport itself keeps no copy.
+        A name that is already registered refuses with
+        ``username_taken`` and nothing is written."""
+        self._session_preamble(username, signer, client_version,
+                               decision_link, decision_link_detail)
+        payload = {"username": self.username, "sign_pub": sign_pub,
+                   "pubkey": pubkey}
+        payload.update(self._declaration_payload())
+        if designation in ("production", "test"):
+            payload["designation"] = designation
+        reply = self._edge_post("register", payload)
+        result = self._adopt_tokens(self.username, reply)
+        result["recovery_key"] = str(reply.get("recovery_key") or "")
+        self.start_activeness()
+        return result
+
+    def recover_and_login(self, username: str, signer, recovery_key: str,
+                          sign_pub: str, pubkey: str,
+                          client_version: str = "",
+                          decision_link: str | None = None,
+                          decision_link_detail: dict | None = None) -> dict:
+        """Recovery-key reclaim (the client path, v2.0.8): present
+        the account's recovery key and rebind the account to THIS
+        machine's identity keys (the fresh pair in the state
+        dir). The used key burns; the Edge issues its successor
+        in the reply, carried as ``recovery_key`` for the client
+        to persist — the transport keeps no copy. A wrong key or
+        an unknown name refuses with ``recovery_failed`` and the
+        account is untouched."""
+        self._session_preamble(username, signer, client_version,
+                               decision_link, decision_link_detail)
+        payload = {"username": self.username,
+                   "recovery_key": recovery_key,
+                   "new_sign_pub": sign_pub, "new_pubkey": pubkey}
+        payload.update(self._declaration_payload())
+        reply = self._edge_post("recovery", payload)
+        result = self._adopt_tokens(self.username, reply)
+        result["recovery_key"] = str(reply.get("recovery_key") or "")
         self.start_activeness()
         return result
 
@@ -1637,7 +1741,7 @@ class ServerlessTransport:
                    "Authorization":
                        f"Bearer {self._jwt or self.config.anon_key}"}
         body = json.dumps(payload).encode()
-        status, _h, raw = self._opener("POST", url, headers, body)
+        status, _h, raw = self._call_opener("POST", url, headers, body)
         if status == 401 and not _retried \
                 and self._signer is not None and self.username:
             self._login(self.username, self._signer)
@@ -2359,7 +2463,7 @@ class ServerlessTransport:
 
     def _http_bytes(self, method: str, url: str,
                     data: bytes | None = None) -> tuple[int, bytes]:
-        status, _h, raw = self._opener(method, url, {}, data)
+        status, _h, raw = self._call_opener(method, url, {}, data)
         return status, raw or b""
 
     def blob_put(self, frame: dict) -> dict:
