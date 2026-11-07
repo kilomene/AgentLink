@@ -1440,6 +1440,9 @@ def test_all_opener_sites_route_through_call_opener():
     src = (Path(__file__).resolve().parents[1]
            / "agentlink" / "transport_v2.py").read_text()
     # The only raw opener call left in the module is the one
-    # inside _call_opener itself.
+    # inside _call_opener itself; _call_opener is called only
+    # by _call_hardened (the 2.0.10 PROXY ride-out), and every
+    # call site routes through _call_hardened.
     assert src.count("self._opener(") == 1
-    assert src.count("self._call_opener(") == 5
+    assert src.count("self._call_opener(") == 1
+    assert src.count("self._call_hardened(") == 5
