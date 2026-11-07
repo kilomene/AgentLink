@@ -136,6 +136,39 @@ def next_backoff_s(attempt: int) -> float:
     return float(min(RECONNECT_BACKOFF_CAP_S, 2 ** (attempt - 1)))
 
 
+def _sleep(seconds: float) -> None:
+    """The transport's own sleep hook. Indirection on purpose:
+    tests (and only tests) patch THIS name to skip backoff waits
+    — patching ``time.sleep`` itself would rewrite the stdlib
+    function for every thread in the process, which once melted
+    a full gate run when hundreds of leaked heartbeat/dashboard
+    threads turned into spin loops (2.0.10 gate, root-caused)."""
+    time.sleep(seconds)
+
+
+#: Attempts ONE logical call makes through a PROXY-class window
+#: before the failure is allowed to surface (2.0.10): the waits
+#: ride next_backoff_s (0, 1, 2, 4, 5 — about 12s of waiting plus
+#: the calls themselves), long enough for the runtime's
+#: credential republish to land and proxycreds' fresh resolution
+#: to pick it up, short enough that a genuinely dead path still
+#: reports while an operator is watching.
+PROXY_RETRY_ATTEMPTS = 5
+
+
+def _proxy_failure_text(text: str) -> bool:
+    """True when a connection-failure string carries the egress
+    proxy's refusal signature (the PROXY desync class): the
+    proxy answered 407, or the tunnel it was asked to build was
+    refused. Target-side failures (the Supabase/Firebase host
+    itself refusing or unreachable) deliberately do NOT match —
+    they are verdicts/outages, not credential weather."""
+    low = (text or "").lower()
+    return ("407" in low
+            or "proxy authentication" in low
+            or "tunnel connection failed" in low)
+
+
 def _jwt_exp(jwt: str) -> int:
     """The exp claim of a JWT (payload read, signature NOT checked
     — the client only schedules its own refresh from it; the
@@ -454,6 +487,60 @@ class ServerlessTransport:
             raise TransportError(
                 f"HTTP {method} connection failed: {exc}") from exc
 
+    def _call_hardened(self, method, url, headers, body,
+                       _require_body: bool = False):
+        """_call_opener + the PROXY-class ride-out (2.0.10).
+
+        The egress proxy's credential ROTATES under this process
+        (the front-door taxonomy's PROXY class): for a window,
+        every candidate the resolver knows is stale — CONNECTs
+        are refused with 407s, or accepted and then stalled into
+        an empty body — until the runtime republishes the fresh
+        credential and proxycreds' next resolution can see it.
+        Before 2.0.10 one such window failed whatever call was
+        in flight: a registration died BETWEEN its challenge and
+        its verify (@lean's install, 2026-11-07), beulah's sends
+        and acks failed first-try all day, and a daemon died in
+        one. The hardened call treats the window as WEATHER: on
+        a proxy-signature failure (HTTP 407, or a connection
+        error carrying the proxy's refusal), it abdicates the
+        resolver's cached winner, waits on the standard backoff
+        ladder, and retries — credential resolution is FRESH on
+        every attempt (proxycreds resolves at dial time), so the
+        attempt after the republish lands succeeds. The budget
+        is bounded (PROXY_RETRY_ATTEMPTS attempts); a failure
+        that is NOT proxy-shaped (a real 4xx/5xx, a refused
+        request, a DNS miss for the target itself) is returned /
+        raised at once, exactly as before — hardening never
+        disguises a verdict as weather.
+
+        ``_require_body`` marks calls whose success is never
+        legitimately bodyless (the login Edge family): a 2xx
+        with a zero-byte body there is the stall costume of the
+        same window, so it retries on the same ladder instead of
+        surfacing as a malformed-reply failure mid-ceremony."""
+        attempt = 0
+        while True:
+            try:
+                status, resp_headers, raw = self._call_opener(
+                    method, url, headers, body)
+            except TransportError as exc:
+                if attempt + 1 < PROXY_RETRY_ATTEMPTS \
+                        and _proxy_failure_text(str(exc)):
+                    proxycreds.reset_winner()
+                    _sleep(next_backoff_s(attempt))
+                    attempt += 1
+                    continue
+                raise
+            proxy_window = status == 407 or (
+                _require_body and status < 400 and not raw)
+            if proxy_window and attempt + 1 < PROXY_RETRY_ATTEMPTS:
+                proxycreds.reset_winner()
+                _sleep(next_backoff_s(attempt))
+                attempt += 1
+                continue
+            return status, resp_headers, raw
+
     def _rest(self, method: str, table: str, query: str = "",
               body=None, prefer: str = "", _retried: bool = False,
               _decode_attempt: int = 0):
@@ -493,7 +580,7 @@ class ServerlessTransport:
         if body is not None:
             data = json.dumps(body).encode()
             headers["Content-Type"] = "application/json"
-        status, _h, raw = self._call_opener(method, path, headers, data)
+        status, _h, raw = self._call_hardened(method, path, headers, data)
         if status == 401 and not _retried and self._signer is not None \
                 and self.username:
             self._login(self.username, self._signer)
@@ -543,7 +630,7 @@ class ServerlessTransport:
         headers = self._headers()
         headers["Content-Type"] = "application/json"
         data = json.dumps(params).encode()
-        status, _h, raw = self._call_opener("POST", path, headers, data)
+        status, _h, raw = self._call_hardened("POST", path, headers, data)
         if status == 401 and not _retried and self._signer is not None \
                 and self.username:
             self._login(self.username, self._signer)
@@ -565,9 +652,10 @@ class ServerlessTransport:
             raise TransportError("no login Edge URL configured")
         url = f"{self.config.login_edge_url}/{suffix}"
         body = json.dumps(payload).encode()
-        status, _h, raw = self._call_opener(
+        status, _h, raw = self._call_hardened(
             "POST", url, {"Content-Type": "application/json",
-                          "apikey": self.config.anon_key}, body)
+                          "apikey": self.config.anon_key}, body,
+            _require_body=True)
         if status >= 400:
             code = ""
             try:
@@ -1243,6 +1331,88 @@ class ServerlessTransport:
                 return rows
             offset += self._QUEUE_PAGE
 
+    def delivery_state(self, message_id: str,
+                       recipients: list[str] | None = None,
+                       group_id: str | None = None) -> dict:
+        """The server's own record of where one sent message
+        stands (2.0.10, class D) — the cure for the eternal
+        "queued": a send result used to be the end of the story,
+        so a sender could never learn whether anyone received
+        or read what they sent. Sources of truth, all already on
+        the server:
+
+        * acceptance — the al_audit_log content row (kind
+          ``message`` / ``group_message``) the send wrote;
+        * custody — a recipient still holds the message while
+          their al_queue row for its payload stands; once they
+          fetch + ack it, the row is gone = delivered to them;
+        * reads — the ``message_read`` audit rows recipients'
+          clients write when they take a message in.
+
+        State precedence: read > queued (custody remains for
+        someone) > delivered (accepted, custody empty) > sent
+        (accepted, recipients unknown) > unknown (no server
+        record — e.g. still in the sender's local outbox)."""
+        mid = str(message_id)
+        audit = self._rest(
+            "GET", "al_audit_log",
+            "select=kind,actor,ts"
+            f"&ref_id=eq.{urllib.parse.quote(mid, safe='')}"
+            "&order=seq.asc") or []
+        accepted = any(r.get("kind") in ("message", "group_message")
+                       for r in audit if isinstance(r, dict))
+        read_by = sorted({str(r.get("actor")) for r in audit
+                          if isinstance(r, dict)
+                          and r.get("kind") == "message_read"
+                          and r.get("actor")
+                          and r.get("actor") != self.username})
+        if recipients is None and group_id:
+            try:
+                rows = self._rest(
+                    "GET", "al_group_members",
+                    "select=username"
+                    f"&group_id=eq.{urllib.parse.quote(str(group_id), safe='')}")
+                recipients = [str(r.get("username")) for r in rows or []
+                              if isinstance(r, dict) and r.get("username")
+                              and r.get("username") != self.username]
+            except Exception:
+                recipients = None
+        pending_for: list[str] = []
+        if recipients:
+            for user in recipients:
+                try:
+                    rows = self._queue_rows(user)
+                except Exception:
+                    continue
+                for row in rows:
+                    payload = row.get("payload") if isinstance(
+                        row, dict) else None
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except Exception:
+                            payload = None
+                    if isinstance(payload, dict) \
+                            and str(payload.get("id") or "") == mid:
+                        pending_for.append(user)
+                        break
+        delivered_to = [u for u in (recipients or [])
+                        if u not in pending_for]
+        if read_by:
+            state = "read"
+        elif pending_for:
+            state = "queued"
+        elif accepted and recipients is not None:
+            state = "delivered"
+        elif accepted:
+            state = "sent"
+        else:
+            state = "unknown"
+        return {"id": mid, "state": state, "accepted": accepted,
+                "read_by": read_by, "pending_for": pending_for,
+                "delivered_to": delivered_to,
+                "recipients": recipients}
+
     def fetch_unacked(self, username: str | None = None) -> list[dict]:
         """Peek my custody queue WITHOUT releasing it: rows in
         seq order, each {"seq", "ts", "frame"} with the frame
@@ -1768,7 +1938,7 @@ class ServerlessTransport:
                    "Authorization":
                        f"Bearer {self._jwt or self.config.anon_key}"}
         body = json.dumps(payload).encode()
-        status, _h, raw = self._call_opener("POST", url, headers, body)
+        status, _h, raw = self._call_hardened("POST", url, headers, body)
         if status == 401 and not _retried \
                 and self._signer is not None and self.username:
             self._login(self.username, self._signer)
@@ -1939,8 +2109,37 @@ class ServerlessTransport:
             query += "&" + self._eq("status", status)
         if group_id:
             query += "&" + self._eq("group_id", group_id)
-        rows = self._rest("GET", "work", query) or []
-        return {"work": [self._work_expand(r) for r in rows]}
+        # Light-index fetch (2.0.10): the one-shot full-row
+        # fetch was exactly the size this host's egress proxy
+        # clips — through a desync window, responses above
+        # ~1-2KB come back empty-bodied while small ones pass
+        # (the documented empty-body signature; measured live:
+        # a 1.4KB single row passed, a 5-row page returned zero
+        # bytes twice), so a busy inbox failed EVERY read while
+        # a light one passed. The inbox therefore pages over an
+        # ID-ONLY index (~25 bytes a row) and expands each row
+        # individually — every response on the path stays small,
+        # and _rest's own retries cover the per-row remainder.
+        # A mid-list failure raises with nothing half-returned.
+        ids: list[str] = []
+        page_size = 25
+        offset = 0
+        while True:
+            page = self._rest(
+                "GET", "work",
+                query + "&select=id"
+                + f"&limit={page_size}&offset={offset}") or []
+            ids.extend(str(r["id"]) for r in page
+                       if isinstance(r, dict) and r.get("id"))
+            if len(page) < page_size:
+                break
+            offset += page_size
+        work = []
+        for wid in ids:
+            row = self._work_row_raw(wid)
+            if row is not None:
+                work.append(self._work_expand(row))
+        return {"work": work}
 
     def work_progress(self, frame: dict) -> dict:
         """work_progress executed store-side, in the relay's
@@ -2490,7 +2689,7 @@ class ServerlessTransport:
 
     def _http_bytes(self, method: str, url: str,
                     data: bytes | None = None) -> tuple[int, bytes]:
-        status, _h, raw = self._call_opener(method, url, {}, data)
+        status, _h, raw = self._call_hardened(method, url, {}, data)
         return status, raw or b""
 
     def blob_put(self, frame: dict) -> dict:
