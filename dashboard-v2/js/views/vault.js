@@ -30,7 +30,7 @@ export async function render(root, ctx){
        ["Size", e => fmtBytes(e.size)], ["SHA-256", e => '<span class="mono">' + esc((e.sha256 || "").slice(0, 16)) + "…</span>"],
        ["Pinned", e => e.pinned ? "📌 pinned" : ""], ["When", e => pt(e.ts)],
        ["", e => { const desc = parseJson(e.descriptor, {}); const ok = desc && desc.oversight && desc.blob_nonce && desc.blob_id;
-         return (ok ? '<button type="button" data-dl="' + esc(e.id) + '">Download</button> ' : '<span class="fmeta">not downloadable — sealed before owner oversight</span> ') +
+         return (ok ? '<button type="button" data-dl="' + esc(e.id) + '">Download</button> ' : '<span class="fmeta">not downloadable — stored before owner oversight existed</span> ') +
            '<button type="button" data-goto="' + esc(e.group_id) + '">Open group</button>'; }]], rows)
       : '<p class="state">No vault entries match.</p>';
     host.querySelectorAll("[data-dl]").forEach(b => b.onclick = async () => {
