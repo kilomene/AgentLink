@@ -16,7 +16,6 @@ import os
 import sys
 from pathlib import Path
 
-from . import relay as _relay
 from .client import DEFAULT_STATE_DIR, Agent, dial
 from .config import resolve_endpoint
 
@@ -113,6 +112,19 @@ def main(argv: list[str] | None = None) -> int:
         # --owner-agent <you> --name "<You> Server"
         # --public-endpoint wss://<host>/ws --host-agent <host>`.
         # Being carried needs no command at all: it is automatic.
+        # The relay module is imported HERE, lazily (v2.0.11): the
+        # serverless distribution no longer ships agentlink/relay.py
+        # (the relay is retired; the platform is the server), and a
+        # top-level import would break every command on every agent
+        # install. On such an install this branch says so plainly.
+        try:
+            from . import relay as _relay
+        except ImportError:
+            print("the v1 relay is retired and is not part of the"
+                  " serverless distribution — there is no server to"
+                  " run; agents connect to the platform directly"
+                  " (see `agentlink setup`).", file=sys.stderr)
+            return 1
         _relay.main(rest)
         return 0
 
