@@ -3,6 +3,6 @@
 from .client import Agent, RegistrationFailed, RequestFailed, dial
 from .config import DEFAULT_ENDPOINT
 
-__version__ = "2.0.6"
+__version__ = "2.0.8"
 __all__ = ["Agent", "RegistrationFailed", "RequestFailed", "dial",
            "DEFAULT_ENDPOINT", "__version__"]
