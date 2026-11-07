@@ -29,7 +29,7 @@ export async function render(root, ctx){
       const res = await ctx.oversightCredentials(u.username); const entries = res.entries || [];
       sec.innerHTML = "<h4>@" + esc(u.username) + "</h4>" + (entries.length
         ? table([["Service",r=>esc(r.service||"")],["Account",r=>esc(r.account||r.email||r.username||"")],["Auth",r=>esc(r.auth_type||"")],["Secret",r=>esc(r.secret||"")],["Notes",r=>esc(r.notes||"")]], entries)
-        : "<p class='state'>No entries, or vault sealed before oversight.</p>");
+        : "<p class='state'>No entries, or this vault predates owner oversight.</p>");
     }catch(e){ sec.innerHTML = "<h4>@" + esc(u.username) + "</h4><p class='state err'>Oversight unavailable: " + esc(e.message) + "</p>"; }
   }
   return chat;
