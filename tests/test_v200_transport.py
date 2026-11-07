@@ -1408,3 +1408,38 @@ def test_mark_read_409_is_first_read_wins_not_an_error():
     out = transport.mark_read(["msg-x"])
     assert out["read"] == ["msg-x"]
     assert out["reads"] == [{"id": "msg-x", "read_at": 424242}]
+
+
+def test_opener_connection_failure_normalizes_to_transport_error(logged_in):
+    # 2.0.8 soak catch (2026-11-06): a connection-level opener
+    # failure (proxy tunnel 407 during a credential rotation)
+    # raised a raw URLError out of _rest, slipped
+    # _mirror_activeness's TransportError guard, and killed the
+    # slow-sync thread — the agent went dark with its process
+    # alive. Every opener call now leaves through _call_opener,
+    # which normalizes any connection failure to TransportError.
+    fake, transport = logged_in
+
+    def dead_opener(method, url, headers, body):
+        raise urllib.error.URLError(
+            "Tunnel connection failed: 407 Proxy Authentication "
+            "Required")
+
+    transport._opener = dead_opener
+    with pytest.raises(TransportError):
+        transport._rest("GET", "queue", "select=*")
+    with pytest.raises(TransportError):
+        transport._rpc("al_attach_oversight", {})
+    # The mirror is fail-soft against TransportError: it records
+    # the error and does NOT raise — the slow-sync cadence retries.
+    transport._mirror_activeness("online")
+    assert transport.last_mirror_error
+
+
+def test_all_opener_sites_route_through_call_opener():
+    src = (Path(__file__).resolve().parents[1]
+           / "agentlink" / "transport_v2.py").read_text()
+    # The only raw opener call left in the module is the one
+    # inside _call_opener itself.
+    assert src.count("self._opener(") == 1
+    assert src.count("self._call_opener(") == 5
