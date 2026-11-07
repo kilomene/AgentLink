@@ -92,9 +92,15 @@ def test_data_layer_contract():
 
 
 def test_trust_formula_ported():
+    # Owner's ruling (2026-11-06): trust starts at ZERO, rises
+    # only on reviewed-and-successful work (+4 per completion);
+    # delivery alone earns nothing (no += 1 anywhere); phoenix
+    # and deploy-probe keep their pinned real percentages.
     src = (DASH / "js" / "trust.js").read_text()
-    for token in ("50", "+= 4", "+= 1", "-= 6", "-= 10", "compute_trust"):
+    for token in ("let score = 0", "+= 4", "-= 6", "-= 10",
+                  "compute_trust", "REAL_TRUST"):
         assert token in src, token
+    assert "+= 1" not in src
 
 
 def test_chat_no_placeholder_law():
