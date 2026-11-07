@@ -754,13 +754,13 @@ def test_named_relay_labels_home_agents_home(state_root):
 def test_approval_gate_happy_path(relay_env, state_root):
     """Item 3: gated delivery parks in awaiting_approval; only the
     assigner's approve completes it; audit records gate set,
-    delivered-awaiting, approved; trust: +1 on proven delivery,
-    +4 on final completion."""
+    delivered-awaiting, approved; trust (owner's zero-base ruling
+    2026-11-06): nothing on delivery, +4 on reviewed completion."""
     async def _t():
         boss = await make(relay_env, state_root, "gate-boss")
         hand = await make(relay_env, state_root, "gate-hand")
         store = relay_env["relay"].store
-        assert store.compute_trust("gate-hand") == 50
+        assert store.compute_trust("gate-hand") == 0
         work = (await boss.assign_work(
             ["gate-hand"], "Gated task", "do the thing",
             require_approval=True))[0]
@@ -768,14 +768,15 @@ def test_approval_gate_happy_path(relay_env, state_root):
         assert work["status"] == "assigned"
         delivered = await hand.deliver_work(work["id"], "done")
         assert delivered["status"] == "awaiting_approval", delivered
-        # proven delivery still earns its +1 while parked
-        assert store.compute_trust("gate-hand") == 51
+        # a proven delivery earns NOTHING while parked: trust moves
+        # only when the review succeeds (owner's ruling 2026-11-06)
+        assert store.compute_trust("gate-hand") == 0
         # the assignee cannot decide their own gate
         with pytest.raises(RequestFailed):
             await hand.approve_work(work["id"])
         approved = await boss.approve_work(work["id"], "looks right")
         assert approved["status"] == "completed"
-        assert store.compute_trust("gate-hand") == 54
+        assert store.compute_trust("gate-hand") == 4
         kinds = [r["kind"] for r in store.list_audit(200)]
         for kind in ("approval_gate_set", "work_awaiting_approval",
                      "work_approved", "work_completed"):
@@ -786,9 +787,11 @@ def test_approval_gate_happy_path(relay_env, state_root):
 
 def test_approval_gate_reject_and_redeliver(relay_env, state_root):
     """Item 3: reject returns the work to changes_requested with the
-    reason reaching the assignee; trust keeps the +1 delivery point
-    but takes the -6 changes-requested hit; a re-delivery parks
-    again and a later approve completes."""
+    reason reaching the assignee; trust takes the -6
+    changes-requested hit against the zero base (clamped at 0 —
+    there is no delivery point to surrender under the owner's
+    2026-11-06 ruling); a re-delivery parks again and a later
+    approve completes."""
     async def _t():
         boss = await make(relay_env, state_root, "rej-boss")
         hand = await make(relay_env, state_root, "rej-hand")
@@ -799,9 +802,9 @@ def test_approval_gate_reject_and_redeliver(relay_env, state_root):
         await hand.deliver_work(work["id"], "v1")
         rejected = await boss.reject_work(work["id"], "needs more detail")
         assert rejected["status"] == "changes_requested"
-        # state-based formula: the delivery +1 is surrendered when the
-        # work leaves the delivered state; the round scores -6.
-        assert store.compute_trust("rej-hand") == 50 - 6
+        # state-based formula on the zero base: the round scores
+        # -6, clamped at 0 — unearned trust cannot go negative.
+        assert store.compute_trust("rej-hand") == 0
         kinds = [r["kind"] for r in store.list_audit(200)]
         assert "work_approval_rejected" in kinds
         assert "work_changes_requested" in kinds
