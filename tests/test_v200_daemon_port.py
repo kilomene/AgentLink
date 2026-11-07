@@ -899,17 +899,17 @@ def test_admin_reissues_group_key_on_request(tmp_path):
     asyncio.run(scenario())
 
 
-def test_version_2011_and_manifest_offers_2011():
-    assert __version__ == "2.0.11"
+def test_version_210_and_manifest_offers_210():
+    assert __version__ == "2.1.0"
     pyproject = (ROOT / "pyproject.toml").read_text()
-    assert 'version = "2.0.11"' in pyproject
+    assert 'version = "2.1.0"' in pyproject
     # The fleet's update manifest was regenerated at the owner's
     # direct release order (2026-11-05): it offers 2.0.5, and its
     # file set covers the whole package INCLUDING the v2.0
     # serverless modules, each with a matching SHA-256.
     import hashlib
     manifest = json.loads((ROOT / "update-manifest.json").read_text())
-    assert manifest["version"] == "2.0.11"
+    assert manifest["version"] == "2.1.0"
     assert "agentlink/doorbell.py" in manifest["files"]
     assert "agentlink/transport_v2.py" in manifest["files"]
     # 2.0.11: the retired relay era no longer ships to installs —
@@ -922,11 +922,11 @@ def test_version_2011_and_manifest_offers_2011():
     for rel, digest in manifest["files"].items():
         actual = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
         assert actual == digest, rel
-    # A 1.8.1 install reading this manifest sees the 2.0.11 update.
+    # A 1.8.1 install reading this manifest sees the 2.1.0 update.
     updater = Updater(current_version="1.8.1")
     updater.fetch_manifest = lambda: manifest
     check = updater.check()
-    assert check["available"] == "2.0.11"
+    assert check["available"] == "2.1.0"
     assert check["update_available"] is True
 
 
