@@ -159,7 +159,8 @@ def _probe_capabilities(state_dir: Path, network: dict) -> list[str]:
 async def run_setup(username: str, state_dir: str | None = None,
                     designation: str = "production",
                     grant: str = "ask",
-                    install_service: bool = True) -> dict:
+                    install_service: bool = True,
+                    auto_support: bool = True) -> dict:
     """Run the full setup and return the plain report dict."""
     from .client import Agent
     uname = normalize_username(username)
@@ -170,6 +171,33 @@ async def run_setup(username: str, state_dir: str | None = None,
     report: dict = {"username": uname, "designation": designation,
                     "state_dir": str(sd)}
 
+    # Support desk (2.1.0): a TERMINAL failure lodges one ticket
+    # with the failure's data and installs the hook that will
+    # register this agent on its own once Phoenix ships the fix.
+    # Once per run_setup, never on success, never masking the
+    # real failure (the exception still propagates; the report
+    # still returns ok=False).
+    _support_state = {"done": False}
+
+    def _auto_support(step: str, error: str, detail: str = ""):
+        if not auto_support or _support_state["done"]:
+            return
+        _support_state["done"] = True
+        try:
+            from . import support as _support_mod
+            res = _support_mod.maybe_auto_lodge(
+                uname, sd, step=step, error=error, detail=detail,
+                hook_grant=grant)
+        except Exception:
+            res = None
+        if res and res.get("ticket_id"):
+            report["support"] = {
+                "ticket_id": res["ticket_id"],
+                "hook": res.get("hook"),
+                "note": (f"support ticket {res['ticket_id']} "
+                         f"lodged with Phoenix; a hook is "
+                         f"watching it")}
+
     # 1 — network first.
     report["network"] = choose_network(sd)
     if not report["network"]["proven"]:
@@ -178,6 +206,7 @@ async def run_setup(username: str, state_dir: str | None = None,
             "no egress candidate answered the login-challenge "
             "roundtrip — fix this machine's network first; "
             "registration was not attempted")
+        _auto_support("network", report["error"])
         return report
 
     # 2 — register via the hardened first-contact suite. The
@@ -287,6 +316,14 @@ async def run_setup(username: str, state_dir: str | None = None,
         except Exception as exc:
             verify["directory_error"] = str(exc)[:200]
         report["verify"] = verify
+    except (RegistrationFailed, ConnectionError) as exc:
+        # Terminal first-contact failure: lodge once with the
+        # failure data, keep the ticket on the exception so the
+        # CLI can show it, then let the failure speak for itself.
+        _auto_support("first-contact", str(exc)[:1000])
+        if report.get("support"):
+            exc.support = report["support"]  # type: ignore[attr-defined]
+        raise
     finally:
         await agent.close()
 
@@ -308,4 +345,9 @@ async def run_setup(username: str, state_dir: str | None = None,
         and report.get("recovery_present")
         and report.get("verify", {}).get("presence_online")
         and report.get("verify", {}).get("directory_finds_me"))
+    if not report["ok"]:
+        _auto_support(
+            "verify",
+            "setup completed registration but self-verification "
+            f"failed: {json.dumps(report.get('verify', {}))[:600]}")
     return report
