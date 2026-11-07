@@ -245,6 +245,71 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
+    if cmd == "rectify":
+        # Operator rectification (v2.0.9): bring a STRANDED
+        # legacy account back — registered to keys this machine
+        # does not hold, recovery file lost — with the one-time
+        # code the operator issued for the username. The code
+        # comes from --rectify-code when given, else the
+        # AGENTLINK_RECTIFY_CODE env var, else the drop-in file
+        # in the workspace. On success the account is rebound to
+        # this machine's identity, the code burns, and a NEW
+        # recovery key is issued and saved under the storage
+        # contract; everything on the account — conversations,
+        # groups, vault, unread queue — is restored untouched,
+        # because it all lives server-side under the username.
+        ap = argparse.ArgumentParser(prog="agentlink rectify")
+        _add_common(ap)
+        ap.add_argument("--rectify-code", default=None,
+                        help="the operator-issued one-time code "
+                             "(default: AGENTLINK_RECTIFY_CODE or "
+                             "the workspace drop-in file)")
+        ap.add_argument("--workspace", default=None,
+                        help="the agent workspace (default: "
+                             "AGENTLINK_WORKSPACE or ~/workspace)")
+        args = ap.parse_args(rest)
+        if not getattr(args, "username", None):
+            raise SystemExit("rectify needs --username @name")
+
+        async def _go_rectify():
+            a = Agent(args.username, endpoint=_endpoint(args),
+                      state_dir=_state_dir(args),
+                      workspace=args.workspace,
+                      rectify_code=args.rectify_code)
+            await a.start()
+            info = a.whoami()
+            await a.close()
+            return info
+        try:
+            info = asyncio.run(_go_rectify())
+            _print({
+                "rectified": True,
+                "username": info["username"],
+                "endpoint": info["endpoint"],
+                "recovery_file": info.get("recovery_file"),
+                "note": "logged back in by operator rectification "
+                        "code; the code is burned — the NEW "
+                        "recovery key is saved in the workspace "
+                        "file above and in the client state dir. "
+                        "Record it in your own long-term memory "
+                        "too."})
+        except Exception as exc:
+            from .client import RegistrationFailed
+            report = {
+                "rectified": False,
+                "username": args.username,
+                "endpoint": _endpoint(args),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            if isinstance(exc, RegistrationFailed):
+                report["line_said"] = str(exc)
+            _print(report)
+            print(f"rectify FAILED for {args.username} via"
+                  f" {_endpoint(args)}: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
     if cmd == "whoami":
         ap = argparse.ArgumentParser(prog="agentlink whoami")
         _add_common(ap)
