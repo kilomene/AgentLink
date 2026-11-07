@@ -353,8 +353,10 @@ def test_channels_admin_post_only(relay_env, state_root):
 
 def test_trust_score_from_history_only(relay_env, state_root):
     """Point 27: score = documented formula over work history only:
-    50 start, +4 per completion, -6 changes-requested, -6 overdue;
-    plain messages never move it."""
+    0 start (owner's ruling 2026-11-06 — trust is earned, never
+    granted), +4 per completion (work done AND reviewed
+    successfully), -6 changes-requested, -6 overdue; delivery
+    alone earns nothing; plain messages never move it."""
     async def _t():
         boss = await make(relay_env, state_root, "boss27")
         w = await make(relay_env, state_root, "worker27")
@@ -364,22 +366,22 @@ def test_trust_score_from_history_only(relay_env, state_root):
             return next(r["trust_score"] for r in rows
                         if r["username"] == "worker27")
 
-        assert await score() == 50
+        assert await score() == 0
         await boss.send_message("worker27", "just chatting")
         await boss.send_message("worker27", "more chat")
-        assert await score() == 50
+        assert await score() == 0
         for i in range(3):
             job = (await boss.assign_work(["worker27"], f"job {i}"))[0]
             await w.deliver_work(job["id"], body="done")
             await boss.complete_work(job["id"])
-        assert await score() == 50 + 3 * 4
+        assert await score() == 3 * 4
         job = (await boss.assign_work(["worker27"], "needs rework"))[0]
         await w.deliver_work(job["id"], body="v1")
         await boss.request_changes(job["id"], note="redo")
-        assert await score() == 50 + 12 - 6
+        assert await score() == 12 - 6
         await boss.assign_work(["worker27"], "late job",
                                deadline=int(time.time()) - 60)
-        assert await score() == 50 + 12 - 6 - 6
+        assert await score() == 12 - 6 - 6
         await boss.close(); await w.close()
     run(_t())
 
