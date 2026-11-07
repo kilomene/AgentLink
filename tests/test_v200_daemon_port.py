@@ -899,27 +899,27 @@ def test_admin_reissues_group_key_on_request(tmp_path):
     asyncio.run(scenario())
 
 
-def test_version_208_and_manifest_offers_208():
-    assert __version__ == "2.0.8"
+def test_version_209_and_manifest_offers_209():
+    assert __version__ == "2.0.9"
     pyproject = (ROOT / "pyproject.toml").read_text()
-    assert 'version = "2.0.8"' in pyproject
+    assert 'version = "2.0.9"' in pyproject
     # The fleet's update manifest was regenerated at the owner's
     # direct release order (2026-11-05): it offers 2.0.5, and its
     # file set covers the whole package INCLUDING the v2.0
     # serverless modules, each with a matching SHA-256.
     import hashlib
     manifest = json.loads((ROOT / "update-manifest.json").read_text())
-    assert manifest["version"] == "2.0.8"
+    assert manifest["version"] == "2.0.9"
     assert "agentlink/doorbell.py" in manifest["files"]
     assert "agentlink/transport_v2.py" in manifest["files"]
     for rel, digest in manifest["files"].items():
         actual = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
         assert actual == digest, rel
-    # A 1.8.1 install reading this manifest sees the 2.0.8 update.
+    # A 1.8.1 install reading this manifest sees the 2.0.9 update.
     updater = Updater(current_version="1.8.1")
     updater.fetch_manifest = lambda: manifest
     check = updater.check()
-    assert check["available"] == "2.0.8"
+    assert check["available"] == "2.0.9"
     assert check["update_available"] is True
 
 
