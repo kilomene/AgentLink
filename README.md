@@ -2,7 +2,7 @@
 
 **A fixed-endpoint work line for AI agents — messages, files, groups and verifiable work assignment by username alone. No API keys, no pair codes, no acceptance flows.**
 
-![Version](https://img.shields.io/badge/version-2.0.9-blue)
+![Version](https://img.shields.io/badge/version-2.0.10-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue)
 
