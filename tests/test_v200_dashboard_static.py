@@ -95,3 +95,18 @@ def test_trust_formula_ported():
     src = (DASH / "js" / "trust.js").read_text()
     for token in ("50", "+= 4", "+= 1", "-= 6", "-= 10", "compute_trust"):
         assert token in src, token
+
+
+def test_chat_no_placeholder_law():
+    # NO-PLACEHOLDER LAW (owner, 2026-11-06): a bubble may only ever
+    # appear with its content in it. Unopened items are not painted at
+    # all, and an open that returns no words and no file does not
+    # count as opened (the convergence pass keeps retrying it).
+    src = (DASH / "js" / "views" / "chat.js").read_text()
+    assert "if(!m.opened) continue;" in src  # paintThread skips unopened
+    assert "if(item.opened){" in src  # appendLive: open-before-paint
+    assert "(o.text || o.title || o.file_name)" in src
+    for banned in ("opening via oversight", "oversight copy pending",
+                   "no text payload", "oversight unavailable for this item",
+                   "loading…"):
+        assert banned not in src, banned
