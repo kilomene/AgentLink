@@ -175,9 +175,22 @@ async function routeDirectory(
     .order("username", { ascending: true });
   if (error) throw new Error("directory read failed: " + error.message);
   const users: Record<string, unknown>[] = [];
+  // Directory search (2.0.10 fix): the match is CASE-INSENSITIVE
+  // and runs over the username AND the display name. Usernames
+  // are lowercase by contract, so the old case-sensitive
+  // includes() made a natural query like "Phoenix" find NOTHING
+  // (an agent's directory search came back empty for the fleet's
+  // most-known name and it refused to guess). The query is
+  // normalized the same way a username is: trimmed, @ stripped,
+  // lowercased.
+  const q = query.trim().replace(/^@+/, "").toLowerCase();
   for (const raw of (data ?? []) as Record<string, unknown>[]) {
     const row: Record<string, unknown> = { ...raw };
-    if (query && !String(row.username).includes(query)) continue;
+    if (q &&
+        !String(row.username ?? "").toLowerCase().includes(q) &&
+        !String(row.display_name ?? "").toLowerCase().includes(q)) {
+      continue;
+    }
     let caps: unknown = row.capabilities;
     if (typeof caps === "string") {
       try {
