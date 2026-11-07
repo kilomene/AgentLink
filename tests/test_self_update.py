@@ -53,7 +53,8 @@ from agentlink.config import (resolve_update_check_seconds,  # noqa: E402
 from agentlink.relay import Relay  # noqa: E402
 from agentlink.timing import (UPDATE_CHECK_SECONDS,  # noqa: E402
                               UPDATE_DRAIN_WAIT_SECONDS)
-from agentlink.updater import Updater  # noqa: E402
+from agentlink.updater import (Updater, UpdateError,  # noqa: E402
+                               self_clean_install)
 
 _v = RUNNING_VERSION.split(".")
 NEXT_VERSION = f"{_v[0]}.{_v[1]}.{int(_v[2]) + 1}"
@@ -767,3 +768,235 @@ def test_g_installer_without_crontab_prints_notice(tmp_path,
     # Never a silent skip: a plain notice + the in-daemon guarantee.
     assert "no crontab binary on this host" in out
     assert "checks for updates itself every 15 minutes" in out
+
+
+# ------------------------------------------------------------------
+# (h) mirror-purge + first-boot self-clean (v2.0.11): an update
+#     REPLACES the install. The stale set is computed before the
+#     swap, backed up with everything else (rollback stays whole),
+#     and deleted only after the health + census gates pass. The
+#     2.0.11 distribution drops the retired relay era from the
+#     manifest, so relay.py/dashboard.py are themselves stale
+#     cargo on a 2.0.10 install. State is never a purge target.
+# ------------------------------------------------------------------
+
+def _make_feed_2011(tmp_path: Path, version: str) -> Path:
+    """The 2.0.11 feed shape: the package WITHOUT relay.py /
+    dashboard.py (retired from the distribution), version-bumped,
+    with a manifest over exactly what ships."""
+    feed = tmp_path / "feed2011"
+    pkg = feed / "agentlink"
+    shutil.copytree(ROOT / "agentlink", pkg,
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    (pkg / "relay.py").unlink()
+    (pkg / "dashboard.py").unlink()
+    init = pkg / "__init__.py"
+    init.write_text(re.sub(
+        r'__version__ = "[^"]+"', f'__version__ = "{version}"',
+        init.read_text()))
+    files = {}
+    for f in sorted(pkg.glob("*.py")):
+        files[f"agentlink/{f.name}"] = _sha(f.read_bytes())
+    (feed / "update-manifest.json").write_text(
+        json.dumps({"version": version, "files": files}))
+    return feed
+
+
+def _plant_junk(install: Path, state: Path) -> dict:
+    """v1-era cargo inside the governed scope + the things that
+    must survive: state sentinels (byte-identical or the test
+    fails) and an ungoverned install-root file."""
+    pkg = install / "agentlink"
+    (pkg / "legacy_v1.py").write_text("# a v1-era module\n")
+    cache = pkg / "__pycache__"
+    cache.mkdir(exist_ok=True)
+    (cache / "legacy_v1.cpython-312.pyc").write_bytes(b"orphaned pyc")
+    (cache / "client.cpython-312.pyc").write_bytes(b"stale pyc")
+    (pkg / "client.py.tmp").write_text("half-written swap leftover")
+    (install / "leftover.tmp").write_text("root swap leftover")
+    docs = install / "docs"
+    docs.mkdir(exist_ok=True)
+    keep = docs / "keep.txt"
+    keep.write_text("not governed — the updater never owned the root")
+    state.mkdir(parents=True, exist_ok=True)
+    sentinel = state / "secret-junk.json"
+    sentinel.write_text('{"username": "junk", "secret": "same-bytes"}')
+    return {"sentinel": sentinel,
+            "sentinel_bytes": sentinel.read_bytes(), "keep": keep}
+
+
+_STALE_SET = {"agentlink/legacy_v1.py", "agentlink/relay.py",
+              "agentlink/dashboard.py", "agentlink/client.py.tmp",
+              "leftover.tmp"}
+
+
+def test_h_apply_purges_stale_and_preserves_state(tmp_path):
+    install = _make_install(tmp_path)
+    state = tmp_path / "state"
+    planted = _plant_junk(install, state)
+    feed = _make_feed_2011(tmp_path, NEXT_VERSION)
+    result = _updater(tmp_path, feed, install, state).apply()
+    assert result["updated"] is True
+    assert _STALE_SET <= set(result["purged"])
+    pkg = install / "agentlink"
+    for rel in _STALE_SET:
+        assert not (install / rel).exists(), rel
+    assert not (pkg / "__pycache__").exists()
+    assert result["purged_caches"] >= 1
+    # The new tree is whole and live.
+    assert f'__version__ = "{NEXT_VERSION}"' in \
+        (pkg / "__init__.py").read_text()
+    assert (pkg / "client.py").exists()
+    # State byte-identical; the ungoverned root file intact.
+    assert planted["sentinel"].read_bytes() == planted["sentinel_bytes"]
+    assert planted["keep"].exists()
+    # The purged files are IN the rollback backup: a rollback
+    # would have restored the exact pre-update tree.
+    backup = Path(result["backup"])
+    assert (backup / "agentlink" / "relay.py").exists()
+    assert (backup / "agentlink" / "legacy_v1.py").exists()
+
+
+def test_h_staged_purges_stale(tmp_path):
+    install = _make_install(tmp_path)
+    state = tmp_path / "state"
+    planted = _plant_junk(install, state)
+    feed = _make_feed_2011(tmp_path, NEXT_VERSION)
+    outcome = _updater(tmp_path, feed, install, state) \
+        .check_and_apply_staged()
+    assert outcome["updated"] is True
+    assert _STALE_SET <= set(outcome["purged"])
+    for rel in _STALE_SET:
+        assert not (install / rel).exists(), rel
+    assert not (install / "agentlink" / "__pycache__").exists()
+    assert planted["sentinel"].read_bytes() == planted["sentinel_bytes"]
+    backup = Path(outcome["backup"])
+    assert (backup / "agentlink" / "dashboard.py").exists()
+
+
+def test_h_apply_rollback_never_purges(tmp_path, monkeypatch):
+    install = _make_install(tmp_path)
+    state = tmp_path / "state"
+    _plant_junk(install, state)
+    feed = _make_feed_2011(tmp_path, NEXT_VERSION)
+    up = _updater(tmp_path, feed, install, state)
+    monkeypatch.setattr(up, "_health_check", lambda v: False)
+    with pytest.raises(UpdateError):
+        up.apply()
+    pkg = install / "agentlink"
+    # Rolled back: replaced files restored, stale files UNTOUCHED
+    # (the purge runs only after every gate has passed).
+    assert f'__version__ = "{RUNNING_VERSION}"' in \
+        (pkg / "__init__.py").read_text()
+    assert (pkg / "legacy_v1.py").exists()
+    assert (pkg / "relay.py").exists()
+    # (client.py.tmp is not asserted: it is the swap's own temp
+    # path for client.py, consumed by the install itself.)
+
+
+def test_h_staged_rollback_never_purges(tmp_path, monkeypatch):
+    install = _make_install(tmp_path)
+    state = tmp_path / "state"
+    _plant_junk(install, state)
+    feed = _make_feed_2011(tmp_path, NEXT_VERSION)
+    up = _updater(tmp_path, feed, install, state)
+    monkeypatch.setattr(up, "_health_check", lambda v: False)
+    with pytest.raises(UpdateError):
+        up.apply_staged()
+    pkg = install / "agentlink"
+    assert f'__version__ = "{RUNNING_VERSION}"' in \
+        (pkg / "__init__.py").read_text()
+    assert (pkg / "legacy_v1.py").exists()
+    assert (pkg / "dashboard.py").exists()
+
+
+def test_h_exact_tree_reports_empty_purge(tmp_path):
+    feed = _make_feed_2011(tmp_path, NEXT_VERSION)
+    install = tmp_path / "install"
+    shutil.copytree(feed / "agentlink", install / "agentlink")
+    init = install / "agentlink" / "__init__.py"
+    init.write_text(re.sub(
+        r'__version__ = "[^"]+"', f'__version__ = "{RUNNING_VERSION}"',
+        init.read_text()))
+    state = tmp_path / "state"
+    state.mkdir()
+    result = _updater(tmp_path, feed, install, state).apply()
+    assert result["updated"] is True
+    assert result["purged"] == []
+    # (purged_caches is not asserted: the health check's own import
+    # creates a fresh __pycache__ that the purge then clears — the
+    # cache clear working as ruled, not stale cargo.)
+
+
+def test_h_self_clean_converges_dirty_tree(tmp_path):
+    install = _make_install(tmp_path)
+    state = tmp_path / "state"
+    planted = _plant_junk(install, state)
+    # Relay-era config cargo: the persisted peer registry, a
+    # platform endpoint planted in the network config, and a
+    # platform variable planted in the env file. The agent's own
+    # proxy (deliberately per-agent) must SURVIVE.
+    (state / "servers.json").write_text(
+        '{"wss://old-relay.example/ws": {"health": 100}}')
+    (state / "network.json").write_text(json.dumps(
+        {"proxy": "http://proxy:8080",
+         "endpoint": "wss://old-relay.example/ws",
+         "transport": "relay"}))
+    (state / "proxy.env").write_text(
+        "HTTPS_PROXY=http://proxy:8080\n"
+        "AGENTLINK_ENDPOINT=wss://old-relay.example/ws\n")
+    feed = _make_feed_2011(tmp_path, RUNNING_VERSION)
+    shutil.copy2(feed / "update-manifest.json",
+                 install / "update-manifest.json")
+    out = self_clean_install(install, state, RUNNING_VERSION)
+    assert out["cleaned"] is True and out["changed"] is True
+    pkg = install / "agentlink"
+    assert not (pkg / "legacy_v1.py").exists()
+    assert not (pkg / "relay.py").exists()
+    assert not (pkg / "dashboard.py").exists()
+    assert not (pkg / "__pycache__").exists()
+    assert not (state / "servers.json").exists()
+    net = json.loads((state / "network.json").read_text())
+    assert net == {"proxy": "http://proxy:8080"}
+    env_lines = (state / "proxy.env").read_text()
+    assert "HTTPS_PROXY=http://proxy:8080" in env_lines
+    assert "AGENTLINK_ENDPOINT" not in env_lines
+    assert planted["sentinel"].read_bytes() == planted["sentinel_bytes"]
+    assert planted["keep"].exists()
+    assert (state / "self-clean.json").exists()
+    # Idempotent: the marker makes the second pass a no-op.
+    out2 = self_clean_install(install, state, RUNNING_VERSION)
+    assert out2["cleaned"] is False
+    # A manifest describing a DIFFERENT version never cleans: the
+    # clean runs only against the running version's own tree.
+    (state / "self-clean.json").unlink()
+    (pkg / "legacy_v1.py").write_text("# junk again\n")
+    out3 = self_clean_install(install, state, NEXT_VERSION)
+    assert out3["cleaned"] is False
+    assert (pkg / "legacy_v1.py").exists()
+
+
+def test_h_self_clean_fetches_manifest(tmp_path):
+    install = _make_install(tmp_path)
+    state = tmp_path / "state"
+    state.mkdir()
+    (install / "agentlink" / "legacy_v1.py").write_text("# junk\n")
+    feed = _make_feed_2011(tmp_path, RUNNING_VERSION)
+    out = self_clean_install(install, state, RUNNING_VERSION,
+                             base_url=feed.as_uri())
+    assert out["cleaned"] is True
+    assert not (install / "agentlink" / "legacy_v1.py").exists()
+
+
+def test_h_self_clean_skips_source_checkout(tmp_path):
+    install = _make_install(tmp_path)
+    (install / "tests").mkdir()  # a development checkout marker
+    (install / "agentlink" / "legacy_v1.py").write_text("# junk\n")
+    state = tmp_path / "state"
+    state.mkdir()
+    feed = _make_feed_2011(tmp_path, RUNNING_VERSION)
+    out = self_clean_install(install, state, RUNNING_VERSION,
+                             base_url=feed.as_uri())
+    assert out["cleaned"] is False
+    assert "checkout" in out["reason"]
+    assert (install / "agentlink" / "legacy_v1.py").exists()
