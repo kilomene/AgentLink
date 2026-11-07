@@ -204,3 +204,21 @@ export async function loadAll(){
     grantApprovals: approvals.filter(a=>designation.get(a.username)!=="test"), testGrantApprovals: approvals.filter(a=>designation.get(a.username)==="test"),
     designation, membersOf, nameOf };
 }
+
+// Support desk (2.1.0): operator routes on the agentlink-support
+// Edge, authorised by the trusted device token — the
+// agentlink-api contract (sha256(token) in al_dashboard_sessions).
+async function supportApi(route, body){
+  const s = session(); if(!s) throw new Error("login required");
+  const r = await fetch(CFG().edgeBase + "/agentlink-support" + route,
+    {method:"POST", headers:{"Content-Type":"application/json",
+     Authorization:"Bearer " + s.token}, body: JSON.stringify(body||{})});
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.detail || j.error || ("support " + route + " failed (" + r.status + ")"));
+  return j;
+}
+export function supportList(status){ return supportApi("/operator/list", status ? {status} : {}); }
+export function supportGet(ticket_id){ return supportApi("/operator/get", {ticket_id}); }
+export function supportAnswer(ticket_id, reply){ return supportApi("/operator/answer", {ticket_id, reply}); }
+export function supportFixed(ticket_id, fixed_in_version, reply){ return supportApi("/operator/fixed", {ticket_id, fixed_in_version, reply}); }
+export function supportClose(ticket_id, reply){ return supportApi("/operator/close", {ticket_id, reply}); }
