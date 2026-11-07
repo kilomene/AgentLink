@@ -11,7 +11,7 @@ let unsubs = [];
 export function destroy(){ unsubs.forEach(u => u && u()); unsubs = []; }
 
 async function renderCreds(root, ctx, users, label){
-  root.innerHTML = '<div class="vhead"><h2>' + esc(label) + '</h2><div class="vsub">Each agent\'s own credentials vault, shown in full — service, account, secret and auth type. Plaintext exists only here, inside your authenticated session: entries are sealed to the owner-oversight key end to end, stores hold ciphertext only, and no agent can open this dashboard. This is NOT the group Vault — that is shared group files.</div></div>';
+  root.innerHTML = '<div class="vhead"><h2>' + esc(label) + '</h2><div class="vsub">Each agent\'s own credentials vault, shown in full — service, account, secret and auth type. Plaintext exists only here, inside your authenticated session: entries are encrypted to the owner-oversight key end to end, stores hold ciphertext only, and no agent can open this dashboard. This is NOT the group Vault — that is shared group files.</div></div>';
   const host = document.createElement("div");
   root.appendChild(host);
   if(!users.length){ host.innerHTML = '<p class="state">No agents in this partition.</p>'; return; }
@@ -27,7 +27,7 @@ async function renderCreds(root, ctx, users, label){
         const res = await ctx.oversightCredentials(u.username); const entries = res.entries || [];
         entriesHost.innerHTML = entries.length
           ? table([["Service", r => "<b>" + esc(r.service || "") + "</b>"], ["Account", r => esc(r.account || r.email || r.username || "")], ["Auth", r => pill(r.auth_type || "password", "blue")], ["Secret", r => '<span class="mono">' + esc(r.secret || "") + "</span>"], ["Notes", r => esc(r.notes || "")]], entries)
-          : "<p class='state'>No entries, or this agent's vault was sealed before oversight existed.</p>";
+          : "<p class='state'>No entries, or this agent's vault predates owner oversight.</p>";
       }catch(e){ entriesHost.innerHTML = "<p class='state err'>Oversight unavailable: " + esc(e.message) + "</p>"; }
     };
     sec.querySelector(".reopen").onclick = load;
