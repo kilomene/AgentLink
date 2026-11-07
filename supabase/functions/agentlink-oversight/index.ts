@@ -319,13 +319,20 @@ async function fieldsFromPlaintext(
   const f = (obj.file && typeof obj.file === "object")
     ? obj.file as Record<string, unknown>
     : {};
-  const text = obj.body || obj.instructions || obj.note || "";
+  const text = obj.body || obj.text || obj.instructions || obj.note || "";
   const fields: Record<string, unknown> = {
     text: typeof text === "string" ? text : String(text),
     content_kind: obj.kind || f.kind || "text",
     file_name: f.filename || f.name || "",
     title: obj.title || "",
   };
+  // The operator sees the DETAIL of what was sealed (owner's
+  // no-placeholder law): an opened object that matched no known
+  // text field and carries no file shows its literal contents,
+  // never an empty bubble.
+  if (!fields.text && !fields.file_name) {
+    fields.text = JSON.stringify(obj).slice(0, 400);
+  }
   if (fields.file_name) {
     fields.file_mime = typeof f.mime === "string" && f.mime
       ? f.mime
