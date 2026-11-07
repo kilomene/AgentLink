@@ -1,6 +1,7 @@
 """v2.0.8 — the registration door and the first-contact suite.
+v2.0.9 — operator rectification for stranded legacy accounts.
 
-Two halves, pinned separately:
+Pinned separately:
 
 * The login Edge's ``register`` method (static pins on the
   shipped TypeScript): first-come claim of an unheld name, the
@@ -15,6 +16,13 @@ Two halves, pinned separately:
   permanent refusal — and weather never poses as an identity
   verdict. The suite separates "no account" from "not your
   keys" by acting, never by guessing.
+
+* The login Edge's ``rectify`` method + the suite's third
+  step: a one-time operator code (hash-only server-side,
+  burned atomically before the rebind) rebinds a stranded
+  account to the presenting machine's keys and mints a fresh
+  recovery key, returned ONCE to that agent only. Every
+  failure is the same ``rectify_failed`` refusal.
 """
 
 import asyncio
@@ -39,10 +47,9 @@ def _fn(name):
 
 def _register_block(src):
     start = src.index('if (method === "register")')
-    end = src.index('if (method === "unknown_method"', start) \
-        if 'if (method === "unknown_method"' in src[start:] else None
-    # the unknown-method return follows the register branch
-    tail = src.index('return errorResponse(\n      "unknown_method"', start)
+    # the register branch ends where the rectify branch begins
+    # (2.0.9); the unknown-method return follows both
+    tail = src.index('if (method === "rectify")', start)
     return src[start:tail]
 
 
@@ -64,8 +71,8 @@ def test_login_edge_register_method_contract():
     assert "issueTokens" in block
     # designation honored at registration (v1.6.0 contract)
     assert 'body.designation === "test"' in block
-    # the method router knows the new method
-    assert "challenge, verify, recovery or register" in src
+    # the method router knows the new methods
+    assert "challenge, verify, recovery, register or rectify" in src
 
 
 def test_login_edge_register_never_stores_plaintext_key():
@@ -76,6 +83,57 @@ def test_login_edge_register_never_stores_plaintext_key():
     # the stored row carries the hash, never the key itself
     assert "recovery_hash" in stored
     assert "recovery_key" not in stored
+
+
+def _rectify_block(src):
+    start = src.index('if (method === "rectify")')
+    tail = src.index('return errorResponse(\n      "unknown_method"', start)
+    return src[start:tail]
+
+
+def test_login_edge_rectify_method_contract():
+    src = _fn("agentlink-login")
+    assert 'rectify: 10' in src  # its own rate-limit bucket
+    block = _rectify_block(src)
+    # authorization is the operator's one-time code, looked up
+    # LIVE for this username and verified by hash, constant-time
+    assert "al_rectify_codes" in block
+    assert '{ username, status: "live" }' in block
+    assert "sha256Hex(presented)" in block
+    assert "constantTimeEqual" in block
+    # an unknown username gets the same refusal as a bad code
+    assert "rectify_failed" in block
+    # key material validated BEFORE the code burns
+    assert block.index("isRawKey32(newSignPub)") < \
+        block.index("const burned")
+    # the burn is atomic: the patch matches the still-live
+    # status and exactly one row must move
+    assert '"al_rectify_codes"' in block
+    assert '{ status: "used", used_at: now }' in block
+    assert "burned !== 1" in block
+    # the rebind mirrors recovery: keys replaced, the recovery
+    # key ROTATES (hash stored), the fresh key returns ONCE
+    assert 'auth_method: "rectify"' in block
+    assert "recovery_hash: await sha256Hex(newRecoveryKey)" in block
+    assert block.count("recovery_key: newRecoveryKey") == 1
+    assert "issueTokens" in block
+
+
+def test_login_edge_rectify_never_stores_the_code():
+    block = _rectify_block(_fn("agentlink-login"))
+    # the presented code is hashed for comparison and never
+    # written anywhere: no insert into the codes table happens
+    # in the rectify path (issuance is operator-side)
+    assert "insertRow" not in block
+    assert "rectify_code:" not in block
+
+
+def test_rectify_codes_migration_shape():
+    sql = (ROOT / "supabase"
+           / "migration-v208-rectify-codes.sql").read_text()
+    assert "create table if not exists public.al_rectify_codes" in sql
+    assert "code_hash text not null" in sql
+    assert "enable row level security" in sql
 
 
 def test_username_rules_match_protocol():
@@ -110,6 +168,9 @@ class FakeV2:
 
     def register_and_login(self, *args, **kw):
         return self._act("register", args)
+
+    def rectify_and_login(self, *args, **kw):
+        return self._act("rectify", args)
 
 
 def _agent(tmp_path):
@@ -191,5 +252,60 @@ def test_first_contact_weather_is_never_an_identity_verdict(tmp_path):
         _run(agent, v2)
 
 
-def test_version_208():
-    assert __version__ == "2.0.8"
+# ------------------------------------------------- rectify (2.0.9)
+
+_TAKEN = ("raise", "login Edge register HTTP 409: username_taken")
+
+
+def test_first_contact_rectifies_taken_name_with_manual_code(tmp_path):
+    agent = Agent(username="newagent", state_dir=str(tmp_path / "state"),
+                  workspace=str(tmp_path / "ws"), transport="serverless",
+                  mode="manual", rectify_code="op-code-1")
+    v2 = FakeV2({"register": _TAKEN, "rectify": ("ok", "fresh-key-3")})
+    assert _run(agent, v2) is True
+    assert [c[0] for c in v2.calls] == ["register", "rectify"]
+    # the presented code is the one handed in ...
+    assert v2.calls[1][1][2] == "op-code-1"
+    # ... and the freshly minted recovery key is saved
+    ws_file = tmp_path / "ws" / "agentlink-recovery-newagent.txt"
+    assert "fresh-key-3" in ws_file.read_text()
+
+
+def test_first_contact_rectifies_with_dropin_file_and_removes_it(tmp_path):
+    agent = _agent(tmp_path)
+    ws = tmp_path / "ws"
+    ws.mkdir(parents=True, exist_ok=True)
+    dropin = ws / "agentlink-rectify-newagent.txt"
+    dropin.write_text("op-code-2\n")
+    v2 = FakeV2({"register": _TAKEN, "rectify": ("ok", "fresh-key-4")})
+    assert _run(agent, v2) is True
+    assert [c[0] for c in v2.calls] == ["register", "rectify"]
+    assert v2.calls[1][1][2] == "op-code-2"
+    # a spent code never lingers in the workspace
+    assert not dropin.exists()
+
+
+def test_first_contact_bad_rectify_code_falls_through_to_refusal(tmp_path):
+    agent = Agent(username="newagent", state_dir=str(tmp_path / "state"),
+                  workspace=str(tmp_path / "ws"), transport="serverless",
+                  mode="manual", rectify_code="spent-code")
+    v2 = FakeV2({"register": _TAKEN,
+                 "rectify": (
+                     "raise", "login Edge rectify HTTP 401: rectify_failed")})
+    assert _run(agent, v2) is False
+    assert [c[0] for c in v2.calls] == ["register", "rectify"]
+
+
+def test_first_contact_rectify_weather_is_connection_error(tmp_path):
+    agent = Agent(username="newagent", state_dir=str(tmp_path / "state"),
+                  workspace=str(tmp_path / "ws"), transport="serverless",
+                  mode="manual", rectify_code="op-code-3")
+    v2 = FakeV2({"register": _TAKEN,
+                 "rectify": (
+                     "raise", "login Edge rectify HTTP 500: login_internal")})
+    with pytest.raises(ConnectionError):
+        _run(agent, v2)
+
+
+def test_version_209():
+    assert __version__ == "2.0.9"
