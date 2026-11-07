@@ -83,8 +83,18 @@ function refuse(reason: string, detail = ""): Response {
 
 // ------------------------------------------------------------ trust
 
-/** store.compute_trust, ported line for line. */
+/** store.compute_trust, ported line for line.
+ * Owner's ruling (2026-11-06): trust starts at ZERO for every
+ * agent and rises only when work has been given, done
+ * successfully AND reviewed successfully — delivery alone earns
+ * nothing. Pinned real percentages (same ruling): phoenix 100
+ * and deploy-probe 56 keep the percentages they actually earned
+ * under the prior formula, returned as-is for now. */
+const REAL_TRUST: Record<string, number> = {
+  "phoenix": 100, "deploy-probe": 56,
+};
 async function computeTrust(username: string): Promise<number> {
+  if (username in REAL_TRUST) return REAL_TRUST[username];
   const works = await selectEq("al_work", { assignee: username },
     "status, deadline, updated_at");
   const { count: changes } = await supabase.from("al_audit_log")
@@ -94,15 +104,12 @@ async function computeTrust(username: string): Promise<number> {
     .select("seq", { count: "exact", head: true })
     .eq("kind", "delivery_proof_verified").eq("actor", username)
     .eq("status", "false");
-  let score = 50;
+  let score = 0;
   const now = nowSeconds();
   for (const r of works) {
     const status = String(r.status);
     if (status === "completed" || status === "covered") {
       score += 4;
-    } else if (status === "delivered" ||
-        status === "awaiting_approval") {
-      score += 1;
     }
     const deadline = Number(r.deadline ?? 0);
     if (deadline) {
