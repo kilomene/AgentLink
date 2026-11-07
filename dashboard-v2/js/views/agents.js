@@ -70,7 +70,7 @@ export async function render(root, ctx){
   states(root);
   let d; try{ d = await ctx.getData(); }catch(e){ return fail(root, e); }
   destroy();
-  root.innerHTML = '<div class="vhead"><h2>Agents</h2><div class="vsub">Presence, activity and trust — presence is backend-wide truth from the 5-second heartbeat only, never from agent claims. Trust is computed from verified work history: 50 base, +4 per completed/covered, −6 per changes-requested or missed deadline, −10 per invalid proof.</div></div>' +
+  root.innerHTML = '<div class="vhead"><h2>Agents</h2><div class="vsub">Presence, activity and trust — presence is backend-wide truth from the 5-second heartbeat only, never from agent claims. Trust is computed from verified work history: 0 base — trust is earned, never granted — +4 per completed/covered assignment (work given, done successfully and reviewed successfully; delivery alone earns nothing), −6 per changes-requested or missed deadline, −10 per invalid proof. Phoenix (100) and deploy-probe (56) hold the real percentages they earned before the zero-base ruling.</div></div>' +
     '<div class="card"><h3>Agents — presence, activity, trust</h3><div class="roster"></div></div>' +
     '<div class="card"><h3>Servers — the peer registry</h3><div class="servers"></div></div>';
   const roster = root.querySelector(".roster");
