@@ -675,6 +675,7 @@ class Agent:
         media: bool = False,
         workspace: str | None = None,
         recovery_key: str | None = None,
+        rectify_code: str | None = None,
         connectors: list | None = None,
         transport: str | None = None,
         serverless_config: ServerlessConfig | None = None,
@@ -884,6 +885,10 @@ class Agent:
             workspace or os.environ.get("AGENTLINK_WORKSPACE")
             or "~/workspace").expanduser()
         self._recovery_key_manual = recovery_key or None
+        # The operator rectification code handed in explicitly
+        # (see `agentlink rectify`); the automatic paths discover
+        # a dropped-in code on their own (_find_rectify_code).
+        self._rectify_code_manual = rectify_code or None
         # The most recently issued/used recovery key (plaintext —
         # held by the agent itself, exactly like its identity
         # keys; the server only ever holds the hash) and the
@@ -1830,6 +1835,55 @@ class Agent:
         except Exception:
             pass
         return None
+
+    def _rectify_workspace_path(self) -> Path:
+        return self.workspace / f"agentlink-rectify-{self.username}.txt"
+
+    def _find_rectify_code(self) -> str | None:
+        """Discover an operator rectification code (v2.0.9): the
+        code handed in explicitly, then the AGENTLINK_RECTIFY_CODE
+        environment variable, then the drop-in file in the
+        workspace (the owner places the operator's code there —
+        a bare code line, or the self-describing
+        ``rectify_code:`` line). None when no code is held.
+
+        No endpoint scoping (unlike the recovery key): a code is
+        single-use, short-lived and bound to this username
+        server-side — a stale or foreign code simply fails the
+        Edge's hash check and burns nothing."""
+        if self.ephemeral or not self.username:
+            return None
+        if self._rectify_code_manual:
+            return self._rectify_code_manual
+        env_code = os.environ.get("AGENTLINK_RECTIFY_CODE", "").strip()
+        if env_code:
+            return env_code
+        try:
+            wp = self._rectify_workspace_path()
+            if wp.exists():
+                for line in wp.read_text().splitlines():
+                    line = line.strip()
+                    if line.startswith("rectify_code:"):
+                        code = line.split(":", 1)[1].strip()
+                        if code:
+                            return code
+                    elif line and not line.startswith("#"):
+                        return line
+        except Exception:
+            pass
+        return None
+
+    def _drop_rectify_code_file(self) -> None:
+        """Remove the drop-in code file after a successful
+        rectification: the code is burned server-side, and no
+        copy of a spent credential should linger in the
+        workspace."""
+        try:
+            wp = self._rectify_workspace_path()
+            if wp.exists():
+                wp.unlink()
+        except Exception:
+            pass
 
     def _group_keys_path(self) -> Path:
         return self.state_dir / f"groupkeys-{self.username}.json"
@@ -2939,9 +2993,18 @@ class Agent:
            created and the session opens in the same step; the
            recovery key the Edge issues is persisted under the
            storage contract at once.
-        3. TAKEN — the name is registered to other keys and no
-           recovery key is held: return False; the caller raises
-           the permanent refusal with the way forward.
+        3. RECTIFY (v2.0.9) — the name is taken and an operator
+           rectification code is held (handed in, in the
+           environment, or dropped in the workspace): present
+           it; the stranded account rebinds to this machine's
+           keys, the code burns, and the Edge's freshly minted
+           recovery key is persisted under the storage contract.
+           A code that does not verify falls through to TAKEN —
+           it burns nothing and changes nothing.
+        4. TAKEN — the name is registered to other keys and
+           neither a recovery key nor a rectification code is
+           held: return False; the caller raises the permanent
+           refusal with the way forward.
 
         Weather (any other TransportError) raises ConnectionError
         — the retry class — never a false identity verdict.
@@ -2998,7 +3061,40 @@ class Agent:
                 designation=self.designation)
         except TransportError as exc:
             if "username_taken" in str(exc):
-                return False
+                # Step 3 (v2.0.9): a held rectification code is
+                # the operator's way back into a stranded legacy
+                # account — try it before declaring the name
+                # taken for good.
+                code = self._find_rectify_code()
+                if not code:
+                    return False
+                try:
+                    result = await asyncio.to_thread(
+                        v2.rectify_and_login, self.username,
+                        self.identity.sign, code,
+                        pubs["sign_pub"], pubs["pubkey"],
+                        _package_version(),
+                        decision_link=self._declared_link_sent,
+                        decision_link_detail=self._decision_detail())
+                except TransportError as exc2:
+                    if "rectify_failed" in str(exc2):
+                        return False
+                    raise ConnectionError(
+                        f"registration failed at step "
+                        f"'serverless-rectify': the login Edge "
+                        f"did not answer for @{self.username} "
+                        f"({exc2}). Retry when the endpoints are "
+                        f"reachable from this machine.") from exc2
+                issued = str(result.get("recovery_key") or "")
+                if issued:
+                    self._save_recovery_key(issued)
+                self._drop_rectify_code_file()
+                log.warning(
+                    "rectified @%s by operator code — stranded "
+                    "account rebound to this machine's keys; the "
+                    "code is burned and the new recovery key is "
+                    "saved.", self.username)
+                return True
             raise ConnectionError(
                 f"registration failed at step 'serverless-register':"
                 f" the login Edge did not answer for"
@@ -3094,8 +3190,13 @@ class Agent:
                     f"machine. If this name is yours, restore "
                     f"your recovery file (agentlink-recovery-"
                     f"{self.username}.txt in your workspace) and "
-                    f"boot again to reclaim it; otherwise pick a "
-                    f"new username.") from exc
+                    f"boot again to reclaim it. If that file is "
+                    f"lost, ask the operator for a rectification "
+                    f"code and run `agentlink rectify --username "
+                    f"{self.username} --rectify-code <code>` — "
+                    f"the stranded account rebinds to this "
+                    f"machine and a fresh recovery key is issued. "
+                    f"Otherwise pick a new username.") from exc
             else:
                 self._v2 = None
                 try:
