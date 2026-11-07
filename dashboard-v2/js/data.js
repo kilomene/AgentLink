@@ -90,9 +90,16 @@ export async function pgAll(table, query){
 export async function oversightOpen(items){
   // items: [{id, oversight, content_envelope}] -> {id: {text,title,content_kind,file_name}}
   const s = session(); if(!s) throw new Error("login required");
-  const r = await fetch(CFG().edgeBase + "/oversight", {method:"POST", headers:{"Content-Type":"application/json", Authorization:"Bearer "+s.jwt}, body: JSON.stringify({items})});
-  if(!r.ok) throw new Error("oversight failed ("+r.status+")");
-  return r.json();
+  // Hard timeout: a hung request must reject, never wedge the
+  // caller's open pass — the chat view retries until every item
+  // reaches its text.
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 25000);
+  try{
+    const r = await fetch(CFG().edgeBase + "/oversight", {method:"POST", headers:{"Content-Type":"application/json", Authorization:"Bearer "+s.jwt}, body: JSON.stringify({items}), signal: ctl.signal});
+    if(!r.ok) throw new Error("oversight failed ("+r.status+")");
+    return await r.json();
+  }finally{ clearTimeout(timer); }
 }
 export async function oversightCredentials(username){
   const s = session(); if(!s) throw new Error("login required");
