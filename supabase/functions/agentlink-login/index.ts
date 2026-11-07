@@ -11,6 +11,24 @@
 //     -> {supabase_jwt, firebase_token, expires_in, recovery_key}
 //   POST {method:"register", username, sign_pub, pubkey}
 //     -> {supabase_jwt, firebase_token, expires_in, recovery_key}
+//   POST {method:"rectify", username, rectify_code,
+//         new_sign_pub, new_pubkey}
+//     -> {supabase_jwt, firebase_token, expires_in, recovery_key}
+//
+// Rectification (v2.0.9) is the OPERATOR path back into a
+// stranded legacy account — one whose registered keys diverged
+// from its host across phases and whose recovery file is lost:
+// login refuses the diverged keys, register refuses the taken
+// name, recovery demands the lost key. The operator issues a
+// one-time code for the username (stored only as its SHA-256 in
+// al_rectify_codes, single-use, short-lived, one live code per
+// username); the agent presents it with the fresh identity keys
+// it generated on its own machine; the account rebinds exactly
+// as the recovery method rebinds, and a NEW recovery key is
+// minted in the response — returned ONCE, to that agent only.
+// The code is burned atomically BEFORE the rebind, so it can
+// never be replayed, and every failure (unknown username, no
+// live code, expired, wrong code) returns the same refusal.
 //
 // Registration (v2.0.8) is FIRST-COME and fully automatic — the
 // v1 relay's claiming hello, restored: a well-formed username
@@ -104,6 +122,8 @@ const KEY_AUTH_FAILED_DETAIL =
 const RECOVERY_UNKNOWN_DETAIL = "recovery refused: no such registered username";
 const RECOVERY_FAILED_DETAIL =
   "recovery refused: the recovery key did not verify for this username";
+const RECTIFY_FAILED_DETAIL =
+  "rectification refused: the code did not verify for this username";
 
 // Per-instance fixed-window limiter (see the header's honest note).
 const WINDOW_SECONDS = 60;
@@ -112,6 +132,7 @@ const LIMITS: Record<string, number> = {
   verify: 20,
   recovery: 10,
   register: 10,
+  rectify: 10,
 };
 const attempts = new Map<string, { window: number; count: number }>();
 
@@ -461,9 +482,96 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ ...tokens, recovery_key: newRecoveryKey });
     }
 
+    // ------------------------------------------------- rectify
+    if (method === "rectify") {
+      if (rateLimited("rectify", username, ip)) {
+        return errorResponse("rate_limited", "too many rectification attempts; retry shortly", 429);
+      }
+      // The operator path back into a stranded legacy account
+      // (see the header). Authorization is a one-time code the
+      // operator issued for THIS username; everything about the
+      // failure is one refusal shape — no oracle distinguishing
+      // an unknown username from a wrong or spent code.
+      const user = await selectOne(
+        supabase,
+        "al_users",
+        "username",
+        { username },
+      );
+      if (!user) {
+        return errorResponse("rectify_failed", RECTIFY_FAILED_DETAIL, 401);
+      }
+      const live = await selectOne(
+        supabase,
+        "al_rectify_codes",
+        "id, code_hash, expires_at",
+        { username, status: "live" },
+      );
+      const presented = String(body.rectify_code ?? "");
+      const presentedHash = presented ? await sha256Hex(presented) : "";
+      const now = nowSeconds();
+      if (
+        !live || !presented ||
+        Number(live.expires_at) < now ||
+        !constantTimeEqual(presentedHash, String(live.code_hash ?? ""))
+      ) {
+        return errorResponse("rectify_failed", RECTIFY_FAILED_DETAIL, 401);
+      }
+      // Fresh key material is validated exactly as the recovery
+      // method validates a rebind — BEFORE the code burns, so a
+      // malformed request never spends the operator's code.
+      const newSignPub = String(body.new_sign_pub ?? "");
+      const newPubkey = String(body.new_pubkey ?? "");
+      if (!isRawKey32(newSignPub) || !isRawKey32(newPubkey)) {
+        return errorResponse(
+          "invalid_key_material",
+          "new_sign_pub and new_pubkey must be base64 raw 32-byte keys",
+          400,
+        );
+      }
+      // Burn the code atomically: the status match makes this
+      // update land only while the code is still live, so two
+      // concurrent presentations can never both pass.
+      const burned = await patchRows(
+        supabase,
+        "al_rectify_codes",
+        { id: live.id, status: "live" },
+        { status: "used", used_at: now },
+      );
+      if (burned !== 1) {
+        return errorResponse("rectify_failed", RECTIFY_FAILED_DETAIL, 401);
+      }
+      // The rebind mirrors the recovery method exactly: fresh
+      // identity keys, the legacy secret rotates (hash only),
+      // and a NEW recovery key is minted — returned ONCE in
+      // this response, to the rectifying agent only; the lost
+      // key and the diverged keys die here.
+      const newRecoveryKey = randomTokenUrlSafe(32);
+      const rotatedSecret = randomTokenUrlSafe(24);
+      const secret = await sha256Hex(rotatedSecret);
+      await patchRows(supabase, "al_users", { username }, {
+        sign_pub: newSignPub,
+        pubkey: newPubkey,
+        secret,
+        recovery_hash: await sha256Hex(newRecoveryKey),
+        recovery_used_at: now,
+        auth_method: "rectify",
+        last_seen: now,
+      });
+      await patchRows(
+        supabase,
+        "al_grants",
+        { username, status: "active" },
+        { bound_sign_pub: newSignPub, updated_at: now },
+        (q) => q.neq("bound_sign_pub", newSignPub),
+      );
+      const tokens = await issueTokens(username);
+      return jsonResponse({ ...tokens, recovery_key: newRecoveryKey });
+    }
+
     return errorResponse(
       "unknown_method",
-      "method must be challenge, verify, recovery or register",
+      "method must be challenge, verify, recovery, register or rectify",
       400,
     );
   } catch (e) {
