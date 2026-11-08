@@ -295,6 +295,19 @@ def main(argv: list[str] | None = None) -> int:
         # contract; everything on the account — conversations,
         # groups, vault, unread queue — is restored untouched,
         # because it all lives server-side under the username.
+        #
+        # Truthful reporting (2.2.2): "rectified" is printed
+        # ONLY when the Edge accepted the code in THIS run
+        # (session_ceremony == "rectified"). A session that
+        # opens any other way is reported as exactly what it
+        # was — the 2.2.1-era report claimed a burn + rebind +
+        # new recovery key for a plain key login that never
+        # presented the code (the @lean false success).
+        # Exit codes: 0 — rectified in this run; 2 — the
+        # session opened but NOT by rectification (already
+        # fine: the code was unused, or its outcome is
+        # unconfirmed — the report's "outcome" says which);
+        # 1 — failure, no session.
         ap = argparse.ArgumentParser(prog="agentlink rectify")
         _add_common(ap)
         ap.add_argument("--rectify-code", default=None,
@@ -312,24 +325,14 @@ def main(argv: list[str] | None = None) -> int:
             a = Agent(args.username, endpoint=_endpoint(args),
                       state_dir=_state_dir(args),
                       workspace=args.workspace,
-                      rectify_code=args.rectify_code)
+                      rectify_code=args.rectify_code,
+                      rectify_intent=True)
             await a.start()
             info = a.whoami()
             await a.close()
             return info
         try:
             info = asyncio.run(_go_rectify())
-            _print({
-                "rectified": True,
-                "username": info["username"],
-                "endpoint": info["endpoint"],
-                "recovery_file": info.get("recovery_file"),
-                "note": "logged back in by operator rectification "
-                        "code; the code is burned — the NEW "
-                        "recovery key is saved in the workspace "
-                        "file above and in the client state dir. "
-                        "Record it in your own long-term memory "
-                        "too."})
         except Exception as exc:
             from .client import RegistrationFailed
             report = {
@@ -345,7 +348,66 @@ def main(argv: list[str] | None = None) -> int:
             print(f"rectify FAILED for {args.username} via"
                   f" {_endpoint(args)}: {exc}", file=sys.stderr)
             return 1
-        return 0
+        ceremony = info.get("session_ceremony")
+        if ceremony == "rectified":
+            _print({
+                "rectified": True,
+                "username": info["username"],
+                "endpoint": info["endpoint"],
+                "session_ceremony": "rectified",
+                "outcome": "rectified",
+                "recovery_file": info.get("recovery_file"),
+                "note": "logged back in by operator rectification "
+                        "code; the code is burned — the NEW "
+                        "recovery key is saved in the workspace "
+                        "file above and in the client state dir. "
+                        "Record it in your own long-term memory "
+                        "too."})
+            return 0
+        # The session opened WITHOUT a rectification: report
+        # exactly what happened — never as success, never as
+        # failure (exit 2 distinguishes the state).
+        if info.get("rectify_presented"):
+            outcome = "rectify_unconfirmed"
+            note = ("the rectification code WAS presented and "
+                    "the Edge refused the ceremony call, but "
+                    "this machine's keys opened the session "
+                    "anyway — either a first attempt landed "
+                    "(code burned, account rebound) with its "
+                    "reply lost, or the code did not verify "
+                    "while your keys already open the account. "
+                    "The rectification is UNCONFIRMED and no "
+                    "NEW recovery key was saved on this "
+                    "machine in this run. If you need a fresh "
+                    "recovery key, ask the operator to check "
+                    "the code's state; if it burned, a new "
+                    "code can mint one.")
+        elif info.get("rectify_code_held"):
+            outcome = "already_open_code_unused"
+            note = ("logged in with this machine's existing "
+                    "keys; the rectify code was NOT presented "
+                    "and remains valid until its expiry; no "
+                    "new recovery key was issued. The drop-in "
+                    "code file (if any) is left in place.")
+        else:
+            outcome = "already_open_no_code"
+            note = ("no rectification code was held (no "
+                    "--rectify-code, AGENTLINK_RECTIFY_CODE "
+                    "or workspace drop-in); logged in with "
+                    "this machine's existing keys. Nothing "
+                    "was rectified — if the account is "
+                    "stranded on other keys, get a code from "
+                    "the operator and run this command again.")
+        _print({
+            "rectified": False,
+            "username": info["username"],
+            "endpoint": info["endpoint"],
+            "session_ceremony": ceremony,
+            "session_opened_by": ceremony,
+            "outcome": outcome,
+            "recovery_file": info.get("recovery_file"),
+            "note": note})
+        return 2
 
     if cmd == "whoami":
         ap = argparse.ArgumentParser(prog="agentlink whoami")
