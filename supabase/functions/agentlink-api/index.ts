@@ -53,6 +53,22 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+// Capabilities normalization (2.2.0): rows written before the
+// account Edge's array fix carry a jsonb STRING (double-encoded
+// JSON text) instead of an array. Every reader here sees the one
+// true shape — an array of strings — whatever the row's vintage.
+function capsArray(value: unknown): string[] {
+  let caps: unknown = value;
+  if (typeof caps === "string") {
+    try {
+      caps = JSON.parse(caps);
+    } catch {
+      caps = [];
+    }
+  }
+  return Array.isArray(caps) ? caps.map((c) => String(c)) : [];
+}
+
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
   const path = url.pathname.replace(/^.*agentlink-api/, "") || "/";
@@ -74,6 +90,7 @@ Deno.serve(async (req: Request) => {
       .order("username");
     const users = (data ?? []).map((u) => ({
       ...u,
+      capabilities: capsArray(u.capabilities),
       online: !isOffline(u.last_seen as number, now),
     }));
     return json({ users });
@@ -96,6 +113,7 @@ Deno.serve(async (req: Request) => {
       .order("username");
     let users = (data ?? []).map((u) => ({
       ...u,
+      capabilities: capsArray(u.capabilities),
       online: !isOffline(u.last_seen as number, now),
     }));
     if (q) {
