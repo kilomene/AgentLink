@@ -70,6 +70,7 @@ class FakeHttp:
         self.verify_ok = None
         self.last_verify = None
         self.advertise_oversight = ""   # verify-reply oversight key
+        self.advertise_recovery = ""    # verify-reply enrollment key (2.2.3)
         self.queue_rows = []   # stored al_queue rows (dicts)
         self.audit_rows = []   # stored al_audit_log rows (raw cols)
         self.postgrest_401_once = False
@@ -154,6 +155,8 @@ class FakeHttp:
                      "expires_at": self.jwt_exp}
             if self.advertise_oversight:
                 reply["oversight_pubkey"] = self.advertise_oversight
+            if self.advertise_recovery:
+                reply["recovery_key"] = self.advertise_recovery
             return 200, reply
         # Firebase RTDB.
         if url.startswith(RTDB):
@@ -1446,3 +1449,51 @@ def test_all_opener_sites_route_through_call_opener():
     assert src.count("self._opener(") == 1
     assert src.count("self._call_opener(") == 1
     assert src.count("self._call_hardened(") == 5
+
+
+def test_login_carries_enrollment_key_from_verify_reply():
+    # 2.2.3: when the login Edge enrolls an unenrolled account
+    # on its verified login, the minted key rides the verify
+    # reply; the transport result must carry it (like the
+    # register / recovery / rectify results do) for the Agent
+    # to persist. A reply without the field carries nothing.
+    fake = FakeHttp()
+    fake.advertise_recovery = "enrolled-key-xyz"
+    transport = make_transport(fake)
+    try:
+        result = transport.login("alice", fake.identity.sign,
+                                 client_version="2.2.3-test")
+        assert result["recovery_key"] == "enrolled-key-xyz"
+    finally:
+        transport.logout()
+    fake2 = FakeHttp()
+    transport2 = make_transport(fake2)
+    try:
+        result2 = transport2.login("alice", fake2.identity.sign,
+                                   client_version="2.2.3-test")
+        assert "recovery_key" not in result2
+    finally:
+        transport2.logout()
+
+
+def test_login_enrollment_sink_fires_on_backstop_relogin():
+    # 2.2.3: enrollment keys arrive on whichever _login runs —
+    # including the 401 backstop inside _rest, where no caller
+    # ever sees the login result. The transport must hand the
+    # key to its enrollment sink there too, or the one reply
+    # that carried it is silently dropped and the account's
+    # server hash has already moved (stranding it for good).
+    fake = FakeHttp()
+    transport = make_transport(fake)
+    try:
+        transport.login("alice", fake.identity.sign,
+                        client_version="2.2.3-test")
+        got = []
+        transport.on_recovery_enrollment = got.append
+        fake.advertise_recovery = "backstop-key-1"
+        fake.postgrest_401_once = True
+        rows = transport.fetch_unacked("alice")
+        assert rows == []
+        assert got == ["backstop-key-1"]
+    finally:
+        transport.logout()
