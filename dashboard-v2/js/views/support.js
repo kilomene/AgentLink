@@ -48,17 +48,36 @@ async function renderDetail(root, ctx, id){
   catch(e){ return fail(root, e); }
   if(!t){ return fail(root, new Error("ticket not found")); }
   const res = t.resolution || {};
-  const atts = (t.attachments||[]).map(a=>
-    '<li>' + (a.download_url
-      ? '<a href="' + esc(a.download_url) + '" target="_blank" rel="noopener">' + esc(a.name||a.key||"file") + '</a>'
-      : esc(a.name||a.key||"file"))
-    + ' <span class="sub">' + esc(a.content_type||"") + " · " + esc(String(a.size||0)) + ' bytes</span></li>').join("");
+  // Proof media renders IN the ticket (2.2.0): an image is
+  // shown, a video plays in-page, anything else downloads.
+  // Before this, every attachment — the owner's own test video
+  // included — was at best a bare download link in a list, so
+  // the desk looked empty of the evidence the agent sent.
+  const atts = (t.attachments||[]).map(a=>{
+    const name = esc(a.name||a.key||"file");
+    const meta = ' <span class="sub">' + esc(a.content_type||"") + " · "
+      + esc(String(a.size||0)) + ' bytes</span>';
+    const url = a.download_url ? esc(a.download_url) : null;
+    if(!url) return '<div class="sup-att">' + name + meta + '</div>';
+    const link = '<a href="' + url + '" target="_blank" rel="noopener">'
+      + name + '</a>' + meta;
+    const ct = String(a.content_type||"");
+    if(ct.startsWith("image/"))
+      return '<div class="sup-att">' + link + '<br><img src="' + url
+        + '" alt="' + name + '" style="max-width:100%;height:auto;'
+        + 'border-radius:8px;margin-top:6px"></div>';
+    if(ct.startsWith("video/"))
+      return '<div class="sup-att">' + link + '<br><video controls '
+        + 'preload="metadata" src="' + url + '" style="max-width:100%;'
+        + 'border-radius:8px;margin-top:6px"></video></div>';
+    return '<div class="sup-att">' + link + '</div>';
+  }).join("");
   const host = document.createElement("div");
   host.innerHTML = '<div class="vhead"><h2>Support — @' + esc(t.desired_username||"") + '</h2>'
     + '<div class="vsub"><a href="#" id="supback">← all tickets</a> · status <b>' + esc(t.status) + '</b> · lodged ' + pt(t.created_at) + (t.welcomed ? ' · welcomed ' + pt(t.welcomed_at) : '') + '</div></div>'
     + '<div class="card"><h3>The problem, in the agent\'s words</h3><pre class="sup-problem">' + esc(t.problem||"") + '</pre></div>'
     + '<div class="card"><h3>Client failure data</h3><pre class="sup-problem">' + esc(JSON.stringify(t.client_context||{}, null, 2)) + '</pre></div>'
-    + (atts ? '<div class="card"><h3>Proof files</h3><ul>' + atts + '</ul></div>' : '')
+    + (atts ? '<div class="card"><h3>Proof files</h3>' + atts + '</div>' : '')
     + (res.reply || res.fixed_in_version ? '<div class="card"><h3>Phoenix\'s answer</h3>'
         + (res.reply ? '<pre class="sup-problem">' + esc(res.reply) + '</pre>' : '')
         + (res.fixed_in_version ? '<p class="sub">Fixed in version <b>' + esc(res.fixed_in_version) + '</b></p>' : '')
