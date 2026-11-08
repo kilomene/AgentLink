@@ -14,7 +14,14 @@ later, one grant decision). Everything else is the agent's job:
    the chosen path.
 2. USERNAME. Registration rides the hardened first-contact
    suite (reclaim -> register -> rectify); identity, state and
-   the recovery file are wired by the client itself.
+   the recovery file are wired by the client itself. ALREADY
+   REGISTERED (2.2.3): when this identity's own daemon already
+   holds the instance lock, the collision is that daemon's
+   success, not setup's failure — setup proves the running
+   instance (live holder, identity keys, control-channel ping,
+   daemon-held recovery, presence online, directory through
+   the daemon) and reports registered through it, never
+   starting a rival and never re-asking its grant.
 3. SUPERVISION. The standard service install (class C) — the
    daemon relaunches on death and starts on boot.
 4. CAPABILITIES. Probed honestly — internet reachability and
@@ -156,6 +163,239 @@ def _probe_capabilities(state_dir: Path, network: dict) -> list[str]:
     return caps
 
 
+def _directory_rows(found) -> list[dict]:
+    """Rows out of a directory answer, whatever shape carried
+    it (the live agent's list, a forwarded list, or a dict with
+    one of the known list keys / a single row)."""
+    rows: list = []
+    if isinstance(found, dict):
+        for key in ("agents", "users", "results", "directory"):
+            if isinstance(found.get(key), list):
+                rows = found[key]
+                break
+        else:
+            if isinstance(found.get("username"), str):
+                rows = [found]
+    elif isinstance(found, list):
+        rows = found
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _directory_names(found) -> list[str]:
+    return [str(r.get("username") or "")
+            for r in _directory_rows(found)]
+
+
+def _read_presence_public(agent, uname: str) -> dict | None:
+    """Unauthenticated presence read (2.2.3 fallback): the
+    RTDB /presence tree is public-read by rule, so a plain
+    GET of the node — proxied opener first, direct second —
+    answers without any Firebase token. Returns the node
+    dict or None; raises the last error when both paths
+    fail to answer at all."""
+    import urllib.request
+
+    from .doorbell import user_key
+    config = agent._make_v2_transport().config
+    url = (f"{config.firebase_database_url.rstrip('/')}"
+           f"/presence/{user_key(uname)}.json")
+    last: Exception | None = None
+    for opener in (urllib.request.build_opener(),
+                   urllib.request.build_opener(
+                       urllib.request.ProxyHandler({}))):
+        try:
+            with opener.open(url, timeout=20) as resp:
+                got = json.loads(resp.read().decode())
+            return got if isinstance(got, dict) else None
+        except Exception as exc:
+            last = exc
+    if last is not None:
+        raise last
+    return None
+
+
+async def _prove_already_running(agent, sd: Path,
+                                 uname: str) -> dict:
+    """The already-registered fast path's proof (2.2.3).
+
+    An instance collision during setup is only a failure when
+    the lock holder is NOT this identity's own live daemon.
+    When it IS, registration is not something setup still has
+    to do — the daemon did it, is doing it, and holds the
+    session. This proof fails CLOSED: every conjunct is
+    measured, none is assumed —
+
+    * the instance lock names THIS username and its pid is
+      alive (client.instance_lock_holder),
+    * this state dir holds the identity keys,
+    * the running instance answers PING on its control
+      channel as this username (identity is triple-checked
+      inside forward_command),
+    * the running instance's own whoami says whether IT
+      holds a recovery key (the rival process's local files
+      are not the daemon's truth),
+    * presence reads ONLINE on the doorbell, and
+    * the directory, asked THROUGH the running instance's
+      authenticated session, finds this username.
+
+    ``registered`` is those measured conjuncts; ``proven``
+    additionally requires a recovery key held IN THE STORED
+    COPIES (the local state copy or the workspace file) —
+    setup's full ok needs both, exactly like the live-start
+    path's conjuncts. The daemon's in-memory key is measured
+    and reported (``recovery_daemon_held``) but is NOT proof:
+    it is the copy the daemon was handed at its own boot, and
+    a registration the daemon itself rescued from a clipped
+    reply holds its key in no copy at all."""
+    import asyncio as _aio
+
+    from .client import forward_command, instance_lock_holder
+    proof: dict = {"username": uname}
+    errors: dict = {}
+    holder = instance_lock_holder(sd, uname)
+    proof["holder"] = holder
+    proof["holder_alive"] = holder is not None
+    proof["identity_present"] = bool(
+        agent.identity is not None
+        and (sd / f"keys-{uname}.json").exists())
+    local_key = None
+    try:
+        local_key = agent._find_recovery_key()
+    except Exception:
+        local_key = None
+    ping = whoami = found = None
+    presence = None
+    if holder is not None:
+        try:
+            ping = await forward_command(
+                str(sd), uname, {"cmd": "ping"}, timeout=30.0)
+        except Exception as exc:
+            errors["ping"] = str(exc)[:200]
+    if ping is not None:
+        try:
+            whoami = await forward_command(
+                str(sd), uname, {"cmd": "whoami"}, timeout=30.0)
+        except Exception as exc:
+            errors["whoami"] = str(exc)[:200]
+        try:
+            found = await forward_command(
+                str(sd), uname,
+                {"cmd": "directory", "query": uname.capitalize()},
+                timeout=180.0)
+        except Exception as exc:
+            errors["directory"] = str(exc)[:200]
+        # Presence through the DAEMON's doorbell (2.2.3): a
+        # rival process holds no Firebase token, so its own
+        # fresh doorbell read can only fail — the daemon is
+        # the beat's writer and reads its node back with its
+        # authenticated client.
+        try:
+            presence = await forward_command(
+                str(sd), uname, {"cmd": "presence"}, timeout=30.0)
+            if not isinstance(presence, dict):
+                presence = None
+        except Exception as exc:
+            errors["presence_control"] = str(exc)[:200]
+    proof["ping"] = ping if isinstance(ping, dict) else None
+    proof["recovery_local"] = bool(local_key)
+    proof["recovery_daemon_held"] = bool(
+        isinstance(whoami, dict) and whoami.get("recovery_key_held"))
+    proof["recovery_present"] = bool(
+        proof["recovery_local"] or proof["recovery_daemon_held"])
+    recovery_file = None
+    if isinstance(whoami, dict) and whoami.get("recovery_file"):
+        recovery_file = whoami["recovery_file"]
+    elif getattr(agent, "recovery_file", None):
+        recovery_file = agent.recovery_file
+    else:
+        try:
+            wp = agent._recovery_workspace_path()
+            if wp.exists():
+                recovery_file = str(wp)
+        except Exception:
+            pass
+    proof["recovery_file"] = recovery_file
+    proof["grant"] = whoami.get("grant") if isinstance(
+        whoami, dict) else None
+    if presence is None and holder is not None:
+        # Fallback: the /presence tree is public-read by rule
+        # (firebase/database.rules.json) — a plain RTDB read,
+        # proxied first, then direct, needs no token at all.
+        try:
+            presence = await _aio.to_thread(
+                _read_presence_public, agent, uname)
+        except Exception as exc:
+            errors["presence"] = str(exc)[:200]
+    proof["presence"] = presence
+    proof["presence_online"] = bool(
+        presence and presence.get("state") == "online")
+    names = _directory_names(found) if found is not None else []
+    proof["directory_matches"] = names
+    proof["directory_finds_me"] = uname in names
+    mine = next((r for r in _directory_rows(found)
+                 if r.get("username") == uname), None) \
+        if found is not None else None
+    caps = mine.get("capabilities") if mine else None
+    proof["capabilities"] = caps if isinstance(caps, list) else None
+    if errors:
+        proof["errors"] = errors
+    proof["registered"] = bool(
+        proof["holder_alive"] and proof["identity_present"]
+        and proof["ping"] and proof["ping"].get("username") == uname
+        and proof["presence_online"] and proof["directory_finds_me"])
+    # Proven = registered AND recovery held, judged at SETUP's
+    # exact ok bar (see run_setup's final conjuncts): a recovery
+    # credential held LOCALLY in the stored copies, or ONE JUST
+    # ISSUED at registration — the only two states setup's own
+    # live path ever accepts (recovery_present = local file).
+    # The daemon lane above is NOT evidence here: a daemon's
+    # in-memory key is the copy it was given at ITS boot, which
+    # says nothing about whether the agent's durable record
+    # holds one — and a registration saved through the daemon's
+    # self-collision rescue has its key in NO copy (the 2.2.0
+    # documented state): such an agent is registered and
+    # running, but is NOT proven recovered, and the operator's
+    # rectification is its documented way to a key. It must
+    # never be reported as holding one.
+    proof["proven"] = bool(
+        proof["registered"] and proof["recovery_local"])
+    return proof
+
+
+def already_running_proof(state_dir, username: str) -> dict:
+    """Synchronous _prove_already_running for sync callers
+    (the support hook's cycle): builds a throwaway Agent on
+    the state dir and runs the proof. Never raises — a proof
+    that cannot be built is a proof that failed."""
+    import asyncio as _aio
+
+    from .client import Agent, instance_lock_holder
+    from .protocol import normalize_username
+    uname = normalize_username(username)
+    if uname is None:
+        return {"username": username, "registered": False,
+                "proven": False}
+    sd = Path(state_dir).expanduser()
+    if instance_lock_holder(sd, uname) is None:
+        # No live holder: nothing to prove, and the check must
+        # stay read-only + offline in that case (a stranded
+        # agent's guard runs on every failed retry — it never
+        # mints identity keys or touches the network for a
+        # daemon that is not there).
+        return {"username": uname, "registered": False,
+                "proven": False, "holder_alive": False}
+    try:
+        agent = Agent(uname, state_dir=str(sd), mode="manual")
+    except Exception as exc:
+        return {"username": uname, "registered": False,
+                "proven": False, "errors": {"agent": str(exc)[:200]}}
+    try:
+        return _aio.run(_prove_already_running(agent, sd, uname))
+    except Exception as exc:
+        return {"username": uname, "registered": False,
+                "proven": False, "errors": {"proof": str(exc)[:200]}}
+
+
 async def run_setup(username: str, state_dir: str | None = None,
                     designation: str = "production",
                     grant: str = "ask",
@@ -221,9 +461,10 @@ async def run_setup(username: str, state_dir: str | None = None,
     # the first-contact suite inside start() itself, and a
     # RegistrationFailed (the one permanent refusal) is never
     # retried.
-    from .client import RegistrationFailed
+    from .client import InstanceCollision, RegistrationFailed
     agent = Agent(uname, state_dir=str(sd), designation=designation,
                   mode="manual")
+    already: dict | None = None
     try:
         import asyncio as _aio
         last_exc: Exception | None = None
@@ -232,6 +473,60 @@ async def run_setup(username: str, state_dir: str | None = None,
                 await agent.start()
                 last_exc = None
                 break
+            except InstanceCollision as exc:
+                # Already-registered fast path (2.2.3): a
+                # collision with this identity's OWN live daemon
+                # is not a failed registration — the daemon IS
+                # the registration, holding the session this
+                # setup was asked to create. Prove it with the
+                # measured conjuncts (live holder, identity keys,
+                # control-channel ping as this username, presence
+                # online, directory-through-the-daemon finds me,
+                # and a recovery key in the stored copies — the
+                # same recovery conjunct setup's own ok requires);
+                # only then does setup report success through the
+                # running instance instead of starting a rival.
+                # A collision whose proof stays unproven past the
+                # attempt budget — a REAL rival, a wedged holder,
+                # or a registered-but-keyless agent (the
+                # self-collision rescue's documented state, healed
+                # by operator rectification, never by pretending
+                # a key exists) — is terminal then, and the
+                # failure names the conjuncts.
+                # The proof runs boundedly INSIDE the retry
+                # loop: its conjuncts ride the platform's own
+                # reads (a directory query through the daemon
+                # takes as long as it takes — seconds to minutes
+                # under this fleet's network weather), so a
+                # single not-yet measurement is weather, not a
+                # verdict: the loop re-proves on the next pass,
+                # exactly as it rides out a ConnectionError. The
+                # proof only becomes the failure when the attempt
+                # budget is spent with it still unproven — and
+                # then it names every conjunct, so the stranded
+                # shape (registered-but-keyless included) reaches
+                # the desk diagnosed, never as a bare collision.
+                proof = await _prove_already_running(agent, sd, uname)
+                report["already_running_check"] = proof
+                if proof.get("proven"):
+                    already = proof
+                    last_exc = None
+                    break
+                if attempt + 1 < 5:
+                    last_exc = exc
+                    report.setdefault("start_retries", []).append(
+                        f"attempt {attempt + 1}: collision proof "
+                        f"not yet proven: {json.dumps({k: proof.get(k) for k in ('holder_alive', 'identity_present', 'presence_online', 'directory_finds_me', 'recovery_present')})}")
+                    await _aio.sleep(min(30, 2 * (2 ** attempt)))
+                    try:
+                        await agent.close()
+                    except Exception:
+                        pass
+                    continue
+                raise InstanceCollision(
+                    f"{exc} — already-running proof failed: "
+                    f"{json.dumps({k: proof.get(k) for k in ('holder_alive', 'identity_present', 'presence_online', 'directory_finds_me', 'recovery_present')})}"
+                ) from exc
             except RegistrationFailed:
                 raise
             except ConnectionError as exc:
@@ -248,74 +543,106 @@ async def run_setup(username: str, state_dir: str | None = None,
         if last_exc is not None:
             raise last_exc
         report["registered"] = True
-        report["recovery_file"] = agent.recovery_file
-        report["recovery_present"] = bool(
-            agent.recovery_file and Path(agent.recovery_file).exists())
-
-        # 4 — capabilities, probed then published.
-        caps = _probe_capabilities(sd, report["network"])
-        try:
-            await agent.update_capabilities(caps)
-            report["capabilities"] = caps
-        except Exception as exc:
-            report["capabilities"] = caps
-            report["capabilities_error"] = str(exc)[:200]
-
-        # 5 — the one-time full admin grant, asked agent-side.
-        if grant == "skip":
-            report["grant"] = {"status": "skipped"}
+        if already is not None:
+            # Through the running instance (2.2.3): capabilities
+            # and the grant are the DAEMON's to publish and to
+            # ask — a rival process neither re-publishes nor
+            # re-asks. The report carries what was measured
+            # through the daemon, in the same fields the live
+            # path fills, so the ok conjuncts below mean the
+            # same thing on both paths.
+            report["already_registered"] = True
+            report["already_running"] = True
+            report["running_instance"] = {
+                "pid": (already.get("holder") or {}).get("pid"),
+                "since": (already.get("holder") or {}).get("since")}
+            report["recovery_file"] = already.get("recovery_file")
+            report["recovery_present"] = bool(
+                already.get("recovery_present"))
+            report["capabilities"] = already.get("capabilities") or []
+            report["grant"] = {"status": "already_running",
+                               "detail": already.get("grant")}
+            report["verify"] = {
+                "presence": already.get("presence"),
+                "presence_online": bool(already.get("presence_online")),
+                "directory_finds_me": bool(
+                    already.get("directory_finds_me")),
+                "directory_matches": already.get(
+                    "directory_matches") or [],
+                "via": "running instance (control channel + doorbell)"}
         else:
-            req = await agent.request_permission(GRANT_REASON)
-            report["grant"] = {"status": "asked",
-                               "request": req.get("id")
-                               or (req if isinstance(req, dict)
-                                   else None)}
-            if grant == "allow":
-                out = await agent.allow_permission("setup-owner")
-                report["grant"] = {
-                    "status": "allowed" if isinstance(out, dict)
-                    and out.get("grant") else "allow_failed",
-                    "detail": out}
-            elif grant == "decline":
-                # The owner's no, recorded the same agent-side
-                # way: the pending request is cleared locally and
-                # the report carries the outcome. The agent can
-                # still message; it cannot act via connectors.
-                agent._clear_permission_request()
-                report["grant"] = {"status": "declined"}
+            report["recovery_file"] = agent.recovery_file
+            report["recovery_present"] = bool(
+                agent.recovery_file
+                and Path(agent.recovery_file).exists())
 
-        # 6a — self-verification while this instance is live:
-        # presence on the beat + directory finds me, any case.
-        verify: dict = {}
-        try:
-            import asyncio as _asyncio
-            presence = await _asyncio.to_thread(
-                agent._v2.doorbell.read_presence, uname)
-            verify["presence"] = presence
-            verify["presence_online"] = bool(
-                presence and presence.get("state") == "online")
-        except Exception as exc:
-            verify["presence_error"] = str(exc)[:200]
-        try:
-            found = await agent.directory(query=uname.capitalize())
-            rows = []
-            if isinstance(found, dict):
-                for key in ("agents", "users", "results", "directory"):
-                    if isinstance(found.get(key), list):
-                        rows = found[key]
-                        break
-                else:
-                    if isinstance(found.get("username"), str):
-                        rows = [found]
-            elif isinstance(found, list):
-                rows = found
-            names = [str(a.get("username") or "") for a in rows
-                     if isinstance(a, dict)]
-            verify["directory_finds_me"] = uname in names
-            verify["directory_matches"] = names
-        except Exception as exc:
-            verify["directory_error"] = str(exc)[:200]
-        report["verify"] = verify
+            # 4 — capabilities, probed then published.
+            caps = _probe_capabilities(sd, report["network"])
+            try:
+                await agent.update_capabilities(caps)
+                report["capabilities"] = caps
+            except Exception as exc:
+                report["capabilities"] = caps
+                report["capabilities_error"] = str(exc)[:200]
+
+            # 5 — the one-time full admin grant, asked agent-side.
+            if grant == "skip":
+                report["grant"] = {"status": "skipped"}
+            else:
+                req = await agent.request_permission(GRANT_REASON)
+                report["grant"] = {"status": "asked",
+                                   "request": req.get("id")
+                                   or (req if isinstance(req, dict)
+                                       else None)}
+                if grant == "allow":
+                    out = await agent.allow_permission("setup-owner")
+                    report["grant"] = {
+                        "status": "allowed" if isinstance(out, dict)
+                        and out.get("grant") else "allow_failed",
+                        "detail": out}
+                elif grant == "decline":
+                    # The owner's no, recorded the same agent-side
+                    # way: the pending request is cleared locally
+                    # and the report carries the outcome. The agent
+                    # can still message; it cannot act via
+                    # connectors.
+                    agent._clear_permission_request()
+                    report["grant"] = {"status": "declined"}
+
+            # 6a — self-verification while this instance is live:
+            # presence on the beat + directory finds me, any case.
+            verify: dict = {}
+            try:
+                import asyncio as _asyncio
+                presence = await _asyncio.to_thread(
+                    agent._v2.doorbell.read_presence, uname)
+                verify["presence"] = presence
+                verify["presence_online"] = bool(
+                    presence and presence.get("state") == "online")
+            except Exception as exc:
+                verify["presence_error"] = str(exc)[:200]
+            try:
+                found = await agent.directory(query=uname.capitalize())
+                verify["directory_finds_me"] = \
+                    uname in _directory_names(found)
+                verify["directory_matches"] = _directory_names(found)
+            except Exception as exc:
+                verify["directory_error"] = str(exc)[:200]
+            report["verify"] = verify
+    except InstanceCollision as exc:
+        # A collision that outlasted the proof budget is NOT a
+        # first-contact failure: the account demonstrably exists
+        # (its daemon holds the lock) — it is a collision with a
+        # measured diagnosis attached (the proof's conjuncts are
+        # in the message and in the report). Lodging it as a
+        # registration failure would tell the desk "this agent
+        # could not register" about an agent that IS registered
+        # — the exact falsehood the 2.2.3 fast path exists to
+        # kill. The CLI report carries the diagnosis; no ticket,
+        # no hook.
+        if report.get("already_running_check"):
+            exc.check = report["already_running_check"]  # type: ignore[attr-defined]
+        raise
     except (RegistrationFailed, ConnectionError) as exc:
         # Terminal first-contact failure: lodge once with the
         # failure data, keep the ticket on the exception so the
@@ -329,7 +656,15 @@ async def run_setup(username: str, state_dir: str | None = None,
 
     # 3 — supervision (after close: the supervisor owns the
     # daemon from here; two instances never fight over the lock).
-    if install_service:
+    # Already-running path (2.2.3): the instance is ALREADY up —
+    # installing/starting a service here would fight it for its
+    # own lock. Supervision is whatever already runs it; the
+    # report says so instead of pretending an install happened.
+    if already is not None:
+        report["service"] = {
+            "skipped": "instance already running",
+            "pid": report.get("running_instance", {}).get("pid")}
+    elif install_service:
         proc = subprocess.run(
             [sys.executable, "-m", "agentlink", "service", "install",
              "--username", uname, "--user", "--state-dir", str(sd)],
@@ -346,8 +681,16 @@ async def run_setup(username: str, state_dir: str | None = None,
         and report.get("verify", {}).get("presence_online")
         and report.get("verify", {}).get("directory_finds_me"))
     if not report["ok"]:
+        # Visibility (2.2.3): the lodged error names EVERY ok
+        # conjunct — registered and recovery_present included.
+        # The old string dumped only the verify dict, so a
+        # failure whose real cause was a missing recovery file
+        # arrived at the desk wearing all-green verify data and
+        # could not be diagnosed from the ticket (the @lean /
+        # @agent-2eb7 verify tickets, 2026-11-07).
         _auto_support(
             "verify",
             "setup completed registration but self-verification "
-            f"failed: {json.dumps(report.get('verify', {}))[:600]}")
+            "failed: "
+            f"{json.dumps({'registered': report.get('registered'), 'recovery_present': report.get('recovery_present'), 'recovery_file': report.get('recovery_file'), 'verify': report.get('verify', {})})[:900]}")
     return report
