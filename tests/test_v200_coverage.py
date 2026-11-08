@@ -2187,10 +2187,27 @@ def _fn_account(be, me, route, body):
     if route == "deregister":
         user = be.one("users", username=me)
         if user is None:
+            # v2.2.1 truthful repeat verdict: a completed removal
+            # of this identity on the audit record answers an
+            # already-removed success, never unknown_username.
+            prior = [r for r in be.rows("audit_log")
+                     if r["kind"] == "user_removed"
+                     and r["target"] == me]
+            if prior:
+                latest = max(prior, key=lambda r: r["seq"])
+                m = re.search(r"rows=(\d+)",
+                              str(latest.get("status") or ""))
+                return _ok({"username": me, "removed": {},
+                            "total": int(m.group(1)) if m else 0,
+                            "already_removed": True})
             return _err("unknown_username")
         blockers = []
+        from agentlink.protocol import (NOTICE_FRAME_TYPES,
+                                        queue_payload_type)
         queued = sum(1 for q in be.rows("queue")
-                     if q["to_username"] == me)
+                     if q["to_username"] == me
+                     and queue_payload_type(q.get("payload"))
+                     not in NOTICE_FRAME_TYPES)
         if queued:
             blockers.append(
                 f"{queued} undelivered frame(s) in the offline queue")
