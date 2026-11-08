@@ -18,6 +18,13 @@ FIXED in a version that has actually shipped:
   4. on failure it lodges a follow-up ticket linked to the
      original and keeps watching.
 
+One failure shape is not a failure (2.2.3): the retry meets
+the agent's OWN daemon already running (instance collision)
+while the agent is in fact registered and live — the proof
+in setup.already_running_proof decides, and a proven
+collision retires the hook as REGISTERED, with no follow-up
+lodged and no attempt burned.
+
 A ticket CLOSED without a fix also retires the hook (the owner
 can lodge again manually). The hook record file is the source
 of truth: every runner tolerates its disappearance, which is
@@ -334,6 +341,17 @@ class Deps:
             grant=record.get("grant", "ask"),
             install_service=True, auto_support=False))
 
+    def already_registered_running(self, record: dict) -> dict:
+        """The 2.2.3 collision proof, asked of the machine
+        itself: is this username already registered AND its
+        own daemon already running here? (setup's measured
+        conjuncts — live lock holder, identity keys, control
+        ping, presence online, directory finds it.)"""
+        from .setup import already_running_proof
+        return already_running_proof(
+            record.get("state_dir") or self.state_dir,
+            record["username"])
+
     def followup(self, record: dict, report: dict) -> dict:
         from . import support
         return support.lodge(
@@ -409,6 +427,28 @@ def cycle(record: dict, deps: Deps) -> str:
                  "setup succeeded after the fix — registered; "
                  "hook retiring")
             deps.cleanup(record, "registered after fix")
+            return "registered"
+        # Already-registered collision guard (2.2.3): a retry
+        # that meets the agent's OWN running daemon has not
+        # failed — the agent is registered and live, and the
+        # collision was setup (pre-2.2.3) mistaking that daemon
+        # for a rival. When the measured proof says registered
+        # + running, retire as success: no attempt burned, no
+        # follow-up lodged. (@lean's loop, 2026-11-07/08: the
+        # hook re-ran setup against its own daemon, collided,
+        # and auto-lodged a fresh ticket for a working agent.)
+        try:
+            proof = deps.already_registered_running(record)
+        except Exception:
+            proof = None
+        if proof and proof.get("proven"):
+            _log(sd, record["ticket_id"],
+                 "setup retry met this agent's own running "
+                 "daemon — already registered and live "
+                 f"(recovery_present={proof.get('recovery_present')})"
+                 "; hook retiring as registered")
+            deps.cleanup(
+                record, "registered after fix (already running)")
             return "registered"
         record["attempts"] = int(record.get("attempts") or 0) + 1
         if record["attempts"] > MAX_SETUP_ATTEMPTS:
