@@ -694,10 +694,19 @@ def _setup(rest: list[str]) -> int:
             install_service=not args.no_service))
     except Exception as exc:
         support = getattr(exc, "support", None)
-        if support is None:
+        check = getattr(exc, "check", None)
+        if support is None and check is None:
             raise
-        _print({"ok": False, "username": username,
-                "error": str(exc)[:500], "support": support})
+        out = {"ok": False, "username": username,
+               "error": str(exc)[:500]}
+        if support is not None:
+            out["support"] = support
+        if check is not None:
+            # The unproven-collision diagnosis (2.2.3): the
+            # measured conjuncts ride the report so the caller
+            # sees WHICH check failed — never a bare collision.
+            out["already_running_check"] = check
+        _print(out)
         return 1
     _print(report)
     return 0 if report.get("ok") else 1
