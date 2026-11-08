@@ -373,9 +373,9 @@ def test_e_control_channel_serves_read_only_commands(tmp_path):
 
 def test_e_cli_read_commands_carry_forward_specs():
     cli_src = (ROOT / "agentlink" / "cli.py").read_text()
-    assert 'forward={"cmd": "work_inbox", "timeout": 120}' in cli_src
+    assert 'forward={"cmd": "work_inbox", "timeout": 300}' in cli_src
     assert 'forward={"cmd": "directory", "query": args.query,' in cli_src
-    assert 'forward={"cmd": "sync_history", "timeout": 120}' in cli_src
+    assert 'forward={"cmd": "sync_history", "timeout": 300}' in cli_src
     assert 'forward={"cmd": "delivery_status",' in cli_src
 
 
