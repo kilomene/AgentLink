@@ -37,6 +37,7 @@ import gzip
 import hashlib
 import json
 import logging
+import re
 import secrets as _secrets
 import socket
 import ssl
@@ -46,7 +47,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .protocol import new_id, new_secret, now_ts
+from .protocol import (NOTICE_FRAME_TYPES, new_id, new_secret, now_ts,
+                       queue_payload_type)
 from .store import CONTENT_AUDIT_KINDS, ROOM_AUDIT_KINDS, DEFAULT_SETTINGS, MAX_GROUP_MEMBERS, GroupFull, NotFound, UsernameTaken
 from .store import NON_TERMINAL_WORK_STATUSES, RemovalBlocked
 from .store import carry_claim_blocked
@@ -1597,8 +1599,18 @@ class SupabaseStore:
 
     def removal_blockers(self, username):
         blockers = []
-        n = len(self._get("queue", self._eq("to_username", username)
-                          + "&select=seq"))
+        # Only CONTENT frames block (v2.2.1, parity with
+        # Store.removal_blockers): notice-class frames report state
+        # persisted in its own tables, so a notice stranded by a
+        # lost ack never strands the account — the cascade voids
+        # it with the rest of the queue. Undecodable payloads count
+        # as content (fail-closed).
+        n = 0
+        for row in self._get("queue", self._eq("to_username", username)
+                             + "&select=payload"):
+            if (queue_payload_type(row.get("payload"))
+                    not in NOTICE_FRAME_TYPES):
+                n += 1
         if n:
             blockers.append(
                 f"{n} undelivered frame(s) in the offline queue")
@@ -1671,10 +1683,31 @@ class SupabaseStore:
                 + ")")
         return n
 
+    def _prior_removal_result(self, username):
+        """Parity with Store._prior_removal_result (v2.2.1): the
+        recorded outcome of a completed removal of this identity,
+        or None when the platform has never removed it."""
+        rows = self._get(
+            "audit_log",
+            self._eq("target", username)
+            + "&kind=eq.user_removed&select=status&order=seq.desc"
+            + "&limit=1")
+        if not rows:
+            return None
+        m = re.search(r"rows=(\d+)", str(rows[0].get("status") or ""))
+        return {"username": username, "removed": {},
+                "total": int(m.group(1)) if m else 0,
+                "already_removed": True}
+
     def remove_user(self, username, *, force=False, actor="",
                     via="self"):
-        """Parity with Store.remove_user — see store.py."""
+        """Parity with Store.remove_user — see store.py. A repeat
+        of a completed removal returns its recorded outcome with
+        ``already_removed`` set (v2.2.1) instead of NotFound."""
         if not self.exists(username):
+            prior = self._prior_removal_result(username)
+            if prior is not None:
+                return prior
             raise NotFound(username)
         blockers = [] if force else self.removal_blockers(username)
         if blockers:
