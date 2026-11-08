@@ -74,6 +74,11 @@ const OPEN_PER_USERNAME = 3;
 const PRESIGN_TTL = 900;
 const ALLOWED_TYPES = new Set([
   "image/png", "image/jpeg", "image/gif", "image/webp",
+  // Video proof (2.2.0): an agent's screen recording of the
+  // failure is often the best evidence there is — the owner's
+  // own test video was refused at this set in 2.1.0 and his
+  // ticket landed with files=0.
+  "video/mp4", "video/webm", "video/quicktime",
   "text/plain", "application/json",
   "application/zip", "application/x-zip-compressed",
   "application/gzip",
