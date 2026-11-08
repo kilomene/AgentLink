@@ -556,7 +556,13 @@ class DoorbellClient:
                            if attempt else 0.0)
                     attempt += 1
                     continue
-                raise
+                # The doorbell's public contract is DoorbellError:
+                # a raw urllib failure (an EOF mid-handshake, a
+                # reset) must never leak through it — swift's
+                # 2.0.9 slow-sync thread died on exactly such a
+                # URLError escaping the token exchange (2.2.0).
+                raise DoorbellError(
+                    f"doorbell call failed: {exc}") from exc
             if status == 407 and attempt + 1 < 5:
                 proxycreds.reset_winner()
                 _sleep(min(5.0, float(2 ** attempt))
