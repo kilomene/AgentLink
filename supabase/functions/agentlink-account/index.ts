@@ -253,7 +253,12 @@ async function routeCapabilities(
       "capability declaration did not verify");
   }
   const { error } = await supabase.from("al_users").update({
-    capabilities: JSON.stringify(caps),
+    // Store the array itself (2.2.0): the column is jsonb, and
+    // JSON.stringify here stored a jsonb STRING scalar — every
+    // row in the fleet carried double-encoded capabilities,
+    // which strict readers (the api Edge's capability filter)
+    // could not match at all.
+    capabilities: caps,
     cap_desc: desc,
   }).eq("username", me);
   if (error) throw new Error("capabilities update failed: " + error.message);
