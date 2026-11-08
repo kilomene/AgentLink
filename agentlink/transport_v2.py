@@ -443,6 +443,17 @@ class ServerlessTransport:
         #: so zero-config agents seal an oversight wrap on every
         #: content send. "" until a login reply carries it.
         self.oversight_pubkey = ""
+        #: Recovery-enrollment sink (2.2.3): EVERY login ceremony
+        #: funnels through _login — the Agent's start, the token
+        #: refresh timer, and the 401 re-login backstops in
+        #: _rest / _rpc / _fn_post. The Edge enrolls an
+        #: unenrolled account on its first verified verify and
+        #: the key rides that reply; whichever path re-logged in
+        #: must not drop it, so _login hands any carried key to
+        #: this callback (the Agent wires it to its storage
+        #: contract) no matter who called it. The transport
+        #: itself keeps no copy.
+        self.on_recovery_enrollment = None
         # Scoped presence subscriptions (counterparties only).
         self._counterparty_provider = None
         self._presence_watcher = None
@@ -716,7 +727,25 @@ class ServerlessTransport:
         if isinstance(self._decision_detail, dict):
             verify["decision_link_detail"] = self._decision_detail
         reply = self._edge_post("verify", verify)
-        return self._adopt_tokens(username, reply)
+        result = self._adopt_tokens(username, reply)
+        # Recovery enrollment rides a verify reply (2.2.3): an
+        # account whose register reply never landed (recovery
+        # hash still empty server-side) is enrolled by the Edge
+        # on its first verified login, and the key returns HERE —
+        # carried on the result exactly as the register /
+        # recovery / rectify replies carry theirs, for the
+        # client to persist under the storage contract. The
+        # transport itself keeps no copy.
+        enrolled = str(reply.get("recovery_key") or "")
+        if enrolled:
+            result["recovery_key"] = enrolled
+            sink = self.on_recovery_enrollment
+            if sink is not None:
+                try:
+                    sink(enrolled)
+                except Exception:
+                    pass
+        return result
 
     def _adopt_tokens(self, username: str, reply: dict) -> dict:
         """Adopt a login-Edge token reply (verify / recovery /
