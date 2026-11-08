@@ -56,6 +56,33 @@ const NON_TERMINAL_WORK_STATUSES = [
   "awaiting_approval", "awaiting_agent",
 ];
 
+// Notice-class frame types (v2.2.1) — protocol.NOTICE_FRAME_TYPES,
+// pinned against the Python ports by test. A notice merely REPORTS
+// state persisted in its own tables (a work_update mirrors its
+// al_work row; a read_receipt mirrors al_message_reads), so it
+// carries no unique content: a notice stranded in the offline
+// queue by a lost ack must never block a deregistration — the
+// removal cascade voids it with the rest of the queue. Content
+// frames still block, and an undecodable payload counts as
+// CONTENT (fail-closed), never as a notice.
+const NOTICE_FRAME_TYPES = new Set(["work_update", "read_receipt"]);
+
+function queuePayloadType(payload: unknown): string {
+  let frame: unknown = payload;
+  if (typeof frame === "string") {
+    try {
+      frame = JSON.parse(frame);
+    } catch {
+      return "";
+    }
+  }
+  if (frame && typeof frame === "object") {
+    const t = (frame as Record<string, unknown>).type;
+    return typeof t === "string" ? t : "";
+  }
+  return "";
+}
+
 async function selectEq(
   table: string,
   match: Record<string, unknown>,
@@ -281,8 +308,21 @@ async function countWhere(
 
 async function removalBlockers(me: string): Promise<string[]> {
   const blockers: string[] = [];
-  const queued = await countWhere("al_queue",
-    (q: any) => q.eq("to_username", me));
+  // Only CONTENT frames block (v2.2.1): the queue count that used
+  // to refuse a deregistration counted every custody row, so a
+  // stranded notice (work_update / read_receipt — state reports
+  // with no unique content) could strand the account's lifecycle
+  // forever. Notices are excluded here and voided by the cascade's
+  // queue delete; content frames block exactly as before.
+  const { data: qrows, error: qerr } = await supabase
+    .from("al_queue").select("payload").eq("to_username", me);
+  if (qerr) throw new Error("al_queue count failed: " + qerr.message);
+  let queued = 0;
+  for (const r of (qrows ?? []) as Record<string, unknown>[]) {
+    if (!NOTICE_FRAME_TYPES.has(queuePayloadType(r.payload))) {
+      queued++;
+    }
+  }
   if (queued) {
     blockers.push(`${queued} undelivered frame(s) in the offline queue`);
   }
@@ -340,7 +380,33 @@ async function routeDeregister(
 ): Promise<Response> {
   const userRow = await oneEq("al_users", { username: me },
     "username");
-  if (!userRow) return refuse("unknown_username");
+  if (!userRow) {
+    // Truthful repeat verdict (v2.2.1): a deregistration whose
+    // first execution committed but whose response was lost in
+    // transit (the egress proxy's clipped/reset windows) is
+    // retried by the hardened client, and the retry meets this
+    // missing row. Refusing 'unknown_username' there reported a
+    // SUCCESSFUL removal as a failure (2 of 4 drills in the 2.2.0
+    // cleanup). The audit log is the server truth: when it
+    // carries a completed removal of this exact identity, report
+    // that outcome — already removed, with the row count the
+    // first execution recorded. No record: the identity is
+    // genuinely unknown, refused BEFORE any delete attempt,
+    // exactly as before.
+    const { data: prior } = await supabase.from("al_audit_log")
+      .select("status").eq("kind", "user_removed").eq("target", me)
+      .order("seq", { ascending: false }).limit(1);
+    if ((prior ?? []).length) {
+      const status = String(
+        (prior as Record<string, unknown>[])[0].status ?? "");
+      const m = /rows=(\d+)/.exec(status);
+      return jsonResponse({
+        ok: true, username: me, removed: {},
+        total: m ? Number(m[1]) : 0, already_removed: true,
+      });
+    }
+    return refuse("unknown_username");
+  }
   const blockers = await removalBlockers(me);
   if (blockers.length) {
     return refuse("deregister_blocked", blockers.join("; "));
