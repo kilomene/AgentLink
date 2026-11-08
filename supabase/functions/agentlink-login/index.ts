@@ -6,6 +6,18 @@
 //     -> {nonce, exp, relay, expires_in}
 //   POST {method:"verify", username, nonce, exp, signature}
 //     -> {supabase_jwt, firebase_token, expires_in}
+//     A verify against an account whose recovery_hash is EMPTY
+//     (its register reply never landed — the egress proxy on
+//     this fleet's home VM clips large responses, so the minted
+//     key can die on the wire after the account row is born)
+//     ENROLLS the account in the same step: a fresh key is
+//     minted, its hash stored, and the key rides THIS reply —
+//     exactly the v1 relay's enrollment-on-first-verified-hello
+//     (relay.py, pinned by tests/test_recovery_key.py pin 2).
+//     The signature above already proved these are the
+//     account's own keys, so the key goes only to its owner.
+//     Enrolled accounts (non-empty hash) get no key here, ever:
+//     a later login can never rotate or re-issue one.
 //   POST {method:"recovery", username, recovery_key,
 //         new_sign_pub, new_pubkey}
 //     -> {supabase_jwt, firebase_token, expires_in, recovery_key}
@@ -241,9 +253,10 @@ Deno.serve(async (req: Request) => {
       // The challenge's own expiry, checked before verification,
       // exactly as the relay checks it.
       if (exp <= now || exp > now + CHALLENGE_TTL_SECONDS + 5) return fail();
-      const row = await selectOne(supabase, "al_users", "sign_pub", {
-        username,
-      });
+      const row = await selectOne(supabase, "al_users",
+        "sign_pub, recovery_hash", {
+          username,
+        });
       const signPub = String(row?.sign_pub ?? "");
       if (!signPub) return fail();
       const expectedNonce = await challengeNonce(username, signPub, exp);
@@ -301,7 +314,27 @@ Deno.serve(async (req: Request) => {
           });
         }
       }
-      return jsonResponse(await issueTokens(username));
+      const tokens = await issueTokens(username);
+      // Recovery enrollment (2.2.3): an account with an EMPTY
+      // recovery hash never received the key its register
+      // minted (the reply was clipped in transit — the account
+      // exists, is fully usable by key login, and is silently
+      // stranded: no recovery path, and no rectify needed
+      // either, since its keys never diverged). The verified
+      // signature above IS the account's owner proving itself,
+      // so mint + enroll + return the key ONCE here, mirroring
+      // the v1 relay's first-verified-hello enrollment. A
+      // non-empty hash means enrolled: no key is minted, none
+      // rotates, none is re-issued — a stolen session can never
+      // harvest a fresh login-back credential from a login.
+      if (!String(row?.recovery_hash ?? "")) {
+        const enrollKey = randomTokenUrlSafe(32);
+        await patchRows(supabase, "al_users", { username }, {
+          recovery_hash: await sha256Hex(enrollKey),
+        });
+        return jsonResponse({ ...tokens, recovery_key: enrollKey });
+      }
+      return jsonResponse(tokens);
     }
 
     // ------------------------------------------------- recovery
