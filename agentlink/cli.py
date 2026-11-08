@@ -68,7 +68,13 @@ async def _with_agent(args, fn, forward=None):
                 # longer — a history sync or a busy work inbox
                 # over a degraded network legitimately takes
                 # longer than 20s to answer, and timing it out
-                # would report a healthy daemon as wedged.
+                # would report a healthy daemon as wedged. 2.2.0:
+                # the read budget is 300s — one hardened network
+                # call riding out a proxy stall window can take
+                # ~160s by design (5 attempts x 30s stalls), so
+                # the old 120s budget cried "wedged" at healthy
+                # daemons in bad weather (phoenix's work inbox,
+                # 2026-11-07, daemon heartbeating throughout).
                 result = await forward_command(
                     _state_dir(args), _username(args), forward,
                     timeout=float(forward.get("timeout") or 20.0))
@@ -463,7 +469,7 @@ def main(argv: list[str] | None = None) -> int:
         _print(asyncio.run(_with_agent(
             args, lambda a: a.directory(args.query, args.capability),
             forward={"cmd": "directory", "query": args.query,
-                     "timeout": 120})))
+                     "timeout": 300})))
         return 0
 
     if cmd == "send":
@@ -722,7 +728,7 @@ def _delivery(rest: list[str]) -> int:
     _print(asyncio.run(_with_agent(
         args, lambda a: a.delivery_status(args.message_id),
         forward={"cmd": "delivery_status",
-                 "message_id": args.message_id, "timeout": 120})))
+                 "message_id": args.message_id, "timeout": 300})))
     return 0
 
 
@@ -740,7 +746,7 @@ def _sync(rest: list[str]) -> int:
     async def _go(a):
         return a.mailbox_sync or await a.sync_history()
     _print(asyncio.run(_with_agent(args, _go,
-                                   forward={"cmd": "sync_history", "timeout": 120})))
+                                   forward={"cmd": "sync_history", "timeout": 300})))
     return 0
 
 
@@ -1340,7 +1346,14 @@ def _service(rest: list[str]) -> int:
             "After=network-online.target\nWants=network-online.target\n\n"
             "[Service]\nType=simple\n"
             f"ExecStart={exec_start}\n"
-            "Restart=always\nRestartSec=1\n\n"
+            "Restart=always\nRestartSec=1\n"
+            # Frozen-but-alive coverage (2.2.0): Restart=always
+            # only sees a DEAD process. The daemon pats systemd's
+            # watchdog from the same 5s stamp loop that writes
+            # its heartbeat stamp (client._sd_notify_watchdog);
+            # a frozen loop stops patting, and systemd restarts
+            # the unit — a hang is handled exactly like a crash.
+            "WatchdogSec=30\nNotifyAccess=main\n\n"
             "[Install]\nWantedBy="
             + ("default.target" if args.user else "multi-user.target") + "\n")
         if args.user:
@@ -1396,11 +1409,11 @@ def _service(rest: list[str]) -> int:
                 except Exception as exc:
                     result["systemd_error"] = str(exc)[:300]
             if result["supervision"] is None:
-                # Fallback: a relaunch loop under the cron
-                # watchdog's care (@reboot start + per-minute
-                # liveness below). Honest second class: it
-                # restarts on death and starts on boot, without
-                # systemd.
+                # Fallback: a relaunch loop that carries its
+                # own watchdog ticker (2.2.0 — @reboot start via
+                # the cron block below when cron exists).
+                # Honest second class: it restarts on death AND
+                # on freeze, and starts on boot, without systemd.
                 try:
                     home = Path("~/.agentlink").expanduser()
                     home.mkdir(parents=True, exist_ok=True)
@@ -1408,7 +1421,16 @@ def _service(rest: list[str]) -> int:
                     sup.write_text(
                         "#!/bin/sh\n"
                         "# AgentLink fallback supervisor (no systemd):\n"
-                        "# relaunch the agent forever.\n"
+                        "# relaunch the agent forever. The background\n"
+                        "# ticker (2.2.0) is the hang watchdog's clock\n"
+                        "# on hosts with no cron: every 30s it runs\n"
+                        "# watchdog.sh, which kills a daemon whose\n"
+                        "# heartbeat stamp went stale — the relaunch\n"
+                        "# loop below then restarts it exactly like a\n"
+                        "# crash.\n"
+                        "( while true; do sleep 30; /bin/sh "
+                        f"\"{home}/watchdog.sh\" >/dev/null 2>&1; "
+                        "done ) &\n"
                         "while true; do\n"
                         f"  {exec_start} >>"
                         f"{home}/agent-supervised.log 2>&1\n"
@@ -1442,27 +1464,75 @@ def _service(rest: list[str]) -> int:
             import subprocess as _sp
             home = Path("~/.agentlink").expanduser()
             home.mkdir(parents=True, exist_ok=True)
-            (home / "watchdog.sh").write_text(
+            # The watchdog (2.2.0 form): stamped for THIS agent
+            # and THIS state dir — the old script globbed the
+            # first heartbeat-*.txt in ~/.agentlink and could
+            # only restart a systemd unit, so a frozen daemon
+            # under the fallback supervisor (or on a host whose
+            # state dir is not ~/.agentlink) was never killed,
+            # and a stopped unit was restarted every minute
+            # whether its owner wanted it or not. Now: a stale
+            # stamp + a LIVE lock pid = a frozen daemon; kill it
+            # and let its supervisor relaunch. systemd keeps its
+            # own restart when it manages the unit (its
+            # WatchdogSec is the primary net there anyway).
+            _sd_path = Path(
+                args.state_dir or DEFAULT_STATE_DIR).expanduser()
+            _watchdog = (
                 "#!/bin/sh\n"
-                "# AgentLink watchdog: HANG = DEATH (point 39d). A stale\n"
-                "# heartbeat stamp (>20s) means the loop is frozen; the\n"
-                "# process is killed and restarted exactly like a crash.\n"
-                "STAMP=$(ls ~/.agentlink/heartbeat-*.txt 2>/dev/null"
-                " | head -1)\n"
-                "if [ -n \"$STAMP\" ]; then\n"
-                "  NOW=$(date +%s); TS=$(cat \"$STAMP\" 2>/dev/null"
-                " || echo 0)\n"
-                "  if [ $((NOW - TS)) -gt 20 ]; then\n"
-                "    systemctl --user restart agentlink-agent 2>/dev/null"
-                " || systemctl restart agentlink-agent 2>/dev/null"
-                " || true\n"
+                "# AgentLink watchdog: HANG = DEATH (point 39d).\n"
+                "# The daemon stamps its heartbeat file every 5s\n"
+                "# from the loop that serves traffic; a stamp\n"
+                "# older than 20s means that loop is frozen.\n"
+                f"STAMP=\"{_sd_path}/heartbeat-{uname}.txt\"\n"
+                f"LOCK=\"{_sd_path}/instance-{uname}.lock\"\n"
+                "NOW=$(date +%s)\n"
+                "TS=$(cat \"$STAMP\" 2>/dev/null || echo 0)\n"
+                "case \"$TS\" in *[!0-9]*|\"\") TS=0 ;; esac\n"
+                "[ $((NOW - TS)) -le 20 ] && exit 0\n"
+                "# Startup allowance: a daemon that has never\n"
+                "# stamped under this lock is still logging in\n"
+                "# (first login on a slow network outlasts any\n"
+                "# tight grace — this release's drill VM measured\n"
+                "# ~75s); it gets 120s from lock time before the\n"
+                "# stale-stamp rule may fire. A daemon that HAS\n"
+                "# stamped and then froze gets no such shelter.\n"
+                "LMT=$(stat -c %Y \"$LOCK\" 2>/dev/null || echo 0)\n"
+                "case \"$LMT\" in *[!0-9]*|\"\") LMT=0 ;; esac\n"
+                "SMT=$(stat -c %Y \"$STAMP\" 2>/dev/null || echo 0)\n"
+                "case \"$SMT\" in *[!0-9]*|\"\") SMT=0 ;; esac\n"
+                "if [ \"$LMT\" -gt 0 ] && [ \"$SMT\" -lt \"$LMT\" ]"
+                " && [ $((NOW - LMT)) -lt 120 ]; then exit 0; fi\n"
+                "if [ \"$LMT\" -gt 0 ] && "
+                "[ $((NOW - LMT)) -lt 30 ]; then exit 0; fi\n"
+                "# systemd manages the unit: its restart keeps\n"
+                "# the unit state truthful (WatchdogSec usually\n"
+                "# fires first; this is the second net).\n"
+                "if command -v systemctl >/dev/null 2>&1; then\n"
+                "  if systemctl --user is-active --quiet"
+                " agentlink-agent 2>/dev/null || systemctl"
+                " is-active --quiet agentlink-agent 2>/dev/null;"
+                " then\n"
+                "    systemctl --user restart agentlink-agent"
+                " 2>/dev/null || systemctl restart"
+                " agentlink-agent 2>/dev/null || true\n"
                 "    exit 0\n"
                 "  fi\n"
                 "fi\n"
-                "systemctl --user is-active --quiet agentlink-agent"
-                " 2>/dev/null || systemctl --user restart agentlink-agent"
-                " 2>/dev/null || systemctl restart agentlink-agent"
-                " 2>/dev/null || true\n")
+                "# Kill the frozen lock holder; its supervisor\n"
+                "# (the supervisor loop, or systemd) relaunches a\n"
+                "# dead daemon. No live pid: nothing to kill —\n"
+                "# starting is the supervisor's job, not ours.\n"
+                "PID=$(sed -n 's/.*\"pid\": *\\([0-9][0-9]*\\).*"
+                "/\\1/p' \"$LOCK\" 2>/dev/null | head -1)\n"
+                "case \"$PID\" in *[!0-9]*|\"\") exit 0 ;; esac\n"
+                "kill -0 \"$PID\" 2>/dev/null || exit 0\n"
+                "kill -TERM \"$PID\" 2>/dev/null || exit 0\n"
+                "sleep 5\n"
+                "kill -0 \"$PID\" 2>/dev/null && "
+                "kill -KILL \"$PID\" 2>/dev/null\n"
+                "exit 0\n")
+            (home / "watchdog.sh").write_text(_watchdog)
             try:
                 (home / "watchdog.sh").chmod(0o755)
             except OSError:
@@ -1493,16 +1563,21 @@ def _service(rest: list[str]) -> int:
             else:
                 result["cron"] = (
                     "no crontab binary on this host — the cron"
-                    " safety net was skipped, and the ONLY thing lost"
-                    " is the per-minute hang watchdog (it inherently"
-                    " needs an external ticker: cron or a supervisor"
-                    " of your own). Self-update is NOT affected: it"
-                    " runs in-daemon (see self_update)")
+                    " safety net was skipped. Hang coverage does"
+                    " NOT depend on it (2.2.0): under systemd the"
+                    " unit's WatchdogSec restarts a frozen daemon;"
+                    " under the fallback supervisor the loop's"
+                    " 30-second ticker runs watchdog.sh itself."
+                    " Self-update is NOT affected either: it runs"
+                    " in-daemon (see self_update)")
                 print("NOTE: no crontab binary on this host — the"
-                      " cron safety net (per-minute hang watchdog)"
-                      " was skipped. Self-update does not depend on"
-                      " it: the agent daemon checks for updates"
-                      " itself every 15 minutes.", flush=True)
+                      " cron safety net was skipped. Hang coverage"
+                      " does not depend on it (2.2.0): systemd"
+                      " units carry WatchdogSec, and the fallback"
+                      " supervisor ticks the watchdog itself."
+                      " Self-update does not depend on it either:"
+                      " the agent daemon checks for updates itself"
+                      " every 15 minutes.", flush=True)
         except Exception as exc:
             result["cron"] = f"skipped: {exc}"
         _print(result)
@@ -1677,7 +1752,16 @@ def _assign(rest: list[str]) -> int:
             group_id=args.group_id, attachments=args.attachments,
             deadline=args.deadline, priority=args.priority,
             require_approval=args.require_approval)
-    _print(asyncio.run(_with_agent(args, _go)))
+    _print(asyncio.run(_with_agent(
+        args, _go,
+        forward={"cmd": "work_assign", "assignees": assignees,
+                 "title": args.title,
+                 "instructions": args.instructions,
+                 "group_id": args.group_id,
+                 "attachments": args.attachments,
+                 "deadline": args.deadline,
+                 "priority": args.priority, "role": args.role,
+                 "require_approval": args.require_approval})))
     return 0
 
 
@@ -1689,7 +1773,10 @@ def _deliver(rest: list[str]) -> int:
     ap.add_argument("body", nargs="?", default="")
     args = ap.parse_args(rest)
     _print(asyncio.run(_with_agent(
-        args, lambda a: a.deliver_work(args.work_id, args.body, args.files))))
+        args, lambda a: a.deliver_work(args.work_id, args.body,
+                                       args.files),
+        forward={"cmd": "work_deliver", "work_id": args.work_id,
+                 "body": args.body, "files": args.files})))
     return 0
 
 
@@ -1704,7 +1791,7 @@ def _work(rest: list[str]) -> int:
         args = ap.parse_args(r)
         _print(asyncio.run(_with_agent(
             args, lambda a: a.work_inbox(args.status, args.group_id),
-            forward={"cmd": "work_inbox", "timeout": 120})))
+            forward={"cmd": "work_inbox", "timeout": 300})))
         return 0
     if sub == "progress":
         ap = argparse.ArgumentParser(prog="agentlink work progress")
@@ -1714,8 +1801,12 @@ def _work(rest: list[str]) -> int:
         ap.add_argument("note", nargs="?", default="")
         args = ap.parse_args(r)
         _print(asyncio.run(_with_agent(
-            args, lambda a: a.report_progress(args.work_id, args.percent,
-                                              args.note))))
+            args, lambda a: a.report_progress(args.work_id,
+                                              args.percent,
+                                              args.note),
+            forward={"cmd": "work_progress",
+                     "work_id": args.work_id,
+                     "percent": args.percent, "note": args.note})))
         return 0
     if sub in ("complete", "request-changes", "approve", "reject"):
         ap = argparse.ArgumentParser(prog=f"agentlink work {sub}")
@@ -1731,7 +1822,10 @@ def _work(rest: list[str]) -> int:
                                                   args.note),
               "reject": lambda a: a.reject_work(args.work_id,
                                                 args.note)}[sub]
-        _print(asyncio.run(_with_agent(args, fn)))
+        _print(asyncio.run(_with_agent(
+            args, fn,
+            forward={"cmd": "work_" + sub.replace("-", "_"),
+                     "work_id": args.work_id, "note": args.note})))
         return 0
     print(f"unknown work command {sub!r}", file=sys.stderr)
     return 2
@@ -1803,7 +1897,7 @@ def _chain(rest: list[str]) -> int:
         args = ap.parse_args(r)
         _print(asyncio.run(_with_agent(
             args, lambda a: a.chain_list(),
-            forward={"cmd": "chain_list", "timeout": 120})))
+            forward={"cmd": "chain_list", "timeout": 300})))
         return 0
     if sub in ("get", "cancel"):
         ap.add_argument("chain_id")
