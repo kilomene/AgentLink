@@ -126,6 +126,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import mimetypes
 import re
 import secrets
@@ -136,6 +137,38 @@ from pathlib import Path
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,30}$")
 
 MAX_FRAME = 2**26  # 64 MiB websocket frames (files ride base64 inline)
+
+#: Notice-class frame types (v2.2.1). A notice merely REPORTS state
+#: that is independently persisted elsewhere — a work_update mirrors
+#: its al_work row, a read_receipt mirrors the al_message_reads row —
+#: so a notice carries no unique content and no data-loss risk. The
+#: one place the distinction is load-bearing is the deregistration
+#: blocker check: content frames in the offline queue still refuse
+#: a self-deregistration (their content exists nowhere else), but a
+#: notice stranded in the queue by a lost ack must never strand the
+#: account's lifecycle — the removal cascade voids it with the rest
+#: of the queue. Every port of the removal contract (SQLite store,
+#: Supabase store, the account Edge) classifies by THIS set; the
+#: Edge's TypeScript copy is pinned against it by test.
+NOTICE_FRAME_TYPES = frozenset({"work_update", "read_receipt"})
+
+
+def queue_payload_type(payload: object) -> str:
+    """The frame type of one offline-queue payload, or "" when the
+    payload does not decode to a frame. Queue rows store the frame
+    as a JSON string; tolerate an already-decoded dict too. An
+    undecodable payload yields "" — callers treat it as CONTENT
+    (fail-closed: unknown shape blocks, it never slips through as
+    a notice)."""
+    frame = payload
+    if isinstance(frame, str):
+        try:
+            frame = json.loads(frame)
+        except Exception:
+            return ""
+    if isinstance(frame, dict):
+        return str(frame.get("type") or "")
+    return ""
 
 _IMAGE = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 _VIDEO = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
