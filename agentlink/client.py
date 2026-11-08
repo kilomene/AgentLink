@@ -385,6 +385,56 @@ def parse_mentions(body: str) -> list[str]:
     return out
 
 
+def _sd_notify_watchdog() -> None:
+    """One systemd watchdog pat (2.2.0), from the stamp loops.
+
+    When the daemon runs under a systemd unit with WatchdogSec
+    (the `service install` template sets 30s), systemd restarts
+    a unit that stops patting — the frozen-but-alive case that
+    Restart=always cannot see. The stamp loops call this beside
+    every heartbeat-stamp write, so a frozen event loop stops
+    patting at exactly the moment its stamp goes stale: the two
+    supervision nets (systemd's watchdog, the host watchdog.sh)
+    read the same liveness truth. No NOTIFY_SOCKET (every
+    non-systemd run) → no-op. Never raises."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    try:
+        import socket as _socket
+        if addr.startswith("@"):
+            addr = "\0" + addr[1:]
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_DGRAM)
+        try:
+            sock.sendto(b"WATCHDOG=1", addr)
+        finally:
+            sock.close()
+    except Exception:
+        pass
+
+
+def _payload_body(payload: dict) -> str:
+    """The text of an opened message payload (2.2.0).
+
+    The canonical payload shape carries the text under "body".
+    The retired drill injector (and any pre-canonical sender)
+    used the DM-era shape {"text": ...} on room frames — real
+    text under a key no reader consulted, which rendered as
+    empty posts fleet-wide (the 29 Nova family items, findings
+    in drill-evidence/v220/findings-29.md). An opened payload's
+    text is its "body" when that key is present (even empty —
+    an intentionally empty body stays empty), else its legacy
+    "text". One helper, every open path, so the alias can never
+    drift between the live and history readers again."""
+    if not isinstance(payload, dict):
+        return ""
+    body = payload.get("body")
+    if isinstance(body, str):
+        return body
+    text = payload.get("text")
+    return text if isinstance(text, str) else ""
+
+
 class RegistrationFailed(Exception):
     pass
 
@@ -488,9 +538,15 @@ async def forward_command(state_dir, username: str, spec: dict,
             raise ControlForwardError(
                 f"control channel: the running instance (pid "
                 f"{pid}) accepted the command but did not answer "
-                f"within {timeout:.0f}s — it is wedged; fail "
-                "closed rather than guess. Restart the daemon if "
-                "it does not recover.")
+                f"within {timeout:.0f}s. Two honest possibilities: "
+                "it is still executing inside a network ride-out "
+                "(a proxy stall window can hold one hardened call "
+                "for ~160s by design), or the daemon is wedged. "
+                "The command may still complete on the daemon — "
+                "for a WRITE, verify in the server record before "
+                "retrying, because it may have landed. Failing "
+                "closed rather than guessing; restart the daemon "
+                "only if it does not recover.")
         if not line:
             raise ControlForwardError(
                 "control channel: the running instance closed "
@@ -872,6 +928,21 @@ class Agent:
         self.known_servers: list[dict] = []
         self.state_dir = Path(state_dir).expanduser()
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        # Capability declaration persistence (2.2.0): the boot
+        # declare in _start_serverless re-presents
+        # self.capabilities — which used to be only ever what the
+        # constructor was handed, i.e. [] for every CLI one-shot
+        # and daemon start. A declaration published in one session
+        # was silently UNPUBLISHED by the next session's boot
+        # declare (proven live: a plain `agentlink directory`
+        # session reverted a drill agent's server row to []).
+        # The declaration is now durable local state: loaded here
+        # when the constructor did not state one explicitly (an
+        # explicit constructor declaration always wins), and
+        # saved by update_capabilities on every successful
+        # publish.
+        if capabilities is None and not ephemeral:
+            self._load_capabilities_declaration()
         # Recovery keys (v1.7.0, owner's design): the agent's
         # login-back credential and its DURABLE storage contract.
         # workspace= names the agent's workspace — where its
@@ -1456,6 +1527,70 @@ class Agent:
                 # daemon ran.) Write commands keep the
                 # existing send/group_add/vault discipline.
                 result = {"items": await self.work_inbox()}
+            elif cmd == "work_progress":
+                # The work lifecycle writes join the forward
+                # set (2.2.0, sweep): an operator driving a
+                # daemon-running agent through CLI one-shots
+                # could read the inbox but could not progress,
+                # deliver or review — the write side of
+                # Beulah's class-E refusal. Same trust boundary
+                # as send/vault_put: same user, socket 0600,
+                # per-boot token, executed AS the daemon.
+                result = await self.report_progress(
+                    str(spec["work_id"]),
+                    int(spec.get("percent") or 0),
+                    str(spec.get("note") or ""))
+            elif cmd == "work_deliver":
+                result = await self.deliver_work(
+                    str(spec["work_id"]),
+                    str(spec.get("body") or ""),
+                    [str(f) for f in (spec.get("files") or [])])
+            elif cmd == "work_assign":
+                if spec.get("role"):
+                    result = await self.assign_work_role(
+                        str(spec.get("group_id") or ""),
+                        str(spec["role"]),
+                        str(spec.get("title") or ""),
+                        str(spec.get("instructions") or ""),
+                        attachments=[str(f) for f in
+                                     (spec.get("attachments")
+                                      or [])],
+                        deadline=spec.get("deadline"),
+                        priority=str(spec.get("priority")
+                                     or "normal"),
+                        require_approval=bool(
+                            spec.get("require_approval")))
+                else:
+                    result = await self.assign_work(
+                        [str(x) for x in
+                         (spec.get("assignees") or [])],
+                        str(spec.get("title") or ""),
+                        str(spec.get("instructions") or ""),
+                        group_id=spec.get("group_id"),
+                        attachments=[str(f) for f in
+                                     (spec.get("attachments")
+                                      or [])],
+                        deadline=spec.get("deadline"),
+                        priority=str(spec.get("priority")
+                                     or "normal"),
+                        require_approval=bool(
+                            spec.get("require_approval")))
+            elif cmd == "work_complete":
+                result = await self.complete_work(
+                    str(spec["work_id"]),
+                    str(spec.get("note") or ""))
+            elif cmd == "work_approve":
+                result = await self.approve_work(
+                    str(spec["work_id"]),
+                    str(spec.get("note") or ""))
+            elif cmd == "work_reject":
+                result = await self.reject_work(
+                    str(spec["work_id"]),
+                    str(spec.get("note") or ""))
+            elif cmd == "work_request_changes":
+                result = await self.request_changes(
+                    str(spec["work_id"]),
+                    str(spec.get("note") or ""))
             elif cmd == "directory":
                 result = await self.directory(
                     query=str(spec.get("query") or ""))
@@ -2122,6 +2257,63 @@ class Agent:
         if isinstance(out, dict):
             out["declared"] = True
         return out
+
+    # -- the capability declaration (durable local state, 2.2.0) --
+
+    def _capabilities_path(self) -> Path:
+        return self.state_dir / \
+            f"capabilities-{self.username}.json"
+
+    def _load_capabilities_declaration(self) -> None:
+        """Adopt the declaration a previous session published
+        (see the __init__ note). Constructor-stated values have
+        already won by the time this runs — it only fills what
+        the constructor left unstated."""
+        if not self.username:
+            return
+        try:
+            p = self._capabilities_path()
+            if not p.exists():
+                return
+            data = json.loads(p.read_text())
+            if not isinstance(data, dict):
+                return
+            caps = data.get("capabilities")
+            if isinstance(caps, list) and caps:
+                merged = [str(c) for c in caps]
+                # The media leg's marker is computed fresh at
+                # every construction; never let a stored
+                # declaration drop it.
+                if "media_audio" in self.capabilities \
+                        and "media_audio" not in merged:
+                    merged.append("media_audio")
+                self.capabilities = merged
+            desc = data.get("description")
+            if isinstance(desc, str) and desc \
+                    and not self.cap_description:
+                self.cap_description = desc
+        except Exception:
+            pass
+
+    def _save_capabilities_declaration(self) -> None:
+        """Persist the declaration update_capabilities just
+        published, so the next session's boot declare re-presents
+        IT — not the constructor default. Best-effort: a failed
+        save must never fail the publish it rode on."""
+        if self.ephemeral or not self.username:
+            return
+        try:
+            p = self._capabilities_path()
+            p.write_text(json.dumps({
+                "capabilities": list(self.capabilities),
+                "description": self.cap_description,
+                "ts": int(time.time())}))
+            try:
+                os.chmod(p, 0o600)
+            except OSError:
+                pass
+        except Exception:
+            pass
 
     # -- the permission request (agent-initiated) ------------------
 
@@ -3010,6 +3202,7 @@ class Agent:
                 stamp.write_text(str(int(time.time())))
             except Exception:
                 return
+            _sd_notify_watchdog()
 
     async def _serverless_first_contact(self, v2) -> bool:
         """The first-contact suite (v2.0.8), run when the key
@@ -3047,6 +3240,39 @@ class Agent:
         Weather (any other TransportError) raises ConnectionError
         — the retry class — never a false identity verdict.
         Returns True when a ceremony opened the session."""
+        async def _key_login_opens() -> bool:
+            # The self-collision rescue (2.2.0): the hardened
+            # ride-out retries a ceremony POST whose first attempt
+            # may have LANDED with its response clipped by the
+            # proxy (200, empty body) — the retry then meets the
+            # ceremony's OWN success and misreads it: register
+            # answers username_taken, recovery/rectify answer
+            # *_failed for the just-burned key/code. A fresh
+            # setup stranded itself exactly this way (2026-11-07:
+            # register landed, its retry said taken, the suite
+            # declared the name a stranger's). The plain key
+            # login discriminates exactly: it opens only for the
+            # account's real keys — if this machine's ceremony
+            # landed, those keys are this machine's and the
+            # session opens; if the name is genuinely another's,
+            # the login refuses and the original verdict stands.
+            # (A rescued registration holds no recovery key —
+            # the minted key rode the clipped reply. The account
+            # is fully usable; an operator rectification rotates
+            # a fresh recovery key if one is ever needed.)
+            try:
+                await asyncio.to_thread(
+                    v2.login, self.username, self.identity.sign,
+                    _package_version(),
+                    decision_link=self._declared_link_sent,
+                    decision_link_detail=self._decision_detail())
+                return True
+            except Exception:
+                # Any failure — the refusal itself, weather, a
+                # transport that cannot run the ceremony — leaves
+                # the original verdict exactly where it was.
+                return False
+
         manual_key = self._recovery_key_manual
         held_key = manual_key or self._find_recovery_key()
         pubs = {"sign_pub": self.identity.signing_public_key_b64,
@@ -3063,6 +3289,12 @@ class Agent:
             except TransportError as exc:
                 if "recovery_failed" in str(exc):
                     if manual_key:
+                        # The key may have burned in a landed
+                        # first attempt whose reply was clipped:
+                        # if the rebind landed, the key login
+                        # opens and no refusal is owed.
+                        if await _key_login_opens():
+                            return True
                         raise RegistrationFailed(
                             f"serverless_recovery_refused: {exc} — "
                             f"the recovery key handed in did not "
@@ -3099,6 +3331,13 @@ class Agent:
                 designation=self.designation)
         except TransportError as exc:
             if "username_taken" in str(exc):
+                # Self-collision first (2.2.0): the taken answer
+                # may be this machine's OWN register, landed a
+                # moment ago with its reply clipped — the key
+                # login opens for exactly that case and leaves a
+                # held rectification code unburned.
+                if await _key_login_opens():
+                    return True
                 # Step 3 (v2.0.9): a held rectification code is
                 # the operator's way back into a stranded legacy
                 # account — try it before declaring the name
@@ -3116,7 +3355,9 @@ class Agent:
                         decision_link_detail=self._decision_detail())
                 except TransportError as exc2:
                     if "rectify_failed" in str(exc2):
-                        return False
+                        # The code may have burned in a landed
+                        # first attempt (see _key_login_opens).
+                        return await _key_login_opens()
                     raise ConnectionError(
                         f"registration failed at step "
                         f"'serverless-rectify': the login Edge "
@@ -4243,6 +4484,7 @@ class Agent:
                         "type": "ping",
                         "activity": self._activity_state()})
                 stamp.write_text(str(int(time.time())))
+                _sd_notify_watchdog()
             except Exception:
                 return
 
@@ -5448,6 +5690,16 @@ class Agent:
         from . import timing as _timing
         page_size = int(getattr(_timing, "DELIVERY_HISTORY_PAGE", 200)
                         or 200)
+        # Clipped-body fallback (2.2.0): on this VM class of
+        # egress proxy, a desync window answers LARGE responses
+        # with an empty body, which the transport reports as an
+        # undecodable page. A 200-row page (~250KB) can stall a
+        # returning agent's whole history sync for the length of
+        # the window; the same cursor at a smaller page size
+        # (~60KB, ~12KB) slips through far more often. On an
+        # undecodable page, shrink and retry the SAME cursor;
+        # the shrunk size holds for the rest of this sync.
+        shrink_ladder = [50, 10]
         before: int | None = None
         smallest: int | None = None
         while True:
@@ -5457,6 +5709,19 @@ class Agent:
             try:
                 data = await self._request(frame, timeout=30)
             except Exception as exc:
+                # Both clip signatures are the same fault: the
+                # transport's read path raises "returned an empty
+                # body" for the zero-byte costume and "returned
+                # an undecodable body" for the truncated one —
+                # match either (the first live shrink stopped
+                # after one step because the 50-row page failed
+                # with the OTHER string).
+                if ("undecodable" in str(exc)
+                        or "empty body" in str(exc)) \
+                        and shrink_ladder:
+                    page_size = shrink_ladder.pop(0)
+                    out["page_shrunk_to"] = page_size
+                    continue
                 log.warning("history sync stopped: %s", exc)
                 out["error"] = str(exc)
                 return out
@@ -5485,7 +5750,17 @@ class Agent:
                     # failing on its pre-repair local copies).
                     existing = mb.get(str(msg["id"]))
                     if existing and (existing.get("sealed")
-                                     or existing.get("unreadable")):
+                                     or existing.get("unreadable")
+                                     or (not existing.get("body")
+                                         and msg.get("body"))):
+                        # The third arm (2.2.0): a journal entry
+                        # that OPENED but rendered empty — the
+                        # legacy {"text": ...} payload shape the
+                        # pre-fix reader could not see into —
+                        # is superseded by the server copy that
+                        # now opens with its real text. An entry
+                        # with any body of its own is never
+                        # overwritten by a re-sync.
                         if mb.replace_msg(msg):
                             out["healed"] += 1
                             self._clear_unreadable(str(msg["id"]))
@@ -5610,7 +5885,7 @@ class Agent:
         if payload is None:
             msg["sealed"] = True
             return msg
-        msg["body"] = payload.get("body", "")
+        msg["body"] = _payload_body(payload)
         msg["kind"] = payload.get("kind") or \
             (payload.get("file") or {}).get("kind") or "text"
         msg["meta"] = payload.get("meta") or {}
@@ -5911,7 +6186,7 @@ class Agent:
             log.warning("dropping message %s: file hash mismatch",
                         frame.get("id"))
             return
-        body = payload.get("body", "")
+        body = _payload_body(payload)
         msg = {
             "id": frame.get("id"),
             "from": frame.get("from"),
@@ -8164,6 +8439,11 @@ class Agent:
             "capabilities": advertised,
             "description": description,
             "sig": self.identity.sign(canonical)})
+        # 2.2.0: the publish is durable local state from here —
+        # the next session's boot declare re-presents this
+        # declaration instead of unpublishing it with the
+        # constructor default.
+        self._save_capabilities_declaration()
         return data
 
     # -- work chains (point 41) ------------------------------------------------------
