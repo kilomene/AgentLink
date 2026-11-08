@@ -308,4 +308,4 @@ def test_first_contact_rectify_weather_is_connection_error(tmp_path):
 
 
 def test_version_222():
-    assert __version__ == "2.2.2"
+    assert __version__ == "2.2.3"
