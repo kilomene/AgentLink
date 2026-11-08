@@ -460,6 +460,40 @@ class ControlForwardError(Exception):
     a rival instance."""
 
 
+def instance_lock_holder(state_dir, username: str) -> dict | None:
+    """The LIVE holder of ``username``'s instance lock, or None
+    (2.2.3). Reads instance-<username>.lock and returns its
+    record only when it names THIS username and its pid is
+    alive right now (a PermissionError on the probe means the
+    pid exists under another owner — alive). A missing /
+    unreadable / foreign / dead holder is None: the flock is
+    the kernel's truth, this record is only the witness the
+    already-registered fast paths (setup, the support hook)
+    use to prove a running instance is OURS before treating
+    an instance collision as that instance's success."""
+    sd = Path(state_dir).expanduser()
+    try:
+        holder = json.loads(
+            (sd / f"instance-{username}.lock").read_text())
+    except Exception:
+        return None
+    if not isinstance(holder, dict) \
+            or holder.get("username") != username:
+        return None
+    pid = holder.get("pid")
+    if not pid:
+        return None
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass  # alive, owned by someone else
+    except Exception:
+        return None
+    return holder
+
+
 async def forward_command(state_dir, username: str, spec: dict,
                           timeout: float = 20.0):
     """Forward one command to the running instance that owns
@@ -1505,6 +1539,29 @@ class Agent:
                           "pid": os.getpid(),
                           "endpoint": self.current_endpoint
                           or self.endpoint}
+            elif cmd == "whoami":
+                # The running instance's own truthful surface
+                # (2.2.3): setup's already-registered fast path
+                # reads the DAEMON's recovery-held / grant /
+                # decision-link state through here instead of
+                # guessing from a rival process. whoami() never
+                # carries a secret — the recovery KEY stays in
+                # its files; only held/not-held crosses.
+                result = self.whoami()
+            elif cmd == "presence":
+                # My own presence record, read back through MY
+                # authenticated doorbell (2.2.3): the rival
+                # process in setup's fast path holds no Firebase
+                # token (its fresh doorbell can only fail with
+                # "no Firebase custom token"), while this daemon
+                # is the beat's writer — reading the node back
+                # through it proves the beat landed server-side.
+                if self._v2 is None:
+                    raise ValueError(
+                        "presence is a serverless surface; this "
+                        "instance runs the relay transport")
+                result = await asyncio.to_thread(
+                    self._v2.doorbell.read_presence, self.username)
             elif cmd == "send":
                 result = await self.send_message(
                     str(spec["to"]), str(spec["body"]),
@@ -1853,17 +1910,30 @@ class Agent:
                 "vault_get": self._vault_decision_get}
 
     async def _stop_control_server(self) -> None:
-        if self._control_server is not None:
-            try:
-                self._control_server.close()
-                # Bounded: wait_closed also waits for in-flight
-                # forwarded commands to drain; a wedged caller
-                # must never stall the daemon's own close.
-                await asyncio.wait_for(
-                    self._control_server.wait_closed(), timeout=2)
-            except Exception:
-                pass
-            self._control_server = None
+        if self._control_server is None:
+            # Not serving: the socket file at this path belongs
+            # to the RUNNING instance, not to this object. A
+            # rival that met the instance collision (setup's
+            # already-registered fast path builds exactly such
+            # an object and closes it in its finally) must never
+            # unlink the daemon's channel out from under it —
+            # the first successful setup run silently killed the
+            # channel for every later one (2.2.3 drill round 2:
+            # the daemon stayed online while its control socket
+            # vanished). Only the serving object removes its own
+            # socket, exactly as _release_instance_lock only
+            # releases a lock this object actually holds.
+            return
+        try:
+            self._control_server.close()
+            # Bounded: wait_closed also waits for in-flight
+            # forwarded commands to drain; a wedged caller
+            # must never stall the daemon's own close.
+            await asyncio.wait_for(
+                self._control_server.wait_closed(), timeout=2)
+        except Exception:
+            pass
+        self._control_server = None
         self._control_token = None
         try:
             self._control_socket_path().unlink()
@@ -3086,9 +3156,28 @@ class Agent:
 
     def _make_v2_transport(self) -> ServerlessTransport:
         if self._serverless_injected is not None:
-            return self._serverless_injected
-        return ServerlessTransport(
-            self._serverless_config or ServerlessConfig.from_env())
+            transport = self._serverless_injected
+        else:
+            transport = ServerlessTransport(
+                self._serverless_config or ServerlessConfig.from_env())
+        # Recovery enrollment (2.2.3): whichever login path the
+        # transport takes (start, refresh, 401 backstop), an
+        # enrollment key the Edge hands back lands in the
+        # storage contract through this sink — never dropped
+        # because the login that carried it was a background
+        # re-login nobody was watching.
+        transport.on_recovery_enrollment = self._adopt_enrollment_key
+        return transport
+
+    def _adopt_enrollment_key(self, key: str) -> None:
+        if not key or self.ephemeral:
+            return
+        self._save_recovery_key(key)
+        log.warning(
+            "recovery key ENROLLED for @%s — the account had "
+            "none on file (its registration reply never landed); "
+            "the key is saved in the client state and the "
+            "workspace file.", self.username)
 
     def _v2_fanout(self) -> str:
         """Presence subscription fan-out for the daemon wiring:
@@ -3597,12 +3686,21 @@ class Agent:
                 _login_needed = False
         if _login_needed:
             try:
-                await asyncio.to_thread(
+                _login_result = await asyncio.to_thread(
                     v2.login, self.username, self.identity.sign,
                     _package_version(),
                     decision_link=self._declared_link_sent,
                     decision_link_detail=self._decision_detail())
                 self.session_ceremony = "plain"
+                # Recovery enrollment (2.2.3): if this account's
+                # recovery hash was still empty server-side (its
+                # register reply never landed), the Edge enrolled
+                # it on this verified login and the key rode the
+                # reply — the transport's enrollment sink (wired
+                # in _make_v2_transport) already persisted it
+                # under the storage contract during the login
+                # itself, on this path and on every background
+                # re-login path alike. Nothing further to do here.
             except TransportError as exc:
                 if "key_auth_failed" in str(exc) and \
                         await self._serverless_first_contact(v2):
