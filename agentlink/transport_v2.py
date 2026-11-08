@@ -434,6 +434,7 @@ class ServerlessTransport:
         self._refresh_timer = None
         self.last_refresh_error = ""
         self.last_mirror_error = ""
+        self.last_slow_sync_error = ""
         self.client_version = ""
         #: Owner-oversight PUBLIC key advertised by the login Edge
         #: with the session tokens (the serverless welcome frame —
@@ -832,7 +833,14 @@ class ServerlessTransport:
                 "updated_at": now_ts()},
                 prefer="return=minimal,resolution=merge-duplicates")
             self.last_mirror_error = ""
-        except TransportError as exc:
+        except Exception as exc:
+            # Fail-soft means ANY failure (2.2.0): the contract is
+            # "never raised", and a raw network exception from a
+            # deeper leg (the doorbell token exchange inside a
+            # re-login) is not a TransportError — swift's slow-sync
+            # thread died on one (URLError, EOF in violation of
+            # protocol) that walked straight through the old
+            # TransportError-only catch.
             self.last_mirror_error = str(exc)
         # The backup leg is part of the mirror, so it lives under
         # the same fail-soft contract: its failure is recorded in
@@ -846,7 +854,7 @@ class ServerlessTransport:
         # could have raised into the login and heartbeat paths.
         try:
             self.update_presence_backup(online=(state != "offline"))
-        except TransportError as exc:
+        except Exception as exc:
             self.last_mirror_error = str(exc)
 
     def _on_beat_transition(self, state: str) -> None:
@@ -1600,7 +1608,20 @@ class ServerlessTransport:
             self._eq("username", str(username))
             + "&select=username,display_name,pubkey,sign_pub,"
               "capabilities,cap_desc,mode,designation,last_seen") or []
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        row = dict(rows[0])
+        # One shape out (2.2.0): rows written before the account
+        # Edge's array fix carry capabilities as a JSON string
+        # (double-encoded in the jsonb column); consumers of this
+        # entry — the same consumers SupabaseStore.directory feeds
+        # with a parsed list — always see the list.
+        caps = row.get("capabilities")
+        if isinstance(caps, str):
+            caps = _loads(caps, [])
+        row["capabilities"] = list(caps) if isinstance(
+            caps, (list, tuple)) else []
+        return row
 
     def group_key_for(self, group_id: str,
                       username: str | None = None) -> dict | None:
@@ -1855,43 +1876,62 @@ class ServerlessTransport:
         they are RTDB-only, on the doorbell's own thread, at 5s."""
         stop = stop_event or threading.Event()
         while not stop.is_set():
-            if self.last_mirror_error:
-                # A transition mirror that failed to land (the
-                # write is fail-soft by design) must never leave
-                # the agent invisible on the dashboard until its
-                # next ladder change: beulah connected on 2.0.1,
-                # read and posted for minutes, and never appeared
-                # in al_activeness, because her connect mirror
-                # failed once and nothing retried it (2026-11-06).
-                # Re-assert the CURRENT state each cadence until
-                # it lands; success clears the error and the
-                # retries stop.
-                self._mirror_activeness(self._activeness_state)
-            elif self.username and self._activeness_state == "online":
-                # Truth-keeping for the Postgres mirror (2.0.4,
-                # owner catch 2026-11-06): the mirror is written
-                # on transitions, but the activeness sweep ages
-                # rows by beat_at/last_seen — timestamps that, for
-                # a steadily online agent, only this loop can
-                # advance, since the 5s beats live in Firebase by
-                # design. Without a periodic re-assertion the
-                # sweep stamped every live agent 'offline' about
-                # a minute after login and the dashboard's mirror
-                # floor showed a false offline forever. One
-                # re-assertion per 60s cadence keeps the Postgres
-                # record as fresh as the sweep's serverless
-                # thresholds (migration v205) require — and only
-                # while genuinely online: an agent that goes
-                # offline stops re-asserting and ages out on the
-                # sweep exactly as designed.
-                self._mirror_activeness("online")
+            try:
+                self._slow_sync_mirror_step()
+            except Exception as exc:
+                # The mirror is fail-soft by contract; this outer
+                # guard is the belt to its braces — the cadence
+                # body as a whole can never kill this thread.
+                self.last_slow_sync_error = str(exc)
             try:
                 frames = self.slow_sync_once()
                 if frames:
                     on_frames(frames)
-            except TransportError:
-                pass  # degraded link; the next cadence retries
+            except Exception as exc:
+                # The reconciliation loop is the guarantee
+                # underneath every signal path: its thread must
+                # never die on a network exception of ANY class
+                # (2.2.0 — swift's 2.0.9 thread died on a raw
+                # URLError escaping the mirror/token path, which
+                # the old TransportError-only catch could not see).
+                # Recorded, and the next cadence retries.
+                self.last_slow_sync_error = str(exc)
             stop.wait(SLOW_SYNC_INTERVAL_SECONDS)
+
+    def _slow_sync_mirror_step(self) -> None:
+        """One cadence of activeness-mirror truth-keeping (see
+        run_slow_sync). Fail-soft by contract; the caller guards
+        it regardless."""
+        if self.last_mirror_error:
+            # A transition mirror that failed to land (the
+            # write is fail-soft by design) must never leave
+            # the agent invisible on the dashboard until its
+            # next ladder change: beulah connected on 2.0.1,
+            # read and posted for minutes, and never appeared
+            # in al_activeness, because her connect mirror
+            # failed once and nothing retried it (2026-11-06).
+            # Re-assert the CURRENT state each cadence until
+            # it lands; success clears the error and the
+            # retries stop.
+            self._mirror_activeness(self._activeness_state)
+        elif self.username and self._activeness_state == "online":
+            # Truth-keeping for the Postgres mirror (2.0.4,
+            # owner catch 2026-11-06): the mirror is written
+            # on transitions, but the activeness sweep ages
+            # rows by beat_at/last_seen — timestamps that, for
+            # a steadily online agent, only this loop can
+            # advance, since the 5s beats live in Firebase by
+            # design. Without a periodic re-assertion the
+            # sweep stamped every live agent 'offline' about
+            # a minute after login and the dashboard's mirror
+            # floor showed a false offline forever. One
+            # re-assertion per 60s cadence keeps the Postgres
+            # record as fresh as the sweep's serverless
+            # thresholds (migration v205) require — and only
+            # while genuinely online: an agent that goes
+            # offline stops re-asserting and ages out on the
+            # sweep exactly as designed.
+            self._mirror_activeness("online")
 
     # ================================================================
     # v2.0 coverage: the full request surface (work lifecycle,
