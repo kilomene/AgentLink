@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import threading
 from pathlib import Path
 
-from .protocol import new_id, new_secret, now_ts
+from .protocol import (NOTICE_FRAME_TYPES, new_id, new_secret, now_ts,
+                       queue_payload_type)
 
 DEFAULT_SETTINGS = {
     "send_messages": "everyone",      # everyone | admins_only
@@ -2923,9 +2925,20 @@ class Store:
         """Live entanglements that refuse a SELF-deregistration."""
         blockers: list[str] = []
         with self._lock:
-            n = self._db.execute(
-                "SELECT COUNT(*) AS n FROM queue WHERE to_username = ?",
-                (username,)).fetchone()["n"]
+            # Only CONTENT frames block (v2.2.1): a notice-class
+            # frame (protocol.NOTICE_FRAME_TYPES) merely reports
+            # state persisted in its own tables, so a notice
+            # stranded by a lost ack must not strand the account —
+            # the cascade below voids it with the rest of the
+            # queue. An undecodable payload counts as content
+            # (fail-closed), exactly as queue_payload_type rules.
+            n = 0
+            for row in self._db.execute(
+                    "SELECT payload FROM queue WHERE to_username = ?",
+                    (username,)):
+                if (queue_payload_type(row["payload"])
+                        not in NOTICE_FRAME_TYPES):
+                    n += 1
             if n:
                 blockers.append(
                     f"{n} undelivered frame(s) in the offline queue")
@@ -2976,6 +2989,32 @@ class Store:
                     args).fetchone()["n"]
         return plan
 
+    def _prior_removal_result(self, username: str) -> dict | None:
+        """The truthful answer for a REPEATED removal (v2.2.1).
+
+        A deregistration whose first execution committed server-
+        side but whose response was lost in transit (the egress
+        proxy's clipped/reset windows) is retried by the hardened
+        client — and the retry meets a missing user row. Reporting
+        'unknown' there is FALSE: the platform's own audit log
+        carries the completed removal of this exact identity. When
+        that record exists, the removal's outcome is reported as
+        what it is — already removed, with the row count the first
+        execution recorded. No record -> None, and the caller keeps
+        the genuine NotFound verdict (an identity the platform has
+        never removed is unknown BEFORE any delete attempt)."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT status FROM audit_log WHERE kind ="
+                " 'user_removed' AND target = ? ORDER BY seq DESC"
+                " LIMIT 1", (username,)).fetchone()
+        if row is None:
+            return None
+        m = re.search(r"rows=(\d+)", str(row["status"] or ""))
+        return {"username": username, "removed": {},
+                "total": int(m.group(1)) if m else 0,
+                "already_removed": True}
+
     def remove_user(self, username: str, *, force: bool = False,
                     actor: str = "", via: str = "self") -> dict:
         """Delete a registration and everything that belongs to it
@@ -2983,8 +3022,16 @@ class Store:
         removed. Raises NotFound for an unknown username and, unless
         force, RemovalBlocked while live entanglements stand. The
         removal is written to the audit log AFTER the cascade, so
-        the record survives the deletion it describes."""
+        the record survives the deletion it describes.
+
+        A repeat of an already-completed removal returns the
+        recorded outcome with ``already_removed`` set instead of
+        raising NotFound — the report must match server truth
+        (v2.2.1; see _prior_removal_result)."""
         if not self.exists(username):
+            prior = self._prior_removal_result(username)
+            if prior is not None:
+                return prior
             raise NotFound(username)
         blockers = [] if force else self.removal_blockers(username)
         if blockers:
