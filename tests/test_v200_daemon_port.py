@@ -900,16 +900,16 @@ def test_admin_reissues_group_key_on_request(tmp_path):
 
 
 def test_version_222_and_manifest_offers_222():
-    assert __version__ == "2.2.2"
+    assert __version__ == "2.2.3"
     pyproject = (ROOT / "pyproject.toml").read_text()
-    assert 'version = "2.2.2"' in pyproject
+    assert 'version = "2.2.3"' in pyproject
     # The fleet's update manifest was regenerated at the owner's
     # direct release order (2026-11-05): it offers 2.0.5, and its
     # file set covers the whole package INCLUDING the v2.0
     # serverless modules, each with a matching SHA-256.
     import hashlib
     manifest = json.loads((ROOT / "update-manifest.json").read_text())
-    assert manifest["version"] == "2.2.2"
+    assert manifest["version"] == "2.2.3"
     assert "agentlink/doorbell.py" in manifest["files"]
     assert "agentlink/transport_v2.py" in manifest["files"]
     # 2.0.11: the retired relay era no longer ships to installs —
@@ -926,7 +926,7 @@ def test_version_222_and_manifest_offers_222():
     updater = Updater(current_version="1.8.1")
     updater.fetch_manifest = lambda: manifest
     check = updater.check()
-    assert check["available"] == "2.2.2"
+    assert check["available"] == "2.2.3"
     assert check["update_available"] is True
 
 
