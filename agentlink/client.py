@@ -733,6 +733,7 @@ class Agent:
         workspace: str | None = None,
         recovery_key: str | None = None,
         rectify_code: str | None = None,
+        rectify_intent: bool = False,
         connectors: list | None = None,
         transport: str | None = None,
         serverless_config: ServerlessConfig | None = None,
@@ -961,6 +962,25 @@ class Agent:
         # (see `agentlink rectify`); the automatic paths discover
         # a dropped-in code on their own (_find_rectify_code).
         self._rectify_code_manual = rectify_code or None
+        # Explicit rectification intent (2.2.2): set ONLY by the
+        # `agentlink rectify` command. In this mode a held code
+        # is PRESENTED to the Edge — never swallowed by a key
+        # login that happens to open the session first (the
+        # false-success defect: the command printed "rectified"
+        # while the code sat unburned server-side, no rebind
+        # happened and no new recovery key existed).
+        self._rectify_intent = bool(rectify_intent)
+        # Which ceremony opened this session (2.2.2) — the
+        # truthful-reporting record the rectify command's report
+        # is built from: "registered", "recovered", "rectified",
+        # "key-login" (the self-collision rescue) or "plain"
+        # (the direct key login). None until a session opens.
+        self.session_ceremony: str | None = None
+        # Whether an operator rectification code was PRESENTED
+        # to the Edge in this run (2.2.2). Presented is not
+        # accepted: session_ceremony == "rectified" is the only
+        # proof the Edge accepted it.
+        self._rectify_presented = False
         # The most recently issued/used recovery key (plaintext —
         # held by the agent itself, exactly like its identity
         # keys; the server only ever holds the hash) and the
@@ -2127,6 +2147,15 @@ class Agent:
                     _rec_file = str(_wp)
             except Exception:
                 pass
+        # Rectification surface (2.2.2): whether an operator
+        # rectification code is currently held (handed in, in
+        # the environment, or in the workspace drop-in).
+        _rect_held = False
+        if self.username and not self.ephemeral:
+            try:
+                _rect_held = bool(self._find_rectify_code())
+            except Exception:
+                _rect_held = False
         return {"username": self.username,
                 "display_name": self.display_name,
                 "designation": self.designation,
@@ -2135,6 +2164,15 @@ class Agent:
                 "servers": list(self.known_servers),
                 "recovery_key_held": _rec_held,
                 "recovery_file": _rec_file,
+                # Ceremony truth (2.2.2): which ceremony opened
+                # this session and whether an operator
+                # rectification code was presented / is held —
+                # the fields the `agentlink rectify` report is
+                # built from, so "rectified" is claimed only
+                # when a rectification actually happened.
+                "session_ceremony": self.session_ceremony,
+                "rectify_presented": self._rectify_presented,
+                "rectify_code_held": _rect_held,
                 # Onboarding surface (v1.8.0): the agent states
                 # its own decision-link wiring truthfully (mode +
                 # verified state — the same facts its hello
@@ -3204,6 +3242,111 @@ class Agent:
                 return
             _sd_notify_watchdog()
 
+    async def _present_rectify_code(self, v2, code: str) -> bool:
+        """Present a held operator rectification code to the
+        login Edge (v2.0.9's third ceremony, factored out
+        2.2.2 so every path presents it identically).
+
+        True: the Edge accepted — the account is rebound to
+        this machine's keys, the code is burned, and the
+        freshly minted recovery key is persisted under the
+        storage contract (state-dir copy + workspace file);
+        the drop-in code file is removed.
+        False: the Edge refused with rectify_failed — the code
+        did not verify, OR it burned in a landed first attempt
+        whose reply was lost; the caller discriminates with the
+        plain key login. Nothing was saved and no file was
+        dropped: a refusal makes no claims.
+        Weather (any other TransportError) raises
+        ConnectionError — never a verdict."""
+        self._rectify_presented = True
+        pubs = {"sign_pub": self.identity.signing_public_key_b64,
+                "pubkey": self.identity.public_key_b64}
+        try:
+            result = await asyncio.to_thread(
+                v2.rectify_and_login, self.username,
+                self.identity.sign, code,
+                pubs["sign_pub"], pubs["pubkey"],
+                _package_version(),
+                decision_link=self._declared_link_sent,
+                decision_link_detail=self._decision_detail())
+        except TransportError as exc:
+            if "rectify_failed" in str(exc):
+                return False
+            raise ConnectionError(
+                f"registration failed at step "
+                f"'serverless-rectify': the login Edge "
+                f"did not answer for @{self.username} "
+                f"({exc}). Retry when the endpoints are "
+                f"reachable from this machine.") from exc
+        issued = str(result.get("recovery_key") or "")
+        if issued:
+            self._save_recovery_key(issued)
+        self._drop_rectify_code_file()
+        self.session_ceremony = "rectified"
+        log.warning(
+            "rectified @%s by operator code — stranded "
+            "account rebound to this machine's keys; the "
+            "code is burned and the new recovery key is "
+            "saved.", self.username)
+        return True
+
+    async def _explicit_rectify_open(self, v2, code: str) -> bool:
+        """The `agentlink rectify` command's opening ceremony
+        (2.2.2): present the operator's code BEFORE any plain
+        key login gets the chance to open the session silently.
+        The operator's intent is the rebind + a NEW recovery
+        key — a session that merely opens on existing keys has
+        NOT done what was asked and must never be reported as
+        a rectification (the lean false-success defect).
+
+        True: the session is open — by rectification itself
+        (session_ceremony == "rectified"), or, when the code
+        was refused but the discriminating key login opened
+        anyway, by key login (session_ceremony == "key-login";
+        the rectification stays UNCONFIRMED — either a first
+        attempt landed and burned the code with its reply
+        lost, or the code did not verify while this machine's
+        keys already open the account; no new recovery key
+        was saved on this machine in this run).
+        Raises RegistrationFailed when the code refused AND
+        this machine's keys do not open the account — the
+        truthful final refusal. Weather raises
+        ConnectionError."""
+        if await self._present_rectify_code(v2, code):
+            return True
+        try:
+            await asyncio.to_thread(
+                v2.login, self.username, self.identity.sign,
+                _package_version(),
+                decision_link=self._declared_link_sent,
+                decision_link_detail=self._decision_detail())
+        except TransportError as exc:
+            if "key_auth_failed" in str(exc):
+                raise RegistrationFailed(
+                    f"serverless_rectify_refused: the "
+                    f"rectification code presented for "
+                    f"@{self.username} did not verify, and "
+                    f"this machine's keys do not open the "
+                    f"account ({exc}). The account is "
+                    f"untouched. Check the code with the "
+                    f"operator — it may be spent, expired, "
+                    f"or issued for another name.") from exc
+            raise ConnectionError(
+                f"registration failed at step "
+                f"'serverless-rectify': the login Edge did "
+                f"not answer for @{self.username} ({exc}). "
+                f"Retry when the endpoints are reachable "
+                f"from this machine.") from exc
+        self.session_ceremony = "key-login"
+        log.warning(
+            "rectify for @%s: the code was presented and "
+            "refused, but this machine's keys opened the "
+            "session — the rectification is UNCONFIRMED and "
+            "no new recovery key was saved in this run.",
+            self.username)
+        return True
+
     async def _serverless_first_contact(self, v2) -> bool:
         """The first-contact suite (v2.0.8), run when the key
         login refuses with key_auth_failed — the Edge's single
@@ -3237,6 +3380,16 @@ class Agent:
            held: return False; the caller raises the permanent
            refusal with the way forward.
 
+        EXPLICIT RECTIFY (2.2.2) — when this agent was built
+        for the `agentlink rectify` command (rectify_intent),
+        a held code outranks the self-collision rescue in the
+        taken branch: the operator's code is consulted FIRST,
+        so an explicit rectification always presents its code
+        and is never silently replaced by a key login that
+        happens to open. (At start() level the same intent
+        presents the code before the plain login at all — see
+        _explicit_rectify_open.)
+
         Weather (any other TransportError) raises ConnectionError
         — the retry class — never a false identity verdict.
         Returns True when a ceremony opened the session."""
@@ -3266,6 +3419,7 @@ class Agent:
                     _package_version(),
                     decision_link=self._declared_link_sent,
                     decision_link_detail=self._decision_detail())
+                self.session_ceremony = "key-login"
                 return True
             except Exception:
                 # Any failure — the refusal itself, weather, a
@@ -3319,6 +3473,7 @@ class Agent:
                     "rebound to this machine's keys; the used key "
                     "is burned and its successor is saved.",
                     self.username)
+                self.session_ceremony = "recovered"
                 return True
         try:
             result = await asyncio.to_thread(
@@ -3331,6 +3486,24 @@ class Agent:
                 designation=self.designation)
         except TransportError as exc:
             if "username_taken" in str(exc):
+                if self._rectify_intent:
+                    # Explicit rectification (2.2.2): the
+                    # operator's code is consulted BEFORE the
+                    # rescue — an explicit `agentlink rectify`
+                    # must present its code, never be swallowed
+                    # by a key login that happens to open (the
+                    # false-success defect: the command printed
+                    # "rectified" while the code sat unburned).
+                    code = self._find_rectify_code()
+                    if code:
+                        if await self._present_rectify_code(
+                                v2, code):
+                            return True
+                        # Refused — the code may have burned in
+                        # a landed first attempt; the key login
+                        # discriminates, exactly as below.
+                        return await _key_login_opens()
+                    return False
                 # Self-collision first (2.2.0): the taken answer
                 # may be this machine's OWN register, landed a
                 # moment ago with its reply clipped — the key
@@ -3345,35 +3518,11 @@ class Agent:
                 code = self._find_rectify_code()
                 if not code:
                     return False
-                try:
-                    result = await asyncio.to_thread(
-                        v2.rectify_and_login, self.username,
-                        self.identity.sign, code,
-                        pubs["sign_pub"], pubs["pubkey"],
-                        _package_version(),
-                        decision_link=self._declared_link_sent,
-                        decision_link_detail=self._decision_detail())
-                except TransportError as exc2:
-                    if "rectify_failed" in str(exc2):
-                        # The code may have burned in a landed
-                        # first attempt (see _key_login_opens).
-                        return await _key_login_opens()
-                    raise ConnectionError(
-                        f"registration failed at step "
-                        f"'serverless-rectify': the login Edge "
-                        f"did not answer for @{self.username} "
-                        f"({exc2}). Retry when the endpoints are "
-                        f"reachable from this machine.") from exc2
-                issued = str(result.get("recovery_key") or "")
-                if issued:
-                    self._save_recovery_key(issued)
-                self._drop_rectify_code_file()
-                log.warning(
-                    "rectified @%s by operator code — stranded "
-                    "account rebound to this machine's keys; the "
-                    "code is burned and the new recovery key is "
-                    "saved.", self.username)
-                return True
+                if await self._present_rectify_code(v2, code):
+                    return True
+                # The code did not verify — or it burned in a
+                # landed first attempt (see _key_login_opens).
+                return await _key_login_opens()
             raise ConnectionError(
                 f"registration failed at step 'serverless-register':"
                 f" the login Edge did not answer for"
@@ -3387,6 +3536,7 @@ class Agent:
             "registered @%s — first-come account created and "
             "session opened; the recovery key is saved in the "
             "client state and the workspace file.", self.username)
+        self.session_ceremony = "registered"
         return True
 
     async def _start_serverless(self) -> str:
@@ -3425,58 +3575,95 @@ class Agent:
             self._decision_detail(), sort_keys=True)
         v2 = self._make_v2_transport()
         self._v2 = v2
-        try:
-            await asyncio.to_thread(
-                v2.login, self.username, self.identity.sign,
-                _package_version(),
-                decision_link=self._declared_link_sent,
-                decision_link_detail=self._decision_detail())
-        except TransportError as exc:
-            if "key_auth_failed" in str(exc) and \
-                    await self._serverless_first_contact(v2):
-                # First contact (v2.0.8): the ceremony — a
-                # recovery reclaim or a first-come registration —
-                # opened the session on this same transport. Fall
-                # through to the post-login sequence below.
-                pass
-            elif "key_auth_failed" in str(exc):
-                self._v2 = None
+        _login_needed = True
+        if self._rectify_intent:
+            # Explicit rectification (2.2.2): the operator ran
+            # `agentlink rectify` — a held code is presented
+            # FIRST (see _explicit_rectify_open), before the
+            # plain key login below gets any chance to open the
+            # session silently and leave the command reporting
+            # a rectification that never happened.
+            _rcode = self._find_rectify_code()
+            if _rcode:
                 try:
-                    await asyncio.to_thread(v2.logout)
+                    await self._explicit_rectify_open(v2, _rcode)
                 except Exception:
+                    self._v2 = None
+                    try:
+                        await asyncio.to_thread(v2.logout)
+                    except Exception:
+                        pass
+                    raise
+                _login_needed = False
+        if _login_needed:
+            try:
+                await asyncio.to_thread(
+                    v2.login, self.username, self.identity.sign,
+                    _package_version(),
+                    decision_link=self._declared_link_sent,
+                    decision_link_detail=self._decision_detail())
+                self.session_ceremony = "plain"
+            except TransportError as exc:
+                if "key_auth_failed" in str(exc) and \
+                        await self._serverless_first_contact(v2):
+                    # First contact (v2.0.8): the ceremony — a
+                    # recovery reclaim or a first-come registration —
+                    # opened the session on this same transport. Fall
+                    # through to the post-login sequence below.
                     pass
-                # key_auth_failed with the first-contact suite
-                # exhausted is the Edge's one genuinely permanent
-                # refusal: the name is registered to keys this
-                # machine does not hold, and no recovery key is
-                # held either. Final until the identity or the
-                # account changes — the same finality a
-                # RegistrationFailed carries on the relay path.
-                # EVERY other refusal is configuration or weather,
-                # never identity: a 405 (the challenge arrived as
-                # the wrong method — a redirect or URL-shape fault
-                # on this host), a 404 (wrong Edge URL), a 429
-                # (rate_limited), a 500 — the daemon retries those
-                # forever under the no-going-dark law. The old
-                # "any HTTP 4xx is permanent" rule crash-looped
-                # beulah's daemon on a 405 (2026-11-06): the
-                # process died on every supervisor relaunch
-                # instead of riding out a fixable fault.
-                raise RegistrationFailed(
-                    f"serverless_login_refused: {exc} — "
-                    f"@{self.username} is registered to other "
-                    f"keys and no recovery key is held on this "
-                    f"machine. If this name is yours, restore "
-                    f"your recovery file (agentlink-recovery-"
-                    f"{self.username}.txt in your workspace) and "
-                    f"boot again to reclaim it. If that file is "
-                    f"lost, ask the operator for a rectification "
-                    f"code and run `agentlink rectify --username "
-                    f"{self.username} --rectify-code <code>` — "
-                    f"the stranded account rebinds to this "
-                    f"machine and a fresh recovery key is issued. "
-                    f"Otherwise pick a new username.") from exc
-            else:
+                elif "key_auth_failed" in str(exc):
+                    self._v2 = None
+                    try:
+                        await asyncio.to_thread(v2.logout)
+                    except Exception:
+                        pass
+                    # key_auth_failed with the first-contact suite
+                    # exhausted is the Edge's one genuinely permanent
+                    # refusal: the name is registered to keys this
+                    # machine does not hold, and no recovery key is
+                    # held either. Final until the identity or the
+                    # account changes — the same finality a
+                    # RegistrationFailed carries on the relay path.
+                    # EVERY other refusal is configuration or weather,
+                    # never identity: a 405 (the challenge arrived as
+                    # the wrong method — a redirect or URL-shape fault
+                    # on this host), a 404 (wrong Edge URL), a 429
+                    # (rate_limited), a 500 — the daemon retries those
+                    # forever under the no-going-dark law. The old
+                    # "any HTTP 4xx is permanent" rule crash-looped
+                    # beulah's daemon on a 405 (2026-11-06): the
+                    # process died on every supervisor relaunch
+                    # instead of riding out a fixable fault.
+                    raise RegistrationFailed(
+                        f"serverless_login_refused: {exc} — "
+                        f"@{self.username} is registered to other "
+                        f"keys and no recovery key is held on this "
+                        f"machine. If this name is yours, restore "
+                        f"your recovery file (agentlink-recovery-"
+                        f"{self.username}.txt in your workspace) and "
+                        f"boot again to reclaim it. If that file is "
+                        f"lost, ask the operator for a rectification "
+                        f"code and run `agentlink rectify --username "
+                        f"{self.username} --rectify-code <code>` — "
+                        f"the stranded account rebinds to this "
+                        f"machine and a fresh recovery key is issued. "
+                        f"Otherwise pick a new username.") from exc
+                else:
+                    self._v2 = None
+                    try:
+                        await asyncio.to_thread(v2.logout)
+                    except Exception:
+                        pass
+                    raise ConnectionError(
+                        f"registration failed at step 'serverless-login':"
+                        f" the login Edge did not answer for"
+                        f" @{self.username} ({exc}). Nothing was"
+                        f" registered. Retry: check the serverless"
+                        f" configuration (AGENTLINK_SUPABASE_URL /"
+                        f" AGENTLINK_LOGIN_EDGE_URL / Firebase settings)"
+                        f" and that the endpoints are reachable from this"
+                        f" machine.") from exc
+            except Exception as exc:
                 self._v2 = None
                 try:
                     await asyncio.to_thread(v2.logout)
@@ -3484,25 +3671,10 @@ class Agent:
                     pass
                 raise ConnectionError(
                     f"registration failed at step 'serverless-login':"
-                    f" the login Edge did not answer for"
-                    f" @{self.username} ({exc}). Nothing was"
-                    f" registered. Retry: check the serverless"
-                    f" configuration (AGENTLINK_SUPABASE_URL /"
-                    f" AGENTLINK_LOGIN_EDGE_URL / Firebase settings)"
-                    f" and that the endpoints are reachable from this"
-                    f" machine.") from exc
-        except Exception as exc:
-            self._v2 = None
-            try:
-                await asyncio.to_thread(v2.logout)
-            except Exception:
-                pass
-            raise ConnectionError(
-                f"registration failed at step 'serverless-login':"
-                f" @{self.username} could not complete the login"
-                f" ceremony ({type(exc).__name__}: {exc})."
-                f" Nothing was registered; a retry with this same"
-                f" state dir resumes cleanly.") from exc
+                    f" @{self.username} could not complete the login"
+                    f" ceremony ({type(exc).__name__}: {exc})."
+                    f" Nothing was registered; a retry with this same"
+                    f" state dir resumes cleanly.") from exc
         self._hello_sent = True
         self._v2_close_requested = False
         if not self._oversight_configured and v2.oversight_pubkey:
