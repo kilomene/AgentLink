@@ -43,6 +43,8 @@ TICKET_MAX_BYTES = 25 * 1024 * 1024
 TICKET_MAX_FILES = 5
 _ALLOWED_TYPES = {
     "image/png", "image/jpeg", "image/gif", "image/webp",
+    # Video proof (2.2.0), mirroring the support Edge's set.
+    "video/mp4", "video/webm", "video/quicktime",
     "text/plain", "application/json",
     "application/zip", "application/x-zip-compressed",
     "application/gzip",
@@ -53,6 +55,8 @@ _EXT_TYPES = {
     ".gz": "application/gzip", ".png": "image/png",
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
     ".gif": "image/gif", ".webp": "image/webp",
+    ".mp4": "video/mp4", ".webm": "video/webm",
+    ".mov": "video/quicktime",
 }
 
 
