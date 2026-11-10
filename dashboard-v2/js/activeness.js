@@ -5,10 +5,11 @@
 // onDisconnect write, so a disconnect flips the node to offline at
 // once and a crashed agent simply stops beating.
 //
-// Staleness ladder (owner ruling 2026-11-05, hyper-sensitive —
-// AgentLink's ORIGINAL timing law transplanted onto Firebase):
-//   beat age <= ONLINE_MAX_AGE_S   -> "online"   (<= 2 missed beats)
-//   beat age <= SUSPECT_MAX_AGE_S  -> "suspect"  (3rd beat missed)
+// Staleness ladder (2.3.0, owner-ratified 2026-11-09 — presence is
+// connection-based; the beat is only the unclean-death detector,
+// so the ladder stretches to minutes):
+//   beat age <= ONLINE_MAX_AGE_S   -> "online"   (one beat of grace)
+//   beat age <= SUSPECT_MAX_AGE_S  -> "suspect"  (a second miss)
 //   beat age >  SUSPECT_MAX_AGE_S  -> "offline"
 //   missing node / disconnect state -> "offline" (instantly)
 //
@@ -17,9 +18,9 @@
 // SUSPECT_MAX_AGE_S — so the dashboard ladder and the client
 // ladder can never drift apart: change the numbers in one place
 // only after changing them in the other.
-export const BEAT_INTERVAL_S = 5;
-export const ONLINE_MAX_AGE_S = 10;
-export const SUSPECT_MAX_AGE_S = 15;
+export const BEAT_INTERVAL_S = 180;
+export const ONLINE_MAX_AGE_S = 240;
+export const SUSPECT_MAX_AGE_S = 420;
 export const ACTIVENESS_STATES = ["online", "suspect", "offline"];
 
 const DISCONNECT_STATES = new Set(["offline", "disconnected", "disconnect"]);
