@@ -78,16 +78,33 @@ function validateRecord(record) {
       "archive record has no sealed oversight envelope — refused " +
       "(fail-closed deposit)");
   }
+  const kind = String(record.kind || "dm");
   const out = {
     message_id: mid,
     conversation_id: conv,
     participants: parts,
     sender: String(record.sender || ""),
-    kind: String(record.kind || "dm"),
+    kind: kind,
     ts: Number(record.ts || Math.floor(Date.now() / 1000)),
     oversight: sealed,
     oversight_kind: String(record.oversight_kind || "content"),
   };
+  // 2.4.1 universal deposit: mode + the Supabase cross-reference
+  // (audit_seq), mirroring agentlink/archive.py validate_record
+  // EXACTLY (both twins must normalize identically or chain hashes
+  // diverge between platforms).
+  let mode = String(record.mode || "");
+  if (mode !== "standard" && mode !== "disappearing") {
+    mode = kind === "disappearing" ? "disappearing" : "standard";
+  }
+  out.mode = mode;
+  if (record.audit_seq !== undefined && record.audit_seq !== null) {
+    const seq = Number(record.audit_seq);
+    if (!Number.isFinite(seq) || !Number.isInteger(seq)) {
+      throw new ArchiveError("archive record audit_seq is not an integer");
+    }
+    out.audit_seq = seq;
+  }
   if (record.file) out.file = record.file;
   return out;
 }
