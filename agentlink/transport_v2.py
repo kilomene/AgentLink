@@ -110,13 +110,15 @@ import urllib.parse
 import urllib.request
 
 from . import proxycreds
-from .archive import (ArchiveError,
+from .archive import (ArchiveError, DepositRetryQueue,
                       conversation_id_channel as
                       archive_conversation_id_channel,
                       conversation_id_dm as
                       archive_conversation_id_dm,
                       conversation_id_group as
-                      archive_conversation_id_group)
+                      archive_conversation_id_group,
+                      validate_record as
+                      _validate_archive_record)
 from .doorbell import (DoorbellClient, DoorbellError,
                        ScopedPresenceWatcher,
                        conversation_id_for_dm,
@@ -521,6 +523,13 @@ class ServerlessTransport:
         #: service over HTTPS). None = NO disappearing sends:
         #: the deposit gate is fail-closed by construction.
         self.archive_depositor = None
+        #: Universal archive deposit (2.4.1): the durable retry
+        #: queue for STANDARD deposits (mandatory-but-not-
+        #: blocking — see _standard_deposit). The Agent wires
+        #: its state-dir queue; None = in-memory-less mode where
+        #: a failed standard deposit parks immediately (still
+        #: never silently dropped).
+        self.deposit_retry_queue = None
         #: Optional sink called with each parked record (the
         #: Agent logs + surfaces it; diagnostics read the park).
         self.on_dead_letter = None
@@ -1244,11 +1253,16 @@ class ServerlessTransport:
                priority="", size=0, mentions=None, ref_id="",
                sender_nickname="", sender_role="",
                sender_custom_role="", oversight="",
-               content_envelope="", work_id="") -> None:
+               content_envelope="", work_id="",
+               return_row: bool = False):
         """One al_audit_log row — the exact body shape of
         SupabaseStore.audit (mentions JSON-string, oversight and
-        content_envelope as JSON strings or "")."""
-        self._rest("POST", "audit_log", body={
+        content_envelope as JSON strings or ""). With
+        ``return_row`` the inserted row comes back (2.4.1: the
+        universal deposit cross-references its ``seq``); the
+        default keeps the historical fire-and-forget shape and
+        returns None."""
+        rows = self._rest("POST", "audit_log", body={
             "ts": now_ts(), "kind": kind, "actor": self.username,
             "target": target, "group_id": group_id,
             "work_id": work_id,
@@ -1260,7 +1274,28 @@ class ServerlessTransport:
             "sender_custom_role": sender_custom_role or "",
             "oversight": oversight or "",
             "content_envelope": content_envelope or ""},
-            prefer="return=minimal")
+            prefer=("return=representation" if return_row
+                    else "return=minimal"))
+        if return_row:
+            return rows[0] if rows else None
+        return None
+
+    def _audit_seq_for(self, mid: str):
+        """The al_audit_log seq of the row written for ``mid``
+        (2.4.1 fallback when the insert reply did not carry the
+        row — e.g. a clipped representation). None when no row
+        matches; the deposit then proceeds without the
+        cross-reference rather than failing the send."""
+        try:
+            rows = self._rest(
+                "GET", "audit_log",
+                self._eq("ref_id", mid) + "&select=seq"
+                + "&order=seq.asc&limit=1")
+            if rows:
+                return int(rows[0].get("seq"))
+        except Exception:
+            pass
+        return None
 
     def _tap(self, conversation_id: str, item_id: str) -> None:
         """Best-effort signal tap: a failed tap never fails a send
@@ -1389,8 +1424,10 @@ class ServerlessTransport:
                   "conversation_id": conversation_id,
                   "participants": list(participants),
                   "sender": self.username,
+                  "kind": "disappearing",
                   "oversight": oversight,
                   "oversight_kind": oversight_kind,
+                  "mode": "disappearing",
                   "ts": int(ts or now_ts())}
         attempt = 0
         last = ""
@@ -1411,6 +1448,136 @@ class ServerlessTransport:
                     f"unconfirmed after {attempt} attempts "
                     f"({last}) — deposit parked, send held")
             _sleep(self.retry_policy.delay_for(attempt - 1))
+
+    # -- universal archive deposit: STANDARD sends (2.4.1) --------
+    def _standard_deposit(self, *, mid: str,
+                          conversation_id: str, participants,
+                          oversight, oversight_kind: str = "content",
+                          kind: str = "dm", ts: int = 0,
+                          audit_row=None, file=None) -> dict:
+        """Universal archive deposit for a STANDARD send (2.4.1,
+        owner ruling 2026-11-10): the SAME deposit path as the
+        disappearing gate, but MANDATORY-BUT-NOT-BLOCKING — the
+        Supabase archive write (already done by the caller) is
+        the durability of record, so a deposit failure NEVER
+        fails the send. Instead the full record enters the
+        durable deposit-retry queue (``deposit_retry_queue``)
+        and lands when the service recovers; at policy
+        exhaustion (drain time) it moves to the dead-letter
+        park WITH the record in detail — visible forever,
+        never silently dropped. A record the archive core
+        REFUSES (unsealed/invalid — a permanent condition, not
+        weather) parks immediately with the refusal reason.
+        With NO depositor wired (test harnesses, pre-archive
+        modes) the deposit is skipped openly — reported in the
+        result, not hidden. The record cross-references the
+        Supabase archive: ``audit_seq`` is the al_audit_log seq
+        of the row holding the same envelope (from the insert
+        reply, or fetched by ref_id as a fallback)."""
+        result = {"confirmed": False}
+        depositor = self.archive_depositor
+        if depositor is None:
+            result["skipped"] = "no_depositor"
+            return result
+        seq = None
+        if isinstance(audit_row, dict) \
+                and audit_row.get("seq") is not None:
+            try:
+                seq = int(audit_row["seq"])
+            except (TypeError, ValueError):
+                seq = None
+        if seq is None:
+            seq = self._audit_seq_for(mid)
+        record = {"message_id": mid,
+                  "conversation_id": conversation_id,
+                  "participants": list(participants),
+                  "sender": self.username,
+                  "kind": kind,
+                  "oversight": oversight,
+                  "oversight_kind": oversight_kind,
+                  "mode": "standard",
+                  "ts": int(ts or now_ts())}
+        if seq is not None:
+            record["audit_seq"] = seq
+        if file is not None:
+            record["file"] = file
+        try:
+            record = _validate_archive_record(record)
+        except Exception as exc:  # noqa: BLE001 - refusal is data
+            self._park("archive_deposit", mid, attempts=0,
+                       last_error=f"standard deposit record "
+                                  f"refused: {exc}",
+                       detail={"record_summary": {
+                           "conversation_id": conversation_id,
+                           "mode": "standard"}})
+            result["parked"] = True
+            return result
+        try:
+            conf = depositor(record)
+            if conf and conf.get("confirmed"):
+                return {"confirmed": True,
+                        "entry_id": conf.get("entry_id") or mid,
+                        "hashes": conf.get("hashes") or {}}
+            last = f"unconfirmed reply: {str(conf)[:120]}"
+        except Exception as exc:  # noqa: BLE001 - weather, not fatal
+            last = str(exc)
+        queue = self.deposit_retry_queue
+        if queue is not None:
+            queue.enqueue(
+                record, last_error=last,
+                next_attempt_at=time.time()
+                + self.retry_policy.delay_for(0))
+            result["queued"] = True
+        else:
+            self._park("archive_deposit", mid, attempts=1,
+                       last_error=last, detail={"record": record})
+            result["parked"] = True
+        return result
+
+    def drain_deposit_queue(self, *, now: float | None = None) -> dict:
+        """Retry due entries of the standard-deposit queue
+        (2.4.1): one deposit attempt per due entry — event-
+        shaped, no polling loop lives here; the Agent calls
+        this from its existing cadences (history sync tail,
+        self-check). Success removes the entry. Failure backs
+        off per the retry policy; at exhaustion the entry moves
+        to the dead-letter park WITH the full record in detail
+        (operator-visible forever, never dropped). Returns
+        {"attempted", "deposited", "parked"} counts."""
+        out = {"attempted": 0, "deposited": 0, "parked": 0}
+        queue = self.deposit_retry_queue
+        depositor = self.archive_depositor
+        if queue is None or depositor is None:
+            return out
+        now = time.time() if now is None else now
+        for entry in queue.due(now):
+            out["attempted"] += 1
+            record = entry.get("record") or {}
+            mid = str(record.get("message_id") or "")
+            try:
+                conf = depositor(record)
+                if not (conf and conf.get("confirmed")):
+                    raise ArchiveError(
+                        "unconfirmed reply: "
+                        f"{str(conf)[:120]}")
+            except Exception as exc:  # noqa: BLE001
+                attempts = int(entry.get("attempts") or 0) + 1
+                if self.retry_policy.exhausted(attempts):
+                    queue.remove(mid)
+                    self._park("archive_deposit", mid,
+                               attempts=attempts,
+                               last_error=str(exc),
+                               detail={"record": record})
+                    out["parked"] += 1
+                else:
+                    queue.note_failure(
+                        mid, last_error=str(exc),
+                        next_attempt_at=now + self.retry_policy
+                        .delay_for(max(0, attempts - 1)))
+                continue
+            queue.remove(mid)
+            out["deposited"] += 1
+        return out
 
     def send_dm(self, to: str, content: dict, *,
                 message_id: str | None = None, mentions=None,
@@ -1476,16 +1643,25 @@ class ServerlessTransport:
                     "disappearing": True, "transit": landed,
                     "archive": conf}
         self._enqueue(to_user, frame)
-        self._audit(
+        audit_row = self._audit(
             "message", target=to_user, status="sent",
             priority=frame["priority"],
             size=len(str((content or {}).get("ct") or "")),
             mentions=frame["mentions"], ref_id=mid,
             oversight=json.dumps(oversight) if oversight else "",
-            content_envelope=json.dumps(content) if content else "")
+            content_envelope=json.dumps(content) if content else "",
+            return_row=True)
         self._push_transit(to_user, frame)
         self._tap(conversation_id_for_dm(self.username, to_user), mid)
-        return {"id": mid, "to": to_user, "queued": True}
+        deposit = self._standard_deposit(
+            mid=mid,
+            conversation_id=archive_conversation_id_dm(
+                self.username, to_user),
+            participants=[self.username, to_user],
+            oversight=oversight, kind="dm", ts=frame["ts"],
+            audit_row=audit_row)
+        return {"id": mid, "to": to_user, "queued": True,
+                "deposit": deposit}
 
     def send_group_frame(self, group_id: str, content: dict, *,
                          members, message_id: str | None = None,
@@ -1554,7 +1730,7 @@ class ServerlessTransport:
                     "archive": conf}
         for member in recipients:
             self._enqueue(member, dict(frame))
-        self._audit(
+        audit_row = self._audit(
             "group_message", group_id=group_id, status="sent",
             priority=frame["priority"],
             size=len(str((content or {}).get("ct") or "")),
@@ -1562,11 +1738,19 @@ class ServerlessTransport:
             sender_nickname=sender_nickname, sender_role=sender_role,
             sender_custom_role=sender_custom_role,
             oversight=json.dumps(oversight) if oversight else "",
-            content_envelope=json.dumps(content) if content else "")
+            content_envelope=json.dumps(content) if content else "",
+            return_row=True)
         for member in recipients:
             self._push_transit(member, dict(frame))
         self._tap(conversation_id_for_group(group_id), mid)
-        return {"id": mid, "group_id": group_id, "queued": recipients}
+        deposit = self._standard_deposit(
+            mid=mid,
+            conversation_id=archive_conversation_id_group(group_id),
+            participants=[self.username] + recipients,
+            oversight=oversight, oversight_kind="content_key",
+            kind="group", ts=frame["ts"], audit_row=audit_row)
+        return {"id": mid, "group_id": group_id, "queued": recipients,
+                "deposit": deposit}
 
     def send_channel_frame(self, channel_id: str, content: dict, *,
                            members, message_id: str | None = None,
@@ -1637,19 +1821,27 @@ class ServerlessTransport:
                     "transit": landed, "archive": conf}
         for member in recipients:
             self._enqueue(member, dict(frame))
-        self._audit(
+        audit_row = self._audit(
             "channel_message", group_id=channel_id, status="sent",
             priority=frame["priority"],
             size=len(str((content or {}).get("ct") or "")),
             mentions=frame["mentions"], ref_id=mid,
             sender_role=sender_role,
             oversight=json.dumps(oversight) if oversight else "",
-            content_envelope=json.dumps(content) if content else "")
+            content_envelope=json.dumps(content) if content else "",
+            return_row=True)
         for member in recipients:
             self._push_transit(member, dict(frame))
         self._tap(conversation_id_for_group(channel_id), mid)
+        deposit = self._standard_deposit(
+            mid=mid,
+            conversation_id=archive_conversation_id_channel(
+                channel_id),
+            participants=[self.username] + recipients,
+            oversight=oversight, oversight_kind="content_key",
+            kind="channel", ts=frame["ts"], audit_row=audit_row)
         return {"id": mid, "channel_id": channel_id,
-                "queued": recipients}
+                "queued": recipients, "deposit": deposit}
 
     # -- receive: fetch / ack ------------------------------------------------
     #: Custody reads page at this many rows (2.0.6). A whole-queue
