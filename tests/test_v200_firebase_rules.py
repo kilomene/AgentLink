@@ -40,9 +40,12 @@ def _walk(node, path=""):
 def test_rules_file_is_valid_json_with_rules_root():
     data = _rules()
     assert set(data.keys()) == {"rules"}
-    # digest added at v2.0 integration (fan-out valve writer/reader)
+    # digest added at v2.0 integration (fan-out valve writer/reader);
+    # inbox + directory added in 2.3.0 (the split's live layer:
+    # message transit queue + directory working copy).
     assert set(data["rules"].keys()) == \
-        {"signals", "presence", "doorbell", "digest"}
+        {"signals", "presence", "doorbell", "digest",
+         "inbox", "directory"}
 
 
 def test_firebase_json_points_at_the_rules_file():
@@ -167,8 +170,13 @@ def test_doorbell_shape_validation_is_exact():
 
 
 def test_no_content_shaped_fields_in_any_validated_shape():
-    """The wire carries ids/counters/timestamps only: no validated
-    node may admit a content-bearing field name."""
+    """No validated node may admit a PLAINTEXT-bearing field
+    name. (2.3.0: the inbox branch's frame child is the transit
+    envelope — a wholesale sealed object, validated by its
+    parent's hasChildren(['frame', 'ts']) exactly as custody
+    payloads always were; no field INSIDE it is individually
+    admitted by any rule, and plaintext field names stay
+    forbidden everywhere.)"""
     forbidden = {"content", "body", "ct", "nonce", "eph_pub",
                  "oversight", "file", "data_b64", "envelope"}
     for path, key, value in _walk(_rules()):
@@ -177,3 +185,38 @@ def test_no_content_shaped_fields_in_any_validated_shape():
             for name in forbidden:
                 assert f"'{name}'" not in value, (
                     f"{path} admits content field {name}")
+
+
+def test_inbox_branch_shape_and_access():
+    """2.3.0 transit queue: the owner reads their own inbox;
+    any authenticated agent may CREATE an item (a send), but a
+    delete (consume) is the owner's alone — the write rule's
+    newData.exists() arm makes non-owner deletes fail."""
+    inbox = _rules()["rules"]["inbox"]["$user"]
+    assert inbox[".read"] == "auth != null && auth.uid === $user"
+    item = inbox["$item"]
+    assert item[".write"] == \
+        "auth != null && (newData.exists() || auth.uid === $user)"
+    assert "hasChildren(['frame', 'ts'])" in item[".validate"]
+    assert item["$other"][".validate"] is False
+    # The frame child carries its OWN validate: without it, RTDB's
+    # deeper-wins validate semantics apply the $other ban to every
+    # field INSIDE the frame object and no inbox item can ever be
+    # written (proven live in the 2.3.0 sandbox drills). The frame
+    # is admitted on its frame shape (type + id — every frame the
+    # protocol builds carries both); its content stays opaque,
+    # never validated field by field.
+    assert item["frame"][".validate"] == \
+        "newData.hasChildren(['type', 'id'])"
+
+
+def test_directory_branch_shape_and_access():
+    """2.3.0 directory working copy: any authenticated agent may
+    read (lookups are the point); only the owner writes their
+    own entry."""
+    directory = _rules()["rules"]["directory"]["$user"]
+    assert directory[".read"] == "auth != null"
+    assert directory[".write"] == "auth != null && auth.uid === $user"
+    assert "hasChildren(['username', 'updated_at'])" in \
+        directory[".validate"]
+    assert directory["$other"][".validate"] is False
