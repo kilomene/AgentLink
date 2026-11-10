@@ -2261,7 +2261,16 @@ class Agent:
                 "permission_request": self._permission_request,
                 "connectors": self.connector_inventory(),
                 "derived_capabilities":
-                    self.derived_capabilities()}
+                    self.derived_capabilities(),
+                # Dead-letter surface (2.3.0): deliveries that
+                # exhausted the retry policy and parked — the
+                # count is always present; the records ride
+                # along so an operator sees WHAT parked without
+                # opening the state dir.
+                "dead_letters": len(self._v2.dead_letters)
+                if self._v2 is not None else 0,
+                "dead_letter_records": self._v2.dead_letters.records()
+                if self._v2 is not None else []}
 
     # -- connector bridge + one-time admin grant (v1.8.1) --------
     # The owner's corrected model, end to end:
@@ -3158,8 +3167,14 @@ class Agent:
         if self._serverless_injected is not None:
             transport = self._serverless_injected
         else:
+            # Dead-letter park (2.3.0): rooted in THIS agent's
+            # state dir, so a delivery that exhausts the retry
+            # policy leaves a durable, operator-visible record.
+            from .retry import DeadLetterPark
             transport = ServerlessTransport(
-                self._serverless_config or ServerlessConfig.from_env())
+                self._serverless_config or ServerlessConfig.from_env(),
+                dead_letter_park=DeadLetterPark(
+                    str(self.state_dir / "dead-letter.jsonl")))
         # Recovery enrollment (2.2.3): whichever login path the
         # transport takes (start, refresh, 401 backstop), an
         # enrollment key the Edge hands back lands in the
@@ -3167,7 +3182,20 @@ class Agent:
         # because the login that carried it was a background
         # re-login nobody was watching.
         transport.on_recovery_enrollment = self._adopt_enrollment_key
+        # Dead-letter surfacing (2.3.0): a parked delivery is a
+        # WARNING in the daemon log the moment it parks, and the
+        # record itself lives in the park (state-dir JSONL +
+        # transport.dead_letters) for diagnostics.
+        transport.on_dead_letter = self._on_v2_dead_letter
         return transport
+
+    def _on_v2_dead_letter(self, record: dict) -> None:
+        log.warning(
+            "dead-letter: %s %s to @%s parked after %s attempts "
+            "(%s) — see dead-letter.jsonl in the state dir",
+            record.get("kind"), record.get("item_id"),
+            record.get("to") or "-", record.get("attempts"),
+            record.get("last_error") or "")
 
     def _adopt_enrollment_key(self, key: str) -> None:
         if not key or self.ephemeral:
@@ -3252,8 +3280,8 @@ class Agent:
     def _on_v2_presence(self, username, record, state) -> None:
         """Scoped-watcher callback (transport thread): record the
         counterparty's ladder state. Display/diagnostics state —
-        reassignment decisions live server-side (pg_cron off the
-        activeness mirror), never on this cache."""
+        reassignment decisions live server-side, never on this
+        cache."""
         self.presence_peers[str(username)] = str(state)
         self.presence_events.append({
             "username": str(username), "state": str(state),
@@ -3277,26 +3305,35 @@ class Agent:
 
     def _on_v2_signal(self, conversation_key, signal) -> None:
         """Signal-stream callback (transport thread): a tap means
-        the custody queue may hold new frames — fetch and deliver
-        them. A fetch failure is the slow-sync leg's cue, not an
-        error worth raising into the stream thread."""
+        something changed in a conversation. Since 2.3.0 the
+        frame itself normally arrives on the TRANSIT INBOX stream
+        — a tap whose item the inbox already delivered needs no
+        fetch at all. A tap for anything else (a custody-only
+        frame, a read receipt, a transit copy Firebase lost)
+        reconciles against the custody queue: signal-triggered,
+        never periodic. A fetch failure is the degraded leg's
+        cue, not an error worth raising into the stream thread."""
         v2 = self._v2
         if v2 is None:
             return
+        if isinstance(signal, dict):
+            item_id = str(signal.get("latest_item_id") or "")
+            if item_id and v2.transit_seen(item_id):
+                return
         try:
             rows = v2.fetch_unacked()
         except Exception as exc:
             # A transient fetch failure (the path emptied or
             # clipped the response past its retry budget) is the
             # designed degradation this docstring describes — the
-            # slow-sync leg retries within the minute and delivery
-            # continues. It is logged as ONE warning line, not a
-            # traceback: a traceback is the shape of a crash, and
-            # stamping one on a self-healing transient corrupts
-            # the log's signal for every operator watching it
-            # (2.0.6 soak catch, 2026-11-06 — the supervisor read
-            # this traceback as a fault while the daemon delivered
-            # on around it).
+            # degraded-sync leg retries while the stream is down
+            # and delivery continues. It is logged as ONE warning
+            # line, not a traceback: a traceback is the shape of
+            # a crash, and stamping one on a self-healing
+            # transient corrupts the log's signal for every
+            # operator watching it (2.0.6 soak catch, 2026-11-06 —
+            # the supervisor read this traceback as a fault while
+            # the daemon delivered on around it).
             log.warning("serverless signal fetch failed: %s", exc)
             return
         for row in rows or []:
@@ -3305,8 +3342,10 @@ class Agent:
                 self._v2_deliver(frame)
 
     def _on_v2_frames(self, rows) -> None:
-        """Slow-sync callback (transport thread): the fallback
-        fetch's frames take the identical delivery path."""
+        """Frame-delivery callback (transport threads): rows from
+        the transit inbox stream, a reconnect reconciliation, or
+        the degraded-sync loop all take the identical delivery
+        path."""
         for row in rows or []:
             frame = row.get("frame") if isinstance(row, dict) else None
             if isinstance(frame, dict):
@@ -3317,11 +3356,11 @@ class Agent:
         relay path's _ping_loop writes heartbeat-<username>.txt
         every HEARTBEAT_SECONDS — the stamp the host watchdog
         reads (a stale stamp = a hung process = death). The
-        NETWORK heartbeat is the doorbell's own thread (5s beats,
-        started by transport login, independent of every loop
-        here); this task maintains only the local stamp contract
-        so host supervision behaves identically on both
-        transports."""
+        NETWORK heartbeat is the doorbell's own thread (180s
+        health beats since 2.3.0, started by transport login,
+        independent of every loop here); this task maintains only
+        the local stamp contract so host supervision behaves
+        identically on both transports."""
         stamp = self.state_dir / f"heartbeat-{self.username}.txt"
         while True:
             await asyncio.sleep(HEARTBEAT_SECONDS)
@@ -3633,11 +3672,12 @@ class Agent:
         (key-signed challenge -> scoped JWT + Firebase token)
         instead of the websocket hello, then the supervision
         bundle the Phase 6 drills require the daemon to own:
-        the supervised signal stream, the 60s slow-sync loop and
-        the scoped presence watcher — plus the doorbell heartbeat
-        the login itself starts, on its own thread, independent
-        of the message/work loops (hardcoded law). The boot
-        sequence mirrors the relay path's order and guards."""
+        the supervised signal stream, the transit inbox stream
+        (2.3.0 — the live delivery path) and the degraded-sync
+        loop — plus the doorbell heartbeat the login itself
+        starts, on its own thread, independent of the message/
+        work loops (hardcoded law). The boot sequence mirrors
+        the relay path's order and guards."""
         if self.ephemeral or not self.username:
             raise RegistrationFailed(
                 "serverless_requires_identity: the serverless "
@@ -3807,13 +3847,19 @@ class Agent:
         except Exception:
             log.exception("serverless presence watch failed to"
                           " start; the line stays up (signals +"
-                          " slow-sync still deliver)")
+                          " transit inbox still deliver)")
         self._v2_threads = [
             threading.Thread(
                 target=v2.listen_supervised,
                 args=(self._on_v2_signal,),
-                kwargs={"stop_event": self._v2_stop},
+                kwargs={"on_frames": self._on_v2_frames,
+                        "stop_event": self._v2_stop},
                 name="agentlink-v2-signals", daemon=True),
+            threading.Thread(
+                target=v2.listen_inbox_supervised,
+                args=(self._on_v2_frames,),
+                kwargs={"stop_event": self._v2_stop},
+                name="agentlink-v2-inbox", daemon=True),
             threading.Thread(
                 target=v2.run_slow_sync,
                 args=(self._on_v2_frames,),
@@ -3822,6 +3868,16 @@ class Agent:
         ]
         for t in self._v2_threads:
             t.start()
+        # Directory working copy (2.3.0): publish my entry to the
+        # live layer so peers read it from RTDB instead of
+        # PostgREST. Best-effort — the Supabase master record
+        # still serves any lookup the copy misses.
+        try:
+            _my_entry = v2.directory_entry(self.username)
+            if _my_entry:
+                v2.publish_my_directory(_my_entry)
+        except Exception:
+            pass
         # Owner-seat control channel: the lock holder serves
         # forwarded one-shot commands, as on the relay path.
         await self._start_control_server()
@@ -3838,12 +3894,13 @@ class Agent:
             except TransportError as exc:
                 # A transient transport failure (the path emptied
                 # or clipped a response past its retry budget) is a
-                # designed degradation: the slow-sync pass retries
-                # within the minute. ONE warning line, not a
-                # traceback — the signal-fetch hygiene doctrine
-                # (2.0.6): a traceback is the shape of a crash, and
-                # stamping one on a self-healing transient corrupts
-                # the log's signal.
+                # designed degradation: the degraded-sync pass and
+                # the reconnect reconciliation retry it. ONE
+                # warning line, not a traceback — the
+                # signal-fetch hygiene doctrine (2.0.6): a
+                # traceback is the shape of a crash, and stamping
+                # one on a self-healing transient corrupts the
+                # log's signal.
                 log.warning("resume/resync pass deferred: %s", exc)
             except Exception:
                 log.exception("resume/resync pass failed")
@@ -3903,8 +3960,8 @@ class Agent:
 
     async def _stop_v2_session(self) -> None:
         """End the serverless session: stop the supervision
-        threads, then log out (Firebase offline write + offline
-        mirror transition + refresh-timer cancel, inside
+        threads, then log out (Firebase offline write + local
+        offline transition + refresh-timer cancel, inside
         transport.logout). Idempotent — close() and run()'s
         teardown may both call it; the first caller wins the
         transport, the second finds None."""
@@ -4008,8 +4065,28 @@ class Agent:
                         await asyncio.to_thread(
                             self._v2_request_sync, frame)
                     except Exception as exc:
-                        self._outbox.mark_failed(
+                        failed = self._outbox.mark_failed(
                             entry["id"], str(exc))
+                        if failed is not None and \
+                                failed.get("status") == "parked":
+                            # Attempt budget spent (2.3.0): the
+                            # entry leaves the retry set and the
+                            # park makes the failure a visible,
+                            # durable record — never a silent
+                            # infinite retry.
+                            self._v2._park(
+                                "outbox", entry["id"],
+                                to=str(frame.get("to")
+                                       or frame.get("group_id")
+                                       or ""),
+                                attempts=int(
+                                    failed.get("attempts") or 0),
+                                last_error=str(exc))
+                            log.error(
+                                "outbox: send %s PARKED after %s "
+                                "attempts (dead-lettered): %s",
+                                entry["id"],
+                                failed.get("attempts"), exc)
                         continue
                     self._outbox.mark_sent(entry["id"])
                     log.info("outbox: queued send %s confirmed by "
@@ -4126,7 +4203,13 @@ class Agent:
             # the audit log under RLS — sync_history merges them
             # through the identical _history_row_to_msg ->
             # put_if_absent path, so exactly-once is one rule on
-            # both transports.
+            # both transports. The 2.3.0 forward arm: with an
+            # ``after_seq`` cursor the page is strictly-newer rows
+            # only (fetch_history_since) — the backward page below
+            # runs exactly once per install.
+            if frame.get("after_seq") is not None:
+                return {"rows": v2.fetch_history_since(
+                    frame["after_seq"], frame.get("limit") or 200)}
             return {"rows": v2.fetch_history_page(
                 frame.get("limit") or 200, frame.get("before_seq"))}
         # -- work lifecycle -------------------------------------------------
@@ -5951,7 +6034,11 @@ class Agent:
         {"fetched", "inserted", "pages", "rectified"} (plus
         "error" when the relay could not be asked — the sync is
         resumable by simply calling it again, and start() calls it
-        on every connect)."""
+        on every connect). Serverless since 2.3.0: a returning
+        agent syncs FORWARD from its persisted history cursor
+        (only the rows it has never journaled); the backward full
+        paging is the once-per-install first sync, and remains
+        the relay path's standing shape."""
         out = {"fetched": 0, "inserted": 0, "pages": 0, "rectified": 0,
                "healed": 0}
         mb = self.mailbox
@@ -5972,9 +6059,21 @@ class Agent:
         shrink_ladder = [50, 10]
         before: int | None = None
         smallest: int | None = None
+        # Forward-cursor sync (2.3.0, serverless only): with a
+        # persisted history cursor the sync asks ONLY for rows
+        # strictly newer than it (the after_seq arm) — a returning
+        # agent downloads exactly what it has never journaled.
+        # The backward full re-download below runs exactly once
+        # per install (cursor 0) and establishes the cursor. The
+        # cursor advances only over pages actually journaled.
+        forward = self._v2 is not None and self._history_cursor() > 0
+        after: int | None = self._history_cursor() if forward else None
+        largest: int | None = None
         while True:
             frame: dict = {"type": "history", "limit": page_size}
-            if before is not None:
+            if forward:
+                frame["after_seq"] = after
+            elif before is not None:
                 frame["before_seq"] = before
             try:
                 data = await self._request(frame, timeout=30)
@@ -6003,6 +6102,8 @@ class Agent:
                 if isinstance(seq, (int, float)):
                     smallest = int(seq) if smallest is None else min(
                         smallest, int(seq))
+                    largest = int(seq) if largest is None else max(
+                        largest, int(seq))
                 msg = self._history_row_to_msg(row)
                 if msg is None or not msg.get("id"):
                     continue
@@ -6049,12 +6150,48 @@ class Agent:
                         out["rectified"] += 1
                     except Exception:
                         pass
+            if forward:
+                if largest is not None:
+                    after = largest
+                    self._save_history_cursor(largest)
+                if len(rows) < page_size or largest is None:
+                    break  # caught up to the archive's head
+                continue
             if len(rows) < page_size or smallest is None:
-                break  # short page = the beginning of history
+                # Short page = the beginning of history: the ONE
+                # full backfill is complete, so the cursor is set
+                # and every later boot syncs forward from it.
+                if self._v2 is not None and largest is not None:
+                    self._save_history_cursor(largest)
+                break
             if before is not None and smallest >= before:
                 break  # no progress — never spin
             before = smallest
         return out
+
+    def _history_cursor_path(self):
+        return self.state_dir / "al_history_cursor"
+
+    def _history_cursor(self) -> int:
+        """The persisted history high-water mark (2.3.0): the
+        greatest audit seq this client has journaled from the
+        archive. 0 when no cursor file exists — a fresh install,
+        whose one full backfill establishes it."""
+        try:
+            return int(
+                self._history_cursor_path().read_text().strip()
+                or 0)
+        except Exception:
+            return 0
+
+    def _save_history_cursor(self, seq: int) -> None:
+        """Persist the history cursor. Fail-soft: a cursor that
+        cannot be written costs one forward re-sync of the same
+        rows (the journal dedupes), never a crash."""
+        try:
+            self._history_cursor_path().write_text(str(int(seq)))
+        except Exception:
+            pass
 
     def _history_row_to_msg(self, row: dict) -> dict | None:
         """Convert one relay history (audit) row into the msg dict
