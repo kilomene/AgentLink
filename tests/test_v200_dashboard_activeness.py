@@ -1,16 +1,18 @@
 """Phase 5b static pins: dashboard activeness staleness ladder.
 
-Owner ruling 2026-11-05 (hyper-sensitive, binding): AgentLink's
-ORIGINAL timing law on Firebase presence — beats every 5s,
-ONLINE_MAX_AGE_S = 10 (suspect after 2 missed beats),
-SUSPECT_MAX_AGE_S = 15 (offline after 3 missed beats), and
-onDisconnect => offline instantly. Dashboard ladder must equal the
-client ladder (agentlink/doorbell.py: same numbers, same names).
+Owner ruling 2026-11-05 set the original hyper-sensitive law
+(beats every 5s, online 10, suspect 15). 2.3.0 SUPERSEDES it
+(owner-ratified 2026-11-09): presence is connection-based and
+the beat is only the unclean-death detector, so the ladder
+stretches to beats every 180s, ONLINE_MAX_AGE_S = 240,
+SUSPECT_MAX_AGE_S = 420, and onDisconnect => offline instantly.
+Dashboard ladder must equal the client ladder
+(agentlink/doorbell.py: same numbers, same names).
 
 Stdlib only. The ladder logic is pinned structurally (thresholds
 extracted and the three branches asserted with their comparisons)
 and, when node is available, behaviourally by executing the real
-js/activeness.js at the 10/11/15/16 boundaries.
+js/activeness.js at the 240/241/420/421 boundaries.
 """
 import json
 import re
@@ -37,21 +39,23 @@ def act():
     return ACT.read_text()
 
 
-# --- 1. ladder constants: 5 / 10 / 15 ---------------------------------
+# --- 1. ladder constants: 180 / 240 / 420 ------------------------------
 
-def test_ladder_constants_hyper_sensitive(act):
-    assert _const(act, "BEAT_INTERVAL_S") == 5
-    assert _const(act, "ONLINE_MAX_AGE_S") == 10
-    assert _const(act, "SUSPECT_MAX_AGE_S") == 15
+def test_ladder_constants_connection_based(act):
+    assert _const(act, "BEAT_INTERVAL_S") == 180
+    assert _const(act, "ONLINE_MAX_AGE_S") == 240
+    assert _const(act, "SUSPECT_MAX_AGE_S") == 420
 
 
-def test_ladder_constants_are_missed_beat_multiples(act):
+def test_ladder_constants_are_ordered_with_grace(act):
     beat = _const(act, "BEAT_INTERVAL_S")
     online = _const(act, "ONLINE_MAX_AGE_S")
     suspect = _const(act, "SUSPECT_MAX_AGE_S")
-    assert online == 2 * beat    # suspect after 2 missed beats
-    assert suspect == 3 * beat   # offline after 3 missed beats
+    # 2.3.0: one beat of grace past the interval reads online;
+    # a second missed beat lands suspect; beyond that, offline.
     assert beat < online < suspect
+    assert online - beat == 60
+    assert suspect - online == beat
 
 
 def test_activeness_mirrors_doorbell_comment(act):
@@ -100,9 +104,9 @@ def test_boundaries_from_extracted_thresholds(act):
     beat = _const(act, "BEAT_INTERVAL_S")
     online = _const(act, "ONLINE_MAX_AGE_S")
     suspect = _const(act, "SUSPECT_MAX_AGE_S")
-    expected = {0: "online", 5: "online", 10: "online",
-                11: "suspect", 15: "suspect",
-                16: "offline", 60: "offline"}
+    expected = {0: "online", 100: "online", 240: "online",
+                241: "suspect", 420: "suspect",
+                421: "offline", 900: "offline"}
     for age, want in expected.items():
         got = _ladder(age, beat, online, suspect)
         assert got == want, f"age {age}: {got} != {want}"
@@ -118,7 +122,7 @@ def test_activeness_js_executed_at_boundaries(act):
         "const now=1000000;"
         "const byAge=a=>({beat_at:(now-a)*1000, state:'online'});"
         "const out={};"
-        "for(const a of [0,10,11,15,16,60]) out[a]=activenessState(byAge(a),now);"
+        "for(const a of [0,240,241,420,421,900]) out[a]=activenessState(byAge(a),now);"
         "out.missing=activenessState(null,now);"
         "out.empty=activenessState({},now);"
         "out.disconnect=activenessState({beat_at:now*1000,state:'offline'},now);"
@@ -130,8 +134,8 @@ def test_activeness_js_executed_at_boundaries(act):
                           capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout.strip().splitlines()[-1])
-    assert out == {"0": "online", "10": "online", "11": "suspect",
-                   "15": "suspect", "16": "offline", "60": "offline",
+    assert out == {"0": "online", "240": "online", "241": "suspect",
+                   "420": "suspect", "421": "offline", "900": "offline",
                    "missing": "offline", "empty": "offline",
                    "disconnect": "offline", "discflag": "offline"}
 
