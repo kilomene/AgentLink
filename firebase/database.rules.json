@@ -84,6 +84,58 @@
      ".validate": "newData.isNumber() && newData.val() > 0"
     }
    }
+  },
+  "inbox": {
+   "$user": {
+    "$item": {
+     ".validate": "newData.hasChildren(['frame', 'ts'])",
+     ".write": "auth != null && (newData.exists() || auth.uid === $user)",
+     "expires_at": {
+      ".validate": "newData.isNumber() && newData.val() >= 0"
+     },
+     "frame": {
+      ".validate": "newData.hasChildren(['type', 'id'])"
+     },
+     "ts": {
+      ".validate": "newData.isNumber() && newData.val() > 0"
+     },
+     "$other": {
+      ".validate": false
+     }
+    },
+    ".read": "auth != null && auth.uid === $user"
+   }
+  },
+  "directory": {
+   "$user": {
+    "$other": {
+     ".validate": false
+    },
+    ".read": "auth != null",
+    ".validate": "newData.hasChildren(['username', 'updated_at'])",
+    ".write": "auth != null && auth.uid === $user",
+    "cap_desc": {
+     ".validate": "newData.isString()"
+    },
+    "designation": {
+     ".validate": "newData.isString()"
+    },
+    "mode": {
+     ".validate": "newData.isString()"
+    },
+    "pubkey": {
+     ".validate": "newData.isString()"
+    },
+    "sign_pub": {
+     ".validate": "newData.isString()"
+    },
+    "updated_at": {
+     ".validate": "newData.isNumber() && newData.val() > 0"
+    },
+    "username": {
+     ".validate": "newData.isString() && newData.val().length > 0"
+    }
+   }
   }
  }
 }
