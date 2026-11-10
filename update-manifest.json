@@ -1,16 +1,16 @@
 {
-  "version": "2.4.0",
+  "version": "2.4.1",
   "files": {
-    "agentlink/__init__.py": "a1e0116a7321b75471b3b128235689ca2515c5b2a6d125291e9d76976dde26b9",
+    "agentlink/__init__.py": "f82a37396d74ed7ba930baf8cb2287d420b51ea0478dd133784e698a8de82797",
     "agentlink/__main__.py": "307299fda7b77d22c64cb51430ec75e5f59d78e9c948786afb3b2544fe45e4b7",
     "agentlink/alerts_local.py": "c08cd95bfaf6f4e5968e3b4cc85c49d74c0b5b54f66e6120235e38b4078ca82d",
-    "agentlink/archive.py": "00c41d95fbb1118d17ca66bf35320b24e273ea6e63b907d21b46744b24d3e2ac",
+    "agentlink/archive.py": "c7209541a3357c64f0624fbd77bfd2886192e366ced800eb14a14b702e0d4261",
     "agentlink/backend.py": "91a7ad63bdcbd3ddcf4c797b23bc6df06a508ea54eba37f370fdc6f609844068",
     "agentlink/backup.py": "5fb14d8858586a1763b0a190a95ff182a912b83663822c76f8fa5e025f128619",
     "agentlink/blobstore.py": "607f0359c9808a8b4bdf0c7c3817ca2362c7392aa96357b27b29ad8ad88ad4d0",
     "agentlink/census.py": "2cb5d77c3ff78c226d1a2c3be37de1bf889c59c61bde57f30c940299c226b78b",
     "agentlink/cli.py": "8674006490696ad4836e558da8b91fb43ef935b4bd55dac6a51b703b94c53626",
-    "agentlink/client.py": "70fcf7b3dad73e48790e93ab77bcd82799d0ad0a5b3b15f585b5ceba281af8d8",
+    "agentlink/client.py": "d90e253425d5ee322ffd4fde5ec46c4ee296432a33bcbb809df7474c28fed80e",
     "agentlink/config.py": "903954c47bad67559cb7daaa828ab5ad154c80c075d34ce638ab6411e1c2e5a6",
     "agentlink/connectors.py": "c345a5d64dbec8c9e2cbbbc5ec06f1626a698354cb680e64432376fb8330e55e",
     "agentlink/crypto.py": "6d653e0d5ae4999d65354e23c388314833c6c03c27e852357431921c78905637",
@@ -29,7 +29,7 @@
     "agentlink/support.py": "879b19582446f43ef482d783bdbac3716ca44a6eee004d76d2ee6d5a497270be",
     "agentlink/support_hook.py": "1bd1a53766a71d69c54f0af2e4414a77a6c6db0000ace44014fbf377771d9263",
     "agentlink/timing.py": "9c5104142310915af0265f7cfc6bd54d37bf701d99902ecd0fe840e4a0d386dd",
-    "agentlink/transport_v2.py": "67aa2f7d26da6d70ee1d356ec2dc5fa23b9d9c05d894d870bbfd9c1d71ee0b92",
+    "agentlink/transport_v2.py": "afac7e44ae9f753f1dbebdae1f55b2d9600bd937d46c0ce3feed9e0490de4038",
     "agentlink/updater.py": "fa5db3568ab0479c0b49c17f9be35f290c63f5eacab6c66c1435eeacf0e3306b",
     "agentlink/vault.py": "b46ef0362df0ebf3dda227a0989868fba0509a499ada2bcc131948ddda10cf7a"
   }
