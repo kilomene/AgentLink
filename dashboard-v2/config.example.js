@@ -5,6 +5,11 @@ window.AGENTLINK_CONFIG = {
   anonKey: "YOUR_ANON_KEY",
   edgeBase: "https://YOUR_PROJECT.supabase.co/functions/v1",
   firebaseDbUrl: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+  // Published update-manifest (v242): the Agents view reads its
+  // "latest" version from here at runtime — the same manifest
+  // artifact the clients' updater consumes, deployed alongside
+  // the dashboard by the ship step. Never a baked constant.
+  manifestUrl: "/update-manifest.json",
   // Archive service base (Firebase Cloud Functions, 2.4.0):
   // disappearing conversations render from the owner archive
   // through this base's /archiveRead — never from the delivery
