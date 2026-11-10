@@ -2432,7 +2432,26 @@ class Agent:
                 "dead_letters": len(self._v2.dead_letters)
                 if self._v2 is not None else 0,
                 "dead_letter_records": self._v2.dead_letters.records()
-                if self._v2 is not None else []}
+                if self._v2 is not None else [],
+                # Standard-deposit retry surface (2.4.1): sends
+                # whose Drive deposit is still owed — count plus
+                # the queued records (message id, conversation,
+                # attempts, last error), so a pending deposit is
+                # as visible as a parked one.
+                "deposit_retries": len(self._v2.deposit_retry_queue)
+                if self._v2 is not None
+                and self._v2.deposit_retry_queue is not None else 0,
+                "deposit_retry_records": [
+                    {"message_id": (e.get("record") or {})
+                     .get("message_id"),
+                     "conversation_id": (e.get("record") or {})
+                     .get("conversation_id"),
+                     "attempts": e.get("attempts"),
+                     "last_error": e.get("last_error")}
+                    for e in (self._v2.deposit_retry_queue.records()
+                              if self._v2 is not None
+                              and self._v2.deposit_retry_queue
+                              is not None else [])]}
 
     # -- connector bridge + one-time admin grant (v1.8.1) --------
     # The owner's corrected model, end to end:
@@ -3352,6 +3371,14 @@ class Agent:
         # Disappearing Mode v2 (2.4.0): the fail-closed archive
         # deposit gate's depositor — this agent's archive path.
         transport.archive_depositor = self._archive_deposit_sync
+        # Universal archive deposit (2.4.1): the durable retry
+        # queue for STANDARD deposits lives beside the park, so
+        # a deposit the archive service could not take at send
+        # time survives restarts and drains when it recovers.
+        if self._serverless_injected is None:
+            from .archive import DepositRetryQueue
+            transport.deposit_retry_queue = DepositRetryQueue(
+                self.state_dir / "deposit-retry.json")
         return transport
 
     #: Production archive service (workstream d): the Firebase
@@ -5975,6 +6002,20 @@ class Agent:
                             work["id"], work["checkpoint"])
                 await self._record_repair("journal_rebuilt_from_mirror")
                 repairs.append("journal")
+        # Universal archive deposit (2.4.1): the self-check
+        # cadence also drains due STANDARD deposit retries, so a
+        # deposit owed to the owner archive lands as soon as the
+        # service recovers even between history syncs.
+        if self._v2 is not None:
+            try:
+                drained = await asyncio.to_thread(
+                    self._v2.drain_deposit_queue)
+                if drained.get("deposited"):
+                    repairs.append(
+                        f"deposit_retries_drained:"
+                        f"{drained['deposited']}")
+            except Exception:
+                log.exception("deposit retry drain failed")
         return {"ok": True, "repairs": repairs}
 
     async def _maybe_provision_keys(self, event: dict) -> None:
@@ -6384,6 +6425,15 @@ class Agent:
             out["disappearing_sweep"] = self.sweep_disappearing()
         except Exception:
             log.exception("disappearing erase sweep failed")
+        # Universal archive deposit (2.4.1): drain any queued
+        # STANDARD deposits whose backoff has come due — the
+        # sync cadence is the drain's clock; no polling added.
+        if self._v2 is not None:
+            try:
+                out["deposit_drain"] = await asyncio.to_thread(
+                    self._v2.drain_deposit_queue)
+            except Exception:
+                log.exception("deposit retry drain failed")
         return out
 
     def sweep_disappearing(self, now: int | None = None) -> dict:
