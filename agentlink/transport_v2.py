@@ -46,9 +46,12 @@ What moves where (blueprint routes, exactly):
   construction) — then pushes the frame itself into the recipient's
   Firebase TRANSIT INBOX and taps the conversation's signal.
   Content bytes are opaque here: they are stored, never opened.
-  A DISAPPEARING message (2.3.0) skips Supabase entirely: the
-  transit inbox is its only home, with an expiry, and no custody
-  or archive row is ever written for it.
+  A DISAPPEARING message skips Supabase entirely: the transit
+  inbox is its only platform home, with NO expiry (v2: unread
+  never expires unread), no custody or Supabase archive row —
+  its durable record is the fail-closed oversight deposit
+  into the owner's archive at send time (Disappearing Mode
+  v2, 2.4.0).
 * **Receive** — the transit inbox stream delivers frames with
   ZERO Supabase reads; consuming a standard frame releases its
   custody through ``ack`` (custody is NOT released by fetching).
@@ -107,6 +110,13 @@ import urllib.parse
 import urllib.request
 
 from . import proxycreds
+from .archive import (ArchiveError,
+                      conversation_id_channel as
+                      archive_conversation_id_channel,
+                      conversation_id_dm as
+                      archive_conversation_id_dm,
+                      conversation_id_group as
+                      archive_conversation_id_group)
 from .doorbell import (DoorbellClient, DoorbellError,
                        ScopedPresenceWatcher,
                        conversation_id_for_dm,
@@ -147,10 +157,14 @@ SLOW_SYNC_INTERVAL_SECONDS = 120
 #: the reconnect churn a flapping path used to generate.
 RECONNECT_BACKOFF_CAP_S = 30
 
-#: Default lifetime of a DISAPPEARING message's transit copy
-#: (seconds): 24h. The consumer discards expired items unopened;
-#: nothing about a disappearing message is ever archived.
+#: Disappearing Mode v2 (2.4.0) window: exactly 24h, applied
+#: PER SIDE (sender: send+24h; receiver: read+24h, no clock
+#: while unread). The transit copy itself carries NO expiry —
+#: an unread disappearing message NEVER expires unread
+#: (DESIGN-BRIEF rules 1-3). Kept for wire compatibility with
+#: the 2.3.0 ttl_s parameter, which v2 ignores for expiry.
 DEFAULT_DISAPPEARING_TTL_S = 24 * 3600
+DISAPPEARING_WINDOW_S = 24 * 3600
 
 #: The Supabase JWT is re-logged-in this many seconds BEFORE its
 #: exp claim, armed as a timer from the token itself.
@@ -197,7 +211,8 @@ def _proxy_failure_text(text: str) -> bool:
     low = (text or "").lower()
     return ("407" in low
             or "proxy authentication" in low
-            or "tunnel connection failed" in low)
+            or "tunnel connection failed" in low
+            or "partial wedge" in low)
 
 
 def _jwt_exp(jwt: str) -> int:
@@ -345,6 +360,30 @@ class ServerlessConfig:
         return self.supabase_url + "/rest/v1"
 
 
+class PartialWedgeError(Exception):
+    """B4 PARTIAL-WEDGE DETECTOR (2.4.0): a response whose body
+    PROVABLY truncated mid-transfer — http.client raised
+    IncompleteRead and the bytes that arrived are fewer than
+    the response's own Content-Length. Before the detector,
+    _read_body silently returned the partial bytes and the
+    wedged egress candidate stayed crowned: the caller ate a
+    clipped payload (a large history page read as a short one)
+    with every health light green. A detected wedge is a
+    PROXY-class failure: _default_opener converts it to a
+    TransportError carrying the proxy signature, so
+    _call_hardened abdicates the winner and retries on the
+    ladder with a freshly resolved candidate."""
+
+
+def _content_length(resp) -> int | None:
+    try:
+        headers = getattr(resp, "headers", None)
+        raw = headers.get("Content-Length") if headers else None
+        return int(raw) if raw is not None else None
+    except Exception:
+        return None
+
+
 def _read_body(resp) -> bytes:
     """Read a response body, tolerating a stream clipped AFTER
     the payload arrived: http.client raises IncompleteRead when
@@ -354,11 +393,23 @@ def _read_body(resp) -> bytes:
     the same doctrine blobstore's R2 reader follows. Whether
     those bytes are the complete payload is judged by the
     body's own parser downstream: a truly truncated body still
-    fails there, unchanged."""
+    fails there, unchanged.
+
+    B4 (2.4.0): when the truncation is PROVABLE (a
+    Content-Length header exceeds the partial bytes), the
+    partial-wedge detector raises instead of returning clipped
+    bytes as if they were the payload."""
     try:
         return resp.read()
     except http.client.IncompleteRead as exc:
-        return exc.partial or b""
+        partial = exc.partial or b""
+        expected = _content_length(resp)
+        if expected is not None and len(partial) < expected:
+            raise PartialWedgeError(
+                f"partial wedge: body truncated at "
+                f"{len(partial)}/{expected} bytes mid-response "
+                f"(tunnel connection failed)") from exc
+        return partial
 
 
 def _default_opener(method, url, headers, body):
@@ -375,8 +426,14 @@ def _default_opener(method, url, headers, body):
     try:
         with proxycreds.open_url(req, timeout=30) as resp:
             return resp.status, dict(resp.headers), _read_body(resp)
+    except PartialWedgeError as exc:
+        raise TransportError(str(exc)) from exc
     except urllib.error.HTTPError as exc:
-        return exc.code, dict(exc.headers or {}), _read_body(exc) or b""
+        try:
+            body = _read_body(exc) or b""
+        except PartialWedgeError as wexc:
+            raise TransportError(str(wexc)) from wexc
+        return exc.code, dict(exc.headers or {}), body
 
 
 def _loads(val, default):
@@ -458,6 +515,12 @@ class ServerlessTransport:
         # a bare transport parks in memory only.
         self.retry_policy = retry_policy or RetryPolicy()
         self.dead_letters = dead_letter_park or DeadLetterPark()
+        #: Disappearing Mode v2 (2.4.0): the archive depositor —
+        #: a callable(record) -> confirmation dict, wired by the
+        #: Agent (archive.archive backends / the Firebase archive
+        #: service over HTTPS). None = NO disappearing sends:
+        #: the deposit gate is fail-closed by construction.
+        self.archive_depositor = None
         #: Optional sink called with each parked record (the
         #: Agent logs + surfaces it; diagnostics read the park).
         self.on_dead_letter = None
@@ -1291,6 +1354,64 @@ class ServerlessTransport:
             "mode": mode,
             "expires_at": int((node or {}).get("expires_at") or 0)}
 
+    def _disappearing_gate(self, *, mid: str, conversation_id: str,
+                           participants, oversight,
+                           oversight_kind: str = "content",
+                           ts: int = 0) -> dict:
+        """Disappearing Mode v2 FAIL-CLOSED OVERSIGHT DEPOSIT
+        (DESIGN-BRIEF rule 5/7). A disappearing send requires
+        the oversight-sealed owner copy, deposited into the
+        owner's archive BEFORE the send completes:
+
+        * no oversight wrap -> TransportError, nothing sent;
+        * no depositor wired -> TransportError, nothing sent;
+        * deposit attempts ride the retry policy; a deposit
+          that stays unconfirmed is PARKED in the dead-letter
+          park (visible, never dropped) and the send stays
+          blocked — never a silent fallback to an unarchived
+          send, on any path.
+
+        Returns the archive service's confirmation dict."""
+        if not (isinstance(oversight, dict) and oversight.get("ct")):
+            self._park("archive_deposit", mid, attempts=0,
+                       last_error="no oversight-sealed deposit copy")
+            raise TransportError(
+                "disappearing send blocked: no oversight-sealed "
+                "deposit copy (fail-closed)")
+        depositor = self.archive_depositor
+        if depositor is None:
+            self._park("archive_deposit", mid, attempts=0,
+                       last_error="archive depositor not configured")
+            raise TransportError(
+                "disappearing send blocked: archive depositor "
+                "not configured (fail-closed)")
+        record = {"message_id": mid,
+                  "conversation_id": conversation_id,
+                  "participants": list(participants),
+                  "sender": self.username,
+                  "oversight": oversight,
+                  "oversight_kind": oversight_kind,
+                  "ts": int(ts or now_ts())}
+        attempt = 0
+        last = ""
+        while True:
+            attempt += 1
+            try:
+                conf = depositor(record)
+                if conf and conf.get("confirmed"):
+                    return conf
+                last = f"unconfirmed reply: {str(conf)[:120]}"
+            except Exception as exc:  # noqa: BLE001 - any doubt blocks
+                last = str(exc)
+            if self.retry_policy.exhausted(attempt):
+                self._park("archive_deposit", mid,
+                           attempts=attempt, last_error=last)
+                raise TransportError(
+                    "disappearing send blocked: archive deposit "
+                    f"unconfirmed after {attempt} attempts "
+                    f"({last}) — deposit parked, send held")
+            _sleep(self.retry_policy.delay_for(attempt - 1))
+
     def send_dm(self, to: str, content: dict, *,
                 message_id: str | None = None, mentions=None,
                 priority: str = "normal", in_reply_to=None,
@@ -1309,12 +1430,16 @@ class ServerlessTransport:
         Returns {"id", "to", "queued": True} (serverless delivery
         is custody-first: everything is 'queued' until acked).
 
-        ``disappearing=True`` (2.3.0) selects the disappearing
-        mode: NO custody row, NO archive row, NO oversight wrap —
-        the frame rides the transit inbox only, stamped with an
-        expiry (``ttl_s``, default DEFAULT_DISAPPEARING_TTL_S),
-        and the result reports {"disappearing": True, "transit":
-        <landed>} instead of a custody claim."""
+        ``disappearing=True`` selects Disappearing Mode v2
+        (2.4.0): NO custody row and NO Supabase archive row — the
+        frame rides the transit inbox only, with NO transit
+        expiry (an unread item never expires unread) — but the
+        OVERSIGHT copy is now MANDATORY and fail-closed: the
+        send first deposits the oversight-sealed copy into the
+        owner's archive (``_disappearing_gate``); no deposit
+        confirmation, no send. The result reports
+        {"disappearing": True, "transit": <landed>,
+        "archive": <confirmation>}."""
         if not self.username:
             raise TransportError("login required before send_dm")
         to_user = str(to)
@@ -1331,18 +1456,25 @@ class ServerlessTransport:
                  "content": content, "ts": now_ts(),
                  "in_reply_to": in_reply_to, "group_id": None}
         if disappearing:
-            expires = now_ts() + int(
-                ttl_s if ttl_s is not None
-                else DEFAULT_DISAPPEARING_TTL_S)
+            conf = self._disappearing_gate(
+                mid=mid,
+                conversation_id=archive_conversation_id_dm(
+                    self.username, to_user),
+                participants=[self.username, to_user],
+                oversight=oversight, ts=frame["ts"])
             frame["disappearing"] = True
-            frame["expires_at"] = expires
-            frame["oversight"] = None
+            frame["sent_at"] = frame["ts"]
+            frame["window_s"] = DISAPPEARING_WINDOW_S
+            frame["archive"] = {
+                "entry_id": conf.get("entry_id") or mid,
+                "hashes": conf.get("hashes") or {}}
             landed = self._push_transit(
-                to_user, frame, disappearing=True, expires_at=expires)
+                to_user, frame, disappearing=True, expires_at=0)
             self._tap(conversation_id_for_dm(self.username, to_user),
                       mid)
             return {"id": mid, "to": to_user, "queued": False,
-                    "disappearing": True, "transit": landed}
+                    "disappearing": True, "transit": landed,
+                    "archive": conf}
         self._enqueue(to_user, frame)
         self._audit(
             "message", target=to_user, status="sent",
@@ -1374,9 +1506,10 @@ class ServerlessTransport:
         conversation regardless of member count (the blueprint's
         fan-out rule).
 
-        ``disappearing=True`` (2.3.0): transit-only — no custody
-        rows, no archive row, no oversight wrap; the frame is
-        stamped with its expiry and pushed per member."""
+        ``disappearing=True``: Disappearing Mode v2 (2.4.0) —
+        transit-only (no custody rows, no Supabase archive row),
+        no transit expiry, and the fail-closed oversight deposit
+        gate runs first, exactly as the DM path."""
         if not self.username:
             raise TransportError("login required before send_group_frame")
         mid = message_id or new_id()
@@ -1396,21 +1529,29 @@ class ServerlessTransport:
         recipients = [str(m) for m in (members or [])
                       if str(m) != self.username]
         if disappearing:
-            expires = now_ts() + int(
-                ttl_s if ttl_s is not None
-                else DEFAULT_DISAPPEARING_TTL_S)
+            conf = self._disappearing_gate(
+                mid=mid,
+                conversation_id=archive_conversation_id_group(
+                    group_id),
+                participants=[self.username] + recipients,
+                oversight=oversight, oversight_kind="content_key",
+                ts=frame["ts"])
             frame["disappearing"] = True
-            frame["expires_at"] = expires
-            frame["oversight"] = None
+            frame["sent_at"] = frame["ts"]
+            frame["window_s"] = DISAPPEARING_WINDOW_S
+            frame["archive"] = {
+                "entry_id": conf.get("entry_id") or mid,
+                "hashes": conf.get("hashes") or {}}
             landed = []
             for member in recipients:
                 if self._push_transit(member, dict(frame),
                                       disappearing=True,
-                                      expires_at=expires):
+                                      expires_at=0):
                     landed.append(member)
             self._tap(conversation_id_for_group(group_id), mid)
             return {"id": mid, "group_id": group_id, "queued": [],
-                    "disappearing": True, "transit": landed}
+                    "disappearing": True, "transit": landed,
+                    "archive": conf}
         for member in recipients:
             self._enqueue(member, dict(frame))
         self._audit(
@@ -1450,8 +1591,9 @@ class ServerlessTransport:
         tap names the channel's conversation id — the channel id
         itself, one tap regardless of subscriber count.
 
-        ``disappearing=True`` (2.3.0): transit-only, exactly as
-        the group path — no custody, no archive, expiry-stamped."""
+        ``disappearing=True``: Disappearing Mode v2 (2.4.0),
+        exactly as the group path — transit-only, no transit
+        expiry, fail-closed oversight deposit gate first."""
         if not self.username:
             raise TransportError("login required before send_channel_frame")
         mid = message_id or new_id()
@@ -1470,22 +1612,29 @@ class ServerlessTransport:
         recipients = [str(m) for m in (members or [])
                       if str(m) != self.username]
         if disappearing:
-            expires = now_ts() + int(
-                ttl_s if ttl_s is not None
-                else DEFAULT_DISAPPEARING_TTL_S)
+            conf = self._disappearing_gate(
+                mid=mid,
+                conversation_id=archive_conversation_id_channel(
+                    channel_id),
+                participants=[self.username] + recipients,
+                oversight=oversight, oversight_kind="content_key",
+                ts=frame["ts"])
             frame["disappearing"] = True
-            frame["expires_at"] = expires
-            frame["oversight"] = None
+            frame["sent_at"] = frame["ts"]
+            frame["window_s"] = DISAPPEARING_WINDOW_S
+            frame["archive"] = {
+                "entry_id": conf.get("entry_id") or mid,
+                "hashes": conf.get("hashes") or {}}
             landed = []
             for member in recipients:
                 if self._push_transit(member, dict(frame),
                                       disappearing=True,
-                                      expires_at=expires):
+                                      expires_at=0):
                     landed.append(member)
             self._tap(conversation_id_for_group(channel_id), mid)
             return {"id": mid, "channel_id": channel_id,
                     "queued": [], "disappearing": True,
-                    "transit": landed}
+                    "transit": landed, "archive": conf}
         for member in recipients:
             self._enqueue(member, dict(frame))
         self._audit(
@@ -2224,9 +2373,9 @@ class ServerlessTransport:
         Supabase reads. Reconnects without limit on the standard
         backoff ladder; a stream failure engages the degraded
         flag so the custody reconciliation covers standard mail
-        meanwhile. Expired disappearing items are purged unopened
-        and never delivered. Runs until stop_event is set —
-        intended for a dedicated thread."""
+        meanwhile. Disappearing items are delivered regardless
+        of age (v2: unread never expires unread). Runs until
+        stop_event is set — intended for a dedicated thread."""
         stop = stop_event or threading.Event()
         attempt = 0
         while not stop.is_set():
@@ -2249,11 +2398,16 @@ class ServerlessTransport:
 
     def _on_transit_item(self, item_id, node, on_frames) -> None:
         """One transit inbox event (stream thread): a delete
-        event is a consumption (mine, or the expiry purge) and
-        delivers nothing; a malformed node is purged (it can
-        never become a frame); an EXPIRED disappearing item is
-        purged unopened — the disappearing contract. A live item
-        is noted (transit_seen + mode, for ack) and delivered."""
+        event is a consumption and delivers nothing; a malformed
+        node is purged (it can never become a frame); a live item
+        is noted (transit_seen + mode, for ack) and delivered.
+
+        Disappearing Mode v2 (2.4.0): there is NO expiry purge
+        here — an UNREAD disappearing item NEVER expires unread
+        (DESIGN-BRIEF rule 3). A legacy 2.3.0 node carrying a
+        past ``expires_at`` is delivered like any live item; the
+        per-side erase clocks live in the clients' mailboxes,
+        never in transit."""
         if node is None:
             return
         if not isinstance(node, dict) \
@@ -2261,12 +2415,6 @@ class ServerlessTransport:
             self._consume_transit_node(str(item_id))
             return
         frame = node["frame"]
-        expires = int(node.get("expires_at")
-                      or frame.get("expires_at") or 0)
-        if frame.get("disappearing") and expires \
-                and expires <= now_ts():
-            self._consume_transit_node(str(item_id))
-            return
         self._note_transit(str(item_id), node)
         stamped = dict(frame)
         stamped["queued"] = True
