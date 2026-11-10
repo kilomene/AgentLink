@@ -955,13 +955,20 @@ Deno.serve(async (req: Request) => {
     string,
     unknown
   >;
-  if (body.username !== undefined && body.username !== me) {
-    return errorResponse(
-      "identity_mismatch",
-      "the admin action belongs to the JWT's agent; body username disagrees",
-      403,
-    );
-  }
+  // Identity comes from the verified JWT ONLY (2.3.1 fix). An
+  // earlier dispatcher guard here rejected any body whose
+  // `username` field disagreed with the JWT — but the target
+  // routes below (group_remove, group_promote, group_demote,
+  // group_nickname, group_custom_role, channel_remove) take
+  // their TARGET member from body.username, the same field name
+  // the relay frame contract uses for the target. The guard
+  // therefore made it impossible for an admin to act on another
+  // member at all: every such call died as identity_mismatch
+  // before its route ran (only self-targeted calls survived).
+  // No route treats body.username as the caller — every handler
+  // receives `me` from the JWT and enforces its own role checks
+  // against it (admin-only for acting on others) — so the field
+  // is a target parameter, never an identity claim.
   const tail = new URL(req.url).pathname.split("/").filter(Boolean)
     .pop() ?? "";
   const route = tail === "agentlink-groups" ? "" : tail;
