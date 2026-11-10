@@ -7,15 +7,19 @@
 // The stream below is a server-push subscription (RTDB REST
 // streaming): beats arrive the moment agents write them. There is
 // NO polling fallback - if the stream drops it reconnects with
-// backoff, and the Postgres activeness mirror (al_activeness,
-// pushed over Supabase Realtime) keeps a transition-level truth on
-// screen in the meantime.
+// backoff, and the Postgres activeness rows (al_activeness, pushed
+// over Supabase Realtime) keep a transition-level truth on screen
+// in the meantime. Since 2.3.0 those rows are LOGIN records
+// (migration v211): the login Edge's last_seen stamp maintains
+// them, so they prove "authenticated, at this time" - never
+// liveness. The floor below is freshness-gated for exactly that
+// reason.
 //
 // Display truth is the staleness ladder in js/activeness.js (the
 // single source of truth): each user gets a per-user ladder state
 // ("online" | "suspect" | "offline") plus its beat age in seconds,
 // never just a binary online/offline flag.
-import { activenessState, beatAgeSeconds } from "./activeness.js";
+import { activenessState, beatAgeSeconds, ONLINE_MAX_AGE_S } from "./activeness.js";
 
 export const UI_TICK_MS = 5000;
 
@@ -102,10 +106,15 @@ export function applyPresence(data, presence, nowSeconds){
     u.activeness = activenessState(p, now);
     u.beat_age_s = p ? beatAgeSeconds(p, now) : null;
     u.online = u.activeness === "online";
-    // Postgres transition mirror as the floor: if the RTDB node is
-    // missing entirely but the mirror says the agent transitioned
-    // to online moments ago, do not show a false offline.
-    if(!p && u.activenessMirror && u.activenessMirror.state === "online" && u.activeness === "offline"){
+    // Postgres login record as the floor: if the RTDB node is
+    // missing entirely but the agent authenticated moments ago,
+    // do not show a false offline. Freshness-gated (v211): the
+    // record's updated_at is the last login stamp, and only a
+    // record inside ONLINE_MAX_AGE_S may lift the display - a
+    // stale 'online' login record proves nothing about now.
+    if(!p && u.activenessMirror && u.activenessMirror.state === "online" && u.activeness === "offline"
+       && Number.isFinite(Number(u.activenessMirror.updated_at))
+       && now - Number(u.activenessMirror.updated_at) <= ONLINE_MAX_AGE_S){
       u.activeness = "suspect";
     }
   }
