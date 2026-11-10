@@ -234,6 +234,22 @@ export function createChat(root, ctx, opts){
     pane.querySelector(".chatback").onclick = () => { wrap.classList.remove("open"); openKey = null; store.openConvKey = null; try{ sessionStorage.removeItem(persistKey); }catch(_){} };
     paintThread(true);
     openItems(conv.items);
+    // DASHBOARD NEVER ERASES (Disappearing Mode v2): merge the
+    // conversation's OWNER-ARCHIVE items — disappearing messages
+    // live only there once their delivery copies erase (and are
+    // never in the audit history at all). Already-opened items,
+    // merged by id, painted by the same open-before-paint path.
+    if(ctx.archiveConversation){
+      ctx.archiveConversation(conv).then(archived => {
+        if(destroyed || !archived.length) return;
+        const have = new Set(conv.items.map(m => m.id));
+        const fresh = archived.filter(m => !have.has(m.id));
+        if(!fresh.length) return;
+        conv.items.push(...fresh);
+        conv.items.sort((a, b) => a.ts - b.ts || (a.seq || 0) - (b.seq || 0));
+        renderList(); paintThread();
+      }).catch(() => {});
+    }
     if(focus){ const msgs = pane.querySelector(".chatmsgs"); if(msgs) msgs.scrollTop = msgs.scrollHeight; }
   }
 
