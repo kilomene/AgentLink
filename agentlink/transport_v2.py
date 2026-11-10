@@ -1954,6 +1954,25 @@ class ServerlessTransport:
         return {"epoch": int(rows[0]["epoch"]),
                 "wrapped": _loads(rows[0].get("wrapped"), None)}
 
+    def group_keys_for(self, group_id: str,
+                       username: str | None = None) -> list[dict]:
+        """ALL my wrapped group-key rows for one group (2.3.1):
+        the plural of group_key_for. The table's primary key is
+        (group_id, username) with epoch as a column, so today this
+        returns at most one row — the member's CURRENT wrap. The
+        plural shape is the epoch-archive contract: should the
+        schema ever retain one row per epoch, every retained wrap
+        is returned with no client change. Rows oldest-first."""
+        user = str(username or self.username)
+        rows = self._rest(
+            "GET", "group_keys",
+            self._eq("group_id", str(group_id)) + "&"
+            + self._eq("username", user)
+            + "&select=epoch,wrapped&order=epoch.asc") or []
+        return [{"epoch": int(r["epoch"]),
+                 "wrapped": _loads(r.get("wrapped"), None)}
+                for r in rows]
+
     def channel_key_for(self, channel_id: str,
                         username: str | None = None) -> dict | None:
         """My wrapped channel key record {"epoch", "wrapped"} —
@@ -1968,6 +1987,21 @@ class ServerlessTransport:
             return None
         return {"epoch": int(rows[0]["epoch"]),
                 "wrapped": _loads(rows[0].get("wrapped"), None)}
+
+    def channel_keys_for(self, channel_id: str,
+                         username: str | None = None) -> list[dict]:
+        """ALL my wrapped channel-key rows for one channel
+        (2.3.1) — the channel twin of group_keys_for; see its
+        docstring for the epoch-archive contract."""
+        user = str(username or self.username)
+        rows = self._rest(
+            "GET", "channel_keys",
+            self._eq("channel_id", str(channel_id)) + "&"
+            + self._eq("username", user)
+            + "&select=epoch,wrapped&order=epoch.asc") or []
+        return [{"epoch": int(r["epoch"]),
+                 "wrapped": _loads(r.get("wrapped"), None)}
+                for r in rows]
 
     def group_members(self, group_id: str) -> list[dict]:
         """Member rows of one group: {username, role, nickname,
