@@ -36,6 +36,27 @@ import threading
 import time
 from pathlib import Path
 
+#: Disappearing Mode v2 window: exactly 24 hours (owner decision
+#: 2026-11-10, DESIGN-BRIEF rule 1).
+DISAPPEARING_WINDOW_S = 24 * 3600
+
+
+def disappearing_deadline(item: dict, owner: str) -> int | None:
+    """The local erase deadline for one disappearing item, or
+    None when it has none yet. Sent by the owner: send+24h.
+    Received: read+24h, and None while unread — an unread
+    disappearing message NEVER expires unread (spec rule 3)."""
+    if not isinstance(item, dict) or not item.get("disappearing"):
+        return None
+    if owner and item.get("from") == owner:
+        sent = item.get("sent_at") or item.get("ts") \
+            or item.get("time") or 0
+        return int(sent) + DISAPPEARING_WINDOW_S if sent else None
+    read = item.get("read_at")
+    if not read:
+        return None
+    return int(read) + DISAPPEARING_WINDOW_S
+
 
 class Mailbox:
     """SQLite-backed durable mailbox for one agent.
@@ -144,18 +165,96 @@ class Mailbox:
             self._db.commit()
             return cur.rowcount > 0
 
-    def mark_taken(self, ids) -> None:
-        """Mark items taken in by the agent's intelligence."""
+    def mark_taken(self, ids, now: int | None = None) -> None:
+        """Mark items taken in by the agent's intelligence.
+
+        Disappearing Mode v2 (2.4.0): the receiver-side 24h clock
+        starts at READ, and *taken* is the read event — so the
+        first take-in of a disappearing item stamps ``read_at``
+        inside its stored msg dict (never overwritten: the clock
+        starts at the FIRST read)."""
         if isinstance(ids, str):
             ids = [ids]
         ids = [str(i) for i in (ids or []) if i]
         if not ids:
             return
+        stamp = int(now if now is not None else time.time())
         with self._lock:
             self._db.executemany(
                 "UPDATE items SET taken = 1 WHERE id = ?",
                 [(i,) for i in ids])
+            for i in ids:
+                row = self._db.execute(
+                    "SELECT msg FROM items WHERE id = ?",
+                    (i,)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    item = json.loads(row[0])
+                except Exception:
+                    continue
+                if item.get("disappearing") \
+                        and not item.get("read_at"):
+                    item["read_at"] = stamp
+                    self._db.execute(
+                        "UPDATE items SET msg = ? WHERE id = ?",
+                        (json.dumps(item, default=str), i))
             self._db.commit()
+
+    def delete(self, ids) -> int:
+        """Erase items outright (Disappearing Mode v2 local
+        erase). Returns how many rows were removed."""
+        if isinstance(ids, str):
+            ids = [ids]
+        ids = [str(i) for i in (ids or []) if i]
+        if not ids:
+            return 0
+        with self._lock:
+            cur = self._db.executemany(
+                "DELETE FROM items WHERE id = ?",
+                [(i,) for i in ids])
+            self._db.commit()
+            return cur.rowcount if cur.rowcount is not None else 0
+
+    def all_items(self) -> list[dict]:
+        """Every stored msg dict (the erase sweep's scan set)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT msg FROM items ORDER BY ts ASC").fetchall()
+        out = []
+        for r in rows:
+            try:
+                out.append(json.loads(r[0]))
+            except Exception:
+                continue
+        return out
+
+    def sweep_disappearing(self, now: int | None = None) -> dict:
+        """Disappearing Mode v2 local erase (2.4.0).
+
+        Per-side deadlines, exactly per the ratified spec:
+        an item the owner SENT erases at send+24h; an item the
+        owner RECEIVED erases at read+24h and has NO deadline
+        while unread. Erase waits for archive confirmation —
+        an item whose ``archive_confirmed`` stamp is missing
+        is reported blocked, never erased (archive first,
+        always). Returns {"erased": [ids], "blocked": [ids]}."""
+        now = int(now if now is not None else time.time())
+        erased: list[str] = []
+        blocked: list[str] = []
+        for item in self.all_items():
+            if not item.get("disappearing"):
+                continue
+            deadline = disappearing_deadline(item, self.owner)
+            if deadline is None or now < deadline:
+                continue
+            if not item.get("archive_confirmed"):
+                blocked.append(str(item.get("id")))
+                continue
+            erased.append(str(item.get("id")))
+        if erased:
+            self.delete(erased)
+        return {"erased": erased, "blocked": blocked}
 
     # -- reads ---------------------------------------------------------
 
