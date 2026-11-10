@@ -273,7 +273,12 @@ OVERSIGHT = {"v": 1, "alg": "x25519-chacha20poly1305",
 
 # ============================ login =================================
 
-def test_login_challenge_flow_and_presence_and_mirror():
+def test_login_challenge_flow_and_presence_no_mirror():
+    # 2.3.0: presence is a Firebase connection fact ALONE — the
+    # Postgres activeness mirror was deleted (it was a per-minute
+    # write per agent into the record layer for data the live
+    # layer already carried). Login writes nothing to
+    # al_activeness / al_connections / al_users.
     fake = FakeHttp()
     transport = make_transport(fake)
     try:
@@ -295,13 +300,10 @@ def test_login_challenge_flow_and_presence_and_mirror():
         assert body["state"] == "online"
         assert body["client_version"] == "2.0.0-test"
         assert body["transport"] == "serverless-rest"
-        # Login transition mirrored exactly once: activeness +
-        # connections + last_seen.
-        assert len(fake.find("POST", "/rest/v1/al_activeness")) == 1
-        act = fake.find("POST", "/rest/v1/al_activeness")[0][2]
-        assert act["username"] == "alice" and act["state"] == "online"
-        assert len(fake.find("POST", "/rest/v1/al_connections")) == 1
-        assert len(fake.find("PATCH", "/rest/v1/al_users")) == 1
+        # The mirror is gone: zero record-layer activeness writes.
+        assert fake.find("POST", "/rest/v1/al_activeness") == []
+        assert fake.find("POST", "/rest/v1/al_connections") == []
+        assert fake.find("PATCH", "/rest/v1/al_users") == []
         assert transport.activeness_state == "online"
     finally:
         transport.logout()
@@ -667,13 +669,22 @@ def test_fetch_conversation_bounds_the_wire_window(logged_in):
 
 # ==================== doorbell wire hygiene ==========================
 
-def test_firebase_wire_carries_no_content_fields(logged_in):
+def test_firebase_wire_carries_only_ratified_shapes(logged_in):
+    # 2.3.0 SUPERSEDES the 2.0.x hygiene pin. The split gives
+    # RTDB a data plane — the message TRANSIT queue — so the
+    # wire law is now per-branch:
+    # * presence / signals / digest nodes carry NO content
+    #   fields at all (unchanged);
+    # * inbox nodes carry exactly {frame, expires_at, ts}, and
+    #   the frame's content is the sealed envelope — ciphertext
+    #   fields only, never a plaintext body. (The envelope was
+    #   always ciphertext; custody in Supabase holds the same
+    #   bytes. Plaintext still never leaves the agent.)
     fake, transport = logged_in
     transport.send_dm("bob", ENVELOPE, oversight=OVERSIGHT)
     transport.doorbell.tap_doorbell("bob", "work_assigned", "w-9")
     transport.doorbell.beat_presence("alice")
-    forbidden = {"content", "body", "ct", "nonce", "eph_pub",
-                 "oversight", "file", "data_b64", "envelope"}
+    forbidden = {"body", "data_b64", "file"}
 
     def keys_of(node):
         if isinstance(node, dict):
@@ -687,8 +698,19 @@ def test_firebase_wire_carries_no_content_fields(logged_in):
     rtdb_calls = [(m, u, b) for (m, u, b) in fake.find()
                   if u.startswith(RTDB) and b is not None]
     assert rtdb_calls, "expected RTDB traffic"
-    for _m, _u, body in rtdb_calls:
-        assert not (set(keys_of(body)) & forbidden), body
+    saw_inbox = False
+    for _m, url, body in rtdb_calls:
+        if "/inbox/" in url and isinstance(body, dict) \
+                and "frame" in body:
+            saw_inbox = True
+            assert set(body.keys()) == {"frame", "expires_at", "ts"}
+            frame = body["frame"]
+            assert frame["content"] == ENVELOPE  # sealed, untouched
+            assert "body" not in frame
+        else:
+            assert not (set(keys_of(body)) & forbidden), body
+            assert "content" not in set(keys_of(body)), body
+    assert saw_inbox, "the transit push is part of the wire now"
 
 
 def test_stream_failure_engages_slow_sync():
@@ -814,14 +836,16 @@ def test_empty_body_write_still_returns_none(logged_in):
     assert out is None
 
 
-def test_slow_sync_fetches_even_with_a_healthy_stream(monkeypatch):
-    # 2.0.6 (found live in the release exercise): delivery must
-    # not hinge on signal arrival. A freshly booted daemon whose
-    # stream snapshot was lost sat on a full custody queue and
-    # fetched NOTHING because the cadence fetch was gated on
-    # slow_sync_active (stream known-down). The reconciliation
-    # fetch now runs every cadence regardless; signals remain
-    # only the instant path.
+def test_slow_sync_fetches_only_while_the_stream_is_down(monkeypatch):
+    # 2.3.0 SUPERSEDES the 2.0.6 always-fetch pin (the owner
+    # reversed it after the 2026-11-08 quota restriction: the
+    # unconditional cadence fetch WAS the burn). Delivery no
+    # longer hinges on signal arrival for a different reason:
+    # the transit stream delivers the frame itself, and the
+    # signals stream reconciles the custody queue on every
+    # (re)connect. The degraded cadence therefore fetches ONLY
+    # while a stream is known-down — and then it is the
+    # guarantee that nothing waits forever.
     import threading as _threading
     monkeypatch.setattr(transport_mod, "SLOW_SYNC_INTERVAL_SECONDS",
                         0.2)
@@ -831,6 +855,7 @@ def test_slow_sync_fetches_even_with_a_healthy_stream(monkeypatch):
         transport.login("alice", fake.identity.sign)
         assert transport.slow_sync_active is False
         fake.seed_queue("alice", {"type": "message", "id": "m-lost-tap"})
+        fake.calls.clear()
         delivered = []
         stop = _threading.Event()
         worker = _threading.Thread(
@@ -839,6 +864,13 @@ def test_slow_sync_fetches_even_with_a_healthy_stream(monkeypatch):
             daemon=True)
         worker.start()
         time.sleep(1.15)
+        assert delivered == []
+        assert fake.find("GET", "/rest/v1/al_queue") == []
+        # The stream drops: the cadence takes over.
+        transport.slow_sync_active = True
+        deadline = time.time() + 3
+        while time.time() < deadline and not delivered:
+            time.sleep(0.05)
         stop.set()
         worker.join(timeout=5)
         ids = [f["frame"]["id"] for f in delivered]
@@ -850,15 +882,18 @@ def test_slow_sync_fetches_even_with_a_healthy_stream(monkeypatch):
 # ==================== activeness ladder ===============================
 
 def test_ladder_constants_are_the_owners_numbers():
-    assert BEAT_INTERVAL_S == 5
-    assert ONLINE_MAX_AGE_S == 10
-    assert SUSPECT_MAX_AGE_S == 15
+    # 2.3.0 (owner-ratified 2026-11-09): the beat stretches to
+    # minutes — presence is connection-based, the beat is only
+    # the unclean-death detector.
+    assert BEAT_INTERVAL_S == 180
+    assert ONLINE_MAX_AGE_S == 240
+    assert SUSPECT_MAX_AGE_S == 420
 
 
 @pytest.mark.parametrize("age,expected", [
-    (0, "online"), (5, "online"), (10, "online"),
-    (11, "suspect"), (13, "suspect"), (15, "suspect"),
-    (16, "offline"), (45, "offline"), (3600, "offline"),
+    (0, "online"), (100, "online"), (240, "online"),
+    (241, "suspect"), (300, "suspect"), (420, "suspect"),
+    (421, "offline"), (900, "offline"), (3600, "offline"),
     (None, "offline"), (-3, "online"),
 ])
 def test_activeness_ladder_boundaries(age, expected):
@@ -872,11 +907,11 @@ def test_activeness_disconnect_overrides_any_age():
 
 def test_activeness_of_record_uses_ladder_and_offline_write():
     now_ms = int(time.time() * 1000)
-    fresh = {"state": "online", "ts": now_ms - 3_000}
+    fresh = {"state": "online", "ts": now_ms - 100_000}
     assert activeness_of_record(fresh, now_ms=now_ms) == "online"
-    ageing = {"state": "online", "ts": now_ms - 12_000}
+    ageing = {"state": "online", "ts": now_ms - 300_000}
     assert activeness_of_record(ageing, now_ms=now_ms) == "suspect"
-    stale = {"state": "online", "ts": now_ms - 20_000}
+    stale = {"state": "online", "ts": now_ms - 500_000}
     assert activeness_of_record(stale, now_ms=now_ms) == "offline"
     fired = {"state": "offline", "ts": now_ms}
     assert activeness_of_record(fired, now_ms=now_ms) == "offline"
@@ -889,8 +924,8 @@ def test_beat_economy_300_virtual_seconds_zero_postgrest():
     """300 virtual seconds at BEAT_INTERVAL_S=5 => ~60 beats, all
     on the OWN presence node, and ZERO PostgREST calls from beats.
     Virtual time is scaled 100x (interval 0.05s) so the test runs
-    in ~3 real seconds; the production default stays 5s (pinned
-    by test_ladder_constants_are_the_owners_numbers)."""
+    in ~3 real seconds; the production default stays 180s
+    (pinned by test_ladder_constants_are_the_owners_numbers)."""
     fake = FakeHttp()
     doorbell = DoorbellClient(project_id="proj",
                               api_key="api-key-public", opener=fake)
@@ -948,34 +983,31 @@ def test_heartbeat_runs_independent_of_a_blocked_worker():
         worker.join(timeout=2)
 
 
-def test_mirror_writes_happen_on_transitions_only(logged_in):
+def test_transitions_write_no_mirror_at_all(logged_in):
+    # 2.3.0: the mirror is deleted, so transitions are pure
+    # local bookkeeping — the ladder state still tracks (the
+    # client and its logs read it), but NO PostgREST write of
+    # any kind follows a transition, ever.
     fake, transport = logged_in
     baseline = len(fake.postgrest_writes())
     assert transport.activeness_state == "online"
-    # Same-state repeats are free: no mirror traffic at all.
     assert transport._transition_activeness("online") is False
-    assert len(fake.postgrest_writes()) == baseline
-    # A real transition writes: al_activeness + connections + users.
     assert transport._transition_activeness("suspect") is True
-    after = fake.postgrest_writes()
-    assert len(after) == baseline + 3
+    assert transport.activeness_state == "suspect"
     assert transport._transition_activeness("suspect") is False
-    assert len(fake.postgrest_writes()) == baseline + 3
     assert transport._transition_activeness("offline") is True
-    assert len(fake.postgrest_writes()) == baseline + 6
-    states = [b["state"] for _m, u, b
-              in fake.postgrest_writes()[baseline:]
-              if "/rest/v1/al_activeness" in u]
-    assert states == ["suspect", "offline"]
+    assert len(fake.postgrest_writes()) == baseline
 
 
 # ==================== reconnect / refresh =============================
 
 def test_reconnect_backoff_first_immediate_and_capped():
-    assert RECONNECT_BACKOFF_CAP_S == 5
-    assert [next_backoff_s(i) for i in range(7)] == \
-        [0.0, 1.0, 2.0, 4.0, 5.0, 5.0, 5.0]
-    assert SLOW_SYNC_INTERVAL_SECONDS == 60
+    # 2.3.0: the cap is 30s (was 5s — a down backend was being
+    # hammered by every agent's supervisor at 5s intervals).
+    assert RECONNECT_BACKOFF_CAP_S == 30
+    assert [next_backoff_s(i) for i in range(8)] == \
+        [0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0]
+    assert SLOW_SYNC_INTERVAL_SECONDS == 120
 
 
 def test_refresh_scheduled_from_token_exp():
@@ -994,13 +1026,14 @@ def test_refresh_scheduled_from_token_exp():
     assert transport._refresh_timer is None
 
 
-def test_source_pins_cadence_and_mirror_structure():
+def test_source_pins_cadence_and_split_structure():
     """Structural pins over both modules' sources:
-    * run_slow_sync waits on SLOW_SYNC_INTERVAL_SECONDS (60s);
+    * run_slow_sync waits on SLOW_SYNC_INTERVAL_SECONDS;
     * the heartbeat wait in doorbell.py is the interval variable
       whose default is BEAT_INTERVAL_S;
-    * update_presence_backup is called ONLY from _mirror_activeness
-      (transition-only mirrors are structural, not a promise)."""
+    * 2.3.0: the Postgres activeness mirror is DELETED — neither
+      _mirror_activeness nor update_presence_backup exists in
+      the transport, as a definition or a call."""
     tpath = Path(__file__).resolve().parents[1] / \
         "agentlink" / "transport_v2.py"
     dpath = Path(__file__).resolve().parents[1] / \
@@ -1020,13 +1053,16 @@ def test_source_pins_cadence_and_mirror_structure():
     assert waits and isinstance(waits[0].args[0], ast.Name)
     assert waits[0].args[0].id == "SLOW_SYNC_INTERVAL_SECONDS"
 
-    callers = set()
-    for name, fn in tfuncs.items():
+    assert "_mirror_activeness" not in tfuncs
+    assert "update_presence_backup" not in tfuncs
+    for fn in tfuncs.values():
         for c in ast.walk(fn):
-            if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) \
-                    and c.func.attr == "update_presence_backup":
-                callers.add(name)
-    assert callers == {"_mirror_activeness"}
+            if isinstance(c, ast.Call) \
+                    and isinstance(c.func, ast.Attribute) \
+                    and c.func.attr in ("_mirror_activeness",
+                                        "update_presence_backup"):
+                raise AssertionError(
+                    f"deleted mirror still called: {c.func.attr}")
 
     dsrc = dpath.read_text()
     assert "BEAT_INTERVAL_S if interval_s is None" in dsrc
@@ -1130,7 +1166,7 @@ def test_serverless_config_production_defaults():
     # coordinates); env still overrides every one of them.
     cfg = ServerlessConfig.from_env({})
     assert cfg.supabase_url == \
-        "https://gqmzwbmmloklrkvxlmdc.supabase.co"
+        "https://zndrhbisrxbjewhzqxss.supabase.co"
     assert cfg.login_edge_url.endswith("/functions/v1/agentlink-login")
     assert cfg.firebase_database_url == \
         "https://agentlink-84609-default-rtdb.firebaseio.com"
@@ -1252,106 +1288,16 @@ def test_v2_stream_opener_routes_through_proxycreds(monkeypatch):
     assert resp.status == 200
 
 
-def test_activeness_mirror_failure_retries_on_slow_sync_cadence():
-    # 2.0.2 (beulah, 2026-11-06): her connect transition mirrored
-    # into a transient failure; the write is fail-soft, so she
-    # stayed invisible in al_activeness while fully active. The
-    # slow-sync cadence now re-asserts the current state whenever
-    # a mirror error is outstanding, and stops once it lands.
-    import threading as _threading
-    fake = FakeHttp()
-    transport = make_transport(fake)
-    try:
-        transport.login("alice", fake.identity.sign,
-                        client_version="2.0.2-test")
-        assert transport.last_mirror_error == ""
-        # The beulah state: an error outstanding, no row landed
-        # for it, agent steadily online (no ladder change coming).
-        transport.last_mirror_error = "simulated mirror failure"
-        fake.calls.clear()
-        stop = _threading.Event()
-        worker = _threading.Thread(
-            target=transport.run_slow_sync,
-            args=(lambda frames: None, stop), daemon=True)
-        worker.start()
-        deadline = time.time() + 5
-        while time.time() < deadline and transport.last_mirror_error:
-            time.sleep(0.05)
-        stop.set()
-        worker.join(timeout=5)
-        assert transport.last_mirror_error == ""
-        posts = fake.find("POST", "/rest/v1/al_activeness")
-        assert len(posts) == 1
-        assert posts[0][2]["state"] == "online"
-        assert posts[0][2]["client_version"] == "2.0.2-test"
-    finally:
-        transport.logout()
-
-
-def test_slow_sync_reasserts_mirror_while_online(monkeypatch):
-    # 2.0.4 (owner catch, 2026-11-06): the Postgres activeness
-    # mirror is written on transitions, but the sweep ages rows
-    # by beat_at/last_seen — timestamps nothing advanced for a
-    # steadily online serverless agent (its 5s beats live in
-    # Firebase by design), so the sweep stamped live agents
-    # 'offline' ~1 minute after login and the dashboard's mirror
-    # floor lied forever. The slow-sync cadence now re-asserts
-    # the mirror while the state is online, keeping the Postgres
-    # record as fresh as the sweep's serverless thresholds
-    # (migration v205) require.
-    import threading as _threading
-    monkeypatch.setattr(transport_mod, "SLOW_SYNC_INTERVAL_SECONDS",
-                        0.2)
-    fake = FakeHttp()
-    transport = make_transport(fake)
-    try:
-        transport.login("alice", fake.identity.sign,
-                        client_version="2.0.4-test")
-        assert transport.last_mirror_error == ""
-        fake.calls.clear()
-        stop = _threading.Event()
-        worker = _threading.Thread(
-            target=transport.run_slow_sync,
-            args=(lambda frames: None, stop), daemon=True)
-        worker.start()
-        time.sleep(1.15)
-        stop.set()
-        worker.join(timeout=5)
-        posts = fake.find("POST", "/rest/v1/al_activeness")
-        assert len(posts) >= 3
-        assert all(p[2]["state"] == "online" for p in posts)
-        assert all(p[2]["transport"] == "rtdb" for p in posts)
-        # The backup touch rides the same write (last_seen is the
-        # sweep's other aging input).
-        assert fake.find("PATCH", "/rest/v1/al_users")
-    finally:
-        transport.logout()
-
-
-def test_mirror_backup_failure_is_fail_soft_and_recorded(logged_in):
-    # 2.0.5 (2.0.4 soak catch, 2026-11-06): _mirror_activeness
-    # documented fail-soft, but its backup leg
-    # (update_presence_backup) raised straight through — a
-    # clipped PATCH users response killed the slow-sync thread
-    # at soak minute 12. The whole mirror now honors the
-    # contract: failure recorded in last_mirror_error, never
-    # raised, and the activeness write itself still lands.
-    _fake, transport = logged_in
-    def boom(online=True):
-        raise transport_mod.TransportError("simulated backup failure")
-    transport.update_presence_backup = boom
-    transport.last_mirror_error = ""
-    transport._mirror_activeness("online")  # must not raise
-    assert transport.last_mirror_error == "simulated backup failure"
-    posts = _fake.find("POST", "/rest/v1/al_activeness")
-    assert posts and posts[-1][2]["state"] == "online"
-
-
-def test_slow_sync_thread_survives_a_failing_mirror(monkeypatch):
-    # The slow-sync loop must keep cycling (and keep retrying
-    # the mirror) even when every mirror attempt fails — a dead
-    # slow-sync thread silently removes the fallback fetch and
-    # the mirror truth-keeping with it.
+def test_degraded_loop_survives_failing_fetches(monkeypatch):
+    # The invariant that outlives the mirror (2.0.8's thread-death
+    # lesson): the degraded loop must keep cycling while EVERY
+    # fetch fails — a dead loop silently removes the only
+    # guaranteed delivery path left when the streams are down.
+    # (The 2.3.0-deleted mirror variants of this pin —
+    # mirror-retry-on-cadence, mirror-reassert-while-online,
+    # backup-fail-soft — tested machinery that no longer exists;
+    # the retry discipline they protected is pinned by
+    # test_v230_split.py's park tests.)
     import threading as _threading
     monkeypatch.setattr(transport_mod, "SLOW_SYNC_INTERVAL_SECONDS",
                         0.2)
@@ -1359,9 +1305,14 @@ def test_slow_sync_thread_survives_a_failing_mirror(monkeypatch):
     transport = make_transport(fake)
     try:
         transport.login("alice", fake.identity.sign)
-        def boom(online=True):
+        attempts = []
+
+        def boom(*a, **kw):
+            attempts.append(1)
             raise transport_mod.TransportError("simulated outage")
-        transport.update_presence_backup = boom
+
+        transport.fetch_unacked = boom
+        transport.slow_sync_active = True
         stop = _threading.Event()
         worker = _threading.Thread(
             target=transport.run_slow_sync,
@@ -1372,7 +1323,7 @@ def test_slow_sync_thread_survives_a_failing_mirror(monkeypatch):
         stop.set()
         worker.join(timeout=5)
         assert alive
-        assert transport.last_mirror_error == "simulated outage"
+        assert len(attempts) >= 2  # it kept cycling through failure
     finally:
         transport.logout()
 
@@ -1416,11 +1367,15 @@ def test_mark_read_409_is_first_read_wins_not_an_error():
 def test_opener_connection_failure_normalizes_to_transport_error(logged_in):
     # 2.0.8 soak catch (2026-11-06): a connection-level opener
     # failure (proxy tunnel 407 during a credential rotation)
-    # raised a raw URLError out of _rest, slipped
-    # _mirror_activeness's TransportError guard, and killed the
-    # slow-sync thread — the agent went dark with its process
-    # alive. Every opener call now leaves through _call_opener,
-    # which normalizes any connection failure to TransportError.
+    # raised a raw URLError out of _rest, slipped a
+    # TransportError-only guard, and killed a supervision
+    # thread — the agent went dark with its process alive.
+    # Every opener call now leaves through _call_opener, which
+    # normalizes any connection failure to TransportError.
+    # (2.3.0: the mirror surface this story originally ran
+    # through is deleted; the normalization contract is pinned
+    # on _rest/_rpc, and the fail-soft surface is now ack(),
+    # whose custody read treats the outage as an empty page.)
     fake, transport = logged_in
 
     def dead_opener(method, url, headers, body):
@@ -1433,10 +1388,9 @@ def test_opener_connection_failure_normalizes_to_transport_error(logged_in):
         transport._rest("GET", "queue", "select=*")
     with pytest.raises(TransportError):
         transport._rpc("al_attach_oversight", {})
-    # The mirror is fail-soft against TransportError: it records
-    # the error and does NOT raise — the slow-sync cadence retries.
-    transport._mirror_activeness("online")
-    assert transport.last_mirror_error
+    # Fail-soft where the contract demands it: acking into a
+    # dead backend acks nothing and raises nothing.
+    assert transport.ack(["m-dead-1"]) == []
 
 
 def test_all_opener_sites_route_through_call_opener():
