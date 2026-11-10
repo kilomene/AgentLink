@@ -44,8 +44,22 @@ test("PARITY: chain hash matches agentlink/archive.py", () => {
   const entry = core.validateRecord(REC);
   entry.prev = "";
   // Vector computed by Python archive.entry_hash on this record.
+  // Recomputed for 2.4.1: validateRecord now stamps mode
+  // ("standard" here) — the normalized entry gained that field,
+  // so the chain hash moved; both twins produce this value.
   assert.equal(core.entryHash("", entry),
-    "c18853bca346584fbe8e8fa34f2fc7e6395ae7449bbf02b1427362ced1aa1a03");
+    "08a0423be338eb46ad772c0b05c731a19b89687f00e65587c03fc476ebcbb4e5");
+});
+
+test("2.4.1: mode + audit_seq normalize like the Python twin", () => {
+  const std = core.validateRecord({ ...REC, audit_seq: 4242 });
+  assert.equal(std.mode, "standard");
+  assert.equal(std.audit_seq, 4242);
+  const dis = core.validateRecord({ ...REC, kind: "disappearing" });
+  assert.equal(dis.mode, "disappearing");
+  assert.throws(
+    () => core.validateRecord({ ...REC, audit_seq: "soon" }),
+    core.ArchiveError);
 });
 
 test("PARITY: oversight envelope opens (X25519/HKDF/ChaCha)", () => {
