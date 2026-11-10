@@ -266,6 +266,33 @@ export async function loadAll(){
     designation, membersOf, nameOf };
 }
 
+// Published "latest" (v242): the version clients themselves
+// update to is the update-manifest served next to the dashboard
+// (config.js: manifestUrl, generated at deploy from the repo's
+// update-manifest.json — the same artifact `agentlink update`
+// reads). The Agents view's "latest" tag compares against THIS,
+// fetched at runtime, never against a fleet-derived maximum and
+// never a baked constant: a fleet whose newest reporter is stale
+// must not crown its own staleness "latest" (owner's screenshot,
+// 2026-11-10: 2.2.3 tagged latest while 2.4.0 was published).
+// Fetched once per page load and cached in memory — one small
+// read per session, no polling. On any failure it resolves to ""
+// and the view shows versions WITHOUT a latest tag: an absent
+// claim, never a wrong one.
+let _manifestVersion = null;
+export async function fetchManifestVersion(){
+  if(_manifestVersion !== null) return _manifestVersion;
+  const url = CFG().manifestUrl;
+  if(!url){ _manifestVersion = ""; return ""; }
+  try{
+    const r = await fetch(url, { cache: "no-store" });
+    if(!r.ok) throw new Error("manifest read failed (" + r.status + ")");
+    const j = await r.json();
+    _manifestVersion = String((j && j.version) || "");
+  }catch(_){ _manifestVersion = ""; }
+  return _manifestVersion;
+}
+
 // Support desk (2.1.0): operator routes on the agentlink-support
 // Edge, authorised by the trusted device token — the
 // agentlink-api contract (sha256(token) in al_dashboard_sessions).
