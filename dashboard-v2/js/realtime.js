@@ -19,8 +19,18 @@
 //
 // The header live-state is driven from here and tells the truth:
 // "live" only when the core feeds (audit, work, users) are
-// subscribed; rtState() also reports the feeds still pending
-// publication so the pill can say so.
+// subscribed. rtState() keeps two lists strictly apart (v242):
+//   pending     — feeds NOT subscribed (channel refused/errored):
+//                 the only state that may be called "pending".
+//   unconfirmed — feeds subscribed whose channel has not carried
+//                 an event yet this session. Publication
+//                 membership is COMPLETE on the backend (all 20
+//                 feed tables, verified server-side 2026-11-09
+//                 and re-verified 2026-11-10), so an unconfirmed
+//                 feed is a QUIET table, not a missing migration —
+//                 the old pill wording claimed a backend debt
+//                 that does not exist and could never clear for
+//                 low-traffic tables.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { session } from "./data.js";
 
