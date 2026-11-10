@@ -1941,6 +1941,17 @@ class SupabaseStore:
             return None
         return {"epoch": row["epoch"], "wrapped": json.loads(row["wrapped"])}
 
+    def group_keys_for(self, group_id, username):
+        """ALL wrapped group-key rows for (group, user) (2.3.1) —
+        the epoch-archive plural of group_key_for; see the
+        transport's group_keys_for for the contract."""
+        rows = self._get("group_keys",
+                         self._eq("group_id", group_id) + "&"
+                         + self._eq("username", username)
+                         + "&select=epoch,wrapped&order=epoch.asc")
+        return [{"epoch": int(r["epoch"]),
+                 "wrapped": json.loads(r["wrapped"])} for r in rows]
+
     def group_key_epoch(self, group_id):
         rows = self._get("group_keys",
                          self._eq("group_id", group_id)
@@ -2326,6 +2337,16 @@ class SupabaseStore:
             return None
         return {"epoch": row["epoch"],
                 "wrapped": json.loads(row["wrapped"])}
+
+    def channel_keys_for(self, channel_id, username):
+        """ALL wrapped channel-key rows for (channel, user)
+        (2.3.1) — the channel twin of group_keys_for."""
+        rows = self._get("channel_keys",
+                         self._eq("channel_id", channel_id) + "&"
+                         + self._eq("username", username)
+                         + "&select=epoch,wrapped&order=epoch.asc")
+        return [{"epoch": int(r["epoch"]),
+                 "wrapped": json.loads(r["wrapped"])} for r in rows]
 
     def channel_key_epoch(self, channel_id):
         rows = self._get("channel_keys",
