@@ -102,7 +102,11 @@ def test_dashboard_agents_roster_shows_version():
     js = (ROOT / "dashboard-v2/js/views/agents.js").read_text()
     assert 'data-label="Version"' in js
     assert "<th>Version</th>" in js
-    assert "activenessMirror" in js  # mirror is a version source
+    # v242 supersedes the mirror clause: since v211 the mirror is
+    # a login record whose client_version is '' by construction,
+    # so the presence node is the ONLY version source (see
+    # tests/test_v242_dashboard_realtime_truth.py).
+    assert "r.presence" in js and "client_version" in js
     assert "not reported" in js      # honest state for silent agents
 
 
