@@ -373,11 +373,30 @@ def _read_body(resp) -> bytes:
     exception's .partial carries the bytes that DID arrive —
     the same doctrine blobstore's R2 reader and transport_v2's
     opener follow. Completeness is judged by the body's own
-    parser downstream."""
+    parser downstream.
+
+    B4 partial-wedge detector (2.4.0, twin of transport_v2's):
+    a PROVABLE truncation (Content-Length exceeds the partial
+    bytes) raises instead of returning clipped bytes as if
+    they were the payload."""
     try:
         return resp.read()
     except http.client.IncompleteRead as exc:
-        return exc.partial or b""
+        partial = exc.partial or b""
+        expected = None
+        try:
+            headers = getattr(resp, "headers", None)
+            raw = headers.get("Content-Length") if headers \
+                else None
+            expected = int(raw) if raw is not None else None
+        except Exception:
+            expected = None
+        if expected is not None and len(partial) < expected:
+            raise DoorbellError(
+                f"partial wedge: body truncated at "
+                f"{len(partial)}/{expected} bytes mid-response "
+                f"(tunnel connection failed)") from exc
+        return partial
 
 
 def _sleep(seconds: float) -> None:
