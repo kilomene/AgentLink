@@ -35,12 +35,16 @@ def test_login_verify_expiry_field_alignment():
     assert "body.exp ?? body.expires" in LOGIN_TS
 
 
-def test_activeness_mirror_carries_beat_clock_and_transport():
-    # Phase 1's al_activeness contract: beat_at is the beat clock at
-    # the transition and transport names the leg; the client writes
-    # both on transition mirrors (never per beat).
-    assert '"beat_at": now_ts()' in TRANSPORT
-    assert '"transport": ("slow-sync" if self.slow_sync_active' in TRANSPORT
+def test_activeness_mirror_is_deleted():
+    # 2.3.0: the Postgres activeness mirror is DELETED — the
+    # transport never writes the table (the only remaining
+    # mentions are the doc-comments recording the deletion).
+    assert 'self._rest(\n            "POST", "activeness"' not in TRANSPORT
+    assert "_mirror_activeness" not in TRANSPORT
+    assert 'update_presence_backup' not in TRANSPORT
+    # The version fact the mirror used to carry rides the
+    # Firebase presence node now (doorbell set_presence).
+    assert '"client_version"' in DOORBELL
 
 
 def test_oversight_accepts_operator_jwt_and_dashboard_contracts():
@@ -61,8 +65,8 @@ def test_oversight_accepts_operator_jwt_and_dashboard_contracts():
 def test_ladder_constants_agree_across_client_and_dashboard():
     # One ladder, three homes: doorbell.py, dashboard activeness.js.
     js = (ROOT / "dashboard-v2/js/activeness.js").read_text()
-    for name, val in (("BEAT_INTERVAL_S", 5), ("ONLINE_MAX_AGE_S", 10),
-                      ("SUSPECT_MAX_AGE_S", 15)):
+    for name, val in (("BEAT_INTERVAL_S", 180), ("ONLINE_MAX_AGE_S", 240),
+                      ("SUSPECT_MAX_AGE_S", 420)):
         assert f"{name} = {val}" in DOORBELL, name
         assert f"{name} = {val}" in js, name
 
@@ -84,13 +88,14 @@ def test_file_route_response_carries_cors():
     assert "access-control-expose-headers" in body
 
 
-def test_activeness_mirror_carries_client_version():
+def test_presence_node_carries_client_version():
     # 2.0.1 (owner's order): the dashboard's Agents list states the
-    # client version each agent actually runs. The Postgres
-    # activeness mirror is one of its two truth sources — before
-    # this fix the mirror write omitted client_version entirely,
-    # so the column stayed '' for every agent forever.
-    assert '"client_version": self.client_version' in TRANSPORT
+    # client version each agent actually runs. The version rides
+    # the Firebase presence node (2.3.0: the Postgres mirror that
+    # also carried it is deleted — presence is the one truth).
+    assert '"client_version": self.client_version' in TRANSPORT or \
+        "client_version=client_version" in TRANSPORT or \
+        '"client_version"' in DOORBELL
 
 
 def test_dashboard_agents_roster_shows_version():
