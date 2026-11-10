@@ -38,35 +38,51 @@ What moves where (blueprint routes, exactly):
   re-login — event-driven, never periodic.
 * **Send** — the caller hands this transport an ALREADY-ENCRYPTED
   content envelope (plus its oversight wrap, exactly as the relay
-  path carries them). The transport inserts one ``al_queue`` custody
-  row per recipient and one ``al_audit_log`` record — the SAME
-  column names and value shapes ``supabase_store.SupabaseStore``
-  writes for the relay (``enqueue`` / ``audit`` and the relay's
-  ``_on_send`` / group-send frame construction) — then taps the
-  conversation's Firebase signal. Content bytes are opaque here:
-  they are stored, never opened.
-* **Receive** — ``fetch_unacked`` peeks ``al_queue`` rows addressed
-  to me in ``seq`` order (custody is NOT released by fetching);
-  ``ack`` releases custody only for durably journaled ids, with the
-  store's exact match rule (a frame matches by its top-level ``id``,
-  a ``work_assigned`` frame by its nested work id) and marks acked
-  message audit rows ``delivered``, mirroring the relay's ack path.
-* **Presence backup** — :meth:`ServerlessTransport.
-  update_presence_backup` upserts ``al_connections`` and touches
-  ``al_users.last_seen``. It runs ONLY on activeness TRANSITIONS
-  (login -> online, suspect, offline, logout): the client's ladder
-  state is tracked locally and the mirror is written when — and
-  only when — it changes (a test pins the call structure). The
-  live activeness system itself (5s beats, connection metadata,
-  the 10/15s ladder) lives in :mod:`agentlink.doorbell` and
-  touches Firebase RTDB ONLY: nothing periodic ever reaches Edge
-  or PostgREST.
-* **Slow-sync fallback** — when the Firebase signal stream fails,
-  :attr:`slow_sync_active` engages and :meth:`run_slow_sync` polls
-  the unacked queue on :data:`SLOW_SYNC_INTERVAL_SECONDS` (60s),
-  only while the doorbell is down. The stream itself reconnects
-  without limit: first retry immediate, backoff capped at
-  :data:`RECONNECT_BACKOFF_CAP_S` (5s).
+  path carries them). For a STANDARD message the transport inserts
+  one ``al_queue`` custody row per recipient and one
+  ``al_audit_log`` record — the SAME column names and value shapes
+  ``supabase_store.SupabaseStore`` writes for the relay (``enqueue``
+  / ``audit`` and the relay's ``_on_send`` / group-send frame
+  construction) — then pushes the frame itself into the recipient's
+  Firebase TRANSIT INBOX and taps the conversation's signal.
+  Content bytes are opaque here: they are stored, never opened.
+  A DISAPPEARING message (2.3.0) skips Supabase entirely: the
+  transit inbox is its only home, with an expiry, and no custody
+  or archive row is ever written for it.
+* **Receive** — the transit inbox stream delivers frames with
+  ZERO Supabase reads; consuming a standard frame releases its
+  custody through ``ack`` (custody is NOT released by fetching).
+  ``fetch_unacked`` peeks ``al_queue`` rows addressed to me in
+  ``seq`` order — the reconciliation read, run ONLY on a signal
+  whose item the transit stream did not deliver, on a stream
+  (re)connect, at boot, or on the degraded cadence while the
+  stream is down. ``ack`` releases custody only for durably
+  journaled ids, with the store's exact match rule (a frame
+  matches by its top-level ``id``, a ``work_assigned`` frame by
+  its nested work id) and marks acked message audit rows
+  ``delivered``, mirroring the relay's ack path.
+* **Presence** — connection-based since 2.3.0 (owner-ratified
+  split): the Firebase connect write IS the online fact, a clean
+  close writes offline instantly, and a health-proof beat every
+  180s bounds unclean-death detection (the doorbell ladder:
+  online <= 240s, suspect <= 420s). Presence lives in Firebase
+  ONLY: the Postgres activeness mirror (al_activeness /
+  al_connections / last_seen writes) is DELETED — nothing
+  periodic reaches Edge, PostgREST or Postgres for presence.
+* **Signal supervision + degraded fallback** — the stream
+  supervisor reconnects WITHOUT LIMIT (first retry immediate,
+  backoff capped at :data:`RECONNECT_BACKOFF_CAP_S` = 30s), and
+  every (re)connect reconciles once against the custody queue.
+  While the stream is DOWN, :meth:`run_slow_sync` reconciles on
+  :data:`SLOW_SYNC_INTERVAL_SECONDS` (120s) — the degraded
+  guarantee underneath the stream. While the stream is UP there
+  is NO periodic fetch of any kind: polling ceased to exist in
+  2.3.0 (the 60s unconditional custody fetch of 2.0.6–2.2.3 was
+  the metered-traffic root cause of the 2026-11-08 restriction).
+* **Retry discipline** — every delivery retry in this transport
+  rides :class:`agentlink.retry.RetryPolicy`: hard attempt caps,
+  exponential backoff, and a dead-letter park for exhausted items
+  (the ~7,863-retry storm of 2026-11-07 is the standing lesson).
 * **Token refresh** — the Supabase JWT is refreshed BEFORE it
   expires: a timer armed from the token's own ``exp`` claim fires
   at ``exp - JWT_REFRESH_MARGIN_S`` and re-runs the login
@@ -96,12 +112,14 @@ from .doorbell import (DoorbellClient, DoorbellError,
                        conversation_id_for_dm,
                        conversation_id_for_group)
 from .protocol import auth_challenge_payload, new_id, now_ts
+from .retry import DeadLetterPark, RetryPolicy
 from .store import CONTENT_AUDIT_KINDS, PRIORITY_WEIGHT
 
 __all__ = [
     "SLOW_SYNC_INTERVAL_SECONDS",
     "RECONNECT_BACKOFF_CAP_S",
     "JWT_REFRESH_MARGIN_S",
+    "DEFAULT_DISAPPEARING_TTL_S",
     "SERVERLESS_SERVER_ID",
     "ServerlessConfig",
     "ServerlessTransport",
@@ -111,15 +129,28 @@ __all__ = [
     "transport_mode",
 ]
 
-#: Slow-sync cadence (seconds): the fallback poll while Firebase
-#: is unreachable. 60s is the blueprint's degraded-mode contract —
-#: never faster, and the loop runs only while the doorbell is down.
-SLOW_SYNC_INTERVAL_SECONDS = 60
+#: Degraded-sync cadence (seconds): the custody reconciliation
+#: interval used ONLY while the Firebase signal stream is down
+#: (2.3.0). While the stream is up there is no periodic fetch at
+#: all — the transit inbox and the signals are the wakeup paths,
+#: and every stream (re)connect reconciles once. (Before 2.3.0
+#: this was the 60s SLOW_SYNC cadence whose custody fetch ran on
+#: EVERY tick, stream up or down — the polling shape that burned
+#: the Supabase org's egress and log budgets into the 2026-11-08
+#: restriction. The name is kept for the degraded contract.)
+SLOW_SYNC_INTERVAL_SECONDS = 120
 
 #: Reconnection backoff cap (seconds): the signal stream retries
 #: WITHOUT LIMIT — first retry immediate, then doubling — but no
-#: wait ever exceeds this cap.
-RECONNECT_BACKOFF_CAP_S = 5
+#: wait ever exceeds this cap. 30s since 2.3.0 (was 5s): a stream
+#: reconnect is a single RTDB connection, and the longer cap ends
+#: the reconnect churn a flapping path used to generate.
+RECONNECT_BACKOFF_CAP_S = 30
+
+#: Default lifetime of a DISAPPEARING message's transit copy
+#: (seconds): 24h. The consumer discards expired items unopened;
+#: nothing about a disappearing message is ever archived.
+DEFAULT_DISAPPEARING_TTL_S = 24 * 3600
 
 #: The Supabase JWT is re-logged-in this many seconds BEFORE its
 #: exp claim, armed as a timer from the token itself.
@@ -265,17 +296,17 @@ class ServerlessConfig:
     # perimeter (this class's own contract). Env always overrides.
     PRODUCTION_DEFAULTS = {
         "AGENTLINK_SUPABASE_URL":
-            "https://gqmzwbmmloklrkvxlmdc.supabase.co",
+            "https://zndrhbisrxbjewhzqxss.supabase.co",
         "AGENTLINK_SUPABASE_ANON_KEY":
-            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh"
-            "YmFzZSIsInJlZiI6ImdxbXp3Ym1tbG9rbHJrdnhsbWRjIiwicm9s"
-            "ZSI6ImFub24iLCJpYXQiOjE3OTM1NzMxOTIsImV4cCI6MjEwOTE"
-            "0OTE5Mn0.trixR09C_xLZZ1LC7VnB9DXuVG3ABZZrrZ0ZQx7xd6A",
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ"
+            "lZiI6InpuZHJoYmlzcnhiamV3aHpxeHNzIiwicm9sZSI6ImFub24iLCJpYXQiOjE"
+            "3OTQyNjM0NjcsImV4cCI6MjEwOTgzOTQ2N30.zhx-OemuLba20wsV1jo62_CfjZ2"
+            "RlUujIqN6Xqd_skw",
         "AGENTLINK_FIREBASE_PROJECT": "agentlink-84609",
         "AGENTLINK_FIREBASE_DATABASE_URL":
             "https://agentlink-84609-default-rtdb.firebaseio.com",
         "AGENTLINK_LOGIN_EDGE_URL":
-            "https://gqmzwbmmloklrkvxlmdc.supabase.co"
+            "https://zndrhbisrxbjewhzqxss.supabase.co"
             "/functions/v1/agentlink-login",
         "AGENTLINK_FIREBASE_API_KEY": "AIzaSyDk9Ic4pbQglf0kyIBa_oLGmu5iHbnWFFI",
     }
@@ -411,7 +442,9 @@ class ServerlessTransport:
     """
 
     def __init__(self, config: ServerlessConfig | None = None,
-                 opener=None, stream_opener=None, doorbell=None):
+                 opener=None, stream_opener=None, doorbell=None,
+                 retry_policy: RetryPolicy | None = None,
+                 dead_letter_park: DeadLetterPark | None = None):
         self.config = config or ServerlessConfig.from_env()
         self._opener = opener or _default_opener
         self.doorbell = doorbell or DoorbellClient(
@@ -419,21 +452,52 @@ class ServerlessTransport:
             api_key=self.config.firebase_api_key,
             database_url=self.config.firebase_database_url,
             opener=opener, stream_opener=stream_opener)
+        # Retry discipline (2.3.0): ONE policy for every delivery
+        # retry in this transport + the dead-letter park exhausted
+        # items land in. The Agent wires its state-dir park file;
+        # a bare transport parks in memory only.
+        self.retry_policy = retry_policy or RetryPolicy()
+        self.dead_letters = dead_letter_park or DeadLetterPark()
+        #: Optional sink called with each parked record (the
+        #: Agent logs + surfaces it; diagnostics read the park).
+        self.on_dead_letter = None
+        # Transit bookkeeping (2.3.0): item ids the transit stream
+        # delivered (so a signal for the same item never triggers
+        # a redundant custody fetch) and the mode/expiry of items
+        # I hold transit copies of (so ack() consumes the transit
+        # node with the custody release, and disappearing items
+        # never touch Supabase at ack time either).
+        self._transit_seen: dict[str, float] = {}
+        self._transit_items: dict[str, dict] = {}
+        # Ack attempt counts per frame id (2.3.0 retry cap): an
+        # ack that keeps failing parks at the policy cap instead
+        # of retrying on every cycle forever.
+        self._ack_attempts: dict[str, int] = {}
+        # Directory working-copy cache (2.3.0): username -> entry
+        # as read from the RTDB copy (or the REST master on a
+        # miss). Event-driven reads only — nothing refreshes this
+        # periodically.
+        self._directory_cache: dict[str, dict] = {}
+        #: Frame ids whose ack exhausted the retry policy and
+        #: parked (2.3.0): ack() skips their Supabase work — the
+        #: local journal + audit archive hold the message; the
+        #: park record is the operator's signal.
+        self._parked_ack: set = set()
         self.username = ""
         self._signer = None
         self._jwt = ""
         self._jwt_expires_at = 0
         #: True while the Firebase signal stream is down and the
-        #: 60-second slow-sync fallback is the wakeup path.
+        #: degraded-sync fallback is the wakeup path.
         self.slow_sync_active = False
         #: Conversation keys tapped most recently (diagnostics).
         self.last_signal_error = ""
-        # Activeness: my last ladder state (transition detection
-        # for the Supabase mirror) + the pre-expiry refresh timer.
+        # Activeness: my last ladder state (LOCAL tracker only
+        # since 2.3.0 — presence itself lives in Firebase) + the
+        # pre-expiry refresh timer.
         self._activeness_state = "offline"
         self._refresh_timer = None
         self.last_refresh_error = ""
-        self.last_mirror_error = ""
         self.last_slow_sync_error = ""
         self.client_version = ""
         #: Owner-oversight PUBLIC key advertised by the login Edge
@@ -487,8 +551,8 @@ class ServerlessTransport:
         written against TransportError as the single transport-
         failure type. Normalize here, at the source. The hole
         this closes was found live in the 2.0.8 soak prep
-        (2026-11-06): a raw URLError escaped _rest, slipped
-        _mirror_activeness's TransportError guard, and killed
+        (2026-11-06): a raw URLError escaped _rest, slipped a
+        TransportError-only guard, and killed
         the slow-sync thread outright — the agent went dark
         with its process alive and every beat stopped."""
         try:
@@ -823,79 +887,39 @@ class ServerlessTransport:
         except Exception as exc:  # noqa: BLE001 - recorded, not raised
             self.last_refresh_error = str(exc)
 
-    # -- activeness transitions + the transition-only mirror ----------
+    # -- activeness state (LOCAL only since 2.3.0) ---------------------
     @property
     def activeness_state(self) -> str:
         return self._activeness_state
 
     def _transition_activeness(self, state: str) -> bool:
-        """Record a ladder transition and mirror it — THE ONLY
-        path that writes the Supabase activeness mirror. Same
-        state again is a no-op (returns False, zero writes):
-        beats may fire a thousand times inside one state and the
-        mirror does not move."""
+        """Record a ladder transition — LOCAL state only (2.3.0).
+
+        Before 2.3.0 this was the one path that wrote the
+        Postgres activeness mirror (al_activeness upsert +
+        al_connections + last_seen). The owner-ratified split
+        DELETED that mirror: presence lives in Firebase alone
+        (the connect write, the 180s health beats, the clean-close
+        offline write — all doorbell, all RTDB), and the dashboard
+        reads presence from Firebase. This tracker survives
+        because the ladder state machine, the heartbeat
+        transition callback and diagnostics read it — it performs
+        ZERO network writes. Same state again is a no-op."""
         if state == self._activeness_state:
             return False
         self._activeness_state = state
-        self._mirror_activeness(state)
         return True
-
-    def _mirror_activeness(self, state: str) -> None:
-        """Supabase mirror write: the al_activeness row (Phase 1's
-        table — {username, state, updated_at}; the write is
-        fail-soft until the coordinator confirms that table's
-        final column contract, and any failure is kept in
-        last_mirror_error, never raised into the beat path) plus
-        the durable backup: al_connections upsert + al_users
-        last_seen touch via update_presence_backup. Called on
-        ladder transitions and, while steadily online, once per
-        slow-sync cadence as truth-keeping (see run_slow_sync —
-        the timestamps this write advances are what the
-        activeness sweep ages serverless rows by)."""
-        try:
-            self._rest("POST", "activeness", body={
-                "username": self.username, "state": state,
-                "beat_at": now_ts(),
-                "client_version": self.client_version,
-                "transport": ("slow-sync" if self.slow_sync_active
-                              else "rtdb"),
-                "updated_at": now_ts()},
-                prefer="return=minimal,resolution=merge-duplicates")
-            self.last_mirror_error = ""
-        except Exception as exc:
-            # Fail-soft means ANY failure (2.2.0): the contract is
-            # "never raised", and a raw network exception from a
-            # deeper leg (the doorbell token exchange inside a
-            # re-login) is not a TransportError — swift's slow-sync
-            # thread died on one (URLError, EOF in violation of
-            # protocol) that walked straight through the old
-            # TransportError-only catch.
-            self.last_mirror_error = str(exc)
-        # The backup leg is part of the mirror, so it lives under
-        # the same fail-soft contract: its failure is recorded in
-        # last_mirror_error (the slow-sync cadence then re-asserts
-        # until the whole mirror lands) and NEVER raised into a
-        # caller. 2.0.4's soak caught the breach: the every-minute
-        # re-assertion multiplied this call's exposure, a clipped
-        # PATCH users response raised TransportError straight out
-        # of run_slow_sync, and the slow-sync thread died at
-        # minute 12 (2026-11-06). On transitions the same hole
-        # could have raised into the login and heartbeat paths.
-        try:
-            self.update_presence_backup(online=(state != "offline"))
-        except Exception as exc:
-            self.last_mirror_error = str(exc)
 
     def _on_beat_transition(self, state: str) -> None:
         """Heartbeat-thread callback: a ladder change detected by
-        the doorbell's beat loop becomes a mirrored transition."""
+        the doorbell's beat loop updates the local tracker."""
         self._transition_activeness(state)
 
     def start_activeness(self) -> None:
         """Bring activeness up after login: the Firebase presence
-        connect write (with metadata) and the independent 5s
+        connect write (with metadata) and the independent 180s
         heartbeat thread. The connect IS the offline->online
-        transition, so the mirror fires exactly once here."""
+        transition — presence is connection-based since 2.3.0."""
         if not self.username:
             raise TransportError("login required before activeness")
         if self.doorbell.has_token:
@@ -913,8 +937,9 @@ class ServerlessTransport:
 
     def stop_activeness(self) -> None:
         """Clean activeness shutdown: stop beats, write the
-        Firebase offline (the REST clean-close write), and mirror
-        the online->offline transition."""
+        Firebase offline (the REST clean-close write — offline
+        instantly, the connection-based contract), and record
+        the local transition."""
         if self.username and self.doorbell.has_token:
             self.doorbell.stop_heartbeat(fire_offline=True)
             try:
@@ -927,8 +952,8 @@ class ServerlessTransport:
               decision_link: str | None = None,
               decision_link_detail: dict | None = None) -> dict:
         """Full login: Edge challenge-response, Firebase token
-        exchange, then activeness (presence connect + heartbeat +
-        the login transition's mirror write).
+        exchange, then activeness (presence connect + heartbeat —
+        Firebase only since 2.3.0; no mirror write exists).
 
         ``decision_link`` / ``decision_link_detail`` are the
         client's decision-link declaration (the relay hello's
@@ -1058,7 +1083,7 @@ class ServerlessTransport:
 
     def logout(self) -> None:
         """Clean disconnect: activeness shutdown (Firebase
-        offline write + offline mirror transition), refresh timer
+        offline write + local offline transition), refresh timer
         cancelled, tokens dropped."""
         if self._refresh_timer is not None:
             self._refresh_timer.cancel()
@@ -1070,28 +1095,27 @@ class ServerlessTransport:
         self._jwt = ""
         self._signer = None
 
-    def update_presence_backup(self, online: bool = True) -> None:
-        """Supabase presence BACKUP: upsert my al_connections row
-        and touch al_users.last_seen.
-
-        Called ONLY from _mirror_activeness (structure-pinned by
-        test) — on ladder transitions and on the slow-sync
-        cadence's online truth-keeping re-assertion. Live
-        activeness is Firebase's job; this backup exists so the
-        Postgres record the sweeps and the dashboard floor read
-        never claims a live agent is offline.
-        """
-        if not self.username:
-            return
-        self._rest("POST", "connections", body={
-            "username": self.username,
-            "server_id": SERVERLESS_SERVER_ID,
-            "endpoint": SERVERLESS_ENDPOINT if online else "",
-            "home_endpoint": SERVERLESS_ENDPOINT,
-            "updated_at": now_ts()},
-            prefer="return=minimal,resolution=merge-duplicates")
-        self._rest("PATCH", "users", self._eq("username", self.username),
-                   body={"last_seen": now_ts()}, prefer="return=minimal")
+    # -- directory working copy (2.3.0) --------------------------------
+    def publish_my_directory(self, entry: dict) -> bool:
+        """Publish MY directory working copy to the live layer
+        (the RTDB /directory/<my_key> node). The Supabase
+        al_directory row — written by the account paths — stays
+        the master record; this is its live copy, refreshed at
+        login and whenever my entry changes. Fail-soft: a failed
+        publish never fails a login (the REST master still serves
+        lookups; the copy re-publishes next login)."""
+        if not self.username or not self.doorbell.has_token:
+            return False
+        payload = dict(entry or {})
+        payload["username"] = self.username
+        try:
+            self.doorbell.publish_directory(payload)
+        except Exception:
+            # Fail-soft as documented: ANY publish failure (the
+            # copy is an optimization over the master record).
+            return False
+        self._directory_cache[self.username] = payload
+        return True
 
     # -- scoped presence subscriptions ----------------------------------
     def set_counterparty_provider(self, provider) -> None:
@@ -1116,8 +1140,8 @@ class ServerlessTransport:
         the default (``"presence"``) keeps every counterparty on
         raw /presence (small fleets); the daemon wiring passes
         ``fanout="digest"`` with the activeness-critical work
-        counterparties in ``critical`` (Phase 1 quota valve —
-        peer records ride 30s-coalesced digest nodes, critical
+        counterparties in ``critical`` (the fan-out valve —
+        peer records ride the coalesced digest nodes, critical
         counterparties stay raw)."""
         if self._counterparty_provider is None:
             raise TransportError(
@@ -1186,21 +1210,111 @@ class ServerlessTransport:
             self.slow_sync_active = True
             self.last_signal_error = str(exc)
 
+    # -- transit (2.3.0: the live layer carries the frame) -------------
+    def _park(self, kind: str, item_id: str, *, to: str = "",
+              attempts: int = 0, last_error: str = "",
+              detail: dict | None = None) -> dict:
+        """Park one exhausted delivery in the dead-letter park
+        and notify the surface sink. Parking NEVER deletes
+        Supabase custody — it ends the client's retrying and
+        makes the failure an operator-visible record."""
+        record = self.dead_letters.park(
+            kind, item_id, to=to, attempts=attempts,
+            last_error=last_error, detail=detail)
+        sink = self.on_dead_letter
+        if sink is not None:
+            try:
+                sink(record)
+            except Exception:
+                pass
+        return record
+
+    def _push_transit(self, to_username: str, frame: dict, *,
+                      disappearing: bool = False,
+                      expires_at: int = 0) -> bool:
+        """Push a frame copy into the recipient's RTDB transit
+        inbox — THE live delivery path since 2.3.0. Returns True
+        when the copy landed. Fail-soft by contract: a failed
+        push never fails the send (a STANDARD message's custody
+        is already durable in Supabase and the signal-triggered
+        reconciliation delivers it; a DISAPPEARING message whose
+        push fails after the policy's attempts is parked —
+        reported, never silently dropped and never archived as
+        a consolation)."""
+        if not self.doorbell.has_token:
+            if disappearing:
+                self._park("transit_push", str(frame.get("id") or ""),
+                           to=to_username, attempts=0,
+                           last_error="no doorbell token")
+            return False
+        item_id = str(frame.get("id") or "")
+        attempt = 0
+        while True:
+            try:
+                self.doorbell.put_inbox(to_username, item_id, frame,
+                                        expires_at=expires_at)
+                return True
+            except DoorbellError as exc:
+                attempt += 1
+                if not disappearing:
+                    # Standard: custody + signal carry it; one
+                    # failed push is weather, not a retry loop.
+                    self.last_signal_error = str(exc)
+                    return False
+                if self.retry_policy.exhausted(attempt):
+                    self._park("transit_push", item_id,
+                               to=to_username, attempts=attempt,
+                               last_error=str(exc))
+                    return False
+                _sleep(self.retry_policy.delay_for(attempt - 1))
+
+    def transit_seen(self, item_id: str, within_s: float = 300.0) -> bool:
+        """True when the transit stream delivered this item
+        recently — the client's signal handler consults it so a
+        signal whose frame already arrived via the inbox never
+        triggers a redundant Supabase custody fetch."""
+        seen_at = self._transit_seen.get(str(item_id))
+        if seen_at is None:
+            return False
+        return (time.monotonic() - seen_at) <= within_s
+
+    def _note_transit(self, item_id: str, node: dict) -> None:
+        """Record a transit delivery (stream consumer side):
+        the seen stamp + the item's mode/expiry, which ack()
+        needs to consume the transit node correctly."""
+        self._transit_seen[str(item_id)] = time.monotonic()
+        frame = node.get("frame") if isinstance(node, dict) else None
+        mode = "standard"
+        if isinstance(frame, dict) and frame.get("disappearing"):
+            mode = "disappearing"
+        self._transit_items[str(item_id)] = {
+            "mode": mode,
+            "expires_at": int((node or {}).get("expires_at") or 0)}
+
     def send_dm(self, to: str, content: dict, *,
                 message_id: str | None = None, mentions=None,
                 priority: str = "normal", in_reply_to=None,
                 oversight=None, from_name: str = "",
-                from_pubkey: str = "") -> dict:
+                from_pubkey: str = "",
+                disappearing: bool = False,
+                ttl_s: int | None = None) -> dict:
         """Send one 1:1 message. ``content`` is the caller's
         E2EE envelope (opaque here — never opened); ``oversight``
         is the owner-oversight wrap dict the relay path carries.
 
         Builds the relay's message frame shape, enqueues it for
         the recipient, records the al_audit_log 'message' row the
-        relay's _on_send records, then taps the DM signal.
+        relay's _on_send records, pushes the frame into the
+        recipient's transit inbox, then taps the DM signal.
         Returns {"id", "to", "queued": True} (serverless delivery
         is custody-first: everything is 'queued' until acked).
-        """
+
+        ``disappearing=True`` (2.3.0) selects the disappearing
+        mode: NO custody row, NO archive row, NO oversight wrap —
+        the frame rides the transit inbox only, stamped with an
+        expiry (``ttl_s``, default DEFAULT_DISAPPEARING_TTL_S),
+        and the result reports {"disappearing": True, "transit":
+        <landed>} instead of a custody claim."""
         if not self.username:
             raise TransportError("login required before send_dm")
         to_user = str(to)
@@ -1216,6 +1330,19 @@ class ServerlessTransport:
                               ("normal", "high", "urgent") else "normal"),
                  "content": content, "ts": now_ts(),
                  "in_reply_to": in_reply_to, "group_id": None}
+        if disappearing:
+            expires = now_ts() + int(
+                ttl_s if ttl_s is not None
+                else DEFAULT_DISAPPEARING_TTL_S)
+            frame["disappearing"] = True
+            frame["expires_at"] = expires
+            frame["oversight"] = None
+            landed = self._push_transit(
+                to_user, frame, disappearing=True, expires_at=expires)
+            self._tap(conversation_id_for_dm(self.username, to_user),
+                      mid)
+            return {"id": mid, "to": to_user, "queued": False,
+                    "disappearing": True, "transit": landed}
         self._enqueue(to_user, frame)
         self._audit(
             "message", target=to_user, status="sent",
@@ -1224,6 +1351,7 @@ class ServerlessTransport:
             mentions=frame["mentions"], ref_id=mid,
             oversight=json.dumps(oversight) if oversight else "",
             content_envelope=json.dumps(content) if content else "")
+        self._push_transit(to_user, frame)
         self._tap(conversation_id_for_dm(self.username, to_user), mid)
         return {"id": mid, "to": to_user, "queued": True}
 
@@ -1235,13 +1363,20 @@ class ServerlessTransport:
                          group_name: str = "",
                          sender_nickname: str = "",
                          sender_role: str = "",
-                         sender_custom_role: str = "") -> dict:
+                         sender_custom_role: str = "",
+                         disappearing: bool = False,
+                         ttl_s: int | None = None) -> dict:
         """Send one group/channel frame: the relay's group message
         frame enqueued for every member except the sender, ONE
         al_audit_log 'group_message' row carrying the content
-        envelope (as the relay's group path records), and ONE
-        signal tap for the conversation regardless of member
-        count (the blueprint's fan-out rule)."""
+        envelope (as the relay's group path records), one transit
+        push per recipient member, and ONE signal tap for the
+        conversation regardless of member count (the blueprint's
+        fan-out rule).
+
+        ``disappearing=True`` (2.3.0): transit-only — no custody
+        rows, no archive row, no oversight wrap; the frame is
+        stamped with its expiry and pushed per member."""
         if not self.username:
             raise TransportError("login required before send_group_frame")
         mid = message_id or new_id()
@@ -1260,6 +1395,22 @@ class ServerlessTransport:
                  "group_name": group_name}
         recipients = [str(m) for m in (members or [])
                       if str(m) != self.username]
+        if disappearing:
+            expires = now_ts() + int(
+                ttl_s if ttl_s is not None
+                else DEFAULT_DISAPPEARING_TTL_S)
+            frame["disappearing"] = True
+            frame["expires_at"] = expires
+            frame["oversight"] = None
+            landed = []
+            for member in recipients:
+                if self._push_transit(member, dict(frame),
+                                      disappearing=True,
+                                      expires_at=expires):
+                    landed.append(member)
+            self._tap(conversation_id_for_group(group_id), mid)
+            return {"id": mid, "group_id": group_id, "queued": [],
+                    "disappearing": True, "transit": landed}
         for member in recipients:
             self._enqueue(member, dict(frame))
         self._audit(
@@ -1271,6 +1422,8 @@ class ServerlessTransport:
             sender_custom_role=sender_custom_role,
             oversight=json.dumps(oversight) if oversight else "",
             content_envelope=json.dumps(content) if content else "")
+        for member in recipients:
+            self._push_transit(member, dict(frame))
         self._tap(conversation_id_for_group(group_id), mid)
         return {"id": mid, "group_id": group_id, "queued": recipients}
 
@@ -1280,7 +1433,9 @@ class ServerlessTransport:
                            in_reply_to=None, oversight=None,
                            from_name: str = "", from_pubkey: str = "",
                            channel_name: str = "",
-                           sender_role: str = "") -> dict:
+                           sender_role: str = "",
+                           disappearing: bool = False,
+                           ttl_s: int | None = None) -> dict:
         """Send one channel frame. NOT the group path: the relay's
         canonical delivered channel frame carries ``channel_id``
         (and ``group_id: None``) — the receiving client's dispatch
@@ -1290,9 +1445,13 @@ class ServerlessTransport:
         The frame built here is the relay's exact shape
         (relay._on_channel_send), the audit row is the relay's
         'channel_message' kind with the channel id in group_id
-        (as the audit log represents channels), and the signal tap
-        names the channel's conversation id — the channel id
-        itself, one tap regardless of subscriber count."""
+        (as the audit log represents channels), the frame is
+        pushed to each subscriber's transit inbox, and the signal
+        tap names the channel's conversation id — the channel id
+        itself, one tap regardless of subscriber count.
+
+        ``disappearing=True`` (2.3.0): transit-only, exactly as
+        the group path — no custody, no archive, expiry-stamped."""
         if not self.username:
             raise TransportError("login required before send_channel_frame")
         mid = message_id or new_id()
@@ -1310,6 +1469,23 @@ class ServerlessTransport:
                  "channel_id": channel_id, "channel_name": channel_name}
         recipients = [str(m) for m in (members or [])
                       if str(m) != self.username]
+        if disappearing:
+            expires = now_ts() + int(
+                ttl_s if ttl_s is not None
+                else DEFAULT_DISAPPEARING_TTL_S)
+            frame["disappearing"] = True
+            frame["expires_at"] = expires
+            frame["oversight"] = None
+            landed = []
+            for member in recipients:
+                if self._push_transit(member, dict(frame),
+                                      disappearing=True,
+                                      expires_at=expires):
+                    landed.append(member)
+            self._tap(conversation_id_for_group(channel_id), mid)
+            return {"id": mid, "channel_id": channel_id,
+                    "queued": [], "disappearing": True,
+                    "transit": landed}
         for member in recipients:
             self._enqueue(member, dict(frame))
         self._audit(
@@ -1320,6 +1496,8 @@ class ServerlessTransport:
             sender_role=sender_role,
             oversight=json.dumps(oversight) if oversight else "",
             content_envelope=json.dumps(content) if content else "")
+        for member in recipients:
+            self._push_transit(member, dict(frame))
         self._tap(conversation_id_for_group(channel_id), mid)
         return {"id": mid, "channel_id": channel_id,
                 "queued": recipients}
@@ -1469,6 +1647,35 @@ class ServerlessTransport:
                         "frame": frame})
         return out
 
+    def _consume_transit_node(self, item_id: str) -> None:
+        """Delete one of MY transit inbox nodes (the transit ack)
+        and forget its bookkeeping. Fail-soft: a failed delete
+        leaves the node for the next ack / the expiry purge —
+        deletes are idempotent and event-driven, never a loop."""
+        self._transit_items.pop(str(item_id), None)
+        if not self.username or not self.doorbell.has_token:
+            return
+        try:
+            self.doorbell.delete_inbox_item(self.username,
+                                            str(item_id))
+        except DoorbellError as exc:
+            self.last_signal_error = str(exc)
+
+    def _note_ack_failures(self, ids, error: str) -> None:
+        """Count one failed ack attempt per id; an id that
+        reaches the retry policy's cap PARKS (2.3.0) — the client
+        stops churning on it and the park record surfaces it."""
+        for item_id in ids:
+            if not item_id:
+                continue
+            attempts = self._ack_attempts.get(str(item_id), 0) + 1
+            self._ack_attempts[str(item_id)] = attempts
+            if self.retry_policy.exhausted(attempts):
+                self._parked_ack.add(str(item_id))
+                self._ack_attempts.pop(str(item_id), None)
+                self._park("ack", str(item_id), attempts=attempts,
+                           last_error=error)
+
     def ack(self, ids) -> list[dict]:
         """Release custody for durably journaled frame ids — the
         client.py ack contract ({"type": "ack", "ids": [...]})
@@ -1477,18 +1684,53 @@ class ServerlessTransport:
         in al_audit_log (the relay's _on_ack + set_audit_status
         semantics, kind-scoped exactly as the store scopes it),
         then delete the retired rows BY SEQ. Unknown ids retire
-        nothing.
-        Returns the acked frames in seq order."""
+        nothing. Returns the acked frames in seq order.
+
+        2.3.0 additions: items that arrived via the transit inbox
+        have their transit node consumed here (the transit ack
+        rides the same journal-completion point); DISAPPEARING
+        items have no custody at all — acking one touches ONLY
+        its transit node, never Supabase. And ack failures are
+        attempt-counted under the retry policy: an id whose ack
+        keeps failing parks at the cap instead of being retried
+        on every cycle forever."""
         wanted = {str(i) for i in (ids or []) if i}
         if not wanted or not self.username:
             return []
-        rows = self._queue_rows(self.username)
+        acked: list[dict] = []
+        # Disappearing items: transit-node consumption only.
+        for item_id in sorted(wanted):
+            info = self._transit_items.get(item_id)
+            if info and info.get("mode") == "disappearing":
+                self._consume_transit_node(item_id)
+                wanted.discard(item_id)
+                acked.append({"type": "message", "id": item_id,
+                              "disappearing": True})
+        if wanted:
+            acked.extend(self._ack_custody(wanted))
+        # Standard items that also rode transit: consume nodes.
+        for frame in list(acked):
+            fid = str(frame.get("id") or "")
+            if fid in self._transit_items:
+                self._consume_transit_node(fid)
+        return acked
+
+    def _ack_custody(self, wanted: set) -> list[dict]:
+        """The custody half of ack() (see its docstring)."""
+        live = {i for i in wanted if i not in self._parked_ack}
+        if not live:
+            return []
+        try:
+            rows = self._queue_rows(self.username)
+        except TransportError as exc:
+            self._note_ack_failures(live, str(exc))
+            return []
         matched = []
         for r in rows:
             frame = _loads(r.get("payload"), None)
             if not isinstance(frame, dict):
                 continue
-            if _ack_id_matches(frame, wanted):
+            if _ack_id_matches(frame, live):
                 matched.append((r["seq"], frame))
         # Retirement is per frame and status-first (2.0.6): a
         # message frame's audit row is marked 'delivered' BEFORE
@@ -1499,8 +1741,12 @@ class ServerlessTransport:
         # guess at. Now a failed status write KEEPS custody: the
         # frame is redelivered, re-journaled (the mailbox dedupes)
         # and the ack retried whole on the next cycle. One frame's
-        # failure never aborts the rest of the batch.
+        # failure never aborts the rest of the batch — but since
+        # 2.3.0 every such failure is attempt-counted, and an id
+        # that exhausts the retry policy parks instead of cycling
+        # forever.
         seqs, acked = [], []
+        failed: set = set()
         for seq, frame in matched:
             if frame.get("type") == "message" and frame.get("id"):
                 try:
@@ -1511,13 +1757,26 @@ class ServerlessTransport:
                         body={"status": "delivered"},
                         prefer="return=minimal")
                 except TransportError:
+                    failed.add(str(frame["id"]))
                     continue
             seqs.append(seq)
             acked.append(frame)
+            if frame.get("id"):
+                self._ack_attempts.pop(str(frame["id"]), None)
+        if failed:
+            self._note_ack_failures(failed,
+                                    "audit status write failed")
         if seqs:
-            self._rest("DELETE", "queue",
-                       "seq=in.(" + ",".join(str(s) for s in seqs) + ")",
-                       prefer="return=minimal")
+            try:
+                self._rest("DELETE", "queue",
+                           "seq=in.(" + ",".join(
+                               str(s) for s in seqs) + ")",
+                           prefer="return=minimal")
+            except TransportError as exc:
+                self._note_ack_failures(
+                    {str(f["id"]) for f in acked if f.get("id")},
+                    str(exc))
+                return []
         return acked
 
     def attach_oversight(self, frame: dict) -> dict:
@@ -1628,29 +1887,57 @@ class ServerlessTransport:
     # transport answered. RLS is the perimeter: every read runs
     # under the agent's own scoped JWT.
 
-    def directory_entry(self, username: str) -> dict | None:
-        """One row of the al_directory safe-column view (username,
-        display_name, pubkey, sign_pub, capabilities, ...) or
-        None. The view never carries secret-bearing columns."""
-        rows = self._rest(
-            "GET", "directory",
-            self._eq("username", str(username))
-            + "&select=username,display_name,pubkey,sign_pub,"
-              "capabilities,cap_desc,mode,designation,last_seen") or []
-        if not rows:
-            return None
-        row = dict(rows[0])
-        # One shape out (2.2.0): rows written before the account
-        # Edge's array fix carry capabilities as a JSON string
-        # (double-encoded in the jsonb column); consumers of this
-        # entry — the same consumers SupabaseStore.directory feeds
-        # with a parsed list — always see the list.
+    @staticmethod
+    def _shape_directory_row(row: dict) -> dict:
+        """One directory row in the consumer shape (2.2.0): rows
+        written before the account Edge's array fix carry
+        capabilities as a JSON string (double-encoded in the
+        jsonb column); consumers always see the list."""
+        row = dict(row)
         caps = row.get("capabilities")
         if isinstance(caps, str):
             caps = _loads(caps, [])
         row["capabilities"] = list(caps) if isinstance(
             caps, (list, tuple)) else []
         return row
+
+    def directory_entry(self, username: str) -> dict | None:
+        """One agent's directory entry (username, display_name,
+        pubkey, sign_pub, capabilities, ...) or None.
+
+        2.3.0 read order — the working copy first: local cache,
+        then the RTDB /directory copy, then the Supabase master
+        (the al_directory safe-column view — it never carries
+        secret-bearing columns) on a miss only. Every read is
+        event-driven (a send, a key lookup, a group operation);
+        nothing refreshes the directory periodically."""
+        name = str(username)
+        cached = self._directory_cache.get(name)
+        if cached is not None:
+            return dict(cached)
+        if self.doorbell.has_token:
+            try:
+                live = self.doorbell.read_directory(name)
+            except Exception:
+                # The live layer is an optimization: ANY failure
+                # of the working-copy read (backend error, a
+                # partial doorbell implementation) falls back to
+                # the master record below — never a failed lookup.
+                live = None
+            if isinstance(live, dict) and live.get("pubkey"):
+                entry = self._shape_directory_row(live)
+                self._directory_cache[name] = entry
+                return dict(entry)
+        rows = self._rest(
+            "GET", "directory",
+            self._eq("username", name)
+            + "&select=username,display_name,pubkey,sign_pub,"
+              "capabilities,cap_desc,mode,designation,last_seen") or []
+        if not rows:
+            return None
+        entry = self._shape_directory_row(rows[0])
+        self._directory_cache[name] = entry
+        return dict(entry)
 
     def group_key_for(self, group_id: str,
                       username: str | None = None) -> dict | None:
@@ -1838,7 +2125,7 @@ class ServerlessTransport:
     def listen_signals(self, callback) -> bool:
         """Run the Firebase signal stream (blocking; use a
         thread). ``callback(conversation_key, signal)`` fires per
-        signal event. On stream failure the slow-sync flag
+        signal event. On stream failure the degraded-sync flag
         engages and False returns — degraded, never dark."""
         def _on_event(path, data):
             self.slow_sync_active = False
@@ -1862,16 +2149,32 @@ class ServerlessTransport:
         """The stream supervisor: listen, and on ANY stream end
         or failure reconnect WITHOUT LIMIT — first retry
         immediate, backoff doubling, every wait capped at
-        RECONNECT_BACKOFF_CAP_S (5s). While the stream is down
+        RECONNECT_BACKOFF_CAP_S (30s). While the stream is down
         slow_sync_active stays engaged, so run_slow_sync (the
-        caller's companion thread) is the wakeup path; a stream
-        event clears the flag. Runs until stop_event is set —
-        intended for a dedicated thread."""
+        caller's companion thread) is the degraded wakeup path; a
+        stream event clears the flag.
+
+        2.3.0: every (RE)CONNECT reconciles once against the
+        custody queue (``on_frames`` receives fetch_unacked rows,
+        exactly as the degraded loop delivers them). The seam
+        between a dying stream and its replacement is where a
+        signal can be lost; one fetch per reconnect closes it —
+        event-driven, never periodic. Runs until stop_event is
+        set — intended for a dedicated thread."""
         stop = stop_event or threading.Event()
         attempt = 0
+        connected_once = False
         while not stop.is_set():
+            if connected_once and on_frames is not None:
+                try:
+                    frames = self.fetch_unacked()
+                    if frames:
+                        on_frames(frames)
+                except Exception as exc:  # noqa: BLE001 - recorded
+                    self.last_slow_sync_error = str(exc)
             if self.listen_signals(callback):
                 attempt = 0
+                connected_once = True
             else:
                 attempt += 1
             if stop.is_set():
@@ -1880,87 +2183,102 @@ class ServerlessTransport:
             if delay:
                 stop.wait(delay)
 
+    def listen_inbox_supervised(self, on_frames, stop_event=None) -> None:
+        """The transit inbox supervisor (2.3.0): stream MY inbox
+        node and hand each live frame to ``on_frames`` (the
+        client's delivery path) as fetch-shaped rows — with ZERO
+        Supabase reads. Reconnects without limit on the standard
+        backoff ladder; a stream failure engages the degraded
+        flag so the custody reconciliation covers standard mail
+        meanwhile. Expired disappearing items are purged unopened
+        and never delivered. Runs until stop_event is set —
+        intended for a dedicated thread."""
+        stop = stop_event or threading.Event()
+        attempt = 0
+        while not stop.is_set():
+            try:
+                self.doorbell.listen_inbox(
+                    self.username,
+                    lambda item_id, node: self._on_transit_item(
+                        item_id, node, on_frames),
+                    stop_event=stop)
+                attempt = 0
+            except DoorbellError as exc:
+                self.slow_sync_active = True
+                self.last_signal_error = str(exc)
+                attempt += 1
+            if stop.is_set():
+                return
+            delay = next_backoff_s(attempt - 1) if attempt else 0.0
+            if delay:
+                stop.wait(delay)
+
+    def _on_transit_item(self, item_id, node, on_frames) -> None:
+        """One transit inbox event (stream thread): a delete
+        event is a consumption (mine, or the expiry purge) and
+        delivers nothing; a malformed node is purged (it can
+        never become a frame); an EXPIRED disappearing item is
+        purged unopened — the disappearing contract. A live item
+        is noted (transit_seen + mode, for ack) and delivered."""
+        if node is None:
+            return
+        if not isinstance(node, dict) \
+                or not isinstance(node.get("frame"), dict):
+            self._consume_transit_node(str(item_id))
+            return
+        frame = node["frame"]
+        expires = int(node.get("expires_at")
+                      or frame.get("expires_at") or 0)
+        if frame.get("disappearing") and expires \
+                and expires <= now_ts():
+            self._consume_transit_node(str(item_id))
+            return
+        self._note_transit(str(item_id), node)
+        stamped = dict(frame)
+        stamped["queued"] = True
+        on_frames([{"seq": None, "ts": node.get("ts"),
+                    "frame": stamped,
+                    "transit_id": str(item_id)}])
+
     def slow_sync_once(self) -> list[dict]:
-        """One slow-sync pass: the unacked fetch a woken agent
-        would do. Pure read — ack stays the caller's journal call."""
+        """One reconciliation pass: the unacked fetch a woken
+        agent would do. Pure read — ack stays the caller's
+        journal call."""
         return self.fetch_unacked()
 
     def run_slow_sync(self, on_frames, stop_event=None) -> None:
-        """The reconciliation loop — the ONLY PostgREST poll in
-        this design, at SLOW_SYNC_INTERVAL_SECONDS (60s). Signals
-        are the instant wakeup path; this loop is the guarantee
-        underneath them: the custody fetch runs on EVERY cadence,
-        stream up or down, so no delivery depends on any single
-        signal arriving. (Before 2.0.6 the fetch ran only while
-        the stream was KNOWN down — slow_sync_active — so a
-        stream whose initial snapshot was lost, or a tap that
-        never landed, or a fetch that failed on a clipped body,
-        left the agent dark indefinitely with every health light
-        green: found live in the 2.0.6 exercise, when a freshly
-        booted daemon sat on a full queue and fetched nothing.)
-        One small GET a minute is the same order as the activeness
-        mirror write this loop already performs. Intended for a
-        dedicated thread for the transport's lifetime; returns
-        when stop_event is set. Beats never come through here —
-        they are RTDB-only, on the doorbell's own thread, at 5s."""
+        """The degraded reconciliation loop (2.3.0 — the standing
+        cadence fetch is DELETED; it was the metered-traffic root
+        cause of the 2026-11-08 restriction).
+
+        While the signal stream is UP this loop performs ZERO
+        fetches: the transit inbox stream and the signals are the
+        wakeup paths, and every stream (re)connect reconciles
+        once. While the stream is DOWN (slow_sync_active) the
+        loop reconciles the custody queue every
+        SLOW_SYNC_INTERVAL_SECONDS (120s) — the guarantee
+        underneath the stream, running only when the live layer
+        is actually degraded. The 2.0.6 lesson is preserved by
+        construction rather than by polling: a lost snapshot or a
+        missed tap can no longer strand an agent, because the
+        inbox stream holds its own snapshot, the reconnect
+        reconciles, and this loop covers the stream-down case.
+
+        The thread never dies on a network exception of ANY class
+        (2.2.0 — swift's 2.0.9 thread died on a raw URLError
+        escaping a periodic path). Intended for a dedicated
+        thread for the transport's lifetime; returns when
+        stop_event is set."""
         stop = stop_event or threading.Event()
         while not stop.is_set():
-            try:
-                self._slow_sync_mirror_step()
-            except Exception as exc:
-                # The mirror is fail-soft by contract; this outer
-                # guard is the belt to its braces — the cadence
-                # body as a whole can never kill this thread.
-                self.last_slow_sync_error = str(exc)
-            try:
-                frames = self.slow_sync_once()
-                if frames:
-                    on_frames(frames)
-            except Exception as exc:
-                # The reconciliation loop is the guarantee
-                # underneath every signal path: its thread must
-                # never die on a network exception of ANY class
-                # (2.2.0 — swift's 2.0.9 thread died on a raw
-                # URLError escaping the mirror/token path, which
-                # the old TransportError-only catch could not see).
-                # Recorded, and the next cadence retries.
-                self.last_slow_sync_error = str(exc)
+            if self.slow_sync_active:
+                try:
+                    frames = self.slow_sync_once()
+                    if frames:
+                        on_frames(frames)
+                except Exception as exc:  # noqa: BLE001 - recorded
+                    self.last_slow_sync_error = str(exc)
             stop.wait(SLOW_SYNC_INTERVAL_SECONDS)
-
-    def _slow_sync_mirror_step(self) -> None:
-        """One cadence of activeness-mirror truth-keeping (see
-        run_slow_sync). Fail-soft by contract; the caller guards
-        it regardless."""
-        if self.last_mirror_error:
-            # A transition mirror that failed to land (the
-            # write is fail-soft by design) must never leave
-            # the agent invisible on the dashboard until its
-            # next ladder change: beulah connected on 2.0.1,
-            # read and posted for minutes, and never appeared
-            # in al_activeness, because her connect mirror
-            # failed once and nothing retried it (2026-11-06).
-            # Re-assert the CURRENT state each cadence until
-            # it lands; success clears the error and the
-            # retries stop.
-            self._mirror_activeness(self._activeness_state)
-        elif self.username and self._activeness_state == "online":
-            # Truth-keeping for the Postgres mirror (2.0.4,
-            # owner catch 2026-11-06): the mirror is written
-            # on transitions, but the activeness sweep ages
-            # rows by beat_at/last_seen — timestamps that, for
-            # a steadily online agent, only this loop can
-            # advance, since the 5s beats live in Firebase by
-            # design. Without a periodic re-assertion the
-            # sweep stamped every live agent 'offline' about
-            # a minute after login and the dashboard's mirror
-            # floor showed a false offline forever. One
-            # re-assertion per 60s cadence keeps the Postgres
-            # record as fresh as the sweep's serverless
-            # thresholds (migration v205) require — and only
-            # while genuinely online: an agent that goes
-            # offline stops re-asserting and ages out on the
-            # sweep exactly as designed.
-            self._mirror_activeness("online")
 
     # ================================================================
     # v2.0 coverage: the full request surface (work lifecycle,
@@ -2100,6 +2418,28 @@ class ServerlessTransport:
         shaped = [_shape_audit_row(r) for r in rows]
         shaped.reverse()
         return shaped
+
+    def fetch_history_since(self, after_seq: int,
+                            limit: int = 200) -> list[dict]:
+        """The forward-cursor twin of fetch_history_page (2.3.0):
+        content rows with ``seq > after_seq``, OLDEST-first,
+        capped at ``limit`` — the ONLY history read a returning
+        agent performs. The client persists its high-water seq
+        (the history cursor) and asks for strictly newer rows, so
+        a boot sync moves exactly the rows it has never journaled
+        and nothing else — the full re-download of everything, on
+        every boot, is deleted. Same RLS scoping and row shaping
+        as fetch_history_page."""
+        if not self.username:
+            raise TransportError(
+                "login required before fetch_history_since")
+        limit = max(1, min(int(limit or 200), 500))
+        kinds = ",".join(CONTENT_AUDIT_KINDS)
+        query = _AUDIT_SELECT_SEQ + f"&kind=in.({kinds})"
+        query += f"&seq=gt.{int(after_seq or 0)}"
+        query += f"&order=seq.asc&limit={limit}"
+        rows = self._rest("GET", "audit_log", query) or []
+        return [_shape_audit_row(r) for r in rows]
 
     # -- work: shapes ---------------------------------------------------
     @staticmethod
