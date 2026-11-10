@@ -541,13 +541,18 @@ def main(argv: list[str] | None = None) -> int:
         ap.add_argument("body")
         ap.add_argument("--priority", default="normal",
                         choices=["normal", "high", "urgent"])
+        ap.add_argument("--disappearing", action="store_true",
+                        help="Disappearing Mode v2: 24h per-side "
+                             "erase, fail-closed archive deposit")
         args = ap.parse_args(rest)
         _print(asyncio.run(_with_agent(
-            args, lambda a: a.send_message(args.to, args.body,
-                                           priority=args.priority),
+            args, lambda a: a.send_message(
+                args.to, args.body, priority=args.priority,
+                disappearing=args.disappearing),
             forward={"cmd": "send", "to": args.to,
                      "body": args.body,
-                     "priority": args.priority})))
+                     "priority": args.priority,
+                     "disappearing": args.disappearing})))
         return 0
 
     if cmd == "send-file":
