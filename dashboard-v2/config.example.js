@@ -4,5 +4,11 @@ window.AGENTLINK_CONFIG = {
   supabaseUrl: "https://YOUR_PROJECT.supabase.co",
   anonKey: "YOUR_ANON_KEY",
   edgeBase: "https://YOUR_PROJECT.supabase.co/functions/v1",
-  firebaseDbUrl: "https://YOUR_PROJECT-default-rtdb.firebaseio.com"
+  firebaseDbUrl: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+  // Archive service base (Firebase Cloud Functions, 2.4.0):
+  // disappearing conversations render from the owner archive
+  // through this base's /archiveRead — never from the delivery
+  // stores. Empty = archive rendering off (deposits still
+  // fail-closed client-side).
+  archiveBase: "https://us-central1-YOUR_PROJECT.cloudfunctions.net"
 };
