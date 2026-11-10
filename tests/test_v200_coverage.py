@@ -2137,9 +2137,14 @@ def _fn_account(be, me, route, body):
             row["capabilities"] = caps
             row["mode"] = "manual" if raw.get("mode") == "manual" \
                 else "autonomous"
-            act = be.one("activeness", username=raw["username"])
-            row["online"] = bool(act) and act.get("state") in (
-                "online", "suspect")
+            # 2.3.0: presence truth is the login itself — the fake
+            # Edge's verify stamped last_seen for this user (the
+            # record layer's one event write); the deleted
+            # al_activeness mirror no longer exists to read. A
+            # user whose last_seen is fresh reads online; dave,
+            # who never verified a login, has last_seen 0.
+            row["online"] = \
+                int(raw.get("last_seen") or 0) >= int(time.time()) - 900
             row["trust_score"] = _compute_trust(be, raw["username"])
             row["core"] = {}
             row["core_compliant"] = None
@@ -2310,6 +2315,11 @@ class StubDoorbell:
         self.presence_listeners = []
         self.signals_started = threading.Event()
         self._signal_release = threading.Event()
+        self.inbox_listeners = []
+        self._inbox_release = threading.Event()
+        self.inbox_nodes = {}
+        self.directory_published = []
+        self.directory_nodes = {}
 
     @property
     def has_token(self):
@@ -2358,6 +2368,38 @@ class StubDoorbell:
         if stop_event is not None:
             stop_event.wait(timeout=60)
 
+    # -- 2.3.0 live-layer surface --------------------------------
+    def listen_inbox(self, username, callback, on_error=None,
+                     stop_event=None):
+        self.inbox_listeners.append(username)
+        released = self._inbox_release.wait(timeout=60)
+        if stop_event is not None and stop_event.is_set():
+            return
+        raise DoorbellError("inbox stream ended")
+
+    def release_inbox(self):
+        self._inbox_release.set()
+
+    def put_inbox(self, username, item_id, frame, expires_at=0):
+        self.inbox_nodes[(username, item_id)] = {
+            "frame": frame, "expires_at": expires_at, "ts": 1}
+        return {}
+
+    def read_inbox(self, username):
+        return {item: node for (user, item), node
+                in self.inbox_nodes.items() if user == username}
+
+    def delete_inbox_item(self, username, item_id):
+        self.inbox_nodes.pop((username, item_id), None)
+        return {}
+
+    def publish_directory(self, entry):
+        self.directory_published.append(dict(entry))
+        return {}
+
+    def read_directory(self, username):
+        return self.directory_nodes.get(username)
+
 
 def register_user(backend, username, identity, mode="autonomous"):
     backend.insert("users", {
@@ -2402,6 +2444,7 @@ async def start(agent):
 
 async def stop(agent, doorbell):
     doorbell.release_signals()
+    doorbell.release_inbox()
     await agent.close()
 
 
@@ -3057,8 +3100,10 @@ def test_directory_capabilities_deregister(tmp_path):
             bob_row = next(u for u in users
                            if u["username"] == "bob")
             assert bob_row["trust_score"] == 0
-            # Bob's agent is started: login wrote his activeness,
-            # so he reads online. Dave never connected: offline.
+            # Bob's agent is started: his login stamped last_seen
+            # (2.3.0's presence truth at this seam — the
+            # activeness mirror is deleted), so he reads online.
+            # Dave never connected: offline.
             assert bob_row["online"] is True
             dave_row = next(u for u in users
                             if u["username"] == "dave")
@@ -3166,10 +3211,14 @@ def test_history_backfill_exactly_once(tmp_path):
             assert stub is not None and not stub.get("body")
             work_rec = alice.mailbox.get("hist-5")
             assert work_rec["kind"] == "work"
-            # Second pass: nothing new, nothing duplicated.
+            # Second pass: nothing new journaled, nothing
+            # duplicated. (2.3.0: the pass is a forward-cursor
+            # delta — it does not re-download the six journaled
+            # rows; before the split it re-fetched all 6 and the
+            # journal deduped them.)
             out = await alice.sync_history()
             assert out["inserted"] == 0
-            assert out["fetched"] == 6
+            assert out["fetched"] == 0
         finally:
             await stop(alice, da)
             await stop(bob, db)
