@@ -1,12 +1,19 @@
-"""Firebase Realtime Database doorbell + activeness for AgentLink v2.0.
+"""Firebase Realtime Database live layer for AgentLink v2.0+.
 
-RTDB is the *trigger wire only* (see ``V2-BLUEPRINT.md``): signals,
-presence/activeness and doorbell taps live here; content NEVER
-does. Content stays end-to-end encrypted inside Supabase under RLS,
-and the journal/ACK custody in ``al_queue`` is the delivery
-guarantee — Firebase may lose every signal and nothing is lost,
-because a receiver that wakes (or reconnects, or slow-syncs)
-re-reads its unacked Supabase queue.
+RTDB is the LIVE layer (owner-ratified split architecture,
+2026-11-09 — see ``V2-BLUEPRINT.md`` and the 2.3.0 design record):
+signals, presence/activeness, doorbell taps, the message TRANSIT
+queue (inbox), typing/work signals and the directory working copy
+live here. Content in transit is the caller's E2EE envelope —
+ciphertext this module never opens. The DURABLE record stays in
+Supabase: the journal/ACK custody in ``al_queue`` and the permanent
+archive in ``al_audit_log`` are the delivery guarantee for standard
+messages — Firebase may lose every signal and every transit copy
+and nothing standard is lost, because a receiver that wakes (or
+reconnects) reconciles against its unacked Supabase queue, on a
+signal, never on a poll. DISAPPEARING messages are the one
+exception by design: they ride the transit queue ONLY, expire, and
+are never archived anywhere.
 
 Structure (see ``firebase/database.rules.json`` and
 ``firebase/README.md``)::
@@ -15,6 +22,10 @@ Structure (see ``firebase/database.rules.json`` and
     /presence/<user_key>         = {state, ts, connected_at,
                                     client_version, transport}
     /doorbell/<user_key>         = {kind, ref, ts}
+    /inbox/<user_key>/<item_id>  = {frame, expires_at, ts}
+    /directory/<user_key>        = {username, pubkey, sign_pub,
+                                    capabilities, cap_desc,
+                                    designation, mode, updated_at}
 
 Keys: RTDB keys may not contain ``. $ # [ ] /`` (or control chars),
 while AgentLink conversation ids look like ``dm:alice|bob`` and
@@ -36,45 +47,39 @@ rules entirely; that path belongs to the Edge outbox tapper, never
 to an agent.
 
 =================================================================
-ACTIVENESS (owner's hyper-sensitive ladder, 2026-11-05 — the
-original AgentLink timing law transplanted onto Firebase)
+ACTIVENESS (2.3.0 — the owner-ratified connection-based ladder,
+2026-11-09; SUPERSEDES the 2026-11-05 hyper-sensitive 5s law,
+which the owner himself flagged as a quota-eater)
 =================================================================
 
+Presence is CONNECTION-based: the connection is the presence fact.
 Three presence signals ride the ONE node ``/presence/<user_key>``:
 
-(a) **Connection + disconnect.** Where a client holds the native
-    Firebase SDK, ``onDisconnect`` writes ``state: "offline"``
-    server-side the moment its socket dies — instant offline,
-    beating every timer. This REST client cannot register a true
-    ``onDisconnect`` (the REST API exposes no disconnect hook);
-    what it implements instead, precisely:
+(a) **Connection + disconnect.** The connect write (below) marks
+    the agent online; a CLEAN shutdown writes ``state: "offline"``
+    itself before exiting (``clear_presence``) — offline instantly,
+    at any beat age. Where a client holds the native Firebase SDK,
+    ``onDisconnect`` writes the same offline record server-side the
+    moment its socket dies. This REST client cannot register a
+    true ``onDisconnect`` (the REST API exposes no disconnect
+    hook); its honest bound for an UNCLEAN death (kill, freeze,
+    power loss) is the ladder: the last server-timestamped beat
+    ages out and every reader converges on "offline" within
+    SUSPECT_MAX_AGE_S + one read (~7 minutes). That bound — not
+    the old 15 seconds — is the trade the owner ratified when he
+    ordered the metronome stopped: presence costs almost nothing,
+    and unclean-death detection is minutes, not seconds.
 
-    * the presence node is bound to the client's long-lived
-      streaming connection (the /signals stream and, per
-      counterparty, the scoped presence streams below): while the
-      stream is open the client considers its disconnect channel
-      ARMED, and a stream drop is known to the client the moment
-      it happens;
-    * on a CLEAN shutdown the client writes ``state: "offline"``
-      itself before exiting (``clear_presence``) — equivalent to
-      onDisconnect firing, minus the network round trip;
-    * on an UNCLEAN death (kill, freeze, power loss) no write is
-      possible from the corpse — the ladder below is the bound:
-      the last server-timestamped beat ages out and every reader
-      converges on "offline" within SUSPECT_MAX_AGE_S + one read.
-      That 15-second bound — not an instant write — is the honest
-      REST guarantee. The native-SDK client gets the instant
-      write with the same node shape and the same ladder.
-
-(b) **Heartbeat beats.** An explicit beat write every
-    :data:`BEAT_INTERVAL_S` (5s), server-timestamped
+(b) **Heartbeat beats.** An explicit health-proof beat every
+    :data:`BEAT_INTERVAL_S` (180s), server-timestamped
     (``{".sv": "timestamp"}``), from an INDEPENDENT thread owned
     by this module — never from a message/work loop, so a stuck
     worker cannot stop the beats (and a frozen process, whose
     socket may linger, is caught precisely because its beats
     stop). Beats touch RTDB ONLY: nothing periodic ever reaches
-    Edge or PostgREST. Own-node beats are never batched and never
-    loosened — 5s is law (see the README's beat-economy note).
+    Edge or PostgREST — and since 2.3.0 nothing periodic reaches
+    Postgres either (the activeness mirror is deleted; presence
+    lives here alone).
 
 (c) **Connection metadata** on the same node: ``connected_at``
     (server timestamp of the connect), ``client_version`` and
@@ -82,12 +87,12 @@ Three presence signals ride the ONE node ``/presence/<user_key>``:
     merged node.
 
 THE LADDER — :func:`activeness_state` in this module is the
-single source of truth (the dashboard and the pg_cron sweeps
-mirror these exact constants)::
+single source of truth::
 
-    beat age <= ONLINE_MAX_AGE_S  (10s = 2 beats)  -> "online"
-    beat age <= SUSPECT_MAX_AGE_S (15s = 3 beats)  -> "suspect"
-    older, or disconnect fired                     -> "offline"
+    disconnect fired (stored offline)              -> "offline"
+    beat age <= ONLINE_MAX_AGE_S  (240s)           -> "online"
+    beat age <= SUSPECT_MAX_AGE_S (420s)           -> "suspect"
+    older                                          -> "offline"
 
 "suspect" is a DISTINCT state, never folded into either side:
 the agent may be mid-reconnect; work must not be reassigned on
@@ -101,9 +106,8 @@ provider callable returning the current counterparty username
 set and keeps one presence stream per counterparty path,
 re-scoping (adding/removing paths) whenever the provider's set
 changes. If quota math ever demands fan-out relief, the valve
-lives HERE, in this subscription layer (e.g. widening which
-counterparties get live streams vs ladder-polled reads) — own-node
-beats are never the valve.
+lives HERE, in this subscription layer — own-node beats are
+already at the ratified 180s cadence and are not a valve.
 """
 
 from __future__ import annotations
@@ -125,6 +129,8 @@ __all__ = [
     "ONLINE_MAX_AGE_S",
     "SUSPECT_MAX_AGE_S",
     "ACTIVENESS_STATES",
+    "DIRECTORY_FIELDS",
+    "INBOX_FIELDS",
     "DoorbellClient",
     "DoorbellError",
     "ScopedPresenceWatcher",
@@ -141,14 +147,17 @@ __all__ = [
 ]
 
 # -- the activeness ladder (SINGLE SOURCE OF TRUTH) ----------------
-#: Heartbeat cadence: one beat write to my OWN presence node every
-#: 5 seconds. RTDB only; never batched, never loosened.
-BEAT_INTERVAL_S = 5
-#: Beat age at or below this (2 missed-beat budget) reads "online".
-ONLINE_MAX_AGE_S = 10
-#: Beat age at or below this (3 beats) reads "suspect"; beyond it,
-#: or on a fired disconnect, the agent reads "offline".
-SUSPECT_MAX_AGE_S = 15
+#: Heartbeat cadence: one health-proof beat write to my OWN
+#: presence node every 180 seconds (2.3.0, owner-ratified: the
+#: connection is the presence fact; the beat only proves the
+#: process still lives. Was 5s under the 2026-11-05 law, which
+#: the owner retired as a quota-eater on 2026-11-09.) RTDB only.
+BEAT_INTERVAL_S = 180
+#: Beat age at or below this (one beat + 60s grace) reads "online".
+ONLINE_MAX_AGE_S = 240
+#: Beat age at or below this (two beats + grace) reads "suspect";
+#: beyond it, or on a fired disconnect, the agent reads "offline".
+SUSPECT_MAX_AGE_S = 420
 
 #: Read timeout on a live event stream's socket. RTDB holds an
 #: idle stream open with periodic keep-alive events, so a healthy
@@ -167,20 +176,18 @@ SUSPECT_MAX_AGE_S = 15
 #: in the 2.0.6 exercise, 2026-11-06.)
 STREAM_READ_TIMEOUT_S = 90
 
-#: The fan-out valve (Phase 1 quota proof, migration-v200-cron.sql
-#: S6): raw presence fan-out at circle-10 would download ~19.9 GB/mo
-#: against the 10 GB free tier, so every client ALSO maintains a
-#: coalesced digest node (/digest/<user_key>) refreshed every
-#: DIGEST_INTERVAL_S of beats. Peer subscriptions may ride the
-#: digest (ScopedPresenceWatcher's fanout="digest"); the agent's
-#: OWN node keeps the raw 5s law, and activeness-critical
-#: counterparties stay on raw presence. The ladder itself — the
-#: 5/10/15 law — never loosens; only the peer fan-out cadence is
-#: coalesced, and a digest record carries the same {state, ts}
-#: shape, so activeness_of_record reads it unchanged (its ts is
-#: simply up to DIGEST_INTERVAL_S staler — display-grade, while
-#: state transitions still arrive instantly via the raw signals).
-DIGEST_INTERVAL_S = 30
+#: The fan-out valve: raw presence fan-out at circle-10 would
+#: download ~19.9 GB/mo against the 10 GB free tier at the old 5s
+#: cadence, so every client ALSO maintains a coalesced digest node
+#: (/digest/<user_key>). Peers subscribed to the digest download a
+#: fraction of the raw stream; activeness-critical counterparties
+#: stay on raw presence. Since 2.3.0 the beat itself rides the
+#: 180s cadence, so the digest refreshes once per beat
+#: (DIGEST_INTERVAL_S == BEAT_INTERVAL_S) — the valve's relief is
+#: now mostly the raw-fan-out avoidance, and a digest record still
+#: carries the same {state, ts} shape, so activeness_of_record
+#: reads it unchanged.
+DIGEST_INTERVAL_S = 180
 DIGEST_EVERY_N_BEATS = DIGEST_INTERVAL_S // BEAT_INTERVAL_S
 
 ACTIVENESS_STATES = ("online", "suspect", "offline")
@@ -270,13 +277,22 @@ _IDENTITY_URL = ("https://identitytoolkit.googleapis.com/v1/"
                  "accounts:signInWithCustomToken")
 _SECURETOKEN_URL = "https://securetoken.googleapis.com/v1/token"
 
-# The ONLY fields any write on this wire may carry. Content of any
-# kind (bodies, ciphertext, envelopes, file data) is forbidden by
-# construction, and the tests pin it.
+# The ONLY fields a /signals write may carry: ids and counters,
+# never content (a signal can only cause a fetch).
 SIGNAL_FIELDS = frozenset({"latest_item_id", "counter", "ts"})
 DOORBELL_FIELDS = frozenset({"kind", "ref", "ts"})
 PRESENCE_FIELDS = frozenset(
     {"state", "ts", "connected_at", "client_version", "transport"})
+# The ONLY fields an /inbox transit node may carry (2.3.0): the
+# frame is the caller's E2EE envelope dict — ciphertext, never
+# opened here — plus its expiry. No plaintext field exists.
+INBOX_FIELDS = frozenset({"frame", "expires_at", "ts"})
+# The ONLY fields a /directory working-copy entry may carry
+# (2.3.0): public directory data only — the Supabase al_directory
+# row stays the master record; this is its live-layer copy.
+DIRECTORY_FIELDS = frozenset(
+    {"username", "pubkey", "sign_pub", "capabilities", "cap_desc",
+     "designation", "mode", "updated_at"})
 
 _UNSAFE = frozenset(".$#[]/:| \t\r\n")
 
@@ -430,7 +446,7 @@ class DoorbellClient:
 
     def __init__(self, project_id: str = "", api_key: str = "",
                  database_url: str = "", opener=None,
-                 stream_opener=None):
+                 stream_opener=None, root_prefix: str = ""):
         self.project_id = project_id or ""
         self.api_key = api_key or ""
         if database_url:
@@ -440,6 +456,12 @@ class DoorbellClient:
                 f"https://{self.project_id}-default-rtdb.firebaseio.com")
         else:
             self.database_url = ""
+        #: Optional RTDB root prefix (2.3.0): every path this
+        #: client touches is namespaced under it ("sandbox230"
+        #: -> /sandbox230/presence/...). Drills and tests run
+        #: under a prefix so production nodes are never touched;
+        #: production clients pass "" (the default).
+        self.root_prefix = str(root_prefix or "").strip("/")
         self._opener = opener or _default_opener
         self._stream_opener = stream_opener or _default_stream_opener
         self._custom_token = ""
@@ -572,10 +594,17 @@ class DoorbellClient:
             return status, resp_headers, raw
 
     # -- REST plumbing ---------------------------------------------------
+    def _path(self, path: str) -> str:
+        """Apply the root prefix (see __init__): every RTDB path
+        this client reads, writes or streams is namespaced."""
+        if self.root_prefix:
+            return f"{self.root_prefix}/{path}"
+        return path
+
     def _url(self, path: str) -> str:
         if not self.database_url:
             raise DoorbellError("no Firebase database URL configured")
-        return (f"{self.database_url}/{path}.json"
+        return (f"{self.database_url}/{self._path(path)}.json"
                 f"?auth={urllib.parse.quote(self.id_token())}")
 
     def _rest(self, method: str, path: str, payload=None):
@@ -634,10 +663,9 @@ class DoorbellClient:
         """One coalesced digest write — the fan-out valve's writer
         half: /digest/<user_key> carries the same {state, ts,
         client_version, transport} shape as the presence node,
-        refreshed on the DIGEST_INTERVAL_S cadence by the heartbeat
-        loop. Peers subscribed to the digest download ~1/6 of the
-        raw beat stream; my own presence node is untouched by this
-        and keeps the raw 5s law."""
+        refreshed once per beat since 2.3.0 (DIGEST_INTERVAL_S ==
+        BEAT_INTERVAL_S). Peers subscribed to the digest avoid the
+        raw fan-out; my own presence node is untouched by this."""
         payload = {"state": "online",
                    "ts": {".sv": "timestamp"},
                    "client_version": self._presence_meta["client_version"],
@@ -689,12 +717,14 @@ class DoorbellClient:
         on a private stop-event, and shares no lock, queue or
         callback path with any message/work loop — a caller whose
         worker is wedged cannot delay a beat. ``interval_s``
-        defaults to BEAT_INTERVAL_S (5s, law); the override exists
-        ONLY so drills/tests can scale virtual time — production
-        callers pass nothing. ``on_beat(ok)`` fires per attempt;
+        defaults to BEAT_INTERVAL_S (180s, the ratified 2.3.0
+        health-proof cadence); the override exists ONLY so
+        drills/tests can scale virtual time — production callers
+        pass nothing. ``on_beat(ok)`` fires per attempt;
         ``on_transition(state)`` fires when MY ladder state changes
-        (the transport hangs its transition-only Supabase mirror
-        on it). Beats themselves touch RTDB only.
+        (the transport tracks transitions locally — since 2.3.0
+        no Supabase mirror hangs on it; presence is Firebase-only).
+        Beats themselves touch RTDB only.
         """
         self.stop_heartbeat(fire_offline=False)
         self._hb_stop = threading.Event()
@@ -809,6 +839,83 @@ class DoorbellClient:
         got = self._rest("GET", f"doorbell/{user_key(username)}")
         return got if isinstance(got, dict) else None
 
+    # -- transit inbox (2.3.0: the live layer carries messages) ------
+    def put_inbox(self, target_username: str, item_id: str,
+                  frame: dict, expires_at: int = 0) -> dict:
+        """Push one frame into ANOTHER agent's transit inbox:
+        PUT /inbox/<target>/<item_id> = {frame, expires_at, ts}.
+        The frame is the caller's E2EE envelope dict — ciphertext,
+        never opened here; the node carries NO other field
+        (INBOX_FIELDS pins the shape). ``expires_at`` (epoch
+        seconds, 0 = no expiry) is the disappearing contract: the
+        consumer discards expired items unopened."""
+        payload = {"frame": frame, "expires_at": int(expires_at or 0),
+                   "ts": {".sv": "timestamp"}}
+        self._rest("PUT",
+                   f"inbox/{user_key(target_username)}/"
+                   f"{sanitize_key(str(item_id))}", payload)
+        return payload
+
+    def read_inbox(self, username: str) -> dict:
+        """Read MY whole transit inbox: {item_id: node} ({} when
+        empty). The boot/reconnect reconciliation read — the
+        stream is the live path; this is its snapshot twin."""
+        got = self._rest("GET", f"inbox/{user_key(username)}")
+        return got if isinstance(got, dict) else {}
+
+    def delete_inbox_item(self, username: str, item_id: str) -> None:
+        """Consume one of MY inbox items: delete its node. Called
+        only after the frame is durably journaled locally —
+        deleting is the transit ack."""
+        self._rest("DELETE",
+                   f"inbox/{user_key(username)}/"
+                   f"{sanitize_key(str(item_id))}")
+
+    def listen_inbox(self, username: str, callback,
+                     stop_event=None) -> None:
+        """Block on MY /inbox/<user_key> stream. callback(item_id,
+        node) fires per item: the initial snapshot delivers every
+        held item, later puts deliver the new/changed item, and a
+        delete delivers (item_id, None). The consumer's live path
+        — no polling exists anywhere in this design."""
+        key = user_key(username)
+
+        def _cb(path, data):
+            if path in ("/", "", None):
+                if isinstance(data, dict):
+                    for item_id, node in data.items():
+                        callback(str(item_id), node)
+                return
+            callback(str(path).lstrip("/"), data)
+
+        try:
+            self._stream(f"inbox/{key}", _cb, stop_event=stop_event)
+        except DoorbellError:
+            raise
+        except Exception as exc:
+            raise DoorbellError(
+                f"inbox stream for {username} failed: {exc}") from exc
+
+    # -- directory working copy (2.3.0) --------------------------------
+    def publish_directory(self, entry: dict) -> dict:
+        """Publish MY directory working copy: PUT
+        /directory/<my_key> with exactly DIRECTORY_FIELDS (public
+        data only). The Supabase al_directory row stays the master
+        record — this is its live-layer copy, written by the same
+        agent at login and whenever its entry changes; the rules
+        allow writing only your OWN node."""
+        payload = {k: entry.get(k) for k in sorted(DIRECTORY_FIELDS)}
+        payload["updated_at"] = {".sv": "timestamp"}
+        name = str(entry.get("username") or "")
+        self._rest("PUT", f"directory/{user_key(name)}", payload)
+        return payload
+
+    def read_directory(self, username: str) -> dict | None:
+        """Read one agent's directory working copy (any authed
+        agent may read any entry — it is public data)."""
+        got = self._rest("GET", f"directory/{user_key(username)}")
+        return got if isinstance(got, dict) else None
+
     # -- streaming listens ----------------------------------------------------
     def _stream(self, path: str, callback, stop_event=None) -> None:
         """Consume one RTDB SSE stream for ``path`` (no leading
@@ -818,7 +925,7 @@ class DoorbellClient:
         the connection whose life presence signal (a) rides on."""
         if not self.database_url:
             raise DoorbellError("no Firebase database URL configured")
-        url = (f"{self.database_url}/{path}.json"
+        url = (f"{self.database_url}/{self._path(path)}.json"
                f"?auth={urllib.parse.quote(self.id_token())}")
         lines = self._stream_opener(url, {"Accept": "text/event-stream"})
         event = ""
@@ -919,7 +1026,7 @@ class ScopedPresenceWatcher:
 
     Fan-out valve: with ``fanout="digest"`` (the production-scale
     mode from the Phase 1 quota proof), counterparty streams ride
-    the coalesced /digest nodes — ~1/6 of the raw download —
+    the coalesced /digest nodes instead of the raw fan-out,
     EXCEPT usernames in ``critical`` (activeness-critical
     counterparties: current work assignees/assigners), which stay
     on raw /presence. The default ``fanout="presence"`` keeps every
