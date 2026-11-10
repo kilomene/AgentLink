@@ -87,6 +87,28 @@ export async function pgAll(table, query){
     if(rows.length < page) return out;
   }
 }
+// EGRESS DISCIPLINE (2.4.0): the audit read is FIELD-MINIMAL —
+// exactly the columns the conversation/activity composition
+// consumes (the same set the client transport selects), never
+// select=*. And the audit history is fetched ONCE in full
+// (immortality law), then refreshed by SEQ DELTA only: a resync
+// asks for rows strictly newer than the highest seq already
+// held, so a 60s safety resync costs the delta, not the archive.
+export const AUDIT_SELECT = "select=seq,ts,kind,actor,target,group_id,work_id,status,priority,size,mentions,ref_id,sender_nickname,sender_role,sender_custom_role,oversight,content_envelope";
+let _auditCache = null, _auditMaxSeq = 0;
+export async function loadAudit(){
+  if(!_auditCache){
+    _auditCache = await pgAll("al_audit_log", AUDIT_SELECT + "&order=seq.asc");
+    _auditMaxSeq = _auditCache.reduce((m, r) => Math.max(m, Number(r.seq || 0)), 0);
+    return _auditCache;
+  }
+  const fresh = await pgAll("al_audit_log", AUDIT_SELECT + "&seq=gt." + _auditMaxSeq + "&order=seq.asc");
+  if(fresh.length){
+    _auditCache.push(...fresh);
+    _auditMaxSeq = fresh.reduce((m, r) => Math.max(m, Number(r.seq || 0)), _auditMaxSeq);
+  }
+  return _auditCache;
+}
 export async function oversightOpen(items){
   // items: [{id, oversight, content_envelope}] -> {id: {text,title,content_kind,file_name}}
   const s = session(); if(!s) throw new Error("login required");
@@ -128,6 +150,45 @@ export async function oversightVaultFile(descriptor){
 export async function oversightLibraryFile(entry){
   return oversightFileBlob({library_file: {work_id: entry.work_id, sha256: entry.sha256, filename: entry.filename, size: entry.size}});
 }
+// DASHBOARD NEVER ERASES (Disappearing Mode v2, 2.4.0):
+// disappearing conversations are NOT in the audit history at
+// all — they render from the OWNER ARCHIVE, read through the
+// archive service (Firebase archiveRead; Drive is the store).
+// The sealed entries are opened on the server, inside the
+// operator session, and only the opened items come back —
+// this layer never opens content itself. The delivery stores
+// erase on the per-side clocks; this path has no erase.
+// Returns dashboard-shaped items (already opened), or [] when
+// the archive service is not configured / holds nothing for
+// the conversation. A conversation is filed under EVERY
+// participant, so reading any one participant's folder is
+// reading the conversation.
+export async function archiveConversation(conv){
+  const base = CFG().archiveBase;
+  if(!base || !conv) return [];
+  const s = session(); if(!s) return [];
+  const people = (conv.participants || []).map(p => typeof p === "string" ? p : p.username).filter(Boolean);
+  let convId = "", agent = people[0] || "";
+  if(conv.group_id){ convId = (conv.isChannel ? "channel:" : "group:") + conv.group_id; }
+  else{
+    const pair = [...people].sort();
+    if(pair.length < 2) return [];
+    convId = "dm:" + pair.join(":");
+    agent = pair[0];
+  }
+  if(!agent || !convId) return [];
+  const r = await fetch(base + "/archiveRead?agent=" + encodeURIComponent(agent) + "&conversation=" + encodeURIComponent(convId),
+    {headers:{"X-Operator-Session": s.token}});
+  if(!r.ok) return [];
+  const j = await r.json();
+  return (j.entries || []).filter(e => e.kind === "content").map(e => ({
+    id: e.message_id, seq: 0, ts: e.ts, from: e.sender, target: "", group_id: conv.group_id || "",
+    kind: "message", status: "", size: 0, mentions: [], work_id: "",
+    sender_nickname: "", sender_role: "", oversight: null, content_envelope: null,
+    sealed: false, disappearing: true,
+    opened: { text: (e.payload && e.payload.body) || "", title: "", content_kind: (e.payload && e.payload.kind) || "text", file_name: "" }
+  }));
+}
 // Probe segregation: port of Relay._parties_test (relay.py, v1.6.1).
 // TEST iff any party besides the owner seat is not a production-
 // registered user (test-designated, unknown, deregistered, ephemeral).
@@ -152,7 +213,7 @@ export async function loadAll(){
     pg("al_users"), pg("al_groups"), pg("al_group_members","select=*"), pg("al_channels"), pg("al_channel_members","select=*"),
     pg("al_work","select=*&order=created_at.desc"), pg("al_work_deliveries","select=*&order=ts.desc&limit=300"), pg("al_chains","select=*&order=created_at.desc"), pg("al_chain_steps","select=*&order=position.asc"),
     pg("al_library","select=*&order=ts.desc"), pg("al_vault","select=*&order=ts.desc"), pg("al_alerts","select=*&order=created_at.desc&limit=100"),
-    pgAll("al_audit_log","select=*&order=seq.asc"), pg("al_message_reads","select=*"), pg("al_servers","select=*"), pg("al_connections","select=*"),
+    loadAudit(), pg("al_message_reads","select=*"), pg("al_servers","select=*"), pg("al_connections","select=*"),
     pg("al_rooms","select=*"), pg("al_grants","select=*"), pg("al_agent_connectors","select=*"),
     pg("al_grant_receipts","select=*&order=ts.desc&limit=200"), pg("al_grant_approvals","select=*&order=ts.desc&limit=100"),
     pg("al_activeness","select=*"), pg("al_blobs","select=*&order=created_at.desc&limit=200"), pg("al_queue","select=*&order=seq.desc&limit=120")
