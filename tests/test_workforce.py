@@ -580,21 +580,30 @@ def test_fleet_alerts_webhook_resolve_reincident(state_root, tmp_path):
 
 def test_39a_no_long_sleep_source_audit():
     """Point 39a: scan the runtime package — no sleep/backoff literal
-    may exceed the 5-second cap. Named, documented exceptions are
-    OPERATOR-plane intervals only (update checks, backup schedule,
-    dashboard session life, login rate window, self-check cadence,
-    network watch) and live in agentlink/timing.py as constants, not
-    as inline waits in the work path."""
+    may exceed its plane's cap. The relay path keeps the 5-second cap
+    (agentlink/timing.py). The serverless signal-stream reconnect
+    cap is 30 s by the owner-ratified 2.3.0 architecture (2026-11-09:
+    a saner reconnect cap replaces the hot 5 s loop that burned
+    quota), so transport_v2.py's RECONNECT_BACKOFF_CAP_S is audited
+    against that plane's own 30 s bound. Named, documented exceptions
+    are OPERATOR-plane intervals only (update checks, backup
+    schedule, dashboard session life, login rate window, self-check
+    cadence, network watch) and live in agentlink/timing.py as
+    constants, not as inline waits in the work path."""
     import agentlink.timing as T
+    from agentlink.transport_v2 import RECONNECT_BACKOFF_CAP_S
+    assert RECONNECT_BACKOFF_CAP_S == 30  # the ratified 2.3.0 cap
     offenders = []
     for py in (ROOT / "agentlink").glob("*.py"):
         src = py.read_text()
+        cap = (RECONNECT_BACKOFF_CAP_S if py.name == "transport_v2.py"
+               else T.RECONNECT_BACKOFF_CAP_SECONDS)
         for m in re.finditer(r"(?:asyncio|time)\.sleep\(\s*(\d+(?:\.\d+)?)",
                              src):
-            if float(m.group(1)) > T.RECONNECT_BACKOFF_CAP_SECONDS:
+            if float(m.group(1)) > cap:
                 offenders.append(f"{py.name}: sleep({m.group(1)})")
         for m in re.finditer(r"backoff[^\n=]*=\s*(\d+(?:\.\d+)?)", src, re.I):
-            if float(m.group(1)) > T.RECONNECT_BACKOFF_CAP_SECONDS:
+            if float(m.group(1)) > cap:
                 offenders.append(f"{py.name}: backoff={m.group(1)}")
     assert offenders == [], offenders
     client_src = (ROOT / "agentlink" / "client.py").read_text()
