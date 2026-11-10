@@ -1,1 +1,1 @@
-{"database":{"rules":"database.rules.json"}}
+{"database":{"rules":"database.rules.json"},"emulators":{"database":{"host":"127.0.0.1","port":9000},"functions":{"host":"127.0.0.1","port":5001},"ui":{"enabled":false}},"functions":[{"codebase":"agentlink-live","ignore":["node_modules",".git","*.md"],"runtime":"nodejs20","source":"functions"}]}
