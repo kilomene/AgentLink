@@ -1123,7 +1123,12 @@ class Agent:
         self._pending: dict[str, asyncio.Future] = {}
         self._reply_waiters: dict[str, asyncio.Future] = {}
         self._pubkey_cache: dict[str, tuple[str, float]] = {}
-        self._group_keys: dict[str, dict] = {}  # gid -> {epoch, key bytes}
+        # gid -> {"epoch": current epoch, "key": current key bytes,
+        #         "epochs": {epoch: key bytes}} — the epoch map
+        # (2.3.1): rotation ARCHIVES the prior epoch's key instead
+        # of discarding it, so history sealed under a prior epoch
+        # stays openable for as long as this agent holds the key.
+        self._group_keys: dict[str, dict] = {}
         self._load_group_keys()
         # Read receipts (v1.1.2): with auto_read on (the default),
         # a message delivered into the registered on_message handler
@@ -2151,24 +2156,123 @@ class Agent:
     def _group_keys_path(self) -> Path:
         return self.state_dir / f"groupkeys-{self.username}.json"
 
+    # -- room key epoch archives (2.3.1) ------------------------------
+    # A room key record is {"epoch", "key", "epochs"}: the current
+    # epoch + its key (what sends seal with), plus EVERY epoch key
+    # this agent has ever held for the room. Rotation used to
+    # REPLACE the single stored key, so the moment a group rotated
+    # (e.g. a member removal), every history row sealed under the
+    # prior epoch became an unopenable sealed stub — the Nova
+    # family's 262 epoch-1 rows after the 2026-11-08 epoch-2
+    # rotation. The archive is the durable guarantee: once this
+    # agent holds an epoch key, no rotation discards it locally.
+    # The on-disk shape keeps the legacy {"epoch", "key"} pair (the
+    # current epoch, exactly as pre-2.3.1 files wrote it) and adds
+    # "keys": {str(epoch): b64 key} for the full map — a pre-2.3.1
+    # file therefore loads losslessly as a one-epoch archive.
+
+    @staticmethod
+    def _room_key_record(epoch: int, key: bytes,
+                         epochs: dict | None = None) -> dict:
+        m = {int(e): k for e, k in (epochs or {}).items()}
+        m[int(epoch)] = key
+        return {"epoch": int(epoch), "key": key, "epochs": m}
+
+    @staticmethod
+    def _room_key_for(rec: dict | None,
+                      epoch: int | None) -> bytes | None:
+        """The key an envelope sealed under ``epoch`` opens with:
+        the archived key for that epoch, else the current key when
+        the envelope names no epoch (legacy rows) or the current
+        epoch. None when this agent never held that epoch's key —
+        the caller then renders the sealed stub, exactly as before
+        (fail-closed, never a crash)."""
+        if not rec:
+            return None
+        if epoch is None or int(epoch) == int(rec["epoch"]):
+            return rec["key"]
+        return (rec.get("epochs") or {}).get(int(epoch))
+
+    @staticmethod
+    def _open_wrapped_file_key(rec: dict | None, wrapped: dict,
+                               stamp_epoch=None) -> bytes:
+        """Open a blob descriptor's room-wrapped file key. New
+        descriptors stamp the sealing epoch (``group_epoch``) and
+        open with exactly that epoch's key; legacy descriptors
+        carry no stamp, so the held epochs are tried newest-first
+        (the wrap is AEAD — a wrong key simply fails, never
+        mis-opens). Raises the last failure when no held key
+        opens it, exactly as the single-key code did."""
+        if not rec:
+            raise ValueError("no room key held")
+        order: list[int] = []
+        if stamp_epoch is not None:
+            order.append(int(stamp_epoch))
+        order.append(int(rec["epoch"]))
+        order.extend(sorted((rec.get("epochs") or {}), reverse=True))
+        last: Exception | None = None
+        seen: set[int] = set()
+        for e in order:
+            if e in seen:
+                continue
+            seen.add(e)
+            key = Agent._room_key_for(rec, e)
+            if key is None:
+                continue
+            try:
+                return decrypt_with_key(key, wrapped)
+            except Exception as exc:  # wrong epoch's key: try next
+                last = exc
+        if last is not None:
+            raise last
+        raise ValueError("no held epoch key opens the wrapped key")
+
+    @staticmethod
+    def _parse_room_key_file(text: str) -> dict:
+        out = {}
+        for rid, rec in json.loads(text).items():
+            epochs = {}
+            for e, kb64 in (rec.get("keys") or {}).items():
+                epochs[int(e)] = base64.b64decode(kb64)
+            cur = base64.b64decode(rec["key"])
+            epochs[int(rec["epoch"])] = cur
+            out[rid] = {"epoch": int(rec["epoch"]), "key": cur,
+                        "epochs": epochs}
+        return out
+
+    @staticmethod
+    def _dump_room_key_map(m: dict) -> dict:
+        return {r: {"epoch": rec["epoch"],
+                    "key": base64.b64encode(rec["key"]).decode(),
+                    "keys": {str(e): base64.b64encode(k).decode()
+                             for e, k in
+                             (rec.get("epochs") or {}).items()}}
+                for r, rec in m.items()}
+
     def _load_group_keys(self) -> None:
         p = self._group_keys_path()
         if p.exists():
             try:
-                for gid, rec in json.loads(p.read_text()).items():
-                    self._group_keys[gid] = {
-                        "epoch": rec["epoch"],
-                        "key": base64.b64decode(rec["key"])}
+                self._group_keys = self._parse_room_key_file(
+                    p.read_text())
             except Exception:
                 pass
 
     def _store_group_key(self, gid: str, epoch: int, key: bytes) -> None:
-        self._group_keys[gid] = {"epoch": epoch, "key": key}
-        data = {g: {"epoch": r["epoch"],
-                    "key": base64.b64encode(r["key"]).decode()}
-                for g, r in self._group_keys.items()}
+        prev = self._group_keys.get(gid) or {}
+        epochs = dict(prev.get("epochs") or {})
+        epochs[int(epoch)] = key
+        if prev and int(prev["epoch"]) > int(epoch):
+            # An OLDER epoch arriving (archive merge, delayed
+            # frame): archive it WITHOUT demoting the current key.
+            cur = {"epoch": int(prev["epoch"]), "key": prev["key"],
+                   "epochs": epochs}
+        else:
+            cur = {"epoch": int(epoch), "key": key, "epochs": epochs}
+        self._group_keys[gid] = cur
         p = self._group_keys_path()
-        p.write_text(json.dumps(data))
+        p.write_text(json.dumps(self._dump_room_key_map(
+            self._group_keys)))
         try:
             os.chmod(p, 0o600)
         except OSError:
@@ -2181,20 +2285,24 @@ class Agent:
         p = self._channel_keys_path()
         if p.exists():
             try:
-                for cid, rec in json.loads(p.read_text()).items():
-                    self._channel_keys[cid] = {
-                        "epoch": rec["epoch"],
-                        "key": base64.b64decode(rec["key"])}
+                self._channel_keys = self._parse_room_key_file(
+                    p.read_text())
             except Exception:
                 pass
 
     def _store_channel_key(self, cid: str, epoch: int, key: bytes) -> None:
-        self._channel_keys[cid] = {"epoch": epoch, "key": key}
-        data = {c: {"epoch": r["epoch"],
-                    "key": base64.b64encode(r["key"]).decode()}
-                for c, r in self._channel_keys.items()}
+        prev = self._channel_keys.get(cid) or {}
+        epochs = dict(prev.get("epochs") or {})
+        epochs[int(epoch)] = key
+        if prev and int(prev["epoch"]) > int(epoch):
+            cur = {"epoch": int(prev["epoch"]), "key": prev["key"],
+                   "epochs": epochs}
+        else:
+            cur = {"epoch": int(epoch), "key": key, "epochs": epochs}
+        self._channel_keys[cid] = cur
         p = self._channel_keys_path()
-        p.write_text(json.dumps(data))
+        p.write_text(json.dumps(self._dump_room_key_map(
+            self._channel_keys)))
         try:
             os.chmod(p, 0o600)
         except OSError:
@@ -4190,6 +4298,16 @@ class Agent:
             return {"group_id": frame["group_id"],
                     "key": v2.group_key_for(frame["group_id"],
                                             self.username)}
+        if ftype == "get_group_keys":
+            # 2.3.1 epoch archive: every retained wrap row for
+            # this member (plural fetch; see transport docstring).
+            return {"group_id": frame["group_id"],
+                    "keys": v2.group_keys_for(frame["group_id"],
+                                              self.username)}
+        if ftype == "get_channel_keys":
+            return {"channel_id": frame["channel_id"],
+                    "keys": v2.channel_keys_for(frame["channel_id"],
+                                                self.username)}
         if ftype == "get_channel_key":
             return {"channel_id": frame["channel_id"],
                     "key": v2.channel_key_for(frame["channel_id"],
@@ -5686,10 +5804,14 @@ class Agent:
                 "name": g.get("name", "")}
             if g["group_id"] not in self._group_keys:
                 await self._ensure_group_key(g["group_id"])
+            # 2.3.1: merge any server-retained prior-epoch wraps
+            # into the local archive (see _load_group_key_archive).
+            await self._load_group_key_archive(g["group_id"])
         for c in data.get("channels", []):
             self.channel_roles[c["channel_id"]] = c.get("my_role", "")
             if c["channel_id"] not in self._channel_keys:
                 await self._ensure_channel_key(c["channel_id"])
+            await self._load_channel_key_archive(c["channel_id"])
 
     async def _record_repair(self, event: str, detail: str = "") -> None:
         rec = {"event": event, "detail": detail,
@@ -6268,14 +6390,18 @@ class Agent:
             try:
                 if channel_id:
                     rec = self._channel_keys.get(channel_id)
-                    if rec:
+                    key = self._room_key_for(
+                        rec, envelope.get("epoch"))
+                    if key is not None:
                         payload = json.loads(decrypt_with_key(
-                            rec["key"], envelope))
+                            key, envelope))
                 elif group_id:
                     rec = self._group_keys.get(group_id)
-                    if rec:
+                    key = self._room_key_for(
+                        rec, envelope.get("epoch"))
+                    if key is not None:
                         payload = json.loads(decrypt_with_key(
-                            rec["key"], envelope))
+                            key, envelope))
                 else:
                     payload = self._decrypt_obj(envelope)
             except Exception:
@@ -6364,6 +6490,43 @@ class Agent:
             return None
         self._store_group_key(gid, int(key_rec["epoch"]), key)
         return self._group_keys[gid]
+
+    async def _load_group_key_archive(self, gid: str) -> None:
+        """Fetch EVERY retained wrap row for this group and merge
+        the unwrapped keys into the local epoch archive (2.3.1).
+        Runs at session start for each of my groups. With today's
+        schema (one wrap row per member, updated in place on
+        rotation) this returns my current wrap — which still
+        matters: it is how an agent whose local file holds only a
+        PRIOR epoch (phoenix's family seat: epoch-2 local file,
+        epoch-1 wrap still on the server) recovers that prior
+        epoch into its archive. A wrap that no longer unwraps
+        (identity rebound since) is skipped, never fatal."""
+        try:
+            data = await self._request({"type": "get_group_keys",
+                                        "group_id": gid})
+        except Exception:
+            return
+        for rec in data.get("keys") or []:
+            try:
+                key = self.identity.unwrap_key(rec["wrapped"])
+            except Exception:
+                continue
+            self._store_group_key(gid, int(rec["epoch"]), key)
+
+    async def _load_channel_key_archive(self, cid: str) -> None:
+        """The channel twin of _load_group_key_archive."""
+        try:
+            data = await self._request({"type": "get_channel_keys",
+                                        "channel_id": cid})
+        except Exception:
+            return
+        for rec in data.get("keys") or []:
+            try:
+                key = self.identity.unwrap_key(rec["wrapped"])
+            except Exception:
+                continue
+            self._store_channel_key(cid, int(rec["epoch"]), key)
 
     # -- unreadable park journal (2.0.10, class A) ------------------
     #
@@ -6467,11 +6630,14 @@ class Agent:
                 to = frame["group_id"]
             payload = None
             if rec is not None:
-                try:
-                    payload = json.loads(decrypt_with_key(
-                        rec["key"], frame["content"]))
-                except Exception:
-                    payload = None
+                key = self._room_key_for(
+                    rec, (frame.get("content") or {}).get("epoch"))
+                if key is not None:
+                    try:
+                        payload = json.loads(decrypt_with_key(
+                            key, frame["content"]))
+                    except Exception:
+                        payload = None
             if payload is None:
                 # 2.0.7 fallback: a sender whose client mis-seals
                 # room traffic to a member's identity key can
@@ -6508,10 +6674,36 @@ class Agent:
             # this client held the old wrap).
             retried = False
             if frame.get("channel_id"):
-                self._channel_keys.pop(frame["channel_id"], None)
+                # Drop ONLY the current epoch (2.3.1): the retry
+                # re-fetches the server's wrap; the epoch ARCHIVE
+                # is never discarded by a transient failure.
+                cur = self._channel_keys.get(frame["channel_id"])
+                if cur:
+                    arch = dict(cur.get("epochs") or {})
+                    arch.pop(int(cur["epoch"]), None)
+                    cur = dict(cur, epochs=arch)
+                    if arch:
+                        top = max(arch)
+                        self._channel_keys[frame["channel_id"]] = {
+                            "epoch": top, "key": arch[top],
+                            "epochs": arch}
+                    else:
+                        self._channel_keys.pop(frame["channel_id"],
+                                               None)
                 retried = True
             elif frame.get("group_id"):
-                self._group_keys.pop(frame["group_id"], None)
+                cur = self._group_keys.get(frame["group_id"])
+                if cur:
+                    arch = dict(cur.get("epochs") or {})
+                    arch.pop(int(cur["epoch"]), None)
+                    cur = dict(cur, epochs=arch)
+                    if arch:
+                        top = max(arch)
+                        self._group_keys[frame["group_id"]] = {
+                            "epoch": top, "key": arch[top],
+                            "epochs": arch}
+                    else:
+                        self._group_keys.pop(frame["group_id"], None)
                 retried = True
             if retried:
                 try:
@@ -7495,12 +7687,14 @@ class Agent:
             key = self.identity.decrypt_envelope(descriptor["wrapped_key"])
         elif frame.get("channel_id"):
             rec = await self._ensure_channel_key(frame["channel_id"])
-            key = decrypt_with_key(rec["key"],
-                                   descriptor["group_wrapped_key"])
+            key = self._open_wrapped_file_key(
+                rec, descriptor["group_wrapped_key"],
+                descriptor.get("group_epoch"))
         else:
             rec = await self._ensure_group_key(frame.get("group_id"))
-            key = decrypt_with_key(rec["key"],
-                                   descriptor["group_wrapped_key"])
+            key = self._open_wrapped_file_key(
+                rec, descriptor["group_wrapped_key"],
+                descriptor.get("group_epoch"))
         raw = decrypt_with_key(key, {"nonce": descriptor["blob_nonce"],
                                      "ct": ct_b64})
         return {"name": descriptor["name"], "kind": descriptor["kind"],
@@ -7654,10 +7848,12 @@ class Agent:
             rec = await self._ensure_group_key(group_id)
             descriptor["group_wrapped_key"] = encrypt_with_key(
                 rec["key"], file_key)
+            descriptor["group_epoch"] = rec["epoch"]
         elif channel_id:
             rec = await self._ensure_channel_key(channel_id)
             descriptor["group_wrapped_key"] = encrypt_with_key(
                 rec["key"], file_key)
+            descriptor["group_epoch"] = rec["epoch"]
         else:
             pub = await self.pubkey_of(for_user)
             descriptor["wrapped_key"] = self.identity.encrypt_for(
@@ -7870,8 +8066,20 @@ class Agent:
                                       members: list[str]) -> None:
         wrapped = {}
         for u in members:
-            if u == self.username:
-                continue
+            # Every member gets a server-side wrap row, INCLUDING
+            # the distributor (2.3.1): the row is the member's
+            # recovery anchor — the session-start archive load
+            # reads it back whenever the local archive lacks an
+            # epoch the server still holds (the phoenix seat:
+            # epoch-2-only local file, epoch-1 wrap still on the
+            # server). Skipping self, as this loop originally did,
+            # left the distributor's own row frozen at whatever
+            # epoch someone else last distributed, silently
+            # defeating that recovery for exactly the agent who
+            # rotates the room. The custody group_key frame is
+            # still sent to OTHER members only (the transport
+            # skips self there); a wrap sealed to my own key harms
+            # nothing — I already hold the key.
             pub = await self.pubkey_of(u)
             if pub:
                 wrapped[u] = self.identity.wrap_key(pub, key)
@@ -8046,8 +8254,13 @@ class Agent:
             rec = self._group_keys.get(gid or "")
             if not envelope or rec is None:
                 return None
+            key = self._room_key_for(rec, envelope.get("epoch")
+                                     if isinstance(envelope, dict)
+                                     else None)
+            if key is None:
+                return None
             try:
-                return json.loads(decrypt_with_key(rec["key"], envelope))
+                return json.loads(decrypt_with_key(key, envelope))
             except Exception:
                 return None
 
@@ -8609,8 +8822,9 @@ class Agent:
                                       key: bytes, members: list[str]) -> None:
         wrapped = {}
         for u in members:
-            if u == self.username:
-                continue
+            # Self included, exactly as _distribute_group_key
+            # (2.3.1): the distributor's own server wrap row is
+            # their archive-recovery anchor.
             pub = await self.pubkey_of(u)
             if pub:
                 wrapped[u] = self.identity.wrap_key(pub, key)
