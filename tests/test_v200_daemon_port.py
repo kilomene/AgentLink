@@ -8,9 +8,11 @@ it):
 
 * start() on the serverless flip performs the Edge login ceremony
   (real signature verification at the fake Edge), starts the
-  doorbell heartbeat via login, and starts ALL THREE supervision
-  pieces the Phase 6 finding names: listen_supervised (signal
-  stream thread), run_slow_sync (slow-sync thread) and the scoped
+  doorbell heartbeat via login, and starts ALL FOUR supervision
+  pieces the Phase 6 finding names (2.3.0 added the inbox
+  transit stream): listen_supervised (signal
+  stream thread), listen_inbox_supervised (transit stream),
+  run_slow_sync (degraded-cadence thread) and the scoped
   presence watcher.
 * Inbound custody frames flow fetch -> _dispatch -> handler ->
   ack exactly as on the relay path.
@@ -233,6 +235,11 @@ class StubDoorbell:
         self._signal_release = threading.Event()
         self._signal_delivered = False
         self.signal_conversation = None  # conversation id to signal
+        self.inbox_listeners = []    # usernames (2.3.0)
+        self._inbox_release = threading.Event()
+        self.inbox_nodes = {}
+        self.directory_published = []
+        self.directory_nodes = {}
 
     @property
     def has_token(self):
@@ -290,6 +297,40 @@ class StubDoorbell:
         self.presence_listeners.append(username)
         if stop_event is not None:
             stop_event.wait(timeout=30)
+
+    # -- 2.3.0 live-layer surface --------------------------------
+    def listen_inbox(self, username, callback, on_error=None,
+                     stop_event=None):
+        self.inbox_listeners.append(username)
+        # Block until released (a live stream) or the supervisor
+        # stops; on release the stream ends, like listen_signals.
+        released = self._inbox_release.wait(timeout=30)
+        if stop_event is not None and stop_event.is_set():
+            return
+        raise DoorbellError("inbox stream ended")
+
+    def release_inbox(self):
+        self._inbox_release.set()
+
+    def put_inbox(self, username, item_id, frame, expires_at=0):
+        self.inbox_nodes[(username, item_id)] = {
+            "frame": frame, "expires_at": expires_at, "ts": 1}
+        return {}
+
+    def read_inbox(self, username):
+        return {item: node for (user, item), node
+                in self.inbox_nodes.items() if user == username}
+
+    def delete_inbox_item(self, username, item_id):
+        self.inbox_nodes.pop((username, item_id), None)
+        return {}
+
+    def publish_directory(self, entry):
+        self.directory_published.append(dict(entry))
+        return {}
+
+    def read_directory(self, username):
+        return self.directory_nodes.get(username)
 
 
 def _make_agent(tmp_path, backend, doorbell, **kw):
@@ -388,12 +429,16 @@ def test_daemon_start_supervision_delivery_and_close(tmp_path):
         # The heartbeat was started by login, doorbell-owned.
         assert doorbell.heartbeat is not None
         assert doorbell.heartbeat[0] == "alice"
-        # ALL THREE supervision pieces are running.
+        # ALL FOUR supervision pieces are running (2.3.0 added
+        # the inbox transit stream to the 2.0 set).
         assert doorbell.signals_started.wait(timeout=5)
         thread_names = {t.name for t in agent._v2_threads}
         assert thread_names == {"agentlink-v2-signals",
+                                "agentlink-v2-inbox",
                                 "agentlink-v2-slowsync"}
         assert all(t.is_alive() for t in agent._v2_threads)
+        assert await _wait_for(
+            lambda: doorbell.inbox_listeners == ["alice"])
         # Scoped presence: exactly bob, never the fleet.
         assert await _wait_for(
             lambda: doorbell.presence_listeners == ["bob"])
@@ -405,13 +450,15 @@ def test_daemon_start_supervision_delivery_and_close(tmp_path):
         assert await _wait_for(
             lambda: backend.rows("queue") == [])
         assert agent.mailbox.get("msg-1") is not None
-        # A beat-ladder transition mirrors to Supabase exactly
-        # once (activeness + connections + last_seen).
+        # A beat-ladder transition writes NOTHING to the record
+        # layer (2.3.0: the Postgres mirror is deleted; the
+        # ladder state is local bookkeeping over the Firebase
+        # connection fact).
         _user, on_transition = doorbell.heartbeat
         on_transition("suspect")
-        assert await _wait_for(
-            lambda: any(r.get("state") == "suspect"
-                        for r in backend.rows("activeness")))
+        await asyncio.sleep(0.3)
+        assert backend.rows("activeness") == []
+        assert transport.activeness_state == "suspect"
         # Send routing: directory lookup + custody row for bob,
         # decryptable by bob, mailbox-recorded by alice.
         result = await agent.send_message("bob", "hi bob")
@@ -451,15 +498,16 @@ def test_daemon_start_supervision_delivery_and_close(tmp_path):
         await asyncio.sleep(0.1)
         assert not serve_task.done()
         doorbell.release_signals()
+        doorbell.release_inbox()
         await agent.close()
         await asyncio.wait_for(serve_task, timeout=10)
-        # Teardown: logout wrote the offline presence + mirror.
+        # Teardown (2.3.0): logout wrote the offline presence to
+        # Firebase — and NOTHING to the record layer's activeness
+        # table (the mirror is deleted).
         assert doorbell.cleared == ["alice"]
         assert doorbell.heartbeat_stopped is True
         assert agent._v2 is None
-        assert await _wait_for(
-            lambda: any(r.get("state") == "offline"
-                        for r in backend.rows("activeness")))
+        assert backend.rows("activeness") == []
 
     asyncio.run(scenario())
 
@@ -899,19 +947,20 @@ def test_admin_reissues_group_key_on_request(tmp_path):
     asyncio.run(scenario())
 
 
-def test_version_222_and_manifest_offers_222():
-    assert __version__ == "2.2.3"
+def test_version_230_and_manifest_offers_230():
+    assert __version__ == "2.3.0"
     pyproject = (ROOT / "pyproject.toml").read_text()
-    assert 'version = "2.2.3"' in pyproject
+    assert 'version = "2.3.0"' in pyproject
     # The fleet's update manifest was regenerated at the owner's
     # direct release order (2026-11-05): it offers 2.0.5, and its
     # file set covers the whole package INCLUDING the v2.0
     # serverless modules, each with a matching SHA-256.
     import hashlib
     manifest = json.loads((ROOT / "update-manifest.json").read_text())
-    assert manifest["version"] == "2.2.3"
+    assert manifest["version"] == "2.3.0"
     assert "agentlink/doorbell.py" in manifest["files"]
     assert "agentlink/transport_v2.py" in manifest["files"]
+    assert "agentlink/retry.py" in manifest["files"]  # new in 2.3.0
     # 2.0.11: the retired relay era no longer ships to installs —
     # relay.py/dashboard.py stay in the source tree (the suite's
     # local-relay harness imports them) but are NOT distributed;
@@ -922,11 +971,11 @@ def test_version_222_and_manifest_offers_222():
     for rel, digest in manifest["files"].items():
         actual = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
         assert actual == digest, rel
-    # A 1.8.1 install reading this manifest sees the 2.2.2 update.
+    # A 1.8.1 install reading this manifest sees the 2.3.0 update.
     updater = Updater(current_version="1.8.1")
     updater.fetch_manifest = lambda: manifest
     check = updater.check()
-    assert check["available"] == "2.2.3"
+    assert check["available"] == "2.3.0"
     assert check["update_available"] is True
 
 
