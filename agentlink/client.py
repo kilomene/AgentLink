@@ -772,6 +772,7 @@ class Agent:
         transport: str | None = None,
         serverless_config: ServerlessConfig | None = None,
         serverless_transport: ServerlessTransport | None = None,
+        archive_backend=None,
     ):
         u = normalize_username(username)
         if u is None and not ephemeral:
@@ -934,6 +935,10 @@ class Agent:
         self._oversight_configured = resolve_oversight_pubkey(
             oversight_pubkey)
         self.oversight_pubkey = self._oversight_configured
+        # Disappearing Mode v2: injected archive backend (drills
+        # pass a LocalArchiveBackend/DriveCliBackend); production
+        # resolves env/HTTPS in _archive_deposit_sync.
+        self._archive_backend = archive_backend
         # Credentials vault (v1.4.0): the agent's OWN vault, sealed
         # to its identity key — see agentlink/vault.py. Opened
         # lazily on first use (an ephemeral dial client raises a
@@ -1570,10 +1575,12 @@ class Agent:
             elif cmd == "send":
                 result = await self.send_message(
                     str(spec["to"]), str(spec["body"]),
-                    priority=str(spec.get("priority") or "normal"))
+                    priority=str(spec.get("priority") or "normal"),
+                    disappearing=bool(spec.get("disappearing")))
             elif cmd == "group_send":
                 result = await self.group_send(
-                    str(spec["group_id"]), str(spec["body"]))
+                    str(spec["group_id"]), str(spec["body"]),
+                    disappearing=bool(spec.get("disappearing")))
             elif cmd == "group_add":
                 result = await self.group_add(
                     str(spec["group_id"]),
@@ -2226,6 +2233,53 @@ class Agent:
         if last is not None:
             raise last
         raise ValueError("no held epoch key opens the wrapped key")
+
+    @staticmethod
+    def _open_room_envelope(rec: dict | None,
+                            envelope: dict) -> dict | None:
+        """Open a room content envelope with EPOCH TRIAL
+        (2.4.0). 2.3.1 dispatched on the envelope's epoch stamp,
+        but production history is full of LEGACY envelopes that
+        carry NO stamp at all (sealed by send paths that never
+        stamped the audit envelope) — _room_key_for(None epoch)
+        maps those to the CURRENT key only, so an unstamped
+        epoch-1 envelope stayed sealed forever after rotation
+        even with epoch 1 archived (found live in the 2.3.1
+        money check: family rows at seq 14179/14183/14196,
+        unstamped, trial-decrypt OPEN under epoch 1). The fix
+        mirrors _open_wrapped_file_key's proven legacy handling:
+        try the stamped epoch first when present, then the
+        current key, then every archived epoch newest-first.
+        The cipher is AEAD — a wrong key fails cleanly, never
+        mis-opens — and an envelope no held key opens returns
+        None, so unknown-epoch rows stay sealed stubs exactly
+        as before (fail-closed)."""
+        if not rec or not isinstance(envelope, dict) \
+                or not envelope.get("ct"):
+            return None
+        order: list[int] = []
+        stamped = envelope.get("epoch")
+        if stamped is not None:
+            try:
+                order.append(int(stamped))
+            except (TypeError, ValueError):
+                pass
+        order.append(int(rec["epoch"]))
+        order.extend(sorted((rec.get("epochs") or {}),
+                            reverse=True))
+        seen: set[int] = set()
+        for e in order:
+            if e in seen:
+                continue
+            seen.add(e)
+            key = Agent._room_key_for(rec, e)
+            if key is None:
+                continue
+            try:
+                return json.loads(decrypt_with_key(key, envelope))
+            except Exception:
+                continue
+        return None
 
     @staticmethod
     def _parse_room_key_file(text: str) -> dict:
@@ -3295,7 +3349,38 @@ class Agent:
         # record itself lives in the park (state-dir JSONL +
         # transport.dead_letters) for diagnostics.
         transport.on_dead_letter = self._on_v2_dead_letter
+        # Disappearing Mode v2 (2.4.0): the fail-closed archive
+        # deposit gate's depositor — this agent's archive path.
+        transport.archive_depositor = self._archive_deposit_sync
         return transport
+
+    #: Production archive service (workstream d): the Firebase
+    #: Cloud Function hosting the deposit service. Until it is
+    #: deployed, deposits to it fail and disappearing sends fail
+    #: CLOSED — by design, never silently unarchived.
+    ARCHIVE_SERVICE_URL_DEFAULT = (
+        "https://us-central1-agentlink-84609.cloudfunctions.net/"
+        "archiveDeposit")
+
+    def _archive_deposit_sync(self, record: dict) -> dict:
+        """The archive depositor the transport's gate calls
+        (sync; the transport runs it on its own threads).
+        Resolution order: an injected backend (tests/drills) ->
+        AGENTLINK_ARCHIVE_LOCAL_DIR (a local directory in the
+        Drive layout — the sandbox/VM staging form) -> the
+        archive service over HTTPS (production). Any failure
+        raises; the gate parks and blocks the send."""
+        from . import archive as _archive
+        if self._archive_backend is not None:
+            return self._archive_backend.deposit(record)
+        local = os.environ.get("AGENTLINK_ARCHIVE_LOCAL_DIR")
+        if local:
+            return _archive.LocalArchiveBackend(local).deposit(
+                record)
+        url = os.environ.get("AGENTLINK_ARCHIVE_URL") \
+            or self.ARCHIVE_SERVICE_URL_DEFAULT
+        token = os.environ.get("AGENTLINK_ARCHIVE_TOKEN", "")
+        return _archive.https_deposit(url, record, token)
 
     def _on_v2_dead_letter(self, record: dict) -> None:
         log.warning(
@@ -4250,6 +4335,7 @@ class Agent:
                 priority=frame.get("priority") or "normal",
                 in_reply_to=frame.get("in_reply_to"),
                 oversight=frame.get("oversight"),
+                disappearing=bool(frame.get("disappearing")),
                 from_name=self.display_name, from_pubkey=pub)
         if ftype == "group_send":
             gid = frame["group_id"]
@@ -4262,6 +4348,7 @@ class Agent:
                 priority=frame.get("priority") or "normal",
                 in_reply_to=frame.get("in_reply_to"),
                 oversight=frame.get("oversight"),
+                disappearing=bool(frame.get("disappearing")),
                 from_name=self.display_name, from_pubkey=pub,
                 group_name=mine.get("name", ""),
                 sender_nickname=mine.get("nickname", ""),
@@ -4285,6 +4372,7 @@ class Agent:
                 mentions=frame.get("mentions"),
                 priority=frame.get("priority") or "normal",
                 oversight=frame.get("oversight"),
+                disappearing=bool(frame.get("disappearing")),
                 from_name=self.display_name, from_pubkey=pub,
                 channel_name=ch_name,
                 sender_role=self.channel_roles.get(cid, ""))
@@ -6289,6 +6377,34 @@ class Agent:
             if before is not None and smallest >= before:
                 break  # no progress — never spin
             before = smallest
+        # Disappearing Mode v2: every sync also runs the local
+        # erase sweep — per-side deadlines, archive-confirmed
+        # items only (see Mailbox.sweep_disappearing).
+        try:
+            out["disappearing_sweep"] = self.sweep_disappearing()
+        except Exception:
+            log.exception("disappearing erase sweep failed")
+        return out
+
+    def sweep_disappearing(self, now: int | None = None) -> dict:
+        """Run the Disappearing Mode v2 local erase sweep over
+        this agent's mailbox NOW: erase each disappearing item
+        whose per-side deadline has passed (sent: send+24h;
+        received: read+24h; unread received items never erase)
+        AND whose archive deposit is confirmed. Items due but
+        unconfirmed stay and are reported under "blocked" —
+        archive first, always. Returns the sweep's verdict."""
+        if self.mailbox is None:
+            return {"erased": [], "blocked": []}
+        out = self.mailbox.sweep_disappearing(now=now)
+        if out["erased"]:
+            log.info("disappearing erase: %d item(s) erased at "
+                     "their per-side deadlines",
+                     len(out["erased"]))
+        if out["blocked"]:
+            log.warning("disappearing erase HELD for %d item(s): "
+                        "archive confirmation missing",
+                        len(out["blocked"]))
         return out
 
     def _history_cursor_path(self):
@@ -6390,18 +6506,12 @@ class Agent:
             try:
                 if channel_id:
                     rec = self._channel_keys.get(channel_id)
-                    key = self._room_key_for(
-                        rec, envelope.get("epoch"))
-                    if key is not None:
-                        payload = json.loads(decrypt_with_key(
-                            key, envelope))
+                    payload = self._open_room_envelope(
+                        rec, envelope)
                 elif group_id:
                     rec = self._group_keys.get(group_id)
-                    key = self._room_key_for(
-                        rec, envelope.get("epoch"))
-                    if key is not None:
-                        payload = json.loads(decrypt_with_key(
-                            key, envelope))
+                    payload = self._open_room_envelope(
+                        rec, envelope)
                 else:
                     payload = self._decrypt_obj(envelope)
             except Exception:
@@ -6630,14 +6740,8 @@ class Agent:
                 to = frame["group_id"]
             payload = None
             if rec is not None:
-                key = self._room_key_for(
-                    rec, (frame.get("content") or {}).get("epoch"))
-                if key is not None:
-                    try:
-                        payload = json.loads(decrypt_with_key(
-                            key, frame["content"]))
-                    except Exception:
-                        payload = None
+                payload = self._open_room_envelope(
+                    rec, frame.get("content") or {})
             if payload is None:
                 # 2.0.7 fallback: a sender whose client mis-seals
                 # room traffic to a member's identity key can
@@ -6748,6 +6852,12 @@ class Agent:
                         "sealed": True,
                         "unreadable": True,
                     }
+                    if frame.get("disappearing"):
+                        stub["disappearing"] = True
+                        stub["sent_at"] = frame.get("sent_at") \
+                            or frame.get("ts")
+                        stub["archive_confirmed"] = bool(
+                            frame.get("archive"))
                     self.mailbox.put_if_absent(stub)
                     await self._send_ack([mid])
                 log.warning(
@@ -6813,6 +6923,18 @@ class Agent:
             "queued": bool(frame.get("queued")),
             "encrypted": True,
         }
+        if frame.get("disappearing"):
+            # Disappearing Mode v2 (2.4.0): the receiver-side
+            # erase clock starts at READ (mailbox take-in stamps
+            # read_at); while unread this item has NO deadline.
+            # The archive confirmation rides the frame from the
+            # sender's fail-closed deposit — erase may proceed
+            # only because it is present (archive first, always).
+            msg["disappearing"] = True
+            msg["sent_at"] = frame.get("sent_at") or frame.get("ts")
+            msg["archive_confirmed"] = bool(frame.get("archive"))
+            msg["archive_entry"] = (
+                frame.get("archive") or {}).get("entry_id")
         # CANONICAL MAILBOX (v1.3.7): journal BEFORE processing,
         # ack only once the item is durable, and never reprocess a
         # duplicate. The claim is taken synchronously — before the
@@ -7891,7 +8013,21 @@ class Agent:
                            file: dict | None = None,
                            in_reply_to: str | None = None,
                            priority: str = "normal",
-                           meta: dict | None = None) -> dict:
+                           meta: dict | None = None,
+                           disappearing: bool = False) -> dict:
+        """Send one DM. ``disappearing=True`` selects Disappearing
+        Mode v2 (2.4.0): 24h per-side erase clocks, the receiver
+        clock starting at READ, unread never expiring — and the
+        FAIL-CLOSED oversight deposit: without an oversight wrap
+        to deposit into the owner's archive the send is refused
+        here, and the transport refuses again at the deposit
+        gate. Files refuse disappearing outright (rule 6: a
+        file case that cannot be made fully consistent fails
+        closed — blob bytes have no per-side erase schedule)."""
+        if disappearing and file is not None:
+            raise RequestFailed(
+                "disappearing_files_unsupported",
+                "disappearing mode refuses file sends (fail-closed)")
         u = normalize_username(to) or to
         pub = await self.pubkey_of(u)
         if not pub:
@@ -7911,15 +8047,29 @@ class Agent:
         ov = self._oversight_for_obj(obj)
         if ov:
             frame["oversight"] = ov
+        if disappearing:
+            if not ov:
+                raise RequestFailed(
+                    "disappearing_needs_oversight",
+                    "disappearing send blocked: no oversight copy "
+                    "to deposit (fail-closed)")
+            frame["disappearing"] = True
         result = await self._send_request(frame)
-        self._mailbox_record_sent({
+        sent = {
             "id": result.get("id") or frame["id"], "from": self.username,
             "to": u, "group_id": None, "channel_id": None,
             "kind": kind, "body": body, "file": file,
             "meta": dict(meta) if meta else {},
             "mentions": frame["mentions"],
             "in_reply_to": in_reply_to, "priority": priority,
-            "ts": int(time.time())})
+            "ts": int(time.time())}
+        if disappearing:
+            sent["disappearing"] = True
+            sent["sent_at"] = sent["ts"]
+            sent["archive_confirmed"] = bool(result.get("archive"))
+            sent["archive_entry"] = (
+                result.get("archive") or {}).get("entry_id")
+        self._mailbox_record_sent(sent)
         return result
 
     def _mailbox_record_sent(self, item: dict) -> None:
@@ -8195,7 +8345,17 @@ class Agent:
                          file: dict | None = None,
                          in_reply_to: str | None = None,
                          priority: str = "normal",
-                         meta: dict | None = None) -> dict:
+                         meta: dict | None = None,
+                         disappearing: bool = False) -> dict:
+        """Send one group message. ``disappearing=True`` =
+        Disappearing Mode v2 (2.4.0): same per-side rules per
+        member as the DM path; the oversight deposit carries the
+        room content-key wrap (the existing oversight doctrine
+        for rooms); files refuse disappearing (fail-closed)."""
+        if disappearing and file is not None:
+            raise RequestFailed(
+                "disappearing_files_unsupported",
+                "disappearing mode refuses file sends (fail-closed)")
         self._gate(group_id, "send_messages")
         rec = await self._ensure_group_key(group_id)
         if rec is None:
@@ -8214,15 +8374,29 @@ class Agent:
         ov = self._oversight_for_key(rec["key"])
         if ov:
             frame["oversight"] = ov
+        if disappearing:
+            if not ov:
+                raise RequestFailed(
+                    "disappearing_needs_oversight",
+                    "disappearing send blocked: no oversight copy "
+                    "to deposit (fail-closed)")
+            frame["disappearing"] = True
         result = await self._send_request(frame)
-        self._mailbox_record_sent({
+        sent = {
             "id": result.get("id") or frame["id"], "from": self.username,
             "to": group_id, "group_id": group_id, "channel_id": None,
             "kind": kind, "body": body, "file": file,
             "meta": dict(meta) if meta else {},
             "mentions": frame["mentions"],
             "in_reply_to": in_reply_to, "priority": priority,
-            "ts": int(time.time())})
+            "ts": int(time.time())}
+        if disappearing:
+            sent["disappearing"] = True
+            sent["sent_at"] = sent["ts"]
+            sent["archive_confirmed"] = bool(result.get("archive"))
+            sent["archive_entry"] = (
+                result.get("archive") or {}).get("entry_id")
+        self._mailbox_record_sent(sent)
         return result
 
     async def group_send_file(self, group_id: str, path: str,
@@ -8254,15 +8428,10 @@ class Agent:
             rec = self._group_keys.get(gid or "")
             if not envelope or rec is None:
                 return None
-            key = self._room_key_for(rec, envelope.get("epoch")
-                                     if isinstance(envelope, dict)
-                                     else None)
-            if key is None:
-                return None
-            try:
-                return json.loads(decrypt_with_key(key, envelope))
-            except Exception:
-                return None
+            # Epoch trial (2.4.0): work envelopes sealed under a
+            # prior epoch — stamped or legacy-unstamped — open
+            # with the archived key, exactly as message history.
+            return self._open_room_envelope(rec, envelope)
 
         content = _try(raw.get("content_enc")) or \
             _try(raw.get("content_self")) or \
@@ -8897,7 +9066,14 @@ class Agent:
     async def channel_send(self, channel_id: str, body: str,
                            kind: str = "text", file: dict | None = None,
                            priority: str = "normal",
-                           meta: dict | None = None) -> dict:
+                           meta: dict | None = None,
+                           disappearing: bool = False) -> dict:
+        """Send one channel message. ``disappearing=True`` =
+        Disappearing Mode v2 (2.4.0), same rules as group_send."""
+        if disappearing and file is not None:
+            raise RequestFailed(
+                "disappearing_files_unsupported",
+                "disappearing mode refuses file sends (fail-closed)")
         rec = await self._ensure_channel_key(channel_id)
         if rec is None:
             raise RequestFailed("no_channel_key",
@@ -8915,14 +9091,28 @@ class Agent:
         ov = self._oversight_for_key(rec["key"])
         if ov:
             frame["oversight"] = ov
+        if disappearing:
+            if not ov:
+                raise RequestFailed(
+                    "disappearing_needs_oversight",
+                    "disappearing send blocked: no oversight copy "
+                    "to deposit (fail-closed)")
+            frame["disappearing"] = True
         result = await self._send_request(frame)
-        self._mailbox_record_sent({
+        sent = {
             "id": result.get("id") or frame["id"], "from": self.username,
             "to": channel_id, "group_id": None, "channel_id": channel_id,
             "kind": kind, "body": body, "file": file,
             "meta": dict(meta) if meta else {},
             "mentions": frame["mentions"], "in_reply_to": None,
-            "priority": priority, "ts": int(time.time())})
+            "priority": priority, "ts": int(time.time())}
+        if disappearing:
+            sent["disappearing"] = True
+            sent["sent_at"] = sent["ts"]
+            sent["archive_confirmed"] = bool(result.get("archive"))
+            sent["archive_entry"] = (
+                result.get("archive") or {}).get("entry_id")
+        self._mailbox_record_sent(sent)
         return result
 
     async def channel_send_file(self, channel_id: str, path: str,
