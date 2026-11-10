@@ -12,7 +12,7 @@ import * as v_credentials from "./views/credentials.js";
 import * as v_grants from "./views/grants.js";
 import * as v_rooms from "./views/rooms.js";
 import * as v_support from "./views/support.js";
-import { session, login, clearSession, loadAll, oversightOpen, oversightCredentials, oversightFile, oversightVaultFile, oversightLibraryFile, ensureFreshJwt } from "./data.js";
+import { session, login, clearSession, loadAll, oversightOpen, oversightCredentials, oversightFile, oversightVaultFile, oversightLibraryFile, archiveConversation, ensureFreshJwt } from "./data.js";
 import { streamPresence, applyPresence, startActivenessTick } from "./presence.js";
 import { startRealtime, onRtState, rtState, setRealtimeJwt, stopRealtime } from "./realtime.js";
 import { store, on as busOn } from "./store.js";
@@ -23,7 +23,7 @@ const ORDER = ["overview","agents","conversations","probes","activity","work","c
 let cache = null, inflight = null, currentView = null, booted = false;
 const ctx = { store, bus: { on: busOn },
   getData: async () => { if(store.data) return store.data; if(!inflight) inflight = loadAll().then(d => { store.setData(d); cache = d; inflight = null; return d; }).catch(e => { inflight = null; throw e; }); return inflight; },
-  oversight: oversightOpen, oversightCredentials, oversightFile, oversightVaultFile, oversightLibraryFile, data: null };
+  oversight: oversightOpen, oversightCredentials, oversightFile, oversightVaultFile, oversightLibraryFile, archiveConversation, data: null };
 ctx.data = ctx; // legacy accessor: views reach store.data via ctx.getData()
 
 function route(){ const name = (location.hash.replace("#/","").split("/")[0]) || "overview"; return ORDER.includes(name)?name:"overview"; }
