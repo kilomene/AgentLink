@@ -1,12 +1,15 @@
 """Digest fan-out valve pins (v2.0 integration — Phase 1 quota proof
 made implementation mandatory at circle-10 scale).
 
-The valve: every client ALSO maintains /digest/<user> on a 30s
-coalesced cadence (every 6th beat); peers may subscribe to digests
-(~1/6 the download) while activeness-critical counterparties stay
-on raw presence; the agent's own presence node keeps the raw 5s
-law untouched. These pins hold the writer cadence, the reader
-scoping, and the rules coverage.
+The valve: every client ALSO maintains /digest/<user>, refreshed
+on the beat cadence; peers may subscribe to digests (a fraction
+of the download) while activeness-critical counterparties stay
+on raw presence. 2.3.0: the beat stretched to 180s and the
+digest now refreshes EVERY beat (DIGEST_EVERY_N_BEATS == 1,
+DIGEST_INTERVAL_S == 180) — at a 3-minute beat a 6-beat
+coalescing would leave digests 18 minutes stale. These pins
+hold the writer cadence, the reader scoping, and the rules
+coverage.
 """
 import json
 import time
@@ -27,8 +30,8 @@ def _recorder_client():
 
 
 def test_digest_cadence_constants():
-    assert DIGEST_INTERVAL_S == 30
-    assert DIGEST_EVERY_N_BEATS == 6
+    assert DIGEST_INTERVAL_S == 180
+    assert DIGEST_EVERY_N_BEATS == 1
     assert DIGEST_EVERY_N_BEATS * BEAT_INTERVAL_S == DIGEST_INTERVAL_S
 
 
@@ -43,7 +46,7 @@ def test_beat_digest_writes_own_digest_node():
     assert all("presence/" not in p for _m, p, _b in calls)
 
 
-def test_heartbeat_loop_refreshes_digest_every_6th_beat():
+def test_heartbeat_loop_refreshes_digest_every_beat():
     c, calls = _recorder_client()
     c.start_heartbeat("alice", interval_s=0.01)
     try:
@@ -61,9 +64,9 @@ def test_heartbeat_loop_refreshes_digest_every_6th_beat():
     digests = [1 for m, p, _b in calls
                if m == "PATCH" and p == "digest/alice"]
     assert len(beats) >= 12
-    # exactly floor(beats/6) digest writes, modulo the beat in flight
-    # when the loop was stopped
-    assert len(beats) // 6 - 1 <= len(digests) <= len(beats) // 6
+    # 2.3.0: one digest per beat, modulo the beat in flight when
+    # the loop was stopped.
+    assert len(beats) - 1 <= len(digests) <= len(beats)
 
 
 class _FakeListenClient:
