@@ -24,9 +24,13 @@ the Supabase org into the 2026-11-08 restriction):
     and stops churning, a failing disappearing push parks too.
 (d) Disappearing messages produce ZERO Supabase rows (queue,
     audit — anything) while standard messages produce exactly
-    one custody row + one archive row; expired disappearing
-    items are purged unopened; acking a disappearing item
-    touches no Supabase surface at all.
+    one custody row + one archive row; acking a disappearing
+    item touches no Supabase surface at all. (Disappearing
+    semantics themselves were superseded by Disappearing Mode
+    v2 in 2.4.0 — mandatory fail-closed oversight deposit, no
+    transit expiry, unread never expires unread; the v2 rules
+    are pinned in test_v240_combined.py and the updated tests
+    below.)
 (e) Presence works with NO activeness-mirror writes: login,
     transitions and logout write nothing to al_activeness /
     al_connections / al_users — presence is the Firebase
@@ -319,6 +323,20 @@ def pair():
         "bob": bob_id.signing_public_key_b64}
     alice = ServerlessTransport(make_config(), opener=fake)
     bob = ServerlessTransport(make_config(), opener=fake)
+    # Disappearing Mode v2 (2.4.0): the fail-closed archive
+    # deposit gate needs a depositor; the fixture wires a
+    # recording one that always confirms (the gate's failure
+    # modes are pinned in test_v240_combined.py).
+    deposits = []
+    def _depositor(record):
+        deposits.append(record)
+        return {"confirmed": True,
+                "entry_id": record["message_id"],
+                "hashes": {p: "h" for p in record["participants"]}}
+    alice.archive_depositor = _depositor
+    bob.archive_depositor = _depositor
+    alice.deposits = deposits
+    bob.deposits = deposits
     alice.login("alice", alice_id.sign, client_version="2.3.0-test")
     bob.login("bob", bob_id.sign, client_version="2.3.0-test")
     yield fake, alice, bob
@@ -535,7 +553,7 @@ def test_disappearing_push_failure_parks(pair, monkeypatch):
     fake.inbox_put_500 = 999
     fake.calls.clear()
     result = alice.send_dm("bob", ENVELOPE, message_id="m-gone-1",
-                           disappearing=True)
+                           oversight=OVERSIGHT, disappearing=True)
     assert result["transit"] is False
     assert len(fake.find("PUT", "/inbox/bob/m-gone-1")) == 5
     records = alice.dead_letters.records()
@@ -554,19 +572,34 @@ def test_disappearing_dm_writes_zero_supabase_rows(pair):
                            oversight=OVERSIGHT, disappearing=True)
     assert result["disappearing"] is True
     assert result["transit"] is True
-    # ZERO Supabase writes of any kind — no custody, no archive.
+    # ZERO Supabase writes of any kind — no custody, no archive
+    # row (the archive record lives in the OWNER archive, not
+    # in Supabase — Disappearing Mode v2).
     assert fake.postgrest_writes() == []
     assert fake.queue_rows == []
     assert [r for r in fake.audit_rows
             if r.get("ref_id") == "m-vanish-1"] == []
-    # The transit node is its ONLY home, expiry-stamped, and the
-    # frame carries the disappearing stamp + no oversight wrap.
+    # The fail-closed deposit ran BEFORE the push: exactly one
+    # deposit, filed under the DM conversation for BOTH
+    # participants, carrying the oversight envelope.
+    assert len(alice.deposits) == 1
+    dep = alice.deposits[0]
+    assert dep["message_id"] == "m-vanish-1"
+    assert dep["conversation_id"] == "dm:alice:bob"
+    assert sorted(dep["participants"]) == ["alice", "bob"]
+    assert dep["oversight"] == OVERSIGHT
+    assert result["archive"]["confirmed"] is True
+    # The transit node is its ONLY platform home, with NO expiry
+    # (v2: an unread item never expires unread), and the frame
+    # carries the disappearing stamp + the oversight wrap + the
+    # archive confirmation.
     node = fake.rtdb.get("inbox/bob/m-vanish-1")
     assert node is not None
     assert set(node.keys()) == {"frame", "expires_at", "ts"}
-    assert node["expires_at"] > now_ts()
+    assert node["expires_at"] == 0
     assert node["frame"]["disappearing"] is True
-    assert node["frame"]["oversight"] is None
+    assert node["frame"]["oversight"] == OVERSIGHT
+    assert node["frame"]["archive"]["entry_id"] == "m-vanish-1"
 
 
 def test_standard_dm_writes_exactly_one_archive_row(pair):
@@ -586,12 +619,19 @@ def test_disappearing_group_writes_zero_supabase_rows(pair):
     fake.calls.clear()
     result = alice.send_group_frame(
         "g-vanish", ENVELOPE, members=["alice", "bob", "carol"],
-        message_id="m-gvanish-1", disappearing=True)
+        message_id="m-gvanish-1", oversight=OVERSIGHT,
+        disappearing=True)
     assert result["disappearing"] is True
     assert sorted(result["transit"]) == ["bob", "carol"]
     assert fake.postgrest_writes() == []
     assert fake.rtdb.get("inbox/bob/m-gvanish-1") is not None
     assert fake.rtdb.get("inbox/carol/m-gvanish-1") is not None
+    # One deposit for the whole group send, filed under EVERY
+    # member (sender included), conversation = the group.
+    assert len(alice.deposits) == 1
+    dep = alice.deposits[0]
+    assert dep["conversation_id"] == "group:g-vanish"
+    assert sorted(dep["participants"]) == ["alice", "bob", "carol"]
 
 
 def test_standard_group_writes_one_archive_row(pair):
@@ -606,7 +646,13 @@ def test_standard_group_writes_one_archive_row(pair):
     assert audits[0][2]["kind"] == "group_message"
 
 
-def test_expired_disappearing_item_is_purged_unopened(pair):
+def test_expired_disappearing_item_is_delivered_not_purged(pair):
+    # Disappearing Mode v2 (2.4.0, DESIGN-BRIEF rule 3) SUPERSEDES
+    # the 2.3.0 purge-unopened behaviour this test used to pin:
+    # an UNREAD disappearing message NEVER expires unread — a
+    # legacy node stamped with a past expiry (e.g. sent before
+    # the receiver's 25h offline stretch) is DELIVERED, and the
+    # receiver's clock starts at READ, in his mailbox.
     fake, _alice, bob = pair
     node = {"frame": {"type": "message", "id": "m-old-1",
                       "from": "alice", "content": ENVELOPE,
@@ -617,15 +663,16 @@ def test_expired_disappearing_item_is_purged_unopened(pair):
     fake.calls.clear()
     delivered = []
     bob._on_transit_item("m-old-1", node, delivered.extend)
-    assert delivered == []
-    assert "inbox/bob/m-old-1" not in fake.rtdb
-    assert fake.find("DELETE", "/inbox/bob/m-old-1") != []
+    assert len(delivered) == 1
+    assert delivered[0]["frame"]["id"] == "m-old-1"
+    assert "inbox/bob/m-old-1" in fake.rtdb
+    assert fake.find("DELETE", "/inbox/bob/m-old-1") == []
 
 
 def test_disappearing_ack_touches_no_supabase(pair):
     fake, alice, bob = pair
     alice.send_dm("bob", ENVELOPE, message_id="m-vanish-2",
-                  disappearing=True)
+                  oversight=OVERSIGHT, disappearing=True)
     node = fake.rtdb.get("inbox/bob/m-vanish-2")
     delivered = []
     bob._on_transit_item("m-vanish-2", node, delivered.extend)
