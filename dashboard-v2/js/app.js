@@ -13,7 +13,7 @@ import * as v_grants from "./views/grants.js";
 import * as v_rooms from "./views/rooms.js";
 import * as v_support from "./views/support.js";
 import { session, login, clearSession, loadAll, oversightOpen, oversightCredentials, oversightFile, oversightVaultFile, oversightLibraryFile, archiveConversation, ensureFreshJwt } from "./data.js";
-import { streamPresence, applyPresence, startActivenessTick } from "./presence.js";
+import { streamPresence, applyPresence, currentPresence, startActivenessTick } from "./presence.js";
 import { startRealtime, onRtState, rtState, setRealtimeJwt, stopRealtime } from "./realtime.js";
 import { store, on as busOn } from "./store.js";
 import { activenessLabel } from "./activeness.js";
@@ -65,12 +65,20 @@ const LIVE_TEXT = { live: "live — real-time push", connecting: "connecting…"
 function paintLiveState(s){
   const rt = rtState();
   const pending = rt.pending || [];
+  const quiet = rt.unconfirmed || [];
   document.querySelectorAll("[data-livestate]").forEach(el=>{
     el.className = s;
     const t = el.querySelector(".ltxt");
-    if(t) t.textContent = (LIVE_TEXT[s] || s) + (s === "live" && pending.length ? " · " + pending.length + " feeds pending migration" : "");
-    el.title = pending.length ? "Feeds awaiting supabase_realtime publication: " + pending.join(", ")
-      : (rt.unconfirmed && rt.unconfirmed.length ? "Core feeds live. Not yet confirmed by traffic: " + rt.unconfirmed.join(", ") : "All feeds subscribed and confirmed by traffic");
+    // v242: the pill states the literal truth. "pending" is
+    // reserved for feeds whose subscription itself failed;
+    // subscribed-but-silent feeds are "quiet" — their tables ARE
+    // in the supabase_realtime publication (verified server-side),
+    // they simply have carried no change yet this session.
+    if(t) t.textContent = (LIVE_TEXT[s] || s)
+      + (pending.length ? " · " + pending.length + " feeds pending subscription" : "")
+      + (!pending.length && quiet.length ? " · " + quiet.length + " feeds quiet" : "");
+    el.title = pending.length ? "Feeds whose realtime subscription has not landed: " + pending.join(", ")
+      : (quiet.length ? "All feeds subscribed. Quiet so far (no changes yet this session): " + quiet.join(", ") : "All feeds subscribed and confirmed by traffic");
   });
 }
 
@@ -80,6 +88,12 @@ async function softReload(){
   try{
     const d = await loadAll();
     store.setData(d); cache = d;
+    // v242: a dataset swap must not strand the board on the
+    // login-record floor until the next RTDB beat (up to 180s):
+    // re-apply the live presence map the stream already holds
+    // onto the fresh rows immediately.
+    applyPresence(d, currentPresence());
+    paintActiveness();
     // Preserve unread badges the operator has not yet cleared.
     oldUnread.forEach((n, key) => { if(n > 0){ const c = store.findConv(key); if(c && (c.lastTs||0) > (oldMark.get(key)||0)) store.unread.set(key, n); } });
     paintBadges();
