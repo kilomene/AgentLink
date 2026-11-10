@@ -7,7 +7,10 @@ mirror/token path: _mirror_activeness caught only TransportError,
 run_slow_sync's fetch catch likewise, and the doorbell's _call
 re-raised non-407 network exceptions raw, outside its own
 DoorbellError contract. All three layers are fixed at the source;
-these tests pin each layer.
+these tests pin each layer. (2.3.0: the mirror layer is DELETED
+with the mirror itself — the surviving layers are the doorbell
+contract and the loop-cannot-die guarantee, re-pinned below
+against the degraded loop.)
 
 B5 — a history page whose body the egress proxy clipped arrives
 as an "undecodable body" error and used to stop the whole sync;
@@ -59,7 +62,7 @@ def test_doorbell_call_still_retries_407_class():
     assert calls["n"] == 3
 
 
-# ---------------- S2 layer 2: the mirror is fail-soft ---------------
+# ---------------- S2 layer 2: fail-soft surfaces ------------------
 
 def _bare_transport():
     from agentlink.transport_v2 import ServerlessConfig, \
@@ -71,33 +74,37 @@ def _bare_transport():
     return ServerlessTransport(config, opener=lambda *a: (200, {}, b""))
 
 
-def test_mirror_activeness_never_raises_on_raw_network_errors():
+def test_transitions_and_acks_never_raise_on_raw_network_errors():
+    # 2.3.0: the mirror this layer pinned is deleted. Its
+    # guarantee — a raw network error on a periodic/fail-soft
+    # path NEVER raises into a supervision thread — now lives
+    # on the surfaces that remain: ladder transitions are pure
+    # local bookkeeping (no network at all), and ack() treats a
+    # dead backend as an empty page.
     t = _bare_transport()
 
     def boom(*a, **k):
         raise urllib.error.URLError(EOF)
 
     t._rest = boom
-    t.update_presence_backup = boom
-    t._mirror_activeness("online")  # must not raise
-    assert "EOF" in t.last_mirror_error
+    assert t._transition_activeness("online") in (True, False)
+    assert t.ack(["m-x"]) == []
 
 
 # ---------------- S2 layer 3: the loop cannot die -------------------
 
-def test_slow_sync_loop_survives_mirror_and_fetch_exceptions(
+def test_slow_sync_loop_survives_fetch_exceptions(
         monkeypatch):
+    # 2.3.0 form of the pin: the degraded loop (the mirror step
+    # it used to also run is deleted) cycles through fetch
+    # failures of ANY exception class and records them.
     import agentlink.transport_v2 as tv2
     monkeypatch.setattr(tv2, "SLOW_SYNC_INTERVAL_SECONDS", 0)
     t = _bare_transport()
     t.username = "swift-test"
+    t.slow_sync_active = True  # degraded mode: the loop fetches
     stop = threading.Event()
-    state = {"mirror": 0, "fetch": 0}
-
-    def mirror_step():
-        state["mirror"] += 1
-        if state["mirror"] == 1:
-            raise RuntimeError("mirror exploded")
+    state = {"fetch": 0}
 
     def fetch_once():
         state["fetch"] += 1
@@ -107,7 +114,6 @@ def test_slow_sync_loop_survives_mirror_and_fetch_exceptions(
             stop.set()
         return []
 
-    t._slow_sync_mirror_step = mirror_step
     t.slow_sync_once = fetch_once
     t.run_slow_sync(lambda frames: None, stop_event=stop)
     assert state["fetch"] == 3
