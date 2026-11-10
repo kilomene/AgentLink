@@ -15,11 +15,31 @@
 // liveness. The floor below is freshness-gated for exactly that
 // reason.
 //
+// v242 (2026-11-10) — the merge contract, fixed at the source.
+// Two defects made the board serve stale presence/version while
+// RTDB held the truth (owner's screenshot: phoenix "offline /
+// 2.2.3 / latest" while his node said online / 2.4.1 / 32s):
+//   1. There was NO deterministic snapshot: the board depended on
+//      the stream's first event landing before the views painted,
+//      and fetchPresence() existed but had no caller. The stream
+//      now seeds itself with one snapshot read at (re)connect.
+//   2. The "put" handler bypassed the merge: it handed the raw
+//      event data to applyPresence, which REPLACED each listed
+//      user's node wholesale. A subtree "put" (path "/<user>")
+//      therefore left every other user at whatever older snapshot
+//      the tick still held, and a missed initial put left
+//      lastPresence empty forever — the stale DB floor won.
+// Every stream event now merges through mergePresencePatch into
+// the single in-memory map, and applyPresence is a pure function
+// of that map: where a presence node exists it is the ONLY source
+// for state, client_version, beat age and last-seen; the registry
+// row supplies static identity fields only.
+//
 // Display truth is the staleness ladder in js/activeness.js (the
 // single source of truth): each user gets a per-user ladder state
 // ("online" | "suspect" | "offline") plus its beat age in seconds,
 // never just a binary online/offline flag.
-import { activenessState, beatAgeSeconds, ONLINE_MAX_AGE_S } from "./activeness.js";
+import { activenessState, beatAgeSeconds, beatTimestampSeconds, ONLINE_MAX_AGE_S } from "./activeness.js";
 
 export const UI_TICK_MS = 5000;
 
@@ -70,6 +90,11 @@ export function mergePresencePatch(presence, path, data){
   return base;
 }
 
+// The stream's current in-memory map (v242): the dataset-swap
+// path in app.js re-applies exactly this onto fresh rows, so a
+// softReload can never resurrect the login-record floor.
+export function currentPresence(){ return lastPresence; }
+
 export function presenceUrl(){ return (window.AGENTLINK_CONFIG||{}).firebaseDbUrl + "/presence.json"; }
 export async function fetchPresence(){
   const r = await fetch(presenceUrl()); if(!r.ok) throw new Error("presence read failed ("+r.status+")");
@@ -77,12 +102,30 @@ export async function fetchPresence(){
 }
 export function streamPresence(onUpdate, onError){
   let stopped = false, es = null, backoff = 2000, retry = null;
+  // One event, one path: every put/patch merges into the SAME
+  // in-memory map the 5s tick reads, so the display can never be
+  // a mix of two snapshots from different moments. A "put" at "/"
+  // is a full snapshot of the provided keys (mergePresencePatch
+  // semantics); a "put"/"patch" below "/" touches only its path.
+  const deliver = (path, data) => {
+    if(stopped) return;
+    lastPresence = mergePresencePatch(lastPresence, path, data);
+    try{ onUpdate(lastPresence); }catch(_){}
+  };
   const connect = () => {
     if(stopped) return;
+    // Deterministic seed: one snapshot read per (re)connect, so a
+    // stream that opens late — or an initial put lost to a proxy
+    // hiccup — can never leave the board on the login-record
+    // floor while RTDB holds live nodes. This is a connect-time
+    // read, not polling: beats still arrive only via the stream.
+    fetchPresence()
+      .then(snap => { if(!stopped && snap && typeof snap === "object") deliver("/", snap); })
+      .catch(() => { /* stream events still seed the map */ });
     try{
       es = new EventSource(presenceUrl());
-      es.addEventListener("put", e => { backoff = 2000; try{ onUpdate(JSON.parse(e.data).data || {}); }catch(_){} });
-      es.addEventListener("patch", e => { try{ const d = JSON.parse(e.data); if(d && d.data !== undefined) onUpdate(mergePresencePatch(lastPresence, d.path, d.data)); }catch(_){} });
+      es.addEventListener("put", e => { backoff = 2000; try{ const d = JSON.parse(e.data); if(d && d.data !== undefined) deliver(d.path || "/", d.data); }catch(_){} });
+      es.addEventListener("patch", e => { try{ const d = JSON.parse(e.data); if(d && d.data !== undefined) deliver(d.path || "/", d.data); }catch(_){} });
       es.onerror = () => {
         if(es){ es.close(); es = null; }
         if(onError) onError(new Error("presence stream interrupted"));
@@ -106,6 +149,15 @@ export function applyPresence(data, presence, nowSeconds){
     u.activeness = activenessState(p, now);
     u.beat_age_s = p ? beatAgeSeconds(p, now) : null;
     u.online = u.activeness === "online";
+    // Live layer wins for last-seen too (v242): with a presence
+    // node, "last seen" IS the node's beat (epoch seconds, the
+    // same scale as al_users.last_seen) — the registry value is
+    // only the fallback for an agent with no node at all, where
+    // it truthfully reads as its last login. A stale login stamp
+    // must never be displayed next to a live agent.
+    const beat = p ? beatTimestampSeconds(p, now) : null;
+    u.last_seen_live = beat === null ? null : Math.floor(beat);
+    u.last_seen_display = beat !== null ? Math.floor(beat) : (u.last_seen ?? null);
     // Postgres login record as the floor: if the RTDB node is
     // missing entirely but the agent authenticated moments ago,
     // do not show a false offline. Freshness-gated (v211): the
