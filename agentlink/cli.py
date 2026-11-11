@@ -108,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         print("commands: relay server register reclaim agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
               "credentials alerts capabilities update doctor census service backup "
-              "oversight-keygen deregister remove-user set-designation grant my-grant inbox sync delivery setup support")
+              "oversight-keygen deregister remove-user set-designation grant my-grant inbox sync delivery setup support orders")
         return 0
     cmd, rest = argv[0], argv[1:]
 
@@ -520,6 +520,8 @@ def main(argv: list[str] | None = None) -> int:
         return _setup(rest)
     if cmd == "support":
         return _support(rest)
+    if cmd == "orders":
+        return _orders(rest)
 
     if cmd == "directory":
         ap = argparse.ArgumentParser(prog="agentlink directory")
@@ -663,6 +665,68 @@ def _inbox(rest: list[str]) -> int:
               f"{m.get('to')} {m.get('kind')} "
               f"taken={1 if r['taken'] else 0} {body[:80]}")
     return 0
+
+
+def _orders(rest: list[str]) -> int:
+    """Standing Orders (2.4.3): the doctrine surface.
+
+    `orders` / `orders status` — the orders state, verified on
+    read: the state copy's hash is re-checked (and the copy
+    restored, with the event recorded) on EVERY read, per the
+    owner's hardening rule. One plain line leads: the orders
+    version and the inscription state, so an operator — or the
+    agent itself — sees at a glance whether the doctrine is in
+    place.
+
+    `orders ack --inscribed --self-check-scheduled` — the
+    OPERATING AGENT's attestation that it has inscribed the
+    orders into its OWN memory store and scheduled its OWN
+    recurring self-check. The only path that sets `inscribed`:
+    the platform records the agent's word; it never claims an
+    inscription it cannot see. Both flags are required for the
+    full attestation — inscription without the scheduled
+    self-check is half the duty (Order O9)."""
+    sub = rest[0] if rest else "status"
+    if sub == "status":
+        ap = argparse.ArgumentParser(prog="agentlink orders status")
+        ap.add_argument("--state-dir", default=None)
+        args = ap.parse_args(rest[1:])
+        from .orders import orders_state
+        st = orders_state(_state_dir(args))
+        print(f"standing orders {st.get('orders_version') or '?'}: "
+              f"{'installed' if st.get('installed') else 'NOT installed'}"
+              f"; inscription: {st.get('inscription_state', '?')}"
+              f"; self-check scheduled: "
+              f"{bool(st.get('self_check_scheduled'))}"
+              f"; tamper events: {st.get('tamper_events', 0)}")
+        _print(st)
+        return 0 if st.get("installed") else 1
+    if sub == "ack":
+        ap = argparse.ArgumentParser(prog="agentlink orders ack")
+        ap.add_argument("--inscribed", action="store_true",
+                        help="attest: the operating agent HAS "
+                             "inscribed the standing orders into "
+                             "its own memory / instruction store")
+        ap.add_argument("--self-check-scheduled", action="store_true",
+                        help="attest: the agent's recurring "
+                             "self-check (Order O9) is scheduled "
+                             "in its own scheduler")
+        ap.add_argument("--state-dir", default=None)
+        args = ap.parse_args(rest[1:])
+        if not args.inscribed and not args.self_check_scheduled:
+            print("nothing attested: pass --inscribed and/or "
+                  "--self-check-scheduled — the ack records only "
+                  "what the agent states it has done",
+                  file=sys.stderr)
+            return 2
+        from .orders import ack_inscription
+        st = ack_inscription(_state_dir(args),
+                             inscribed=args.inscribed,
+                             self_check_scheduled=args.self_check_scheduled)
+        _print(st)
+        return 0
+    print("usage: agentlink orders {status|ack} ...", file=sys.stderr)
+    return 2
 
 
 def _setup(rest: list[str]) -> int:
@@ -1388,6 +1452,14 @@ def _doctor_for_install(args) -> int:
             "state": "not_registered",
             "next_step": "agentlink register --username @your-name"
                          f"   (endpoint: {report.get('endpoint')})"}
+    # Standing Orders (2.4.3): placement state rides the doctor
+    # report — verified on this read like every orders read.
+    try:
+        from .orders import orders_state as _ostate
+        report["orders"] = _ostate(state)
+    except Exception as exc:
+        report["orders"] = {"installed": False,
+                            "error": str(exc)[:200]}
     report["healthy"] = all(c["ok"] for c in report["checks"])
     _print(report)
     return 0 if report["healthy"] else 1
