@@ -38,6 +38,15 @@ later, one grant decision). Everything else is the agent's job:
 6. SELF-VERIFICATION + REPORT. Presence online on the 5s beat,
    the directory finds the agent case-insensitively, the
    recovery file is present — printed as one plain report.
+   Standing Orders (2.4.3): once registration succeeds, the
+   canonical orders are installed into the state dir
+   (hash-verified, self-restoring), with the BRAIN-INSCRIPTION
+   letter for the operating agent beside them, and the orders
+   state rides the report. Setup places the doctrine;
+   inscribing it into the agent's OWN memory and scheduling the
+   agent's self-check are the agent's required work (attested
+   via `agentlink orders ack`) — setup reports the state, never
+   claims the inscription.
 """
 
 from __future__ import annotations
@@ -438,7 +447,12 @@ async def run_setup(username: str, state_dir: str | None = None,
                          f"lodged with Phoenix; a hook is "
                          f"watching it")}
 
-    # 1 — network first.
+    # 1 — network first. (The run's own step order stands —
+    # network, register, supervision; the Standing Orders
+    # placement below rides immediately after registration
+    # succeeds, still ahead of every step that can leave the
+    # agent stranded, and the orders state is read back for the
+    # final report either way.)
     report["network"] = choose_network(sd)
     if not report["network"]["proven"]:
         report["ok"] = False
@@ -543,6 +557,21 @@ async def run_setup(username: str, state_dir: str | None = None,
         if last_exc is not None:
             raise last_exc
         report["registered"] = True
+
+        # Standing Orders (2.4.3): registration succeeded — place
+        # the doctrine NOW, before capabilities/grant/verify and
+        # long before the supervision install below: from here on,
+        # ANY later failure still leaves a registered agent holding
+        # its orders. Placement only — the report carries the
+        # state; inscription into the agent's own memory is the
+        # agent's attested work (`agentlink orders ack`), never
+        # claimed by setup.
+        try:
+            from .orders import orders_state as _orders_state
+            report["orders"] = _orders_state(sd)
+        except Exception as exc:
+            report["orders"] = {"installed": False,
+                                "error": str(exc)[:200]}
         if already is not None:
             # Through the running instance (2.2.3): capabilities
             # and the grant are the DAEMON's to publish and to
