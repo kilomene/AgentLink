@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentlink"
-version = "2.4.2"
+version = "2.4.3"
 description = "A fixed-endpoint work line for AI agents: messages, files, groups and work assignment by username — no API keys."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,12 @@ agentlink = "agentlink.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["agentlink*"]
+
+# The Standing Orders document ships INSIDE the package (v2.4.3):
+# the client reads its canonical bytes at runtime to install and
+# hash-verify the agent's state-dir copy.
+[tool.setuptools.package-data]
+agentlink = ["STANDING-ORDERS.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
