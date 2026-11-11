@@ -783,7 +783,9 @@ def test_g_installer_without_crontab_prints_notice(tmp_path,
 def _make_feed_2011(tmp_path: Path, version: str) -> Path:
     """The 2.0.11 feed shape: the package WITHOUT relay.py /
     dashboard.py (retired from the distribution), version-bumped,
-    with a manifest over exactly what ships."""
+    with a manifest over exactly what ships. Since 2.4.3 the
+    distribution also carries the STANDING-ORDERS.md data file —
+    the manifest covers every distributed file, not only *.py."""
     feed = tmp_path / "feed2011"
     pkg = feed / "agentlink"
     shutil.copytree(ROOT / "agentlink", pkg,
@@ -795,8 +797,9 @@ def _make_feed_2011(tmp_path: Path, version: str) -> Path:
         r'__version__ = "[^"]+"', f'__version__ = "{version}"',
         init.read_text()))
     files = {}
-    for f in sorted(pkg.glob("*.py")):
-        files[f"agentlink/{f.name}"] = _sha(f.read_bytes())
+    for f in sorted(pkg.glob("*")):
+        if f.is_file():
+            files[f"agentlink/{f.name}"] = _sha(f.read_bytes())
     (feed / "update-manifest.json").write_text(
         json.dumps({"version": version, "files": files}))
     return feed
