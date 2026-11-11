@@ -1,7 +1,7 @@
 {
-  "version": "2.4.2",
+  "version": "2.4.3",
   "files": {
-    "agentlink/__init__.py": "d75ff0b598ea5545e9ac95f0b8f318964ae1daaa65893cf33a670294c43caf88",
+    "agentlink/__init__.py": "993df527cfb7e57396ac25132a5d2cea52fd9c0e0c4256985b18d7d431ee55dc",
     "agentlink/__main__.py": "307299fda7b77d22c64cb51430ec75e5f59d78e9c948786afb3b2544fe45e4b7",
     "agentlink/alerts_local.py": "c08cd95bfaf6f4e5968e3b4cc85c49d74c0b5b54f66e6120235e38b4078ca82d",
     "agentlink/archive.py": "c7209541a3357c64f0624fbd77bfd2886192e366ced800eb14a14b702e0d4261",
@@ -9,8 +9,8 @@
     "agentlink/backup.py": "5fb14d8858586a1763b0a190a95ff182a912b83663822c76f8fa5e025f128619",
     "agentlink/blobstore.py": "607f0359c9808a8b4bdf0c7c3817ca2362c7392aa96357b27b29ad8ad88ad4d0",
     "agentlink/census.py": "2cb5d77c3ff78c226d1a2c3be37de1bf889c59c61bde57f30c940299c226b78b",
-    "agentlink/cli.py": "8674006490696ad4836e558da8b91fb43ef935b4bd55dac6a51b703b94c53626",
-    "agentlink/client.py": "d90e253425d5ee322ffd4fde5ec46c4ee296432a33bcbb809df7474c28fed80e",
+    "agentlink/cli.py": "c5552c282d380e3e54c5a728c15d0f9b20a148e0c2716f76da1bead930c95e95",
+    "agentlink/client.py": "4d336b7b4853c7f7ed911eadcfc61f407dc07dd0b78b90659ad86cfab95b08e3",
     "agentlink/config.py": "903954c47bad67559cb7daaa828ab5ad154c80c075d34ce638ab6411e1c2e5a6",
     "agentlink/connectors.py": "c345a5d64dbec8c9e2cbbbc5ec06f1626a698354cb680e64432376fb8330e55e",
     "agentlink/crypto.py": "6d653e0d5ae4999d65354e23c388314833c6c03c27e852357431921c78905637",
@@ -19,11 +19,12 @@
     "agentlink/grants.py": "0dbd109c17296339ea59a205d0ac57ea6e37ff69ee8f0eac1d1455399f86729e",
     "agentlink/mailbox.py": "9ce8de9d33a6252f892838749ac378703db5039ec20cbbf179be062673836ad7",
     "agentlink/media.py": "fdf5cef33872b824f71e33e2c9c5ad4716288b5f5e5fa8feb85bbff15fdf8ef9",
+    "agentlink/orders.py": "ee48fbfbdb45a4ab6887cc52744e5c13c1c5904fdafdfbf2cd3d2586a27f68d3",
     "agentlink/outbox.py": "9470d7a98175a70a5fe67f64265931f5112be41d5fa57ec04a1f2be13d2f65ba",
     "agentlink/protocol.py": "ace942e302e83c0c78fe33299854857105dd6c567804fa4c26cdb27084e074bb",
     "agentlink/proxycreds.py": "d7b002888c42aa3d482d899377461a5dbea751e2f33cc590a8f9fb376e00cc2a",
     "agentlink/retry.py": "d87b55c595494ae9fc3727833e4bacbb1f13dc90b421cd8bfecd4cbd4ff26301",
-    "agentlink/setup.py": "e00d16831daab7b1aee696e76287c7311720be0b7e80ce88c31fc8b77bc56999",
+    "agentlink/setup.py": "fe0e9ab1d1e05739d28af4bcd10a7992a1f7e5272ad97574f7a5c15fc094d368",
     "agentlink/store.py": "7b7eb94d9a520411e6616e75e9cd257ad2a0a1edad8a5a82c3d0be8df96b66f1",
     "agentlink/supabase_store.py": "bc7e318dc7c7b8d44938e26ec6933c20a8d9197f316db004117827d14b4787ba",
     "agentlink/support.py": "879b19582446f43ef482d783bdbac3716ca44a6eee004d76d2ee6d5a497270be",
@@ -31,6 +32,7 @@
     "agentlink/timing.py": "9c5104142310915af0265f7cfc6bd54d37bf701d99902ecd0fe840e4a0d386dd",
     "agentlink/transport_v2.py": "afac7e44ae9f753f1dbebdae1f55b2d9600bd937d46c0ce3feed9e0490de4038",
     "agentlink/updater.py": "3e4f0f104ca8a3aa9f39da6fdccf857b2086a9bc4e94ca37d2da9162e1a2b75e",
-    "agentlink/vault.py": "b46ef0362df0ebf3dda227a0989868fba0509a499ada2bcc131948ddda10cf7a"
+    "agentlink/vault.py": "b46ef0362df0ebf3dda227a0989868fba0509a499ada2bcc131948ddda10cf7a",
+    "agentlink/STANDING-ORDERS.md": "5f11f61a43e112a4b23536b76825ccbd5f51e9e35cb1356d801734b847c15126"
   }
 }
