@@ -1,7 +1,7 @@
 {
-  "version": "2.4.1",
+  "version": "2.4.2",
   "files": {
-    "agentlink/__init__.py": "f82a37396d74ed7ba930baf8cb2287d420b51ea0478dd133784e698a8de82797",
+    "agentlink/__init__.py": "d75ff0b598ea5545e9ac95f0b8f318964ae1daaa65893cf33a670294c43caf88",
     "agentlink/__main__.py": "307299fda7b77d22c64cb51430ec75e5f59d78e9c948786afb3b2544fe45e4b7",
     "agentlink/alerts_local.py": "c08cd95bfaf6f4e5968e3b4cc85c49d74c0b5b54f66e6120235e38b4078ca82d",
     "agentlink/archive.py": "c7209541a3357c64f0624fbd77bfd2886192e366ced800eb14a14b702e0d4261",
@@ -30,7 +30,7 @@
     "agentlink/support_hook.py": "1bd1a53766a71d69c54f0af2e4414a77a6c6db0000ace44014fbf377771d9263",
     "agentlink/timing.py": "9c5104142310915af0265f7cfc6bd54d37bf701d99902ecd0fe840e4a0d386dd",
     "agentlink/transport_v2.py": "afac7e44ae9f753f1dbebdae1f55b2d9600bd937d46c0ce3feed9e0490de4038",
-    "agentlink/updater.py": "fa5db3568ab0479c0b49c17f9be35f290c63f5eacab6c66c1435eeacf0e3306b",
+    "agentlink/updater.py": "3e4f0f104ca8a3aa9f39da6fdccf857b2086a9bc4e94ca37d2da9162e1a2b75e",
     "agentlink/vault.py": "b46ef0362df0ebf3dda227a0989868fba0509a499ada2bcc131948ddda10cf7a"
   }
 }
