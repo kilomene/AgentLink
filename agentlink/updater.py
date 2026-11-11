@@ -50,6 +50,25 @@ unlisted install-root files (README, installers) are not the
 updater's to delete. A source checkout (``.git``/``tests/``
 present) is never purged: the purge exists for installed trees.
 
+Full replacement (v2.4.2, owner's ruling restated 2026-11-10):
+the mirror-purge converged the package directory's CONTENTS, but
+the installation itself survived every update — the pip metadata
+(dist-info) pip wrote at the original install sits at the install
+ROOT, outside the purge's governed scope, frozen at its first
+version forever (the deploy venv on Phoenix's VM: code 2.4.1,
+``pip show`` 1.3.0), and rollback backups accumulated one per
+update, never pruned. An update now REPLACES the install whole:
+the verified new tree is staged, then the live package directory
+is REMOVED ENTIRE and the new tree moved in as a unit; every old
+metadata dir is deleted and fresh metadata is written whose
+version IS the new code's version; stale bytecode goes with the
+old directory. Exactly ONE rollback slot is kept — the previous
+tree whole, in the state dir, outside the live path — and the
+next successful update wipes it. The swap never leaves a
+half-install: any failure restores the pre-update tree from the
+slot before the error propagates. Agent state (identity, keys,
+mailbox, config) lives outside the install and is never touched.
+
 First-boot self-clean (v2.0.11): an agent that ARRIVED at this
 version through an older overlay updater still carries the old
 tree's leftovers (and, commonly, the retired relay era's cargo).
@@ -67,6 +86,7 @@ failure never blocks startup.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -215,6 +235,174 @@ def purge_stale_files(install_dir, stale, manifest_files) -> dict:
     return {"files": removed, "caches": caches, "failed": failed}
 
 
+# -- full replacement: pip metadata + install snapshots (v2.4.2) ---
+
+_METADATA_PATTERNS = ("agentlink-*.dist-info", "agentlink.egg-info")
+
+
+def find_metadata_dirs(install_dir) -> list:
+    """Every agentlink metadata dir at the install root — pip's
+    ``agentlink-<ver>.dist-info`` (possibly several, from successive
+    installs) or a legacy ``agentlink.egg-info``. These live BESIDE
+    the package, outside the mirror-purge's governed scope: before
+    v2.4.2 no updater path ever touched them."""
+    install_dir = Path(install_dir)
+    out = []
+    if install_dir.is_dir():
+        for pattern in _METADATA_PATTERNS:
+            out.extend(p for p in install_dir.glob(pattern)
+                       if p.is_dir())
+    return sorted(out)
+
+
+def pip_visible_version(install_dir):
+    """The version pip / importlib.metadata report for this
+    install: the ``Version:`` field of a metadata dir's METADATA /
+    PKG-INFO at the install root. None when no metadata exists."""
+    for meta_dir in find_metadata_dirs(install_dir):
+        for name in ("METADATA", "PKG-INFO"):
+            meta_file = meta_dir / name
+            if not meta_file.is_file():
+                continue
+            try:
+                for line in meta_file.read_text(
+                        errors="replace").splitlines():
+                    if line.startswith("Version:"):
+                        return line.split(":", 1)[1].strip()
+                    if not line.strip():
+                        break
+            except Exception:
+                continue
+    return None
+
+
+def write_fresh_metadata(install_dir, version) -> Path:
+    """Remove EVERY existing agentlink metadata dir at the install
+    root and write ONE fresh dist-info whose version IS ``version``
+    (the code's own version), with a RECORD covering the installed
+    tree — so pip and importlib.metadata report exactly what runs.
+    """
+    install_dir = Path(install_dir)
+    for meta_dir in find_metadata_dirs(install_dir):
+        shutil.rmtree(meta_dir, ignore_errors=True)
+    dist = install_dir / f"agentlink-{version}.dist-info"
+    dist.mkdir(parents=True, exist_ok=True)
+    (dist / "METADATA").write_text(
+        "Metadata-Version: 2.1\n"
+        "Name: agentlink\n"
+        f"Version: {version}\n"
+        "Summary: A fixed-endpoint work line for AI agents:"
+        " messages, files, groups and work assignment by username"
+        " — no API keys.\n")
+    (dist / "INSTALLER").write_text("agentlink-updater\n")
+    (dist / "top_level.txt").write_text("agentlink\n")
+    (dist / "entry_points.txt").write_text(
+        "[console_scripts]\nagentlink = agentlink.cli:main\n")
+    covered = []
+    pkg = install_dir / "agentlink"
+    if pkg.is_dir():
+        covered.extend(p for p in pkg.rglob("*")
+                       if p.is_file()
+                       and "__pycache__" not in p.parts)
+    covered.extend(p for p in dist.iterdir() if p.is_file())
+    records = []
+    for path in sorted(covered):
+        rel = path.relative_to(install_dir).as_posix()
+        data = path.read_bytes()
+        digest = base64.urlsafe_b64encode(
+            hashlib.sha256(data).digest()).rstrip(b"=").decode()
+        records.append(f"{rel},sha256={digest},{len(data)}")
+    records.append(f"{dist.name}/RECORD,,")
+    (dist / "RECORD").write_text("\n".join(records) + "\n")
+    return dist
+
+
+def _snapshot_install(install_dir: Path, slot: Path,
+                      version: str) -> None:
+    """Copy the ENTIRE current installation — the package tree and
+    every metadata dir, install-relative — into the rollback slot.
+    Bytecode is not snapshotted (it regenerates on import); every
+    source and metadata byte is."""
+    if slot.exists():
+        shutil.rmtree(slot)
+    slot.mkdir(parents=True)
+    pkg = install_dir / "agentlink"
+    if pkg.is_dir():
+        shutil.copytree(
+            pkg, slot / "agentlink",
+            ignore=shutil.ignore_patterns("__pycache__"))
+    for meta_dir in find_metadata_dirs(install_dir):
+        shutil.copytree(
+            meta_dir, slot / meta_dir.name,
+            ignore=shutil.ignore_patterns("__pycache__"))
+    # The old per-file updater's *.tmp swap leftovers at the
+    # install root are part of the old installation too.
+    for tmp_file in install_dir.glob("*.tmp"):
+        if tmp_file.is_file():
+            shutil.copy2(tmp_file, slot / tmp_file.name)
+    (slot / "VERSION").write_text(version)
+
+
+def _restore_install(install_dir: Path, slot: Path) -> None:
+    """Put the slot's tree back as the live installation — the
+    exact inverse of the full-replacement swap: the live package
+    and metadata are removed whole and the slot's copies take
+    their place."""
+    pkg = install_dir / "agentlink"
+    if pkg.exists():
+        shutil.rmtree(pkg)
+    if (slot / "agentlink").is_dir():
+        shutil.copytree(
+            slot / "agentlink", pkg,
+            ignore=shutil.ignore_patterns("__pycache__"))
+    for meta_dir in find_metadata_dirs(install_dir):
+        shutil.rmtree(meta_dir, ignore_errors=True)
+    for child in sorted(slot.iterdir()):
+        if child.is_dir() and (child.name == "agentlink.egg-info"
+                               or (child.name.startswith("agentlink-")
+                                   and child.name.endswith(
+                                       ".dist-info"))):
+            shutil.copytree(child, install_dir / child.name)
+    for tmp_file in slot.glob("*.tmp"):
+        if tmp_file.is_file():
+            shutil.copy2(tmp_file, install_dir / tmp_file.name)
+
+
+def _move_tree(src: Path, dst: Path) -> None:
+    """Move a directory tree, across filesystems when needed (the
+    stage lives under the state dir; the install may be elsewhere).
+    """
+    if dst.exists():
+        shutil.rmtree(dst)
+    try:
+        os.replace(src, dst)
+    except OSError:
+        shutil.copytree(src, dst)
+        shutil.rmtree(src, ignore_errors=True)
+
+
+def _slot_only_files(slot: Path, manifest_files) -> list:
+    """Install-relative files the rollback slot holds that the new
+    manifest does not list — what the replacement discarded —
+    plus the discarded metadata dirs."""
+    out = []
+    pkg = slot / "agentlink"
+    if pkg.is_dir():
+        for path in pkg.rglob("*"):
+            if path.is_file():
+                rel = path.relative_to(slot).as_posix()
+                if rel not in manifest_files:
+                    out.append(rel)
+    for child in sorted(slot.iterdir()):
+        if child.is_dir() and (child.name == "agentlink.egg-info"
+                               or (child.name.startswith("agentlink-")
+                                   and child.name.endswith(
+                                       ".dist-info"))):
+            out.append(child.name + "/")
+    out.extend(p.name for p in slot.glob("*.tmp") if p.is_file())
+    return sorted(out)
+
+
 # Platform settings a relay-era config can still carry. Endpoints
 # and transport are HARDENED shared settings (baked into the
 # build), never per-agent choices: a stored copy is how an agent
@@ -348,11 +536,25 @@ def self_clean_install(install_dir, state_dir, version, *,
                           " version; nothing cleaned"}
     stale = find_stale_files(install_dir, manifest["files"], state_dir)
     outcome = purge_stale_files(install_dir, stale, manifest["files"])
+    # Full-replacement convergence (v2.4.2): the pip metadata at
+    # the install root is part of the installation. A tree that
+    # arrived through an older updater can carry a dist-info frozen
+    # at any ancient version — converge it to the running version
+    # so every surface (code, pip, manifest) agrees.
+    metadata_version = None
+    try:
+        if pip_visible_version(install_dir) != version:
+            write_fresh_metadata(install_dir, version)
+            metadata_version = version
+    except Exception:
+        metadata_version = None
     config = normalize_agent_config(state_dir)
     result = {"cleaned": True, "version": version,
               "removed": outcome["files"], "caches": outcome["caches"],
-              "failed": outcome["failed"], "config": config}
+              "failed": outcome["failed"], "config": config,
+              "metadata_version": metadata_version}
     result["changed"] = bool(outcome["files"] or outcome["caches"]
+                             or metadata_version
                              or config["removed_files"]
                              or config["stripped"])
     try:
@@ -413,12 +615,11 @@ class Updater:
             pass
         return False
 
-    def _fail_census_loss(self, backup, rels, backed_up,
-                          new_version) -> None:
+    def _fail_census_loss(self, slot, new_version) -> None:
         """Roll back and raise for a census-loss update failure.
         Always raises UpdateError."""
         from .census import describe_losses
-        self._restore(backup, rels, backed_up)
+        self._rollback_to_slot(slot)
         detail = describe_losses(self._census_loss or {})
         try:
             from .alerts_local import record_local_alert
@@ -433,7 +634,7 @@ class Updater:
         raise UpdateError(
             f"conversation census loss during update to "
             f"{new_version} ({detail}); rolled back to "
-            f"{self.current_version} from {backup}")
+            f"{self.current_version} from {slot}")
 
     def fetch_manifest(self) -> dict:
         raw = _fetch(f"{self.base}/{MANIFEST_NAME}")
@@ -458,11 +659,6 @@ class Updater:
                     "version": self.current_version}
         # Immortality gate (v1.3.2): census BEFORE anything changes.
         census_before = self._census_before()
-        # Mirror-purge (v2.0.11): the stale set is computed BEFORE
-        # the swap and backed up with everything else, so rollback
-        # restores the exact pre-update tree; the deletion itself
-        # happens only after every gate has passed (step 6).
-        stale = self._stale_files(manifest)
         # 1) Download + verify EVERY file before writing anything.
         payloads: dict[str, bytes] = {}
         for rel, want_sha in manifest["files"].items():
@@ -474,56 +670,45 @@ class Updater:
                 raise UpdateError(
                     f"sha256 mismatch for {rel}: manifest {want_sha}, got {got}")
             payloads[rel] = data
-        # 2) Back up current files.
+        # 2) Stage the complete verified tree beside the state dir
+        # (v2.4.2: the swap consumes a whole staged tree, exactly
+        # like the in-daemon path — nothing is written in place).
         stamp = time.strftime("%Y%m%d%H%M%S")
-        backup = self.state_dir / "update-backups" / stamp
-        backup.mkdir(parents=True, exist_ok=True)
-        backed_up = []
-        for rel in payloads:
-            src = self.install_dir / rel
-            if src.exists():
-                dst = backup / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
-                backed_up.append(rel)
-        self._backup_stale(backup, stale)
-        (backup / "VERSION").write_text(self.current_version)
-        # 3) Install.
+        stage_root = self.state_dir / "update-staging" / ("apply-" + stamp)
+        if stage_root.exists():  # same-second re-run: never merge
+            stage_root = self.state_dir / "update-staging" / \
+                ("apply-" + stamp + "-2")
         for rel, data in payloads.items():
-            dst = self.install_dir / rel
+            dst = stage_root / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dst.with_suffix(dst.suffix + ".tmp")
-            tmp.write_bytes(data)
-            os.replace(tmp, dst)
+            dst.write_bytes(data)
+        # 3) FULL REPLACEMENT (v2.4.2): snapshot the whole current
+        # install into the single rollback slot, remove the live
+        # package dir + every metadata dir entire, move the staged
+        # tree in whole, write fresh metadata at the new version.
+        caches_before = len(find_cache_dirs(self.install_dir,
+                                            manifest["files"]))
+        slot = self._full_replace(stage_root / "agentlink",
+                                  new_version, stamp)
+        shutil.rmtree(stage_root, ignore_errors=True)
         # 4) Health check; roll back automatically on failure.
         if not self._health_check(new_version):
-            self._restore(backup, payloads.keys(), backed_up)
-            try:
-                from .alerts_local import record_local_alert
-                record_local_alert(
-                    "update_rollback", new_version,
-                    f"update to {new_version} failed its health check"
-                    f" and was rolled back to {self.current_version}",
-                    state_dir=self.state_dir)
-            except Exception:
-                pass
-            raise UpdateError(
-                f"health check failed after installing {new_version};"
-                f" rolled back to {self.current_version} from {backup}")
-        # 5) Immortality gate (v1.3.2): a clean file swap over a
+            self._rollback_and_raise(slot, new_version,
+                                     "health check failed")
+        # 5) Immortality gate (v1.3.2): a clean replacement over a
         # store that lost conversations is still a failed update.
         if not self._census_intact(census_before):
-            self._fail_census_loss(backup, payloads.keys(), backed_up,
-                                   new_version)
-        # 6) Mirror-purge (v2.0.11): every gate is green — the old
-        # tree's leftovers are discarded NOW, with immediate
-        # effect. The update has replaced the install.
-        purged = self._purge_after_gates(manifest, stale)
+            self._fail_census_loss(slot, new_version)
+        # 6) Success: the slot is now the ONE kept prior tree.
+        self._finish_success_bookkeeping(slot, stamp)
         return {"updated": True, "from": self.current_version,
-                "to": new_version, "backup": str(backup),
-                "purged": purged["files"],
-                "purged_caches": purged["caches"],
-                "purge_failed": purged["failed"],
+                "to": new_version, "backup": str(slot),
+                "replaced": True,
+                "metadata_version":
+                    pip_visible_version(self.install_dir),
+                "purged": _slot_only_files(slot, manifest["files"]),
+                "purged_caches": caches_before,
+                "purge_failed": [],
                 "restart": "restart the agent daemon to pick up the new"
                            " code (e.g. systemctl --user restart"
                            " agentlink-agent); live connections are not"
@@ -536,6 +721,115 @@ class Updater:
                 shutil.copy2(backup / rel, dst)
             elif dst.exists():
                 dst.unlink()
+
+    # -- full replacement (v2.4.2) ----------------------------------
+
+    ROLLBACK_SLOT_NAME = "update-rollback-slot"
+
+    def _rollback_slot(self) -> Path:
+        return self.state_dir / self.ROLLBACK_SLOT_NAME
+
+    def _full_replace(self, stage_pkg: Path, new_version: str,
+                      stamp: str) -> Path:
+        """Swap a staged package tree in AS THE WHOLE INSTALL.
+
+        The current installation (package tree + every metadata
+        dir) is snapshotted into the ONE rollback slot; the live
+        package directory and all metadata are then REMOVED ENTIRE
+        and the staged tree is moved in as a unit; fresh metadata
+        is written at ``new_version``. Any failure mid-swap restores
+        the pre-update tree from the slot before the error
+        propagates — the swap never leaves a half-install. The
+        previous slot is parked during the swap and wiped by
+        :meth:`_finish_success_bookkeeping` once every gate has
+        passed, so exactly one prior tree ever survives."""
+        slot = self._rollback_slot()
+        parked = None
+        if slot.exists():
+            parked = self.state_dir / (self.ROLLBACK_SLOT_NAME
+                                       + ".prev-" + stamp)
+            _move_tree(slot, parked)
+        try:
+            _snapshot_install(self.install_dir, slot,
+                              self.current_version)
+            live_pkg = self.install_dir / "agentlink"
+            if live_pkg.exists():
+                shutil.rmtree(live_pkg)
+            for meta_dir in find_metadata_dirs(self.install_dir):
+                shutil.rmtree(meta_dir, ignore_errors=True)
+            for tmp_file in self.install_dir.glob("*.tmp"):
+                try:
+                    tmp_file.unlink()
+                except Exception:
+                    pass
+            _move_tree(stage_pkg, live_pkg)
+            write_fresh_metadata(self.install_dir, new_version)
+        except Exception:
+            restored = False
+            try:
+                _restore_install(self.install_dir, slot)
+                restored = True
+            except Exception:
+                pass
+            if restored and parked is not None and parked.exists():
+                # The pre-update state is whole again, including
+                # the older slot: put the parked slot back and drop
+                # the snapshot of the (still live) current tree.
+                shutil.rmtree(slot, ignore_errors=True)
+                _move_tree(parked, slot)
+            raise
+        return slot
+
+    def _rollback_to_slot(self, slot: Path) -> None:
+        _restore_install(self.install_dir, slot)
+
+    def _rollback_and_raise(self, slot: Path, new_version: str,
+                            why: str) -> None:
+        """Restore the pre-update tree from the slot, alert, and
+        raise. Always raises UpdateError."""
+        self._rollback_to_slot(slot)
+        try:
+            from .alerts_local import record_local_alert
+            record_local_alert(
+                "update_rollback", new_version,
+                f"update to {new_version} failed ({why}) and was"
+                f" rolled back to {self.current_version}",
+                state_dir=self.state_dir)
+        except Exception:
+            pass
+        raise UpdateError(
+            f"{why} after installing {new_version}; rolled back"
+            f" to {self.current_version} from {slot}")
+
+    def _finish_success_bookkeeping(self, slot: Path,
+                                    stamp: str) -> None:
+        """Post-gates success bookkeeping: wipe the parked previous
+        slot (exactly ONE prior tree survives an update — the one
+        in the slot) and refresh the legacy ``update-backups``
+        marker to a single stamp dir pointing at the slot."""
+        parked = self.state_dir / (self.ROLLBACK_SLOT_NAME
+                                   + ".prev-" + stamp)
+        if parked.exists():
+            shutil.rmtree(parked, ignore_errors=True)
+        # The delivered install is source-exact: even the fresh
+        # bytecode the health check's import just wrote is cleared
+        # (it regenerates on first real import) — no bytecode of
+        # any vintage survives an update.
+        pkg = self.install_dir / "agentlink"
+        if pkg.is_dir():
+            for cache_dir in pkg.rglob("__pycache__"):
+                if cache_dir.is_dir():
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+        backups = self.state_dir / "update-backups"
+        try:
+            if backups.exists():
+                shutil.rmtree(backups)
+            marker = backups / stamp
+            marker.mkdir(parents=True)
+            (marker / "VERSION").write_text(self.current_version)
+            (marker / "ROLLBACK-SLOT").write_text(str(slot))
+        except Exception:
+            pass
 
     # -- mirror-purge (v2.0.11) --------------------------------------
 
@@ -695,63 +989,40 @@ class Updater:
         manifest = prepared.get("manifest") or {}
         # Immortality gate (v1.3.2): census BEFORE the swap.
         census_before = self._census_before()
-        # Mirror-purge (v2.0.11): stale set computed at swap time
-        # (the truth of the tree being replaced), backed up in
-        # phase 4, deleted only after every gate passes (phase 8).
-        stale = self._stale_files(manifest) if manifest else []
-        # 4) Back up the current copies of everything being replaced.
-        backup = self.state_dir / "update-backups" / stamp
-        backup.mkdir(parents=True, exist_ok=True)
-        backed_up = []
-        for rel in payloads:
-            src = self.install_dir / rel
-            if src.exists():
-                dst = backup / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
-                backed_up.append(rel)
-        self._backup_stale(backup, stale)
-        (backup / "VERSION").write_text(self.current_version)
-        # 5) Atomic per-file swap.
-        for rel, data in payloads.items():
-            dst = self.install_dir / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dst.with_suffix(dst.suffix + ".tmp")
-            tmp.write_bytes(data)
-            os.replace(tmp, dst)
+        caches_before = len(find_cache_dirs(
+            self.install_dir, manifest.get("files") or {}))
+        # 4) FULL REPLACEMENT (v2.4.2): the staged tree — already
+        # smoke-tested whole in prepare — replaces the installation
+        # ENTIRE: the whole current install is snapshotted into the
+        # single rollback slot, the live package dir and every
+        # metadata dir are removed, the staged tree moves in as a
+        # unit, and fresh metadata is written at the new version.
+        # Nothing of the old version survives in the live install:
+        # removed/renamed modules, old dist-info, stale bytecode.
+        slot = self._full_replace(stage / "agentlink", new_version,
+                                  stamp)
         shutil.rmtree(stage, ignore_errors=True)
-        # 6) Health check the installed tree; roll back on failure.
+        # 5) Health check the installed tree; roll back on failure.
         if not self._health_check(new_version):
-            self._restore(backup, payloads.keys(), backed_up)
-            try:
-                from .alerts_local import record_local_alert
-                record_local_alert(
-                    "update_rollback", new_version,
-                    f"update to {new_version} failed its health check"
-                    f" and was rolled back to {self.current_version}",
-                    state_dir=self.state_dir)
-            except Exception:
-                pass
-            raise UpdateError(
-                f"health check failed after installing {new_version};"
-                f" rolled back to {self.current_version} from {backup}")
-        # 7) Immortality gate (v1.3.2): as in apply() — the swap is
+            self._rollback_and_raise(slot, new_version,
+                                     "health check failed")
+        # 6) Immortality gate (v1.3.2): as in apply() — the swap is
         # only a success while every conversation survives it.
         if not self._census_intact(census_before):
-            self._fail_census_loss(backup, payloads.keys(), backed_up,
-                                   new_version)
-        # 8) Mirror-purge (v2.0.11): every gate is green — discard
-        # the old tree's leftovers now. Handles prepared before the
-        # manifest rode along carry no manifest and skip the purge
-        # (the first-boot self-clean converges such a tree anyway).
-        purged = self._purge_after_gates(manifest, stale) if manifest \
-            else {"files": [], "caches": 0, "failed": []}
+            self._fail_census_loss(slot, new_version)
+        # 7) Success: the slot is now the ONE kept prior tree; the
+        # parked older slot is wiped.
+        self._finish_success_bookkeeping(slot, stamp)
         return {"updated": True, "from": self.current_version,
-                "to": new_version, "backup": str(backup),
+                "to": new_version, "backup": str(slot),
                 "changed": sorted(payloads), "staged_smoke": True,
-                "purged": purged["files"],
-                "purged_caches": purged["caches"],
-                "purge_failed": purged["failed"],
+                "replaced": True,
+                "metadata_version":
+                    pip_visible_version(self.install_dir),
+                "purged": _slot_only_files(
+                    slot, manifest.get("files") or {}),
+                "purged_caches": caches_before,
+                "purge_failed": [],
                 "restart": "the daemon re-execs itself to run the new"
                            " code; no supervisor or cron is involved"}
 
