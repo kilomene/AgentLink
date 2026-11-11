@@ -1548,7 +1548,15 @@ class Agent:
                 result = {"username": self.username,
                           "pid": os.getpid(),
                           "endpoint": self.current_endpoint
-                          or self.endpoint}
+                          or self.endpoint,
+                          # Standing Orders (v2.4.3): the
+                          # daemon's periodic self-report carries
+                          # the doctrine state — orders version +
+                          # inscription — refreshed live, so an
+                          # operator (or the agent itself) sees
+                          # at a glance whether the orders are in
+                          # place. A status line, not behavior.
+                          "orders": self._orders_status()}
             elif cmd == "whoami":
                 # The running instance's own truthful surface
                 # (2.2.3): setup's already-registered fast path
@@ -2362,6 +2370,24 @@ class Agent:
         except OSError:
             pass
 
+    def _orders_status(self) -> dict:
+        """Standing Orders state (v2.4.3), read live from the
+        state dir on every call: reading the state RE-VERIFIES
+        the state copy's hash and restores it if it drifted
+        (the owner's rule — verify at every start and at every
+        read). Never raises into a status path; an ephemeral
+        dial client has no state dir to hold orders and says so.
+        """
+        if not self.username or self.ephemeral:
+            return {"installed": False, "inscribed": False,
+                    "note": "ephemeral client — no state dir"}
+        try:
+            from .orders import orders_state
+            return orders_state(self.state_dir)
+        except Exception as exc:
+            return {"installed": False, "inscribed": False,
+                    "error": str(exc)[:200]}
+
     def whoami(self) -> dict:
         # Recovery surface (v1.7.0): whether this agent HOLDS a
         # recovery key — its login-back credential — and the
@@ -2451,7 +2477,16 @@ class Agent:
                     for e in (self._v2.deposit_retry_queue.records()
                               if self._v2 is not None
                               and self._v2.deposit_retry_queue
-                              is not None else [])]}
+                              is not None else [])],
+                # Standing Orders surface (v2.4.3): the doctrine
+                # state as start() last verified it, refreshed
+                # from the state dir on every read so a tamper /
+                # restore that happened since boot is visible,
+                # not stale. Factual state only (orders version,
+                # installed, inscribed, tamper count): the
+                # platform reports placement + the agent's
+                # attestation; it never speaks for the agent.
+                "orders": self._orders_status()}
 
     # -- connector bridge + one-time admin grant (v1.8.1) --------
     # The owner's corrected model, end to end:
@@ -4606,6 +4641,23 @@ class Agent:
                         _package_version())
             except Exception:
                 log.debug("self-clean skipped", exc_info=True)
+        # Standing Orders (v2.4.3): placement + hash-verify at
+        # EVERY start — install the canonical orders into the
+        # state dir when absent, restore them when edited,
+        # truncated, replaced, or deleted, and (re)write the
+        # brain-inscription letter for the operating agent.
+        # Placement only: the platform never claims an
+        # inscription it cannot see; the agent attests via
+        # `agentlink orders ack`. A failure here never blocks
+        # startup, exactly like the self-clean above.
+        if self.username and not self.ephemeral:
+            try:
+                from .orders import ensure_orders, orders_state
+                ensure_orders(self.state_dir)
+                self._orders = orders_state(self.state_dir)
+            except Exception:
+                log.debug("standing-orders ensure skipped",
+                          exc_info=True)
         if self._serverless():
             return await self._start_serverless()
         url = endpoint or self.endpoint
