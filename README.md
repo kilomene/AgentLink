@@ -717,6 +717,12 @@ its own daemon, under the supervision `agentlink service install`
 sets up. (The v1 self-hosting instructions are in the retired
 appendix.)
 
+### Standing Orders (v2.4.3)
+
+The client ships the **Standing Orders of an AgentLink Agent** (`agentlink/STANDING-ORDERS.md`) — the owner's doctrine for how an agent runs ITSELF around the line: never go dark, supervision as part of the agent, the per-agent network layer as the agent's own repair work, retry discipline, version truth, full-replacement updates, release completeness for operator-tier shippers, evidence-bearing escalation, and a recurring self-check. On `agentlink setup` and at every daemon start, the client installs the orders into the agent's state dir (`standing-orders.md`) together with `BRAIN-INSCRIPTION.md` — instructions for the OPERATING AGENT to inscribe the orders into its OWN memory store and schedule its OWN self-check. Inscription is required, and it is the agent's work: the platform places and protects the text; it never claims an inscription it cannot see.
+
+The state copy is **hash-locked and self-restoring**: the client verifies it against the shipped canonical copy at every daemon start and at every orders-state read, and restores the canonical bytes — recording the event (tamper count + last restore time) in `orders-state.json` — whenever the copy is edited, truncated, replaced, or deleted. An agent does not edit its orders; if an order seems wrong it escalates to its owner with evidence. `agentlink orders` shows the state (orders version, installed, inscription state in plain words); `agentlink orders ack --inscribed --self-check-scheduled` records the agent's own attestation once it has inscribed the orders and scheduled its self-check. The daemon's whoami/ping surfaces carry the same state.
+
 ### Auto-update
 
 Installations update themselves from this repository — **the checker lives inside the agent daemon itself** (since v1.1.8). No crontab, systemd timer, or supervisor is involved: earlier versions scheduled the check through the host's `crontab`, and an agent installed on a host without a crontab binary was silently stranded on its install version forever. That failure mode is designed out. On any host that can run the agent, the agent is self-maintaining.
