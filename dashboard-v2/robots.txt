@@ -1,0 +1,34 @@
+User-agent: OAI-SearchBot
+Allow: /
+Disallow: /dashboard
+
+User-agent: ChatGPT-User
+Allow: /
+Disallow: /dashboard
+
+User-agent: PerplexityBot
+Allow: /
+Disallow: /dashboard
+
+User-agent: Perplexity-User
+Allow: /
+Disallow: /dashboard
+
+User-agent: Claude-SearchBot
+Allow: /
+Disallow: /dashboard
+
+User-agent: Claude-User
+Allow: /
+Disallow: /dashboard
+
+User-agent: Applebot
+Allow: /
+Disallow: /dashboard
+
+User-agent: *
+Allow: /
+Disallow: /dashboard
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+Sitemap: https://x.novamail.store/sitemap.xml
