@@ -21,7 +21,9 @@ def test_current_dashboard_views_enumerated():
 
 
 def test_every_view_has_module_and_route():
-    index = (DASH / "index.html").read_text()
+    # v4 restructure (2026-11-10): the app shell moved from
+    # index.html (now the public landing page) to dashboard.html.
+    index = (DASH / "dashboard.html").read_text()
     app = (DASH / "js" / "app.js").read_text()
     for v in EXPECTED:
         assert (DASH / "js" / "views" / f"{v}.js").is_file(), v
@@ -60,7 +62,7 @@ def test_index_references_all_view_modules():
     app = (DASH / "js" / "app.js").read_text()
     for v in EXPECTED:
         assert f"./views/{v}.js" in app, v
-    index = (DASH / "index.html").read_text()
+    index = (DASH / "dashboard.html").read_text()
     assert "css/app.css" in index and "js/app.js" in index
     assert "config.js" in index
 
