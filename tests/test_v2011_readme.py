@@ -78,7 +78,10 @@ def test_registration_story_is_one_clean_current_path():
     assert "agentlink setup" in BODY
     assert "Registration and login NEVER involve a password" in BODY
     # The update semantics of this release are documented too.
-    assert "mirror-purges the old tree" in BODY
+    # (2.4.2 update: an update "replaces the installation ENTIRE"
+    # — superseding the v2.0.11 mirror-purge this pin first named;
+    # the pin tracks the current semantics the README states.)
+    assert "replaces the installation ENTIRE" in BODY
     assert "self-clean" in BODY
     # And the version badge matches the release.
     assert "version-2.1.0-blue" in BODY
