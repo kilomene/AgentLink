@@ -37,6 +37,23 @@ dict plus a *backend* — a backend is any object with
 * on this VM against the real Drive through the proven
   ``hatch_gws_cli`` route (``DriveCliBackend``).
 
+TWO-COPY LAW (2.5.0, owner correction 2026-11-11): every
+archive deposit of a REAL conversation lands TWO copies in the
+agent's archive subfolder — the SEALED hash-chained file
+(tamper evidence of record; this module's chain) and, beside
+it, a READABLE transcript (``<conversation>.readable.md``)
+rendered from the plaintext the DEPOSITOR already holds at
+deposit time (sender-side or participant-side local plaintext —
+NEVER produced by breaking the seal server-side; a depositor
+with no plaintext deposits the chain only and the gap is a
+visible note in its deposit report). SEALED for proof, READABLE
+for the owner. PRIVACY POSTURE (owner's explicit order): the
+readable copies are plaintext in the owner's own Drive, in the
+owner's own archive, at the owner's order — his archive, his
+call; the sealed chain remains the copy that proves nothing was
+altered. Media entries render as a readable placeholder line
+(name/size/sha256), never a fake inline.
+
 Portability boundary: everything above the backend interface is
 portable (validation, layout, chaining, read/verify). The
 backend is the only platform-specific piece — Drive REST +
@@ -193,7 +210,7 @@ class LocalArchiveBackend:
                     continue
         return last
 
-    def deposit(self, record: dict) -> dict:
+    def deposit(self, record: dict, readable_entry=None) -> dict:
         entry = validate_record(record)
         entry_id = entry["message_id"]
         hashes = {}
@@ -207,9 +224,118 @@ class LocalArchiveBackend:
             with open(path, "a") as fh:
                 fh.write(json.dumps(link, default=str) + "\n")
             hashes[agent] = link["hash"]
-        return {"confirmed": True, "entry_id": entry_id,
+        readable = None
+        if readable_entry is not None:
+            # TWO-COPY LAW: the readable transcript lands beside
+            # the chain, rendered from the depositor's own
+            # plaintext (see the module docstring).
+            try:
+                readable = self.deposit_readable(
+                    entry["participants"],
+                    entry["conversation_id"], readable_entry)
+            except Exception as exc:  # noqa: BLE001 - visible gap
+                readable = {"status": "error",
+                            "reason": str(exc)[:160]}
+        conf = {"confirmed": True, "entry_id": entry_id,
                 "hashes": hashes,
                 "folders": sorted(hashes)}
+        if readable is not None:
+            conf["readable"] = readable
+        return conf
+
+    # -- readable transcripts (TWO-COPY LAW, 2.5.0) --------------
+    def _readable_entries_path(self, agent: str,
+                               conversation_id: str) -> Path:
+        return self._chain_path(agent, conversation_id).parent / \
+            "readable-entries.jsonl"
+
+    def _readable_path(self, agent: str,
+                       conversation_id: str) -> Path:
+        return self._chain_path(agent, conversation_id).parent / \
+            "readable.md"
+
+    def read_readable_entries(self, agent: str,
+                              conversation_id: str) -> list[dict]:
+        path = self._readable_entries_path(agent, conversation_id)
+        if not path.exists():
+            return []
+        out = []
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+        return out
+
+    def deposit_readable(self, participants, conversation_id: str,
+                         entry: dict) -> dict:
+        """File ONE plaintext entry (the depositor's own —
+        sender/participant side) into every participant's
+        readable transcript beside the chain, re-rendering the
+        .md from the full entry set (dedupe by message id, so
+        re-deposits and multi-participant renders converge).
+        Returns {status, entries, files}."""
+        entry = validate_readable_entry(entry)
+        files = []
+        count = 0
+        for agent in participants:
+            entries = self.read_readable_entries(
+                agent, conversation_id)
+            if not any(e.get("message_id") == entry["message_id"]
+                       for e in entries):
+                entries.append(entry)
+                epath = self._readable_entries_path(
+                    agent, conversation_id)
+                epath.parent.mkdir(parents=True, exist_ok=True)
+                with open(epath, "a") as fh:
+                    fh.write(json.dumps(entry, default=str) + "\n")
+            chain = self.read_conversation(agent, conversation_id)
+            head = chain[-1]["hash"] if chain else ""
+            md = render_transcript(conversation_id, participants,
+                                   entries, chain_head=head)
+            mpath = self._readable_path(agent, conversation_id)
+            mpath.parent.mkdir(parents=True, exist_ok=True)
+            mpath.write_text(md)
+            files.append(str(mpath))
+            count = len({e["message_id"] for e in entries})
+        return {"status": "stored", "entries": count,
+                "files": files}
+
+    def deposit_readable_many(self, participants,
+                              conversation_id: str,
+                              entries) -> dict:
+        """Bulk form (operator backfill): file many entries,
+        render ONCE per participant."""
+        norm = [validate_readable_entry(e) for e in entries]
+        files = []
+        count = 0
+        for agent in participants:
+            existing = self.read_readable_entries(
+                agent, conversation_id)
+            known = {e.get("message_id") for e in existing}
+            fresh = [e for e in norm
+                     if e["message_id"] not in known]
+            if fresh:
+                epath = self._readable_entries_path(
+                    agent, conversation_id)
+                epath.parent.mkdir(parents=True, exist_ok=True)
+                with open(epath, "a") as fh:
+                    for e in fresh:
+                        fh.write(json.dumps(e, default=str) + "\n")
+                existing = existing + fresh
+            chain = self.read_conversation(agent, conversation_id)
+            head = chain[-1]["hash"] if chain else ""
+            md = render_transcript(conversation_id, participants,
+                                   existing, chain_head=head)
+            mpath = self._readable_path(agent, conversation_id)
+            mpath.parent.mkdir(parents=True, exist_ok=True)
+            mpath.write_text(md)
+            files.append(str(mpath))
+            count = len({e["message_id"] for e in existing})
+        return {"status": "stored", "entries": count,
+                "files": files}
 
     def read_conversation(self, agent: str,
                             conversation_id: str) -> list[dict]:
@@ -244,30 +370,283 @@ class DriveCliBackend:
         self.drive_folder_id = drive_folder_id
         self.cli = cli
 
-    def deposit(self, record: dict) -> dict:
+    def _upload(self, staged: Path) -> None:
         import subprocess
-        conf = self.local.deposit(record)
+        res = subprocess.run(
+            [self.cli, "drive", "+upload", str(staged),
+             "--parent", self.drive_folder_id,
+             "--format", "json"],
+            capture_output=True, text=True, timeout=120)
+        if res.returncode != 0:
+            raise ArchiveError(
+                f"Drive upload failed for {staged.name}: "
+                f"{res.stderr[:200]}")
+
+    def deposit(self, record: dict, readable_entry=None) -> dict:
+        conf = self.local.deposit(record,
+                                  readable_entry=readable_entry)
         conv = validate_record(record)["conversation_id"]
         for agent in conf["folders"]:
             path = self.local._chain_path(agent, conv)
             name = f"{agent}__{conv.replace(':', '_')}__chain.jsonl"
             staged = path.parent / name
             staged.write_bytes(path.read_bytes())
-            res = subprocess.run(
-                [self.cli, "drive", "+upload", str(staged),
-                 "--parent", self.drive_folder_id,
-                 "--format", "json"],
-                capture_output=True, text=True, timeout=120)
-            if res.returncode != 0:
-                raise ArchiveError(
-                    "Drive upload failed for "
-                    f"{agent}/{conv}: {res.stderr[:200]}")
+            self._upload(staged)
+            # TWO-COPY LAW: the readable transcript uploads
+            # beside the chain file (same folder, same naming
+            # discipline) whenever the depositor held plaintext.
+            rpath = self.local._readable_path(agent, conv)
+            if readable_entry is not None and rpath.exists():
+                rname = (f"{agent}__{conv.replace(':', '_')}"
+                         f"__readable.md")
+                rstaged = path.parent / rname
+                rstaged.write_bytes(rpath.read_bytes())
+                self._upload(rstaged)
         conf["drive_folder"] = self.drive_folder_id
         return conf
+
+    def deposit_readable(self, participants, conversation_id: str,
+                         entry: dict) -> dict:
+        out = self.local.deposit_readable(participants,
+                                          conversation_id, entry)
+        for agent in participants:
+            rpath = self.local._readable_path(agent,
+                                              conversation_id)
+            if rpath.exists():
+                conv = conversation_id
+                rname = (f"{agent}__{conv.replace(':', '_')}"
+                         f"__readable.md")
+                staged = rpath.parent / rname
+                staged.write_bytes(rpath.read_bytes())
+                self._upload(staged)
+        out["drive_folder"] = self.drive_folder_id
+        return out
+
+    def deposit_readable_many(self, participants,
+                              conversation_id: str,
+                              entries) -> dict:
+        out = self.local.deposit_readable_many(
+            participants, conversation_id, entries)
+        for agent in participants:
+            rpath = self.local._readable_path(agent,
+                                              conversation_id)
+            if rpath.exists():
+                rname = (f"{agent}__"
+                         f"{conversation_id.replace(':', '_')}"
+                         f"__readable.md")
+                staged = rpath.parent / rname
+                staged.write_bytes(rpath.read_bytes())
+                self._upload(staged)
+        out["drive_folder"] = self.drive_folder_id
+        return out
 
     def read_conversation(self, agent: str,
                             conversation_id: str) -> list[dict]:
         return self.local.read_conversation(agent, conversation_id)
+
+
+# ----------------------------------------------------------------------
+# Readable transcripts — the owner's reading copy (TWO-COPY LAW,
+# 2.5.0). Rendered ONLY from plaintext the depositor already
+# holds (its own sent messages, or a participant's local
+# mailbox) — never by opening the sealed chain server-side.
+# ----------------------------------------------------------------------
+
+def validate_readable_entry(entry: dict) -> dict:
+    """One readable entry: {message_id, sender, ts, text} or
+    {message_id, sender, ts, file: {name, size, sha256}}.
+    Anything else is refused — the readable copy carries message
+    plaintext and file FACTS only, never blobs or envelopes."""
+    if not isinstance(entry, dict):
+        raise ArchiveError("readable entry is not an object")
+    mid = str(entry.get("message_id") or "")
+    sender = str(entry.get("sender") or "")
+    if not mid or not sender:
+        raise ArchiveError("readable entry needs message_id + sender")
+    try:
+        ts = int(entry.get("ts") or 0)
+    except (TypeError, ValueError):
+        raise ArchiveError("readable entry ts is not an integer")
+    out = {"message_id": mid, "sender": sender, "ts": ts}
+    f = entry.get("file")
+    if isinstance(f, dict) and f:
+        out["file"] = {"name": str(f.get("name") or "file"),
+                       "size": int(f.get("size") or 0),
+                       "sha256": str(f.get("sha256") or "")}
+        if entry.get("text"):
+            out["text"] = str(entry["text"])
+    elif entry.get("text") is not None:
+        out["text"] = str(entry.get("text") or "")
+    else:
+        raise ArchiveError(
+            "readable entry carries neither text nor file facts")
+    return out
+
+
+def _fmt_ts(ts: int) -> str:
+    import datetime
+    try:
+        return datetime.datetime.fromtimestamp(
+            int(ts), datetime.timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC")
+    except (OverflowError, OSError, ValueError):
+        return f"ts {ts}"
+
+
+def render_transcript(conversation_id: str, participants,
+                      entries, *, chain_head: str = "") -> str:
+    """The deterministic readable rendering. Sorted by
+    (ts, message_id), deduped by message id. The header binds
+    the rendering to the depositor's entry set (render hash)
+    and to the sealed chain (head hash at render time), so a
+    tampered readable file is detectable: re-rendering from the
+    entry set must reproduce it byte-for-byte, and the head must
+    match the chain it sits beside."""
+    seen: dict[str, dict] = {}
+    for e in entries:
+        e = validate_readable_entry(e)
+        seen.setdefault(e["message_id"], e)
+    ordered = sorted(seen.values(),
+                     key=lambda e: (e["ts"], e["message_id"]))
+    render_hash = hashlib.sha256(
+        _canonical(ordered)).hexdigest()
+    lines = [
+        f"# {conversation_id}",
+        "",
+        f"Participants: {', '.join(str(p) for p in participants)}",
+        "Archive copies: SEALED chain (tamper evidence of record)"
+        " + this READABLE transcript (the owner's reading copy).",
+        f"Entries: {len(ordered)} · Chain head at render: "
+        f"{chain_head or 'none'} · Render hash: {render_hash}",
+        "",
+    ]
+    for e in ordered:
+        stamp = _fmt_ts(e["ts"])
+        if "file" in e:
+            f = e["file"]
+            line = (f"[{stamp}] {e['sender']}: [file: {f['name']} "
+                    f"— {f['size']} bytes — sha256 "
+                    f"{f['sha256'] or 'unknown'}]")
+            if e.get("text"):
+                line += f" {e['text']}"
+            lines.append(line)
+        else:
+            text = e.get("text") or ""
+            parts = text.split("\n")
+            lines.append(f"[{stamp}] {e['sender']}: {parts[0]}")
+            for extra in parts[1:]:
+                lines.append(f"  {extra}")
+    return "\n".join(lines) + "\n"
+
+
+def verify_readable(md_text: str, entries,
+                    chain_entries=None) -> tuple[bool, str]:
+    """Detect a tampered readable file: (1) re-rendering from
+    the depositor's entry set must reproduce the file exactly
+    (modulo the chain-head line, which legitimately advances as
+    the chain grows — the head recorded IN the file is used for
+    the re-render); (2) when the sealed chain is supplied, the
+    readable entry set must match the chain's message set and
+    the recorded head must be one of the chain's hashes."""
+    head = ""
+    for line in md_text.splitlines():
+        if "Chain head at render:" in line:
+            head = line.split("Chain head at render:")[1].split(
+                "·")[0].strip()
+            break
+    conv = ""
+    for line in md_text.splitlines():
+        if line.startswith("# "):
+            conv = line[2:].strip()
+            break
+    participants = []
+    for line in md_text.splitlines():
+        if line.startswith("Participants: "):
+            participants = [p.strip() for p in
+                            line[len("Participants: "):].split(",")]
+            break
+    expected = render_transcript(conv, participants, entries,
+                                 chain_head=head)
+    if expected != md_text:
+        return False, "readable file does not match its entry set"
+    if chain_entries is not None:
+        chain_ids = [c.get("message_id") for c in chain_entries]
+        entry_ids = {validate_readable_entry(e)["message_id"]
+                     for e in entries}
+        if not entry_ids.issubset(set(chain_ids)):
+            return False, ("readable entries are not a subset of "
+                           "the sealed chain")
+        hashes = {c.get("hash") for c in chain_entries}
+        if head and head not in hashes:
+            return False, ("recorded chain head is not in the "
+                           "sealed chain")
+    return True, "ok"
+
+
+def backfill_entries_from_mailbox(mailbox_db_path, owner: str
+                                  ) -> dict:
+    """OPERATOR BACKFILL (2.5.0): build readable entries from a
+    PARTICIPANT's local mailbox (participant-side plaintext —
+    the agent's own journal of what it sent and received; the
+    seal is never opened). Returns
+    {conversation_id: {"participants": [...], "entries": [...]}}
+    plus a "_gaps" list naming journal rows that carried no
+    renderable plaintext (visible, never silently skipped)."""
+    import sqlite3
+    db = sqlite3.connect(str(mailbox_db_path))
+    try:
+        rows = db.execute(
+            "SELECT id, ts, from_user, to_user, group_id, msg "
+            "FROM items ORDER BY ts, id").fetchall()
+    finally:
+        db.close()
+    convs: dict[str, dict] = {}
+    gaps = []
+    for mid, ts, frm, to, gid, msg_raw in rows:
+        try:
+            msg = json.loads(msg_raw or "{}")
+        except Exception:
+            gaps.append({"message_id": mid,
+                         "reason": "journal row not JSON"})
+            continue
+        body = msg.get("body")
+        file = msg.get("file")
+        if body is None and not file:
+            gaps.append({"message_id": mid,
+                         "reason": "no plaintext in journal row"})
+            continue
+        entry = {"message_id": mid, "sender": frm or owner,
+                 "ts": int(msg.get("ts") or ts or 0)}
+        if file:
+            entry["file"] = {
+                "name": str(file.get("name") or "file"),
+                "size": int(file.get("size") or 0),
+                "sha256": str(file.get("sha256") or "")}
+            if body:
+                entry["text"] = str(body)
+        else:
+            entry["text"] = str(body or "")
+        if gid:
+            conv = conversation_id_group(gid)
+            parts = convs.setdefault(
+                conv, {"participants": set(), "entries": []})
+            parts["participants"].add(frm or owner)
+            parts["participants"].add(owner)
+        else:
+            other = to if frm == owner else frm
+            conv = conversation_id_dm(owner, other or "")
+            parts = convs.setdefault(
+                conv, {"participants": {owner, other},
+                       "entries": []})
+        parts["entries"].append(entry)
+    out = {}
+    for conv, data in convs.items():
+        out[conv] = {
+            "participants": sorted(p for p in
+                                   data["participants"] if p),
+            "entries": data["entries"]}
+    out["_gaps"] = gaps
+    return out
 
 
 class DepositRetryQueue:
