@@ -741,36 +741,6 @@ class DepositRetryQueue:
         return str(message_id) in self._entries
 
 
-def https_deposit(url: str, record: dict, token: str = "",
-                  timeout: float = 30.0) -> dict:
-    """Deposit via the archive service's HTTPS endpoint (the
-    Firebase function's ``archiveDeposit``). Returns the
-    service's confirmation; raises ArchiveError on ANY doubt —
-    a non-200, an undecodable body, or a body that does not
-    explicitly confirm. Fail-closed by construction."""
-    import urllib.request
-    from . import proxycreds
-    entry = validate_record(record)
-    data = json.dumps(entry).encode()
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    if token:
-        req.add_header("X-Archive-Token", token)
-    try:
-        with proxycreds.open_url(req, timeout=timeout) as resp:
-            raw = resp.read()
-    except Exception as exc:
-        raise ArchiveError(f"archive deposit call failed: {exc}")
-    try:
-        conf = json.loads(raw or b"")
-    except Exception:
-        raise ArchiveError("archive deposit reply undecodable")
-    if not conf.get("confirmed"):
-        raise ArchiveError(
-            f"archive deposit not confirmed: {str(conf)[:160]}")
-    return conf
-
-
 # ============================================================
 # Universal archive backfill (2.4.1): deposit the EXISTING
 # standard Supabase archive (al_audit_log) into the Drive
