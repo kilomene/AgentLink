@@ -68,6 +68,14 @@ UPDATE_DRAIN_WAIT_SECONDS = 120  # bounded wait for in-flight operations
                                  # DEFERS to the next check — an update
                                  # never interrupts an operation
 
+# Archive deposits (2.5.0, operator plane): the dossier deposit
+# queue's next-due base — a durable-queue DUE TIME, never a
+# sleep: a failed dossier deposit becomes due again after this
+# base, doubling per attempt, dead-letter parked at the attempt
+# cap. Visibility, not urgency, is the design (the deposit is
+# mandatory-but-non-blocking, like standard archive deposits).
+DOSSIER_DEPOSIT_NEXT_DUE_BASE_SECONDS = 300
+
 # Fleet alerts (point 37)
 ALERT_OFFLINE_SECONDS = 300      # agent offline beyond 5 min -> alert
 ALERT_URGENT_SECONDS = 120       # urgent undelivered beyond 2 min
