@@ -107,6 +107,14 @@ tr.row-in{animation:rowIn .5s cubic-bezier(.2,.8,.25,1)}
 /* ---------- activeness ladder (single source of truth classes) ---------- */
 .activeness{display:inline-flex;align-items:center;gap:7px;max-width:100%;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:600;line-height:1.5;white-space:normal;word-break:break-word;border:1px solid var(--glass-brd);backdrop-filter:blur(8px)}
 .activeness::before{content:"";width:8px;height:8px;border-radius:50%;flex:none}
+.activeness-beating{background:rgba(158,222,31,.22);color:#3f6212;border-color:rgba(132,204,22,.45)}
+.activeness-beating::before{background:#65a30d;box-shadow:0 0 3px rgba(158,222,31,.3);animation:pulseDot 2s ease-out infinite}
+.activeness-resting{background:rgba(56,189,248,.16);color:#075985;border-color:rgba(56,189,248,.45)}
+.activeness-resting::before{background:#38bdf8}
+.activeness-dark{background:rgba(239,68,68,.18);color:#991b1b;border-color:rgba(239,68,68,.5)}
+.activeness-dark::before{background:#ef4444;box-shadow:0 0 0 3px rgba(239,68,68,.25)}
+.activeness-unproven{background:rgba(132,148,169,.10);color:var(--muted);border-color:rgba(132,148,169,.3);border-style:dashed}
+.activeness-unproven::before{background:#cbd5e1}
 .activeness-online{background:rgba(158,222,31,.22);color:#3f6212;border-color:rgba(132,204,22,.45)}
 .activeness-online::before{background:#65a30d;box-shadow:0 0 0 3px rgba(158,222,31,.3);animation:pulseDot 2s ease-out infinite}
 .activeness-suspect{background:rgba(245,158,11,.2);color:#92400e;border-color:rgba(245,158,11,.5)}
