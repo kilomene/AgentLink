@@ -123,7 +123,8 @@ from .doorbell import (DoorbellClient, DoorbellError,
                        ScopedPresenceWatcher,
                        conversation_id_for_dm,
                        conversation_id_for_group)
-from .liveness import (declare_payload as _liveness_declare_payload,
+from .liveness import (attest_payload as _liveness_attest_payload,
+                       declare_payload as _liveness_declare_payload,
                        drift_payload as _liveness_drift_payload,
                        prove_payload as _liveness_prove_payload,
                        receipt_payload as
@@ -587,6 +588,15 @@ class ServerlessTransport:
         self.last_liveness_error = ""
         self.last_liveness_attempt_at = 0.0
         self._liveness_snapshot: dict | None = None
+        # Build Integrity Attestation (2.5.2): the state dir
+        # the Agent hands over at start (the updater's install
+        # record lives there); the last statement's outcome +
+        # the last error, for status surfaces. Attestation is
+        # transport machinery like the challenge answers: it
+        # NEVER raises into a login or a beat.
+        self.build_state_dir: str | None = None
+        self.last_build_error = ""
+        self._build_snapshot: dict | None = None
         self.last_slow_sync_error = ""
         self.client_version = ""
         #: Owner-oversight PUBLIC key advertised by the login Edge
@@ -879,6 +889,14 @@ class ServerlessTransport:
             verify["decision_link"] = self._decision_link
         if isinstance(self._decision_detail, dict):
             verify["decision_link_detail"] = self._decision_detail
+        # Client version (2.5.2): the ceremony carries the
+        # version claim so the login Edge can RECORD it
+        # (al_record_login_version) — the platform's login
+        # record is what the attestation stripped-check and
+        # the dossier judge read. A claim, recorded at a
+        # verified ceremony; verdicts come from attestation.
+        if self.client_version:
+            verify["client_version"] = self.client_version
         reply = self._edge_post("verify", verify)
         result = self._adopt_tokens(username, reply)
         # Recovery enrollment rides a verify reply (2.2.3): an
@@ -1062,6 +1080,88 @@ class ServerlessTransport:
             return base64.b64encode(sig).decode()
         return str(sig)
 
+    # ------------------------------------------------ Build
+    # Integrity Attestation (2.5.2, migration v215) — THE
+    # STREET RULE: the law lives on the platform, never in the
+    # agent. This side only ever produces signed EVIDENCE: the
+    # digest of the build it actually runs, computed by
+    # build.attested_build from the manifest it installed from
+    # + the live tree. The platform judges the evidence
+    # against the registered release digest and records the
+    # verdict (stock | modified | unattested); nothing here
+    # decides, displays-as-final, or clears anything.
+
+    def _attested_digest(self) -> tuple[str, str] | tuple[None, None]:
+        """(version, digest) this client can sign for RIGHT
+        NOW, from the install record alone (no feed fetch —
+        receipts never block on the network beyond their own
+        POST). (None, None) when no state dir was handed over
+        or no manifest is on record: the caller then sends the
+        legacy payload and the platform draws its own (loud)
+        conclusion."""
+        if not getattr(self, "build_state_dir", None):
+            return None, None
+        try:
+            from .build import attested_build
+            att = attested_build(self.build_state_dir, fetch=False)
+            if att.get("digest"):
+                return str(att["version"]), str(att["digest"])
+        except Exception:
+            pass
+        return None, None
+
+    def attest_build(self, state_dir) -> dict:
+        """The BUILD STATEMENT: signed at login and on the
+        start that follows every update (the Agent's start path
+        calls this beside the nature assertion). Computes the
+        honest digest (fetching the running version's manifest
+        when an older updater left no record — the bootstrap),
+        signs the statement with my identity key, and posts it
+        to the liveness Edge, which verifies and records the
+        platform's verdict. NEVER raises: a statement that
+        cannot land is reported in the result and in
+        last_build_error, and the record carries 'unattested'
+        meanwhile — visible, never hidden."""
+        self.build_state_dir = str(state_dir)
+        result: dict = {"attested": False}
+        if not self.username or self._signer is None:
+            result["error"] = "not_logged_in"
+            self.last_build_error = "not_logged_in"
+            return result
+        try:
+            from .build import attested_build
+            att = attested_build(state_dir)
+        except Exception as exc:  # noqa: BLE001 - reported
+            att = {"version": "", "digest": None,
+                   "basis": "none"}
+            result["compute_error"] = str(exc)[:300]
+        result["local"] = att
+        if not att.get("digest"):
+            self.last_build_error = (
+                "no manifest obtainable for the running build; "
+                "this agent is unattested until one is")
+            result["error"] = self.last_build_error
+            self._build_snapshot = dict(result)
+            return result
+        ts = int(time.time())
+        payload = _liveness_attest_payload(
+            self.username, str(att["version"]),
+            str(att["digest"]), ts)
+        try:
+            posted = self._fn_post(
+                "agentlink-liveness", "attest",
+                {"version": str(att["version"]),
+                 "manifest_sha256": str(att["digest"]),
+                 "ts": ts, "sig": self._liveness_sign(payload)})
+            result.update({"attested": True, "ts": ts,
+                           "result": posted})
+            self.last_build_error = ""
+        except Exception as exc:  # noqa: BLE001 - fail-visible
+            self.last_build_error = str(exc)[:300]
+            result["error"] = self.last_build_error
+        self._build_snapshot = dict(result)
+        return result
+
     def answer_liveness_challenges(self) -> dict:
         """Answer my outstanding liveness challenge, if one
         waits. Returns a result dict; NEVER raises — a failed
@@ -1078,13 +1178,22 @@ class ServerlessTransport:
             if not ch:
                 return {"answered": False, "reason": "no_challenge"}
             ts = int(time.time())
+            # Build attestation (2.5.2): the digest rides INSIDE
+            # the signed receipt (v2 payload) whenever this
+            # client can produce one — continuous evidence, not
+            # a login-time claim. Without one the v1 payload
+            # goes out and the platform rejects it loudly for
+            # any agent recorded at >= 2.5.2.
+            _bver, digest = self._attested_digest()
             payload = _liveness_receipt_payload(
                 self.username, str(ch["id"]), str(ch["nonce"]),
-                "daemon", ts)
+                "daemon", ts, digest)
+            body = {"challenge_id": str(ch["id"]), "ts": ts,
+                    "sig": self._liveness_sign(payload)}
+            if digest:
+                body["build_digest"] = digest
             result = self._fn_post(
-                "agentlink-liveness", "answer",
-                {"challenge_id": str(ch["id"]), "ts": ts,
-                 "sig": self._liveness_sign(payload)})
+                "agentlink-liveness", "answer", body)
             self.last_liveness_error = ""
             return {"answered": True, "challenge_id": str(ch["id"]),
                     "tier": "daemon", "ts": ts, "result": result}
@@ -1121,10 +1230,14 @@ class ServerlessTransport:
         if not self.username or self._signer is None:
             raise TransportError("liveness prove needs login")
         ts = int(time.time())
-        payload = _liveness_prove_payload(self.username, ts)
+        _bver, digest = self._attested_digest()
+        payload = _liveness_prove_payload(self.username, ts,
+                                          digest)
+        body = {"ts": ts, "sig": self._liveness_sign(payload)}
+        if digest:
+            body["build_digest"] = digest
         result = self._fn_post(
-            "agentlink-liveness", "prove",
-            {"ts": ts, "sig": self._liveness_sign(payload)})
+            "agentlink-liveness", "prove", body)
         return {"proved": True, "tier": "runtime", "ts": ts,
                 "result": result}
 
@@ -1298,7 +1411,9 @@ class ServerlessTransport:
             "last_runtime_proof_at,judged_nature_version,"
             "judged_declared_at,judged_class,nature_compliant,"
             "noncompliant_since,dossier_status,"
-            "dossier_deposited_at,dossier_version"
+            "dossier_deposited_at,dossier_version,"
+            "build_version,build_digest,build_integrity,"
+            "build_attested_at"
             f"&username=eq.{self.username}")
         me_rows = self._rest(
             "GET", "al_users",
@@ -1332,6 +1447,19 @@ class ServerlessTransport:
             "dossier_status": lv.get("dossier_status") or "",
             "dossier_deposited_at":
                 lv.get("dossier_deposited_at") or 0,
+            # Build integrity (2.5.2): the platform's VERDICT
+            # from the record (build_integrity is judged
+            # server-side against the registered release
+            # digest — never my own claim), plus my local
+            # statement snapshot, labelled as the claim it is.
+            "build_integrity": lv.get("build_integrity")
+            or "unattested",
+            "build_version": lv.get("build_version") or "",
+            "build_digest": lv.get("build_digest") or "",
+            "build_attested_at": lv.get("build_attested_at")
+            or 0,
+            "build_local": self._build_snapshot,
+            "last_build_error": self.last_build_error,
             "last_liveness_error": self.last_liveness_error,
         }
         # Live node first for the grade fields it carries.
@@ -1358,6 +1486,13 @@ class ServerlessTransport:
                 status["last_proof_tier"] = node["last_proof_tier"]
                 status["last_proof_at"] = node.get(
                     "last_proof_at") or 0
+            if node.get("build_integrity"):
+                status["build_integrity"] = str(
+                    node["build_integrity"])
+                status["build_version"] = str(
+                    node.get("build_version") or "")
+                status["build_digest"] = str(
+                    node.get("build_digest") or "")
         if not status["grade"]:
             status["grade"] = "unproven"
             status["grade_source"] = "none"
@@ -1428,6 +1563,8 @@ class ServerlessTransport:
             payload["decision_link"] = self._decision_link
         if isinstance(self._decision_detail, dict):
             payload["decision_link_detail"] = self._decision_detail
+        if self.client_version:
+            payload["client_version"] = self.client_version
         return payload
 
     def register_and_login(self, username: str, signer, sign_pub: str,
