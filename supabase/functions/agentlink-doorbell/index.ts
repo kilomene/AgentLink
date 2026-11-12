@@ -315,6 +315,14 @@ Deno.serve(async (req: Request) => {
             nature_compliant: Boolean(lv?.nature_compliant),
             dossier_status: String(lv?.dossier_status ?? "")
               || "missing",
+            // Build integrity (2.5.2): the platform's verdict,
+            // mirrored from the record like every other field
+            // here (written only by the attestation fn).
+            build_integrity: String(lv?.build_integrity ?? "")
+              || "unattested",
+            build_version: String(lv?.build_version ?? ""),
+            build_digest: String(lv?.build_digest ?? "")
+              .slice(0, 12),
             as_of: { ".sv": "timestamp" },
           });
       }
