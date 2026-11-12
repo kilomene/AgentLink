@@ -858,6 +858,17 @@ class DoorbellClient:
         got = self._rest("GET", f"doorbell/{user_key(username)}")
         return got if isinstance(got, dict) else None
 
+    def read_liveness(self, username: str) -> dict | None:
+        """Read a Life Signs live node (2.5.0): /liveness/<user>
+        carries the sweep-computed grade + proof summary with an
+        as_of server timestamp, written by the platform's
+        verification machinery at transition/proof time. Fleet-
+        readable operational metadata, like presence. None when
+        no node exists — surfaces then read 'unproven' or fall
+        back to the record layer, never a guessed grade."""
+        got = self._rest("GET", f"liveness/{user_key(username)}")
+        return got if isinstance(got, dict) else None
+
     # -- transit inbox (2.3.0: the live layer carries messages) ------
     def put_inbox(self, target_username: str, item_id: str,
                   frame: dict, expires_at: int = 0) -> dict:
