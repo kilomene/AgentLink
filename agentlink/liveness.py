@@ -200,17 +200,46 @@ def canonical_json(obj) -> str:
 
 
 def receipt_payload(username: str, challenge_id: str, nonce: str,
-                    tier: str, ts: int) -> str:
+                    tier: str, ts: int,
+                    digest: str | None = None) -> str:
     """What the daemon signs to answer a challenge. The tier is a
     claim INSIDE the signed bytes; the daemon path only ever
-    passes tier='daemon' (gate-pinned)."""
+    passes tier='daemon' (gate-pinned). From v2.5.2 the build
+    digest rides INSIDE the same signed bytes (v2 form): a build
+    that strips it produces v1 receipts, which the platform
+    rejects from any agent whose recorded client is >= 2.5.2 —
+    stripping is a visible state, never a silent pass. The v1
+    form remains for pre-2.5.2 senders (theirs is the honest
+    unattested state)."""
+    if digest:
+        return (f"agentlink-liveness-receipt-v2|{username}"
+                f"|{challenge_id}|{nonce}|{tier}|{digest}"
+                f"|{int(ts)}")
     return (f"agentlink-liveness-receipt-v1|{username}|{challenge_id}"
             f"|{nonce}|{tier}|{int(ts)}")
 
 
-def prove_payload(username: str, ts: int) -> str:
-    """What the runtime countersigns for a runtime-tier proof."""
+def prove_payload(username: str, ts: int,
+                  digest: str | None = None) -> str:
+    """What the runtime countersigns for a runtime-tier proof.
+    The v2 form carries the build digest inside the signed
+    bytes, exactly like the daemon receipt."""
+    if digest:
+        return (f"agentlink-liveness-prove-v2|{username}"
+                f"|{digest}|{int(ts)}")
     return f"agentlink-liveness-prove-v1|{username}|{int(ts)}"
+
+
+def attest_payload(username: str, version: str, digest: str,
+                   ts: int) -> str:
+    """What the daemon signs as its BUILD STATEMENT (v2.5.2):
+    'the build I run is the one this manifest digest defines.'
+    A claim of EVIDENCE — the platform judges it against the
+    registered release digest and records the verdict; the
+    statement itself never decides anything (the Street Rule:
+    the agent's copy is never the court)."""
+    return (f"agentlink-build-attest-v1|{username}|{version}"
+            f"|{digest}|{int(ts)}")
 
 
 def declare_payload(username: str, profile: dict, ts: int) -> str:
@@ -277,6 +306,16 @@ def compose_liveness_node(liveness_row: dict | None,
         "nature_compliant": bool(lv.get("nature_compliant")),
         "dossier_status": str(lv.get("dossier_status") or "")
         or "missing",
+        # Build integrity (v2.5.2): the platform's VERDICT,
+        # computed server-side from the agent's signed
+        # attestation against the registered release digest —
+        # never the agent's own claim. An agent with no judged
+        # attestation reads 'unattested', including honest
+        # pre-2.5.2 builds.
+        "build_integrity": str(lv.get("build_integrity") or "")
+        or "unattested",
+        "build_version": str(lv.get("build_version") or ""),
+        "build_digest": str(lv.get("build_digest") or "")[:12],
     }
 
 
