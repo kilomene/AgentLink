@@ -85,6 +85,32 @@ exports.archiveDeposit = onRequest(ARCHIVE_CAPS, async (req, res) => {
       return _sendJson(res, 401, { confirmed: false,
         error: "unauthorized" });
     }
+    // Agent Dossier deposits (2.5.0) ride this same service
+    // path, but land in the SYSTEM tree ("AgentLink System"
+    // root, one subfolder per agent) — the folder law: the two
+    // Drive trees never mix, so the dossier store is rooted at
+    // DOSSIER_ROOT_FOLDER_ID, NOT the archive root, and fails
+    // closed until that root is shared with this function.
+    // A dossier is the owner's operational record (signed by
+    // the agent, hash-chained) — not a sealed message record,
+    // so it does not pass the sealed-envelope validation.
+    if (req.body && req.body.kind === "dossier") {
+      const agent = String(req.body.agent || "");
+      if (!agent || !req.body.files) {
+        return _sendJson(res, 400, { confirmed: false,
+          error: "dossier deposit needs agent + files" });
+      }
+      const sysRoot = process.env.DOSSIER_ROOT_FOLDER_ID;
+      if (!sysRoot) {
+        return _sendJson(res, 502, { confirmed: false,
+          error: "DOSSIER_ROOT_FOLDER_ID not configured — " +
+            "dossier service is fail-closed until the " +
+            "AgentLink System root is shared" });
+      }
+      const conf = await new DriveStore(sysRoot).writeDossier(
+        agent, req.body.files);
+      return _sendJson(res, 200, conf);
+    }
     const conf = await core.deposit(_archiveStore(), req.body);
     return _sendJson(res, 200, conf);
   } catch (err) {
