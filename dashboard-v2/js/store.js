@@ -21,6 +21,7 @@ function emit(kind, payload){
   (listeners.get(kind) || []).forEach(cb => { try{ cb(payload); }catch(_){} });
   (listeners.get("*") || []).forEach(cb => { try{ cb(kind, payload); }catch(_){} });
 }
+export { emit as emitBus };
 
 export const store = {
   data: null,
