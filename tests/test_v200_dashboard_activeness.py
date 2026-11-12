@@ -209,7 +209,19 @@ def test_agents_view_three_states_and_beat_age():
     assert "activeness-" in src            # per-state badge classes
     assert "Beat age" in src               # beat-age column shown
     assert "beat_age_s" in src and "data-beat-age-user" in src
-    assert "activenessLabel" in src        # suspect label w/ staleness
+    # 2.5.0 SUPERSEDES the activenessLabel pin (owner's Life
+    # Signs brief, item 6): the roster's liveness surface is the
+    # computed GRADE + last proof, judged by the agent's own
+    # declared nature — the bare online light is gone from the
+    # primary column (the beat-age column above remains).
+    assert "lifeSignCell" in src
+    assert 'data-label="Life sign"' in src
+    for grade in ("BEATING", "RESTING", "SUSPECT", "DARK"):
+        assert grade in src, grade
+    assert "last_proof_tier" in src        # proof tier shown
+    assert "judged by nature v" in src     # judged-by stated
+    assert "unproven" in src               # no grade = unproven
+    assert "activenessLabel" not in src    # dead code swept
 
 
 def test_overview_view_three_states():
