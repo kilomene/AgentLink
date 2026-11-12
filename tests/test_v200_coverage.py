@@ -2336,7 +2336,8 @@ class StubDoorbell:
         self.presence_writes.append(username)
         return {}
 
-    def start_heartbeat(self, username, on_transition=None):
+    def start_heartbeat(self, username, on_transition=None,
+                        on_beat=None):
         self.heartbeat = (username, on_transition)
 
     def stop_heartbeat(self, fire_offline=True):
