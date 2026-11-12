@@ -43,13 +43,26 @@ PLUMBING: the client builds the dossier locally and deposits
 through the archive deposit discipline — a durable local queue,
 capped retries, dead-letter park; mandatory-but-non-blocking
 (the standard-message class): a failed deposit never blocks
-the daemon. Agents hold NO Drive credentials: deposits ride
-the archive service path (the Firebase archiveDeposit
-function, owner's Blaze step) or, on operator hosts, the
-VM's Drive CLI route. Generation + deposit are AUTOMATIC
-(hardened reporting class): at setup, at daemon start when
-stale, on any nature/spec version change, and at a 7-day
-max-age refresh. No opt-out exists.
+the daemon. Agents hold NO Drive credentials.
+
+DESTINATION, HARDENED (v2.5.1, owner's correction): the
+deposit destination is a built-in of the platform, not a
+setting. Deposits ride the agent's OWN authenticated session
+to the platform deposit route (the agentlink-deposit Edge
+function + the platform deposit inbox on the record layer);
+the operator drain files inbox deposits into this tree. There
+is NO env-configured URL, NO shared archive token, and NO
+per-agent destination option anywhere in the stock client —
+the 2.5.0 defect ("dossier stays local since no archive
+destination is set", fleet-wide, silently) is an impossible
+state by construction now: either the deposit lands in the
+platform inbox, or the queue + the dossier_status flag carry
+the failure loudly (non-current on every surface, and the
+platform's single transition alert past 24h) until it does.
+Generation + deposit are AUTOMATIC (hardened reporting
+class): at setup, at daemon start when stale, on any
+nature/spec version change, on a client version change, and
+at a 7-day max-age refresh. No opt-out exists.
 """
 from __future__ import annotations
 
@@ -430,20 +443,29 @@ def dossier_status(state_dir: Path, nature_version: int = 0,
 
 
 def needs_refresh(state_dir: Path, nature_version: int = 0,
-                  now: int | None = None) -> bool:
+                  now: int | None = None,
+                  client_version: str = "") -> bool:
     """Generation triggers (owner's dossier ruling): no
     dossier yet, the nature/spec version moved since the
-    dossier was generated, or the dossier aged past the 7-day
-    max. A dossier that exists but is merely UNDEPOSITED is
-    NOT regenerated — it is drained (regenerating would spam
-    versions into the archive history for a transport
-    problem)."""
+    dossier was generated, the dossier aged past the 7-day
+    max — or (2.5.1) the CLIENT version moved: the dossier
+    names the client that generated it, and a dossier stating
+    a superseded client version is stale truth on the record
+    (Order O5, version truth — the same law that redeclares
+    the nature on a client version change). A dossier that
+    exists but is merely UNDEPOSITED is NOT regenerated — it
+    is drained (regenerating would spam versions into the
+    archive history for a transport problem)."""
     now = int(time.time()) if now is None else now
     st = load_state(state_dir)
     if not st or not st.get("version"):
         return True
     if nature_version and int(st.get("nature_version") or 0) \
             != int(nature_version):
+        return True
+    if client_version and st.get("client_version") \
+            and str(st.get("client_version")) != str(
+                client_version):
         return True
     return now - int(st.get("generated_at") or 0) > MAX_AGE_S
 
@@ -499,6 +521,7 @@ def generate(state_dir: Path, *, signer, username: str,
     st.update({"version": version, "generated_at": now,
                "nature_version":
                    int(standing.get("nature_version") or 0),
+               "client_version": client_version or "",
                "sha256": entry["sha256"], "queue": queue})
     _save_state(state_dir, st)
     return {"version": version,
@@ -584,92 +607,26 @@ def drain_queue(state_dir: Path, depositor,
 
 # ------------------------------------------------------- depositors
 
-def drive_cli_depositor(root_folder_id: str, username: str,
-                        cli: str = "/opt/hatch/bin/hatch_gws_cli",
-                        staging: Path | None = None):
-    """Operator-host deposit route (this VM's proven Drive
-    channel — the same CLI + account as the daily backups and
-    the 2.4.1 backfill; the CLI holds its own auth, no Drive
-    credential enters this process). The root passed in is the
-    SYSTEM tree root ("AgentLink System" in production,
-    "AgentLink System Test" for every drill — folder law:
-    PRODUCTION ROOTS ARE NOT TEST SURFACES). Layout: root ->
-    <agent> folder -> DOSSIER.json / DOSSIER.md /
-    dossier-chain.jsonl + dossier-history/. Uploads create a
-    fresh file per deposit (the archive's own operator-path
-    semantics: newest snapshot of a name is the current one;
-    the chain file makes every version verifiable)."""
-    import subprocess
-    import tempfile
+def platform_depositor(transport, username: str):
+    """THE deposit route (2.5.1, hardened): the platform
+    deposit inbox, reached through the agent's OWN transport —
+    the session JWT the transport already holds is the only
+    credential, and the function's URL derives from the
+    platform's own functions base (a built-in, like the
+    production endpoints). There is no other stock route: no
+    env URL, no shared token, no Drive CLI fallback, no
+    per-agent destination setting — "no destination set" is
+    not a state this client can be in.
 
-    def _run(args, timeout=180):
-        res = subprocess.run([cli] + args, capture_output=True,
-                             text=True, timeout=timeout)
-        if res.returncode != 0:
-            raise RuntimeError(
-                f"gws {' '.join(args[:3])} failed: "
-                f"{(res.stderr or res.stdout)[:200]}")
-        try:
-            return json.loads(res.stdout)
-        except Exception:
-            return {}
-
-    def _find(parent: str, name: str, folder: bool):
-        q = (f"'{parent}' in parents and name = '{name}' and "
-             f"trashed = false")
-        out = _run(["drive", "files", "list", "--params",
-                    json.dumps({"q": q,
-                                "fields": "files(id,name,"
-                                          "modifiedTime)",
-                                "orderBy": "modifiedTime desc",
-                                "pageSize": 5}),
-                    "--format", "json"])
-        files = out.get("files") or []
-        if folder:
-            files = [f for f in files if f["name"] == name]
-        return files[0]["id"] if files else None
-
-    def _folder(parent: str, name: str) -> str:
-        found = _find(parent, name, True)
-        if found:
-            return found
-        made = _run(["drive", "files", "create", "--json",
-                     json.dumps({
-                         "name": name,
-                         "mimeType":
-                             "application/vnd.google-apps.folder",
-                         "parents": [parent]}),
-                     "--format", "json"])
-        if not made.get("id"):
-            raise RuntimeError(f"folder create failed: {name}")
-        return made["id"]
-
-    def depositor(files: dict[str, bytes]) -> dict:
-        agent_dir = _folder(root_folder_id, username)
-        hist_dir = _folder(agent_dir, "dossier-history")
-        uploaded = []
-        tmp = Path(tempfile.mkdtemp(prefix="dossier-up-"))
-        for name, data in sorted(files.items()):
-            parent = hist_dir if name.startswith(
-                "dossier-history/") else agent_dir
-            base = name.rsplit("/", 1)[-1]
-            local = tmp / base
-            local.write_bytes(data)
-            _run(["drive", "+upload", str(local),
-                  "--parent", parent, "--format", "json"])
-            uploaded.append(name)
-        return {"route": "drive-cli", "agent_folder": agent_dir,
-                "files": uploaded}
-
-    return depositor
-
-
-def https_depositor(url: str, token: str = "", username: str = ""):
-    """The archive service route (the Firebase archiveDeposit
-    function — owner's Blaze step; the client side is built to
-    that interface now): POST the deposit set; a confirmed
-    deposit answers 2xx with the folder receipt."""
-    from .archive import https_deposit
+    The deposit record is the dossier kind of the platform
+    inbox protocol: {kind: "dossier", agent, files: {name:
+    base64}} — the same wire shape the retired archive-service
+    route used, now authenticated by the agent's own identity
+    and verified platform-side (the Edge checks the dossier's
+    signature against the registry key before it confirms).
+    The drain files the deposit set into the agent's folder
+    under the System tree root the operator configured —
+    folder law: PRODUCTION ROOTS ARE NOT TEST SURFACES."""
 
     def depositor(files: dict[str, bytes]) -> dict:
         import base64
@@ -679,26 +636,6 @@ def https_depositor(url: str, token: str = "", username: str = ""):
             "files": {name: base64.b64encode(data).decode()
                       for name, data in files.items()},
         }
-        return https_deposit(url, record, token)
+        return transport.deposit_record(record)
 
     return depositor
-
-
-def resolve_depositor(username: str):
-    """Which deposit route this host has (checked in order):
-    the archive service (env-configured), then the operator
-    Drive CLI route (env-configured root + the CLI present).
-    None -> deposits park in the durable queue, visibly.
-    AGENTLINK_DOSSIER_DRIVE_ROOT names the SYSTEM tree root
-    (production "AgentLink System" or the Test twin) — never
-    the conversation archive root (folder law)."""
-    url = os.environ.get("AGENTLINK_ARCHIVE_URL") or ""
-    if url:
-        return https_depositor(
-            url, os.environ.get("AGENTLINK_ARCHIVE_TOKEN") or "",
-            username)
-    root = os.environ.get("AGENTLINK_DOSSIER_DRIVE_ROOT") or ""
-    cli = "/opt/hatch/bin/hatch_gws_cli"
-    if root and Path(cli).exists():
-        return drive_cli_depositor(root, username, cli)
-    return None
