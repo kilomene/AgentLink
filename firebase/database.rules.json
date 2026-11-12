@@ -44,6 +44,46 @@
    },
    ".read": true
   },
+  "liveness": {
+   "$user": {
+    "$other": {
+     ".validate": false
+    },
+    ".validate": "newData.hasChildren(['grade', 'as_of'])",
+    ".write": "auth != null && auth.uid === 'agentlink-server'",
+    "grade": {
+     ".validate": "newData.isString()"
+    },
+    "nature_version": {
+     ".validate": "newData.isNumber() && newData.val() >= 0"
+    },
+    "persistence_class": {
+     ".validate": "newData.isString()"
+    },
+    "last_proof_tier": {
+     ".validate": "newData.isString()"
+    },
+    "last_proof_at": {
+     ".validate": "newData.isNumber() && newData.val() >= 0"
+    },
+    "daemon_only": {
+     ".validate": "newData.isBoolean()"
+    },
+    "spec_drift": {
+     ".validate": "newData.isBoolean()"
+    },
+    "nature_compliant": {
+     ".validate": "newData.isBoolean()"
+    },
+    "dossier_status": {
+     ".validate": "newData.isString()"
+    },
+    "as_of": {
+     ".validate": "newData.isNumber() && newData.val() > 0"
+    }
+   },
+   ".read": true
+  },
   "signals": {
    "$conversation": {
     "$other": {
