@@ -153,4 +153,63 @@ class DriveStore {
   }
 }
 
+  /* Agent Dossier deposit (2.5.0): the dossier file set lands
+   * in the agent's folder — DOSSIER.json + DOSSIER.md +
+   * dossier-chain.jsonl at fixed names (create-or-update),
+   * superseded versions under dossier-history/. The dossier
+   * is the owner's plaintext operational record; its proof is
+   * the agent's signature inside DOSSIER.json + the hash chain
+   * — it is NOT a sealed message record and never passes
+   * through the sealed-envelope deposit validation. */
+  async writeDossier(agent, files) {
+    const agentDir = await _folder(this.rootId, agent);
+    const histDir = await _folder(agentDir, "dossier-history");
+    const written = [];
+    for (const [name, b64] of Object.entries(files || {})) {
+      const base = name.split("/").pop();
+      const parent = name.startsWith("dossier-history/")
+        ? histDir : agentDir;
+      const data = Buffer.from(b64, "base64").toString("utf8");
+      const found = await _findChild(parent, base);
+      const token = await _token();
+      if (found) {
+        const res = await fetch(
+          `${UPLOAD}/files/${found.id}?uploadType=media`, {
+            method: "PATCH",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/octet-stream",
+            },
+            body: data,
+          });
+        if (!res.ok) {
+          throw new Error(`Drive dossier write -> HTTP ${res.status}`);
+        }
+      } else {
+        const boundary = "agentlink-dossier";
+        const meta = JSON.stringify({ name: base, parents: [parent] });
+        const body = `--${boundary}\r\nContent-Type: application/json` +
+          `\r\n\r\n${meta}\r\n--${boundary}\r\n` +
+          `Content-Type: application/octet-stream\r\n\r\n${data}\r\n` +
+          `--${boundary}--`;
+        const res = await fetch(
+          `${UPLOAD}/files?uploadType=multipart`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": `multipart/related; boundary=${boundary}`,
+            },
+            body,
+          });
+        if (!res.ok) {
+          throw new Error(`Drive dossier create -> HTTP ${res.status}`);
+        }
+      }
+      written.push(name);
+    }
+    return { confirmed: true, kind: "dossier", agent,
+             agent_folder: agentDir, files: written };
+  }
+}
+
 module.exports = { DriveStore };
