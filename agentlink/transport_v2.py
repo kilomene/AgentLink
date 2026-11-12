@@ -3086,6 +3086,31 @@ class ServerlessTransport:
         data = self._fn_post(name, route, payload)
         return {k: v for k, v in data.items() if k != "ok"}
 
+    def deposit_record(self, record: dict) -> dict:
+        """Deposit one record into the platform deposit inbox
+        (2.5.1): the dossier deposit set or one sealed archive
+        record, POSTed to the agentlink-deposit Edge function
+        under MY OWN session JWT — the destination is a hardened
+        built-in of the platform (the function's URL derives
+        from the same functions base as every other Edge call),
+        never an env-configured URL and never a shared token.
+        The function verifies my identity from the JWT, verifies
+        the dossier's own signature for dossier deposits, and
+        lands the record in the platform inbox; the operator
+        drain files it into the owner's Drive trees from there.
+
+        Fail-closed: anything but an explicit {confirmed: true}
+        reply raises, so callers park/queue the deposit instead
+        of believing it landed."""
+        if not self.username or self._signer is None:
+            raise TransportError("deposit needs login")
+        data = self._fn_post("agentlink-deposit", "", record)
+        if not data.get("confirmed"):
+            raise TransportError(
+                "deposit not confirmed by the platform inbox: "
+                + str(data)[:160])
+        return data
+
     @staticmethod
     def _frame_body(frame: dict) -> dict:
         """The request frame minus its type — the Edge route's
