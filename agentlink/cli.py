@@ -108,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         print("commands: relay server register reclaim agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
               "credentials alerts capabilities update doctor census service backup "
-              "oversight-keygen deregister remove-user set-designation grant my-grant inbox sync delivery setup support orders")
+              "oversight-keygen deregister remove-user set-designation grant my-grant inbox sync delivery setup support orders liveness nature dossier archive")
         return 0
     cmd, rest = argv[0], argv[1:]
 
@@ -522,6 +522,14 @@ def main(argv: list[str] | None = None) -> int:
         return _support(rest)
     if cmd == "orders":
         return _orders(rest)
+    if cmd == "liveness":
+        return _liveness(rest)
+    if cmd == "nature":
+        return _nature(rest)
+    if cmd == "dossier":
+        return _dossier(rest)
+    if cmd == "archive":
+        return _archive(rest)
 
     if cmd == "directory":
         ap = argparse.ArgumentParser(prog="agentlink directory")
@@ -729,6 +737,340 @@ def _orders(rest: list[str]) -> int:
     return 2
 
 
+def _liveness(rest: list[str]) -> int:
+    """Life Signs (2.5.0): my grade and my proofs.
+
+    `liveness` / `liveness status` — my persistence class,
+    windows, server-computed grade and BOTH proof tiers, stated
+    separately forever: a daemon receipt proves the DAEMON woke;
+    only a runtime proof proves the runtime. `liveness prove` —
+    the runtime's own countersignature (the waking duty, Orders
+    O2): run by the agent's BRAIN on every waking, never by the
+    daemon on its own. `liveness answer` — manually trigger the
+    daemon's automatic challenge answer (drill/operator
+    convenience; the machinery also runs on beats + reconnects).
+    """
+    sub = rest[0] if rest else "status"
+    r = rest[1:] if rest else []
+    if sub == "status":
+        ap = argparse.ArgumentParser(prog="agentlink liveness status")
+        _add_common(ap)
+        args = ap.parse_args(r)
+        out = asyncio.run(_with_agent(
+            args, lambda a: a.liveness_status(),
+            forward={"cmd": "liveness_status", "timeout": 300}))
+        st = out.get("result") if isinstance(out, dict) \
+            and "result" in out else out
+        if isinstance(st, dict):
+            grade = st.get("grade") or "unproven"
+            print(f"life sign: {grade}"
+                  f" (class: {st.get('persistence_class') or 'undeclared'},"
+                  f" nature v{st.get('nature_version') or 0},"
+                  f" judged by v{st.get('judged_nature_version') or 0})")
+            print(f"  daemon-proven: {st.get('last_daemon_receipt_at') or 'never'}"
+                  f" · runtime-proven: {st.get('last_runtime_proof_at') or 'never'}"
+                  f"{' · DAEMON-ONLY (runtime proof stale)' if st.get('daemon_only') else ''}")
+            if st.get("live_node_stale"):
+                print(f"  live node STALE (as of {st.get('live_node_as_of')})"
+                      " — showing the last known grade, not a current one")
+            if st.get("dossier_status"):
+                print(f"  dossier: {st['dossier_status']}"
+                      f" (last deposited {st.get('dossier_deposited_at') or 'never'};"
+                      " content lives only in the AgentLink System tree)")
+        _print(out)
+        return 0
+    if sub == "prove":
+        ap = argparse.ArgumentParser(prog="agentlink liveness prove")
+        _add_common(ap)
+        args = ap.parse_args(r)
+        out = asyncio.run(_with_agent(
+            args, lambda a: a.liveness_prove(),
+            forward={"cmd": "liveness_prove", "timeout": 300}))
+        _print(out)
+        return 0
+    if sub == "answer":
+        ap = argparse.ArgumentParser(prog="agentlink liveness answer")
+        _add_common(ap)
+        args = ap.parse_args(r)
+
+        async def _go(a):
+            return await a.liveness_answer()
+        out = asyncio.run(_with_agent(args, _go))
+        _print(out)
+        return 0
+    print("usage: agentlink liveness {status|prove|answer} ...",
+          file=sys.stderr)
+    return 2
+
+
+def _archive(rest: list[str]) -> int:
+    """The owner archive's TWO COPIES (2.5.0): SEALED for proof,
+    READABLE for the owner. `archive readable --conversation
+    <id> [--agent <user>]` prints the readable transcript from
+    the local archive staging tree (AGENTLINK_ARCHIVE_LOCAL_DIR)
+    — the same rendering that lands beside the chain file in
+    Drive. The operator backfill lives in the drill-evidence
+    tooling (backfill_readable.py) on top of
+    archive.backfill_entries_from_mailbox."""
+    sub = rest[0] if rest else "readable"
+    r = rest[1:] if rest else []
+    if sub == "readable":
+        ap = argparse.ArgumentParser(prog="agentlink archive readable")
+        ap.add_argument("--conversation", required=True)
+        ap.add_argument("--agent", default="")
+        ap.add_argument("--state-dir", default="")
+        args = ap.parse_args(r)
+        import os as _os
+        root = _os.environ.get("AGENTLINK_ARCHIVE_LOCAL_DIR")
+        if not root:
+            print("AGENTLINK_ARCHIVE_LOCAL_DIR is not set — the "
+                  "readable transcript lives beside the chain "
+                  "file in the archive tree (Drive in "
+                  "production); this command reads the local "
+                  "staging form.")
+            return 2
+        from . import archive as _ar
+        backend = _ar.LocalArchiveBackend(root)
+        agent = args.agent
+        if not agent:
+            # The conversation's first participant folder that
+            # holds a readable copy.
+            import pathlib as _pl
+            for p in sorted(_pl.Path(root).glob("*")):
+                if (p / args.conversation.replace("/", "_")
+                        / "readable.md").exists():
+                    agent = p.name
+                    break
+        if not agent:
+            print(f"no readable copy of {args.conversation} in "
+                  f"the local staging tree")
+            return 1
+        path = backend._readable_path(agent, args.conversation)
+        if not path.exists():
+            print(f"no readable copy at {path} (chain-only "
+                  f"deposit — the depositor held no plaintext)")
+            return 1
+        print(path.read_text())
+        return 0
+    print("usage: agentlink archive readable --conversation <id>")
+    return 2
+
+
+def _dossier(rest: list[str]) -> int:
+    """The Agent Dossier (2.5.0): my extensive record in the
+    owner's Google Drive SYSTEM tree — ONLY there. Generation +
+    deposit are automatic (setup, daemon start, nature change,
+    7-day max-age); these commands are the runtime's window +
+    hand on the two parts that are its own: its
+    self-description and its declared location label.
+
+    `dossier` / `dossier status` — my dossier flag + version +
+    last deposit (content itself is never shown by any client
+    surface; it is the owner's archive record).
+    `dossier update` — run maintenance now (regenerate if
+    stale, drain the deposit queue, report the flag).
+    `dossier describe` — author my self-description + location
+    label (the dossier's self-description section is
+    compulsory; its words are the runtime's own).
+    """
+    sub = rest[0] if rest else "status"
+    r = rest[1:] if rest else []
+    if sub == "status":
+        ap = argparse.ArgumentParser(prog="agentlink dossier status")
+        _add_common(ap)
+        args = ap.parse_args(r)
+        out = asyncio.run(_with_agent(
+            args, lambda a: a.dossier_maintain("status"),
+            forward={"cmd": "dossier_maintain",
+                     "reason": "status", "timeout": 300}))
+        st = out.get("result") if isinstance(out, dict) \
+            and "result" in out else out
+        if isinstance(st, dict):
+            print(f"dossier: {st.get('status')}"
+                  f" · version {st.get('version') or 0}"
+                  f" · last deposited "
+                  f"{st.get('deposited_at') or 'never'}")
+            print("  content lives only in the owner's Drive "
+                  "system tree (AgentLink System/<agent>/"
+                  "DOSSIER.*) — no platform surface carries it")
+        _print(out)
+        return 0
+    if sub == "update":
+        ap = argparse.ArgumentParser(prog="agentlink dossier update")
+        _add_common(ap)
+        args = ap.parse_args(r)
+        out = asyncio.run(_with_agent(
+            args, lambda a: a.dossier_maintain("manual"),
+            forward={"cmd": "dossier_maintain",
+                     "reason": "manual", "timeout": 300}))
+        _print(out)
+        return 0
+    if sub == "describe":
+        ap = argparse.ArgumentParser(
+            prog="agentlink dossier describe")
+        _add_common(ap)
+        ap.add_argument("--text", default=None,
+                        help="my self-description, in my own "
+                             "words (how I work, what I am for)")
+        ap.add_argument("--location-label", default=None,
+                        help="where I run, as a label I or my "
+                             "owner declare (never coordinates, "
+                             "never IP-derived)")
+        args = ap.parse_args(r)
+        state_dir = Path(_state_dir(args)).expanduser()
+        from . import dossier as _dm
+        local = _dm.load_local(state_dir)
+        if args.text is not None:
+            local["self_description"] = args.text
+            local["self_description_updated_at"] = int(time.time())
+        if args.location_label is not None:
+            local["location_label"] = args.location_label
+        _dm.save_local(state_dir, local)
+        print("dossier-local.json updated — the next dossier "
+              "generation carries it (runs automatically; force "
+              "it with `agentlink dossier update`)")
+        return 0
+    print("usage: agentlink dossier {status|update|describe} ...",
+          file=sys.stderr)
+    return 2
+
+
+def _nature(rest: list[str]) -> int:
+    """Nature Profile (2.5.0): my signed declaration of how I run.
+
+    `nature` / `nature show` — declared profile vs the machine
+    this client detects NOW, side by side (the declaration is a
+    signed snapshot; drift between them is shown, never hidden).
+    `nature propose` — sensible per-runtime defaults, proposed
+    only: nothing is signed or sent. `nature declare` — sign +
+    record a declaration: fields not given keep their current
+    declared values (or the proposal, when nothing is declared
+    yet); the machine snapshot is detected fresh and always
+    carried in the declaration (hardened reporting: there is
+    no way to declare without it). Declarations are
+    versioned history; grading judges a silence by the nature in
+    force when it began — a redeclaration never rewrites a past
+    silence."""
+    from .liveness import (detect_machine, machine_drift,
+                           machine_summary, nature_summary,
+                           propose_defaults, validate_profile)
+    sub = rest[0] if rest else "show"
+    r = rest[1:] if rest else []
+    if sub == "propose":
+        ap = argparse.ArgumentParser(prog="agentlink nature propose")
+        ap.add_argument("--state-dir", default=None)
+        args = ap.parse_args(r)
+        proposal = propose_defaults(_state_dir(args))
+        print("proposed nature (NOT declared — review, edit, then"
+              " `agentlink nature declare`):")
+        _print(proposal)
+        print("detected machine (would be carried as the declared"
+              " snapshot):")
+        _print(detect_machine(_state_dir(args)))
+        return 0
+    if sub == "show":
+        ap = argparse.ArgumentParser(prog="agentlink nature show")
+        _add_common(ap)
+        args = ap.parse_args(r)
+        out = asyncio.run(_with_agent(
+            args, lambda a: a.liveness_status(),
+            forward={"cmd": "liveness_status", "timeout": 300}))
+        st = out.get("result") if isinstance(out, dict) \
+            and "result" in out else out
+        profile = (st or {}).get("nature") if isinstance(st, dict) \
+            else None
+        detected = detect_machine(_state_dir(args))
+        print(f"declared: {nature_summary(profile)}"
+              f" (nature v{(st or {}).get('nature_version') or 0},"
+              f" declared at {(st or {}).get('nature_declared_at') or 'never'})")
+        print(f"declared machine: "
+              f"{machine_summary((profile or {}).get('machine'))}")
+        print(f"detected machine: {machine_summary(detected)}")
+        drift = machine_drift((profile or {}).get("machine"),
+                              detected)
+        if drift:
+            print(f"SPEC DRIFT: {', '.join(drift)} — the machine"
+                  " changed since the declaration; redeclare with"
+                  " `agentlink nature declare`")
+        _print({"declared": profile, "detected": detected,
+                "spec_drift": drift})
+        return 0
+    if sub == "declare":
+        ap = argparse.ArgumentParser(prog="agentlink nature declare")
+        _add_common(ap)
+        ap.add_argument("--runtime-kind", default=None,
+                        choices=["persistent-daemon", "session-chat",
+                                 "scheduled", "embedded", "other"])
+        ap.add_argument("--host-class", default=None,
+                        choices=["cloud-vm", "home-pc", "phone",
+                                 "server", "other"])
+        ap.add_argument("--class", default=None,
+                        dest="persistence_class",
+                        choices=["persistent", "session"])
+        ap.add_argument("--suspect-after", type=int, default=None)
+        ap.add_argument("--expected-gap", type=int, default=None)
+        ap.add_argument("--dark-after", type=int, default=None)
+        ap.add_argument("--supervision", default=None,
+                        choices=["none", "service-manager",
+                                 "watchdog", "owner-relaunch"])
+        ap.add_argument("--wake", action="append", default=None,
+                        dest="wake_paths",
+                        choices=["boot-autostart", "owner-action",
+                                 "inbound-task", "none"])
+        ap.add_argument("--duty", default=None)
+        ap.add_argument("--network-class", default=None,
+                        choices=["datacenter", "residential",
+                                 "mobile", ""])
+        args = ap.parse_args(r)
+        state_dir = _state_dir(args)
+        # Step 1: the current declaration (via the daemon when
+        # one runs, else a one-shot agent) — unspecified fields
+        # keep their current declared values.
+        cur_out = asyncio.run(_with_agent(
+            args, lambda a: a.liveness_status(),
+            forward={"cmd": "liveness_status", "timeout": 300}))
+        cur_st = cur_out.get("result") if isinstance(cur_out, dict) \
+            and "result" in cur_out else cur_out
+        current = (cur_st or {}).get("nature") or {} \
+            if isinstance(cur_st, dict) else {}
+        # Step 2: merge + detect + validate HERE, so the exact
+        # profile being signed is printed before it is sent.
+        base = dict(current) if current else propose_defaults(
+            state_dir)
+        merged = dict(base)
+        for key, val in (
+                ("runtime_kind", args.runtime_kind),
+                ("host_class", args.host_class),
+                ("persistence_class", args.persistence_class),
+                ("suspect_after_s", args.suspect_after),
+                ("expected_gap_s", args.expected_gap),
+                ("dark_after_s", args.dark_after),
+                ("supervision", args.supervision),
+                ("wake_paths", args.wake_paths),
+                ("duty_pattern", args.duty),
+                ("network_class", args.network_class)):
+            if val is not None:
+                merged[key] = val
+        # The machine snapshot ALWAYS rides a declaration
+        # (hardened reporting): detection is the client's job,
+        # run automatically — there is no flag to declare
+        # without it.
+        merged["machine"] = detect_machine(state_dir)
+        profile = validate_profile(merged)
+        print("declaring nature (signed, versioned, history kept):")
+        _print(profile)
+        # Step 3: sign + record through the agent's own session.
+        out = asyncio.run(_with_agent(
+            args, lambda a: a.liveness_declare(profile),
+            forward={"cmd": "liveness_declare",
+                     "profile": profile, "timeout": 300}))
+        _print(out)
+        return 0
+    print("usage: agentlink nature {show|propose|declare} ...",
+          file=sys.stderr)
+    return 2
+
+
 def _setup(rest: list[str]) -> int:
     """Full self-setup (2.0.10, class H): network first, then
     register, supervision, probed capabilities, the one-time
@@ -751,6 +1093,12 @@ def _setup(rest: list[str]) -> int:
                          " (owner-present setups and drills)")
     ap.add_argument("--no-service", action="store_true",
                     help="skip the supervision install")
+    ap.add_argument("--declare-nature", action="store_true",
+                    help="accepted for compatibility (2.5.0):"
+                         " nature+machine declaration at setup is"
+                         " AUTOMATIC and carries no opt-out — the"
+                         " hardened reporting ruling; the report"
+                         " shows the declaration either way")
     args = ap.parse_args(rest)
     username = args.username
     if not username:
@@ -760,7 +1108,8 @@ def _setup(rest: list[str]) -> int:
         report = asyncio.run(run_setup(
             username, state_dir=args.state_dir,
             designation=args.designation, grant=args.grant,
-            install_service=not args.no_service))
+            install_service=not args.no_service,
+            declare_nature=args.declare_nature))
     except Exception as exc:
         support = getattr(exc, "support", None)
         check = getattr(exc, "check", None)
@@ -1882,6 +2231,13 @@ def _assign(rest: list[str]) -> int:
     ap.add_argument("--require-approval", action="store_true",
                     help="approval gate: a proven delivery parks in"
                          " awaiting_approval until you approve/reject")
+    ap.add_argument("--heavy", action="store_true",
+                    help="the work is hardware-heavy: the nature-fit"
+                         " lines below warn when an assignee's"
+                         " DECLARED machine carries no GPU (a"
+                         " client-side warning only — fitness is"
+                         " the assigner's judgment, never a platform"
+                         " refusal)")
     ap.add_argument("assignees", help="comma-separated usernames")
     ap.add_argument("title")
     ap.add_argument("instructions", nargs="?", default="")
@@ -1910,6 +2266,34 @@ def _assign(rest: list[str]) -> int:
                  "deadline": args.deadline,
                  "priority": args.priority, "role": args.role,
                  "require_approval": args.require_approval})))
+    # Nature-fit surface (2.5.0): after the assignment, state each
+    # assignee's declared nature + grade + declared machine, so a
+    # long job is never handed to a nature that cannot hold it
+    # blind. Best-effort display — the assignment already landed;
+    # a failed read is reported as unavailable, never hidden.
+    from .liveness import machine_summary, nature_summary
+    for name in assignees:
+        try:
+            out = asyncio.run(_with_agent(
+                args, lambda a, n=name: a.peer_liveness(n),
+                forward={"cmd": "peer_liveness", "username": name,
+                         "timeout": 60}))
+            peer = out.get("result") if isinstance(out, dict) \
+                and "result" in out else out
+            lv = (peer or {}).get("liveness") or {}
+            prof = (peer or {}).get("nature") or {}
+            print(f"nature-fit @{name}: {nature_summary(prof)} · "
+                  f"grade {lv.get('grade') or 'unproven'}"
+                  f"{' · daemon-only' if lv.get('daemon_only') else ''}"
+                  f" · machine (declared): "
+                  f"{machine_summary(prof.get('machine'))}")
+            if args.heavy and prof.get("machine") is not None \
+                    and not (prof["machine"].get("gpus") or []):
+                print(f"  WARNING: @{name} declares no GPU — heavy"
+                      " work fitness is your call (the platform"
+                      " does not refuse assignments)")
+        except Exception as exc:
+            print(f"nature-fit @{name}: unavailable ({exc})")
     return 0
 
 
