@@ -462,6 +462,14 @@ def test_reconnect_reconciliation_fetches_the_queue(pair):
         # later cycles while it stays unacked — at-least-once is
         # the contract; dedupe is the mailbox's job.)
         assert got and got[0]["frame"]["id"] == "m-recon-1"
+        # A reconnect really happened: the second stream attempt
+        # follows the reconciliation on the same loop; allow it
+        # the same bounded window (2.5.0: the loop also fires the
+        # async liveness answer on reconnect — the old immediate
+        # assert raced that legitimate work under load).
+        deadline = time.time() + 5
+        while time.time() < deadline and stream_calls["n"] < 2:
+            time.sleep(0.02)
         assert stream_calls["n"] >= 2  # a reconnect really happened
     finally:
         stop.set()
