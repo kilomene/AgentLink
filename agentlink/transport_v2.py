@@ -123,6 +123,13 @@ from .doorbell import (DoorbellClient, DoorbellError,
                        ScopedPresenceWatcher,
                        conversation_id_for_dm,
                        conversation_id_for_group)
+from .liveness import (declare_payload as _liveness_declare_payload,
+                       drift_payload as _liveness_drift_payload,
+                       prove_payload as _liveness_prove_payload,
+                       receipt_payload as
+                       _liveness_receipt_payload,
+                       validate_profile as
+                       _liveness_validate_profile)
 from .protocol import auth_challenge_payload, new_id, now_ts
 from .retry import DeadLetterPark, RetryPolicy
 from .store import CONTENT_AUDIT_KINDS, PRIORITY_WEIGHT
@@ -570,6 +577,16 @@ class ServerlessTransport:
         self._activeness_state = "offline"
         self._refresh_timer = None
         self.last_refresh_error = ""
+        # Life Signs (2.5.0): the daemon answers liveness
+        # challenges as transport machinery (like presence beats
+        # and delivery receipts — line-level, not cognition). The
+        # last attempt's outcome + the last known server-computed
+        # snapshot live here for status surfaces; attempts are
+        # throttled to the heartbeat (>= 480s apart) and NEVER
+        # raise into a beat or a login.
+        self.last_liveness_error = ""
+        self.last_liveness_attempt_at = 0.0
+        self._liveness_snapshot: dict | None = None
         self.last_slow_sync_error = ""
         self.client_version = ""
         #: Owner-oversight PUBLIC key advertised by the login Edge
@@ -1001,11 +1018,17 @@ class ServerlessTransport:
                     transport="serverless-rest")
                 self.doorbell.start_heartbeat(
                     self.username,
-                    on_transition=self._on_beat_transition)
+                    on_transition=self._on_beat_transition,
+                    on_beat=self._on_liveness_beat)
             except DoorbellError as exc:
                 self.slow_sync_active = True
                 self.last_signal_error = str(exc)
         self._transition_activeness("online")
+        # Life Signs (2.5.0): a daemon that just came up answers
+        # any waiting challenge immediately — for a session agent
+        # this IS the wake proof (daemon-tier, labelled as such).
+        # Fire-and-forget: liveness never delays or fails a login.
+        self._liveness_attempt_async()
 
     def stop_activeness(self) -> None:
         """Clean activeness shutdown: stop beats, write the
@@ -1019,6 +1042,339 @@ class ServerlessTransport:
             except DoorbellError:
                 pass
         self._transition_activeness("offline")
+
+    # ------------------------------------------------ Life Signs
+    # (2.5.0, migration v213): challenges + receipts + proofs +
+    # nature declarations. The daemon answers challenges as
+    # transport machinery: it signs the nonce with the agent's
+    # identity key and the receipt records the DAEMON tier — the
+    # tier string is inside the signed payload and this path only
+    # ever signs 'daemon' (liveness.receipt_payload; gate-pinned).
+    # The runtime tier is signed ONLY by liveness_prove(), which
+    # the agent's runtime invokes itself (`agentlink liveness
+    # prove`). The platform verifies; it never signs for anyone.
+
+    def _liveness_sign(self, payload: str) -> str:
+        if self._signer is None:
+            raise TransportError("liveness signing needs login")
+        sig = self._signer(payload.encode())
+        if isinstance(sig, bytes):
+            return base64.b64encode(sig).decode()
+        return str(sig)
+
+    def answer_liveness_challenges(self) -> dict:
+        """Answer my outstanding liveness challenge, if one
+        waits. Returns a result dict; NEVER raises — a failed
+        answer is recorded (last_liveness_error) for status
+        surfaces, exactly like a failed beat."""
+        self.last_liveness_attempt_at = time.time()
+        if not self.username or self._signer is None:
+            return {"answered": False, "reason": "not_logged_in"}
+        try:
+            data = self._fn_post("agentlink-liveness", "challenge",
+                                 {})
+            ch = data.get("challenge") if isinstance(data, dict) \
+                else None
+            if not ch:
+                return {"answered": False, "reason": "no_challenge"}
+            ts = int(time.time())
+            payload = _liveness_receipt_payload(
+                self.username, str(ch["id"]), str(ch["nonce"]),
+                "daemon", ts)
+            result = self._fn_post(
+                "agentlink-liveness", "answer",
+                {"challenge_id": str(ch["id"]), "ts": ts,
+                 "sig": self._liveness_sign(payload)})
+            self.last_liveness_error = ""
+            return {"answered": True, "challenge_id": str(ch["id"]),
+                    "tier": "daemon", "ts": ts, "result": result}
+        except Exception as exc:  # noqa: BLE001 - recorded, soft
+            self.last_liveness_error = str(exc)[:300]
+            return {"answered": False, "reason": "error",
+                    "error": self.last_liveness_error}
+
+    def _liveness_attempt_async(self) -> None:
+        try:
+            threading.Thread(
+                target=self.answer_liveness_challenges,
+                name="agentlink-liveness-answer",
+                daemon=True).start()
+        except Exception:
+            pass
+
+    def _on_liveness_beat(self, ok: bool) -> None:
+        """Heartbeat-thread callback (per 180s beat): attempt a
+        challenge answer at most every 480s (the persistent
+        challenge cadence guard in the sweep is 480s; checking
+        more often would only read 'no challenge')."""
+        if not ok:
+            return
+        if time.time() - self.last_liveness_attempt_at < 480:
+            return
+        self._liveness_attempt_async()
+
+    def liveness_prove(self) -> dict:
+        """The RUNTIME's countersignature (tier=runtime). Only
+        the agent's own runtime calls this — on waking, per the
+        Standing Orders (O2). Raises on failure: a proof that did
+        not land must be visible to the runtime that owes it."""
+        if not self.username or self._signer is None:
+            raise TransportError("liveness prove needs login")
+        ts = int(time.time())
+        payload = _liveness_prove_payload(self.username, ts)
+        result = self._fn_post(
+            "agentlink-liveness", "prove",
+            {"ts": ts, "sig": self._liveness_sign(payload)})
+        return {"proved": True, "tier": "runtime", "ts": ts,
+                "result": result}
+
+    def liveness_declare(self, profile: dict) -> dict:
+        """Declare (or redeclare) my nature: the profile is
+        validated, canonicalised and signed by MY key; the Edge
+        verifies and the platform appends it to my signed
+        declaration history. Versioning + anti-gaming judging
+        are the sweep's law (migration v213) — a redeclaration
+        applies prospectively, never retroactively."""
+        if not self.username or self._signer is None:
+            raise TransportError("liveness declare needs login")
+        clean = _liveness_validate_profile(profile)
+        ts = int(time.time())
+        payload = _liveness_declare_payload(self.username, clean,
+                                            ts)
+        result = self._fn_post(
+            "agentlink-liveness", "declare",
+            {"profile": clean, "ts": ts,
+             "sig": self._liveness_sign(payload)})
+        return {"declared": True, "profile": clean, "ts": ts,
+                "result": result}
+
+    def ensure_nature_declared(self, state_dir) -> dict:
+        """AUTOMATIC nature+spec assertion (2.5.0, owner's
+        hardening ruling): reporting is not optional and carries
+        NO opt-out — no config flag, no env var, no prompt. This
+        runs on the daemon's on-line path (setup + every start +
+        drift) and declares when the record needs it:
+
+        * no declaration on record -> declare (the per-runtime
+          proposal as the baseline + the freshly detected
+          machine; the runtime may redeclare its judgment
+          fields at any time — they are never a gate on the
+          machine facts being reported),
+        * declared machine != detected machine (drift) ->
+          redeclare with the fresh snapshot,
+        * the client version moved since the declaration
+          (client_runtime carries it) -> redeclare, so version
+          truth (O5) and the declaration never diverge.
+
+        Detection gaps never block the declaration: failed
+        fields go as 'unknown' with a detection_gap note —
+        silence is not a representable state. A declaration
+        that cannot LAND (network) is reported in the result,
+        never hidden; the next start retries, and the record
+        carries nature_compliant=false meanwhile (visibility +
+        consequence, never lockout)."""
+        from .liveness import (detect_machine, detection_gaps,
+                               machine_drift, propose_defaults)
+        result: dict = {"declared": False, "current": False,
+                        "reasons": []}
+        try:
+            detected = detect_machine(state_dir)
+        except Exception as exc:  # detection itself failed open
+            detected = {"hostname": "unknown", "os": "unknown",
+                        "os_version": "", "kernel": "",
+                        "arch": "unknown", "cpu_model": "unknown",
+                        "cores_physical": None,
+                        "cores_logical": None, "ram_mb": None,
+                        "gpus": [], "storage_total_mb": None,
+                        "storage_free_mb": None,
+                        "client_runtime": "",
+                        "detected_at": int(time.time())}
+            result["reasons"].append(f"detection_failed: {exc}")
+        current = None
+        try:
+            current = self.liveness_status().get("nature")
+        except Exception:
+            current = None
+        reasons: list[str] = []
+        if not current:
+            reasons.append("no declaration on record")
+        else:
+            drift = machine_drift(current.get("machine"),
+                                  detected)
+            if drift:
+                reasons.append(
+                    "spec drift: " + ",".join(drift))
+            from . import __version__ as _client_version
+            runtime_seen = str(
+                (current.get("machine") or {}).get(
+                    "client_runtime") or "")
+            if _client_version not in runtime_seen:
+                reasons.append("client version changed")
+        if not reasons:
+            result["current"] = True
+            return result
+        base = dict(current) if current else propose_defaults(
+            state_dir)
+        base["machine"] = detected
+        gaps = detection_gaps(detected)
+        if gaps:
+            base["detection_gap"] = ",".join(gaps)
+        elif "detection_gap" in base:
+            base.pop("detection_gap", None)
+        try:
+            profile = _liveness_validate_profile(base)
+            out = self.liveness_declare(profile)
+            result.update({"declared": True,
+                           "reasons": reasons,
+                           "nature_version": (out.get("result")
+                                              or {}).get(
+                                                  "nature_version")})
+        except Exception as exc:  # noqa: BLE001 - fail-visible
+            result.update({"declared": False,
+                           "reasons": reasons,
+                           "error": str(exc)[:300]})
+            self.last_liveness_error = str(exc)[:300]
+        return result
+
+    def report_spec_drift(self, fields: list[str]) -> dict:
+        """Report machine spec drift (2.5.0): the daemon detected
+        at start that this machine no longer matches the declared
+        snapshot; the signed report puts the drift on my record
+        (grade surfaces + the live node carry it) until I
+        redeclare. Field NAMES only — the new values arrive with
+        the next declaration's snapshot."""
+        if not self.username or self._signer is None:
+            raise TransportError("drift report needs login")
+        ts = int(time.time())
+        payload = _liveness_drift_payload(self.username,
+                                          list(fields), ts)
+        result = self._fn_post(
+            "agentlink-liveness", "drift",
+            {"fields": sorted(str(f) for f in fields), "ts": ts,
+             "sig": self._liveness_sign(payload)})
+        return {"reported": True, "fields": sorted(fields),
+                "result": result}
+
+    def report_dossier_status(self, status: str,
+                              deposited_at: int,
+                              version: int) -> dict:
+        """Report my dossier flag (2.5.0): the signed status the
+        grade surfaces + live node carry — a flag + the last
+        confirmed deposit date ONLY. Dossier content never
+        transits the platform (Drive archive only)."""
+        if not self.username or self._signer is None:
+            raise TransportError("dossier report needs login")
+        from .liveness import dossier_status_payload
+        ts = int(time.time())
+        payload = dossier_status_payload(
+            self.username, status, int(deposited_at or 0),
+            int(version or 0), ts)
+        result = self._fn_post(
+            "agentlink-liveness", "dossier-status",
+            {"status": status,
+             "deposited_at": int(deposited_at or 0),
+             "version": int(version or 0), "ts": ts,
+             "sig": self._liveness_sign(payload)})
+        return {"reported": True, "status": status,
+                "result": result}
+
+    def liveness_status(self) -> dict:
+        """My Life Signs surface: declared nature + windows, the
+        server-computed grade and both proof tiers. ONE truth on
+        every surface (owner's real-time ruling): the LIVE node
+        (/liveness/<me>) is read first — it is the freshest
+        graded truth, written at transition/proof time — and the
+        record layer (own-row RLS reads under my JWT) is the
+        fallback + the source of the declaration detail. A live
+        node older than the staleness bound is reported AS
+        STALE with its as_of: the last known grade, never
+        dressed as current."""
+        if not self.username:
+            raise TransportError("liveness status needs login")
+        lv_rows = self._rest(
+            "GET", "al_liveness",
+            "select=username,grade,grade_since,daemon_only,"
+            "spec_drift,last_daemon_receipt_at,"
+            "last_runtime_proof_at,judged_nature_version,"
+            "judged_declared_at,judged_class,nature_compliant,"
+            "noncompliant_since,dossier_status,"
+            "dossier_deposited_at,dossier_version"
+            f"&username=eq.{self.username}")
+        me_rows = self._rest(
+            "GET", "al_users",
+            "select=username,persistence_class,suspect_after_s,"
+            "dark_after_s,expected_gap_s,nature_profile,"
+            "nature_version,nature_declared_at,last_seen"
+            f"&username=eq.{self.username}")
+        lv = lv_rows[0] if lv_rows else {}
+        me = me_rows[0] if me_rows else {}
+        status = {
+            "username": self.username,
+            "persistence_class": me.get("persistence_class"),
+            "declared_windows": {
+                "suspect_after_s": me.get("suspect_after_s"),
+                "expected_gap_s": me.get("expected_gap_s"),
+                "dark_after_s": me.get("dark_after_s")},
+            "nature": me.get("nature_profile"),
+            "nature_version": me.get("nature_version") or 0,
+            "nature_declared_at": me.get("nature_declared_at") or 0,
+            "grade": lv.get("grade") or "",
+            "grade_since": lv.get("grade_since") or 0,
+            "daemon_only": bool(lv.get("daemon_only")),
+            "spec_drift": lv.get("spec_drift") or "",
+            "last_daemon_receipt_at":
+                lv.get("last_daemon_receipt_at") or 0,
+            "last_runtime_proof_at":
+                lv.get("last_runtime_proof_at") or 0,
+            "last_seen": me.get("last_seen") or 0,
+            "judged_nature_version":
+                lv.get("judged_nature_version") or 0,
+            "dossier_status": lv.get("dossier_status") or "",
+            "dossier_deposited_at":
+                lv.get("dossier_deposited_at") or 0,
+            "last_liveness_error": self.last_liveness_error,
+        }
+        # Live node first for the grade fields it carries.
+        try:
+            node = self.doorbell.read_liveness(self.username) \
+                if self.doorbell.has_token else None
+        except Exception:
+            node = None
+        if node:
+            as_of_ms = node.get("as_of")
+            as_of = int(as_of_ms) // 1000 if isinstance(
+                as_of_ms, (int, float)) and as_of_ms > 10**12 \
+                else int(as_of_ms or 0)
+            stale = bool(as_of) and \
+                (int(time.time()) - as_of) > 180
+            status["live_node"] = node
+            status["live_node_as_of"] = as_of
+            status["live_node_stale"] = stale
+            if node.get("grade"):
+                status["grade"] = str(node["grade"])
+                status["grade_source"] = "live-node" + (
+                    "-stale" if stale else "")
+            if node.get("last_proof_tier"):
+                status["last_proof_tier"] = node["last_proof_tier"]
+                status["last_proof_at"] = node.get(
+                    "last_proof_at") or 0
+        if not status["grade"]:
+            status["grade"] = "unproven"
+            status["grade_source"] = "none"
+        elif "grade_source" not in status:
+            status["grade_source"] = "record"
+        self._liveness_snapshot = dict(status)
+        return status
+
+    def peer_liveness(self, username: str) -> dict:
+        """Nature-fit surface for assignment (2.5.0): a peer's
+        declared nature + machine + current grade + last proofs,
+        read through the liveness Edge (fleet-visible operational
+        metadata — the directory's class of fact, never content).
+        Display only: fitness is the assigner's judgment, never a
+        platform refusal."""
+        return self._fn_post("agentlink-liveness", "peer",
+                             {"username": username})
 
     def login(self, username: str, signer, client_version: str = "",
               decision_link: str | None = None,
@@ -2547,6 +2903,10 @@ class ServerlessTransport:
                         on_frames(frames)
                 except Exception as exc:  # noqa: BLE001 - recorded
                     self.last_slow_sync_error = str(exc)
+                # Life Signs (2.5.0): a reconnect is a waking —
+                # answer any challenge that waited while the
+                # stream was down (daemon tier, as always).
+                self._liveness_attempt_async()
             if self.listen_signals(callback):
                 attempt = 0
                 connected_once = True
