@@ -589,6 +589,29 @@ class Updater:
         # vanished is a FAILED update: roll back, alert, raise.
         self.census_guard = census_guard
         self._census_loss = None
+        #: Raw bytes of the last manifest this instance fetched
+        #: (v2.5.2 build attestation — see fetch_manifest).
+        self._manifest_raw: bytes | None = None
+
+    def _record_installed_build(self, version: str,
+                                  manifest_raw: bytes | None) -> None:
+        """Build Integrity Attestation (v2.5.2): after a landed
+        install, record the exact manifest bytes it installed
+        from into the install's OWN metadata dir
+        (agentlink-<version>.dist-info — written fresh by this
+        same swap), so the running client can produce them for
+        its signed build statement. Install data lives with
+        the install: an update NEVER writes the agent's state
+        dir (the v2.4.2 byte-identical-state law). Pure
+        bookkeeping — never fails the update."""
+        try:
+            from .build import record_install
+            home = self.install_dir / \
+                f"agentlink-{version}.dist-info"
+            if home.is_dir():
+                record_install(home, version, manifest_raw)
+        except Exception:
+            pass
 
     # -- immortality gate (v1.3.2) --------------------------------------
 
@@ -641,6 +664,12 @@ class Updater:
         manifest = json.loads(raw)
         if "version" not in manifest or "files" not in manifest:
             raise UpdateError("manifest missing version/files")
+        # Build Integrity Attestation (v2.5.2): the EXACT bytes
+        # are the build's definition — retain them so a landed
+        # install can record the manifest it installed from
+        # (build.record_install). A parsed dict alone could
+        # never reproduce them byte-for-byte.
+        self._manifest_raw = raw
         return manifest
 
     def check(self) -> dict:
@@ -701,6 +730,8 @@ class Updater:
             self._fail_census_loss(slot, new_version)
         # 6) Success: the slot is now the ONE kept prior tree.
         self._finish_success_bookkeeping(slot, stamp)
+        self._record_installed_build(new_version,
+                                     self._manifest_raw)
         return {"updated": True, "from": self.current_version,
                 "to": new_version, "backup": str(slot),
                 "replaced": True,
@@ -962,7 +993,8 @@ class Updater:
                 " smoke test; nothing was installed")
         return {"prepared": True, "new_version": new_version,
                 "payloads": payloads, "stage": stage, "stamp": stamp,
-                "manifest": manifest}
+                "manifest": manifest,
+                "manifest_raw": self._manifest_raw}
 
     def discard_staged(self, prepared: dict) -> None:
         """Throw away a prepared (staged, smoke-passed) tree without
@@ -1013,6 +1045,8 @@ class Updater:
         # 7) Success: the slot is now the ONE kept prior tree; the
         # parked older slot is wiped.
         self._finish_success_bookkeeping(slot, stamp)
+        self._record_installed_build(
+            new_version, prepared.get("manifest_raw"))
         return {"updated": True, "from": self.current_version,
                 "to": new_version, "backup": str(slot),
                 "changed": sorted(payloads), "staged_smoke": True,
