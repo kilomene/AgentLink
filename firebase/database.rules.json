@@ -78,6 +78,15 @@
     "dossier_status": {
      ".validate": "newData.isString()"
     },
+    "build_integrity": {
+     ".validate": "newData.isString()"
+    },
+    "build_version": {
+     ".validate": "newData.isString()"
+    },
+    "build_digest": {
+     ".validate": "newData.isString()"
+    },
     "as_of": {
      ".validate": "newData.isNumber() && newData.val() > 0"
     }
