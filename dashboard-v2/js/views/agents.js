@@ -130,6 +130,41 @@ function natureLine(r){
   if(prof.duty_pattern) line += '<br><small>' + esc(String(prof.duty_pattern)) + "</small>";
   return line;
 }
+
+// Build integrity chip (2.5.2, the Street Rule): the
+// PLATFORM's verdict on the build this agent runs, computed
+// server-side from its signed attestation against the
+// registered release digest — never the agent's own version
+// string. stock = the attested manifest IS the release;
+// modified = a verified attestation names a different build
+// (non-compliant, shown everywhere non-compliance is shown);
+// unattested = no verified attestation (every pre-2.5.2
+// build reads this until it lands 2.5.2). Node-first,
+// record fallback, exactly like the grade.
+function buildLine(r){
+  const node = r.livenessNode || null;
+  const rec = r.liveness || null;
+  let verdict = "", bVer = "", bDig = "";
+  if(node && node.build_integrity){
+    verdict = String(node.build_integrity);
+    bVer = String(node.build_version || "");
+    bDig = String(node.build_digest || "");
+  } else if(rec){
+    verdict = String(rec.build_integrity || "unattested");
+    bVer = String(rec.build_version || "");
+    bDig = String(rec.build_digest || "").slice(0, 12);
+  }
+  if(!verdict) verdict = "unattested";
+  const detail = (bVer ? " · v" + esc(bVer) : "") +
+    (bDig ? " · " + esc(bDig) + "…" : "");
+  if(verdict === "modified")
+    return '<br><small><b>build: MODIFIED' + detail + '</b>' +
+      ' — non-compliant (platform verdict)</small>';
+  if(verdict === "stock")
+    return '<br><small>build: stock' + detail +
+      ' (attested)</small>';
+  return '<br><small>build: unattested' + detail + '</small>';
+}
 function beatAgeCell(r, age){
   return '<span data-beat-age-user="' + esc(r.username) + '">' +
     (age === null || age === undefined ? "—" : age + "s ago") + "</span>";
@@ -196,7 +231,7 @@ function rosterHtml(d, now){
     return '<tr><td data-label="Agent" class="tfirst">' + avatar(r.username) + " <b>@" + esc(r.username) + "</b>" +
       (r.display_name ? '<br><small>' + esc(r.display_name) + "</small>" : "") +
       '<br><small>' + esc(r.designation || "production") + " · mode " + esc(r.mode || "autonomous") + '</small>' +
-      natureLine(r) + '</td><td data-label="Life sign">' +
+      natureLine(r) + buildLine(r) + '</td><td data-label="Life sign">' +
       lifeSignCell(r, now) + '</td><td data-label="Beat age">' + beatAgeCell(r, age) + '</td><td data-label="Version">' +
       versionCell(r, latest) + '</td><td data-label="Reachability">' +
       esc(r.reachability || REACHABILITY[state]) + '</td><td data-label="Trust">' +
