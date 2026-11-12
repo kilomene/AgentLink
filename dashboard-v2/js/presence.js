@@ -178,6 +178,64 @@ export function applyPresence(data, presence, nowSeconds){
   return data;
 }
 
+// ------------------------------------------------ Life Signs
+// (2.5.0): /liveness/<username> holds {grade, nature_version,
+// persistence_class, last_proof_tier, last_proof_at, daemon_only,
+// spec_drift, as_of} — written by the platform's verification
+// machinery (the liveness Edge at proof time, the doorbell
+// tapper at sweep transitions) from the record layer's truth.
+// The dashboard subscribes exactly like presence: server-push,
+// seeded by one snapshot per (re)connect, never polled. A node
+// whose as_of ages past the staleness bound is displayed AS
+// STALE with its age — the last known grade, never dressed as
+// current; no node at all reads "unproven".
+export const LIVENESS_STALE_S = 180;
+let lastLiveness = {};
+export function currentLiveness(){ return lastLiveness; }
+export function livenessUrl(){ return (window.AGENTLINK_CONFIG||{}).firebaseDbUrl + "/liveness.json"; }
+export async function fetchLiveness(){
+  const r = await fetch(livenessUrl()); if(!r.ok) throw new Error("liveness read failed ("+r.status+")");
+  return (await r.json()) || {};
+}
+export function streamLiveness(onUpdate, onError){
+  let stopped = false, es = null, backoff = 2000, retry = null;
+  const deliver = (path, data) => {
+    if(stopped) return;
+    lastLiveness = mergePresencePatch(lastLiveness, path, data);
+    try{ onUpdate(lastLiveness); }catch(_){}
+  };
+  const connect = () => {
+    if(stopped) return;
+    fetchLiveness()
+      .then(snap => { if(!stopped && snap && typeof snap === "object") deliver("/", snap); })
+      .catch(() => { /* stream events still seed the map */ });
+    try{
+      es = new EventSource(livenessUrl());
+      es.addEventListener("put", e => { backoff = 2000; try{ const d = JSON.parse(e.data); if(d && d.data !== undefined) deliver(d.path || "/", d.data); }catch(_){} });
+      es.addEventListener("patch", e => { try{ const d = JSON.parse(e.data); if(d && d.data !== undefined) deliver(d.path || "/", d.data); }catch(_){} });
+      es.onerror = () => {
+        if(es){ es.close(); es = null; }
+        if(onError) onError(new Error("liveness stream interrupted"));
+        if(!stopped){ retry = setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 30000); }
+      };
+    }catch(err){
+      if(onError) onError(err);
+      if(!stopped){ retry = setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 30000); }
+    }
+  };
+  connect();
+  return () => { stopped = true; if(retry) clearTimeout(retry); if(es) es.close(); };
+}
+
+export function applyLiveness(data, liveness){
+  lastLiveness = liveness || {};
+  for(const u of [...(data.users||[]), ...(data.testUsers||[])]){
+    u.livenessNode = lastLiveness[u.username] || null;
+  }
+  data.liveness = lastLiveness;
+  return data;
+}
+
 // Local 5s UI tick: re-evaluates ladder states from the presence
 // snapshot already in memory. Ages advance locally - beats already
 // arrive via the stream above; the tick only recomputes
