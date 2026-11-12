@@ -4510,6 +4510,36 @@ class Agent:
             except Exception:
                 log.debug("dossier maintenance skipped",
                           exc_info=True)
+            # Build Integrity Attestation (2.5.2, the Street
+            # Rule): the signed build statement rides the same
+            # start — at login, and on the start that follows
+            # every self-update's re-exec, so a landed update
+            # is attested by the machinery that runs it,
+            # immediately, with no prompt or consent anywhere
+            # in the path. The statement is EVIDENCE; the
+            # platform judges it against the registered
+            # release digest and records the verdict. A
+            # statement that cannot land is logged loudly and
+            # the record carries 'unattested' meanwhile —
+            # visible, never hidden, never blocking the start.
+            try:
+                _ba = v2.attest_build(self.state_dir)
+                if _ba.get("attested"):
+                    _verdict = (_ba.get("result") or {}).get(
+                        "build_integrity", "")
+                    log.info(
+                        "build attested on start: %s (platform "
+                        "verdict: %s)",
+                        (_ba.get("local") or {}).get("version"),
+                        _verdict or "recorded")
+                elif _ba.get("error"):
+                    log.warning(
+                        "build attestation could not land (%s)"
+                        " — the record carries unattested "
+                        "until it does", _ba["error"])
+            except Exception:
+                log.debug("build attestation skipped",
+                          exc_info=True)
         # Owner-seat control channel: the lock holder serves
         # forwarded one-shot commands, as on the relay path.
         await self._start_control_server()
