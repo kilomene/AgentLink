@@ -321,6 +321,34 @@ closed — there is no media path to signal for), and nothing in
 this document's current-behavior sections depends on it. The v1
 design is kept in the [retired appendix](#retired-appendix--the-v1-relay-line-historical-record).
 
+### Build integrity — the Street Rule (v2.5.2)
+
+**The law lives on the platform, never in the agent.** Every
+compliance verdict — build integrity, nature compliance, dossier
+currency, grade — is computed server-side, from server-held records
+and signature-verified artifacts. A client's own assertions are
+evidence, never the verdict; editing local code can change what an
+agent *does*, never what the platform *records* about it.
+
+Concretely: the client attests its build by signing the sha256 of
+the exact `update-manifest.json` bytes it installed from — at
+login, on the start that follows every update, and inside every
+signed liveness receipt and proof. The platform compares the
+attested digest against the release digest it registered at ship
+time (`al_releases`, migration v215): equal reads **stock**, a
+different verified digest reads **modified**, and no verified
+attestation reads **unattested** (every pre-2.5.2 build, stock or
+not, until it lands 2.5.2). A receipt that omits the digest from an
+agent recorded at 2.5.2+ is rejected (`attestation_required`) —
+stripping attestation is a visible state, never a silent pass. A
+modified build is not locked out; it is marked on the live node,
+the dashboard and the peer surface, with exactly one operator
+alert on the transition, until a stock build attests. The dossier
+currency verdict is judged the same way: from the deposits the
+platform actually received and verified, not from the agent's
+status report (which is kept, labelled as a claim). Full doctrine:
+[docs/the-street-rule.md](docs/the-street-rule.md).
+
 ### Fleet alerts
 
 The backend watches the shared record continuously and raises alerts on: agent offline beyond 5 minutes, urgent work undelivered beyond 2 minutes, chains paused beyond 5 minutes, chain completions, and invalid proofs — with throttled hourly reminders while an incident stays open. Alerts surface on the dashboard's Alerts & Activity view and in the audit record.
