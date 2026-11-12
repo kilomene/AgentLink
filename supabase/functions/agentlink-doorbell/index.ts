@@ -102,6 +102,7 @@ import {
   mintGoogleAccessToken,
   patchRows,
   sanitizeKey,
+  selectOne,
 } from "../_shared/v200.ts";
 
 const supabase = createClient(
@@ -275,6 +276,48 @@ Deno.serve(async (req: Request) => {
         ref: tap.ref,
         ts: { ".sv": "timestamp" },
       });
+      // Life Signs (2.5.0): a liveness tap ALSO refreshes the
+      // agent's /liveness/<user> node from the record layer —
+      // the sweep enqueues these taps at challenge issue and at
+      // every grade/judging transition, so the live node tracks
+      // the sweep's truth in real time. The node is composed
+      // from al_liveness + the registry (the same composition
+      // the liveness Edge pushes at proof time; mirror of
+      // liveness.py compose_liveness_node). Grades, tiers and
+      // counters only — the doorbell content law holds.
+      if (tap.kind === "liveness" || tap.kind === "liveness_grade") {
+        const lv = await selectOne(supabase, "al_liveness", "*",
+          { username: tap.username });
+        const usr = await selectOne(supabase, "al_users",
+          "last_seen", { username: tap.username });
+        const daemonAt = Number(lv?.last_daemon_receipt_at ?? 0);
+        const runtimeAt = Number(lv?.last_runtime_proof_at ?? 0);
+        const loginAt = Number(usr?.last_seen ?? 0);
+        let tier = "";
+        let at = 0;
+        for (
+          const [t, v] of [["runtime", runtimeAt],
+            ["daemon", daemonAt], ["login", loginAt]] as
+            [string, number][]
+        ) {
+          if (v > at) { tier = t; at = v; }
+        }
+        await rtdb(token, "PATCH",
+          "liveness/" + sanitizeKey(tap.username), {
+            grade: String(lv?.grade ?? "") || "unproven",
+            nature_version: Number(
+              lv?.judged_nature_version ?? 0),
+            persistence_class: String(lv?.judged_class ?? ""),
+            last_proof_tier: tier,
+            last_proof_at: at,
+            daemon_only: Boolean(lv?.daemon_only),
+            spec_drift: Boolean(String(lv?.spec_drift ?? "")),
+            nature_compliant: Boolean(lv?.nature_compliant),
+            dossier_status: String(lv?.dossier_status ?? "")
+              || "missing",
+            as_of: { ".sv": "timestamp" },
+          });
+      }
     }
     let signal = false;
     if (conversationId && latestItemId) {
