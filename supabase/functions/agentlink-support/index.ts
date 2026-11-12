@@ -352,8 +352,40 @@ Deno.serve(async (req: Request) => {
         signed.push({ ...a, download_url: dl });
       }
       const { claim_secret_hash: _drop, ip_hash: _drop2, ...rest } = row;
+      // Life Signs context (2.5.0): half of Folk-class tickets
+      // are nature mismatches — the operator reads the ticket
+      // WITH the agent's declared nature, declared machine and
+      // current grade beside it. Read-only registry facts; a
+      // ticket from an unregistered name says so plainly.
+      let natureContext: Record<string, unknown> = {
+        registered: false,
+        note: "no registered agent by the ticket's name",
+      };
+      const tUser = String(row.desired_username ?? "");
+      if (tUser) {
+        const { data: urows } = await supabase
+          .from("al_users")
+          .select("username, persistence_class, nature_profile, " +
+            "nature_version, nature_declared_at")
+          .eq("username", tUser).limit(1);
+        const u = urows?.[0];
+        if (u) {
+          const { data: lrows } = await supabase
+            .from("al_liveness")
+            .select("grade, daemon_only, spec_drift, " +
+              "last_daemon_receipt_at, last_runtime_proof_at")
+            .eq("username", tUser).limit(1);
+          natureContext = {
+            registered: true,
+            nature: u.nature_profile ?? null,
+            nature_version: u.nature_version ?? 0,
+            liveness: lrows?.[0] ?? null,
+          };
+        }
+      }
       return jsonResponse({ ok: true,
-        ticket: { ...rest, attachments: signed } });
+        ticket: { ...rest, attachments: signed },
+        nature_context: natureContext });
     }
     if (path === "/operator/answer" ||
         path === "/operator/fixed" ||
