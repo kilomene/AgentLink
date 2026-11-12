@@ -2923,15 +2923,19 @@ class Agent:
         return await asyncio.to_thread(v2.peer_liveness, username)
 
     def _dossier_maintain(self, reason: str) -> dict:
-        """The Agent Dossier duty (2.5.0, hardened reporting):
-        generate when stale, drain the deposit queue when a
-        route exists, and report the flag. AUTOMATIC — at
-        setup, at daemon start, on nature version change, and
-        on the 7-day max-age refresh. Mandatory-but-non-
-        blocking: any failure is recorded in the result and the
-        flag; it never raises into the daemon. Dossier CONTENT
-        is built + deposited only (Drive System tree); the platform
-        sees the flag + deposit date and nothing else."""
+        """The Agent Dossier duty (2.5.0, hardened reporting;
+        destination hardened 2.5.1): generate when stale, drain
+        the deposit queue into the platform deposit inbox (the
+        built-in route, my own session identity — there is no
+        other destination and no destination to be missing),
+        and report the flag. AUTOMATIC — at setup, at daemon
+        start, on nature/client version change, and on the
+        7-day max-age refresh. Mandatory-but-non-blocking: any
+        failure is recorded in the result and the flag; it
+        never raises into the daemon. Dossier CONTENT is built
+        + deposited only (Drive System tree, via the operator
+        drain); the platform sees the flag + deposit date and
+        nothing else."""
         from . import dossier as dossier_mod
         out: dict = {"reason": reason}
         try:
@@ -2947,8 +2951,9 @@ class Agent:
                 status = {}
             nature_version = int(status.get("nature_version")
                                  or 0)
-            if dossier_mod.needs_refresh(self.state_dir,
-                                         nature_version):
+            if dossier_mod.needs_refresh(
+                    self.state_dir, nature_version,
+                    client_version=_package_version()):
                 standing = {
                     "grade": status.get("grade") or "unproven",
                     "nature_compliant": bool(
@@ -3003,12 +3008,16 @@ class Agent:
                     nature_profile=status.get("nature"),
                     standing=standing)
                 out["generated"] = gen["version"]
-            depositor = dossier_mod.resolve_depositor(
-                self.username)
-            if depositor is not None:
-                drained = dossier_mod.drain_queue(
-                    self.state_dir, depositor)
-                out["drain"] = drained
+            # The destination is a platform built-in (2.5.1):
+            # my own transport carries the deposit to the
+            # platform inbox under my own session identity.
+            # There is no route to be absent — a deposit either
+            # confirms or the queue + flag carry the failure.
+            depositor = dossier_mod.platform_depositor(
+                v2, self.username)
+            drained = dossier_mod.drain_queue(
+                self.state_dir, depositor)
+            out["drain"] = drained
             st = dossier_mod.load_state(self.state_dir)
             flag = dossier_mod.dossier_status(
                 self.state_dir, nature_version)
@@ -3645,22 +3654,23 @@ class Agent:
                 self.state_dir / "deposit-retry.json")
         return transport
 
-    #: Production archive service (workstream d): the Firebase
-    #: Cloud Function hosting the deposit service. Until it is
-    #: deployed, deposits to it fail and disappearing sends fail
-    #: CLOSED — by design, never silently unarchived.
-    ARCHIVE_SERVICE_URL_DEFAULT = (
-        "https://us-central1-agentlink-84609.cloudfunctions.net/"
-        "archiveDeposit")
-
     def _archive_deposit_sync(self, record: dict) -> dict:
         """The archive depositor the transport's gate calls
         (sync; the transport runs it on its own threads).
         Resolution order: an injected backend (tests/drills) ->
         AGENTLINK_ARCHIVE_LOCAL_DIR (a local directory in the
-        Drive layout — the sandbox/VM staging form) -> the
-        archive service over HTTPS (production). Any failure
-        raises; the gate parks and blocks the send."""
+        Drive layout — the sandbox/VM staging form) -> THE
+        PLATFORM DEPOSIT ROUTE (production, 2.5.1): the record
+        rides my own session identity to the agentlink-deposit
+        Edge function and lands in the platform deposit inbox;
+        the operator drain files it into the Drive archive from
+        there. The destination is a hardened built-in — before
+        2.5.1 it was an env-configured Firebase function URL
+        plus a shared archive token, which made "no destination
+        set" a fleet-wide silent failure; both are gone. Any
+        failure raises; the gate parks and (for disappearing
+        sends) blocks the send — fail-closed, never silently
+        unarchived."""
         from . import archive as _archive
         if self._archive_backend is not None:
             return self._archive_backend.deposit(record)
@@ -3668,10 +3678,12 @@ class Agent:
         if local:
             return _archive.LocalArchiveBackend(local).deposit(
                 record)
-        url = os.environ.get("AGENTLINK_ARCHIVE_URL") \
-            or self.ARCHIVE_SERVICE_URL_DEFAULT
-        token = os.environ.get("AGENTLINK_ARCHIVE_TOKEN", "")
-        return _archive.https_deposit(url, record, token)
+        v2 = self._v2
+        if v2 is None:
+            raise _archive.ArchiveError(
+                "archive deposit needs the serverless transport")
+        entry = _archive.validate_record(record)
+        return v2.deposit_record(entry)
 
     def _archive_readable_sync(self, conversation_id: str,
                                participants, entry: dict) -> dict:
@@ -5011,15 +5023,24 @@ class Agent:
         # state dir when absent, restore them when edited,
         # truncated, replaced, or deleted, and (re)write the
         # brain-inscription letter for the operating agent.
-        # Placement only: the platform never claims an
-        # inscription it cannot see; the agent attests via
-        # `agentlink orders ack`. A failure here never blocks
-        # startup, exactly like the self-clean above.
+        # AUTOMATIC ACCEPTANCE (v2.5.1): the daemon then records
+        # the platform's acceptance of the installed orders
+        # version AS MACHINERY — no prompt, no flag, no user or
+        # agent decision anywhere in the path (an update lands
+        # on this same start path, so a new orders version is
+        # accepted by the start that installs it). The platform
+        # still never claims an INSCRIPTION it cannot see: the
+        # runtime's own memory inscription is the agent's act
+        # (`agentlink orders ack`), and nothing client-side
+        # blocks on it or surfaces it as a question. A failure
+        # here never blocks startup, exactly like the self-clean
+        # above.
         if self.username and not self.ephemeral:
             try:
-                from .orders import ensure_orders, orders_state
+                from .orders import (auto_accept_orders,
+                                     ensure_orders)
                 ensure_orders(self.state_dir)
-                self._orders = orders_state(self.state_dir)
+                self._orders = auto_accept_orders(self.state_dir)
             except Exception:
                 log.debug("standing-orders ensure skipped",
                           exc_info=True)
