@@ -209,14 +209,15 @@ export function itemOf(r){
     oversight: r.oversight || null, content_envelope: r.content_envelope || null, sealed: true, opened: null };
 }
 export async function loadAll(){
-  const [users, groups, gm, channels, cm, work, deliveries, chains, steps, library, vault, alerts, audit, reads, servers, conns, rooms, grants, connectors, receipts, approvals, activenessRows, blobs, queue] = await Promise.all([
+  const [users, groups, gm, channels, cm, work, deliveries, chains, steps, library, vault, alerts, audit, reads, servers, conns, rooms, grants, connectors, receipts, approvals, activenessRows, blobs, queue, livenessRows] = await Promise.all([
     pg("al_users"), pg("al_groups"), pg("al_group_members","select=*"), pg("al_channels"), pg("al_channel_members","select=*"),
     pg("al_work","select=*&order=created_at.desc"), pg("al_work_deliveries","select=*&order=ts.desc&limit=300"), pg("al_chains","select=*&order=created_at.desc"), pg("al_chain_steps","select=*&order=position.asc"),
     pg("al_library","select=*&order=ts.desc"), pg("al_vault","select=*&order=ts.desc"), pg("al_alerts","select=*&order=created_at.desc&limit=100"),
     loadAudit(), pg("al_message_reads","select=*"), pg("al_servers","select=*"), pg("al_connections","select=*"),
     pg("al_rooms","select=*"), pg("al_grants","select=*"), pg("al_agent_connectors","select=*"),
     pg("al_grant_receipts","select=*&order=ts.desc&limit=200"), pg("al_grant_approvals","select=*&order=ts.desc&limit=100"),
-    pg("al_activeness","select=*"), pg("al_blobs","select=*&order=created_at.desc&limit=200"), pg("al_queue","select=*&order=seq.desc&limit=120")
+    pg("al_activeness","select=*"), pg("al_blobs","select=*&order=created_at.desc&limit=200"), pg("al_queue","select=*&order=seq.desc&limit=120"),
+    pg("al_liveness","select=*").catch(() => [])
   ]);
   const designation = new Map(users.map(u=>[u.username, u.designation==="test" ? "test" : "production"]));
   const membersOf = (id, isCh) => (isCh?cm:gm).filter(m=>(isCh?m.channel_id:m.group_id)===id).map(m=>m.username);
@@ -245,7 +246,12 @@ export async function loadAll(){
   const convTest = c => c.group_id ? isTestGroup(c.group_id) : partiesTest((c.participants||[]).map(p=>typeof p==="string"?p:p.username), designation);
   const now = Math.floor(Date.now()/1000);
   const actMap = {}; activenessRows.forEach(a=>{ actMap[a.username]=a; });
-  const usersFull = users.map(u=>({...u, trust_score: computeTrust(u.username, work, audit, now), online:false, activenessMirror: actMap[u.username]||null,
+  // Life Signs (2.5.0): the record-layer grade rows join the
+  // roster (the LIVE nodes layer on top via presence.js
+  // applyLiveness; where they disagree the node is fresher and
+  // the view says which source it is showing).
+  const livMap = {}; (livenessRows||[]).forEach(a=>{ livMap[a.username]=a; });
+  const usersFull = users.map(u=>({...u, trust_score: computeTrust(u.username, work, audit, now), online:false, activenessMirror: actMap[u.username]||null, liveness: livMap[u.username]||null,
     connectors: parseJson((connectors.find(x=>x.username===u.username)||{}).inventory, []), grant: grants.find(g=>g.username===u.username)||null}));
   const split = (arr, fn) => ({prod: arr.filter(x=>!fn(x)), test: arr.filter(fn)});
   const U = split(usersFull, u=>designation.get(u.username)==="test");
@@ -261,6 +267,7 @@ export async function loadAll(){
     vault:V.prod, testVault:V.test, conversations:C.prod, testConversations:C.test,
     alerts, activity:[...audit].reverse(), auditAsc: audit, reads, servers, connections:conns, rooms, deliveries, blobs, queue,
     activeness: actMap,
+    liveness: livMap,
     grantActivity: receipts.filter(r=>designation.get(r.username)!=="test"), testGrantActivity: receipts.filter(r=>designation.get(r.username)==="test"),
     grantApprovals: approvals.filter(a=>designation.get(a.username)!=="test"), testGrantApprovals: approvals.filter(a=>designation.get(a.username)==="test"),
     designation, membersOf, nameOf };
