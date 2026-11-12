@@ -650,7 +650,7 @@ def test_drive_folder_law():
 
 def test_manifest_250():
     m = json.loads((ROOT / "update-manifest.json").read_text())
-    assert m["version"] == "2.5.0"
+    assert m["version"] == "2.5.1"
     for rel in ("agentlink/liveness.py", "agentlink/dossier.py",
                 "agentlink/STANDING-ORDERS.md"):
         assert rel in m["files"]
