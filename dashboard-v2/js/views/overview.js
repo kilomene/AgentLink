@@ -51,6 +51,41 @@ export async function render(root, ctx){
   };
   paintAlerts();
   root.appendChild(alertsCard);
+  // Fleet nature census (2.5.0): the fleet's real shape — how
+  // many of each runtime / host / supervision class, which
+  // grades are live right now, how many machines carry a GPU,
+  // and who is non-compliant. Composed from the signed nature
+  // declarations (operator-visible history's current state) +
+  // the liveness rows/nodes; declared facts, labelled as such.
+  const natureCard = document.createElement("div");
+  const paintNature = () => {
+    const dd = ctx.store.data;
+    const users = dd.users || [];
+    const by = (fn) => { const m = {}; for(const u of users){ const k = fn(u); m[k] = (m[k] || 0) + 1; } return m; };
+    const dist = (m) => Object.entries(m).sort((a, b) => b[1] - a[1])
+      .map(([k, n]) => esc(k) + " <b>" + n + "</b>").join(" · ") || "—";
+    const runtime = by(u => (u.nature_profile || {}).runtime_kind || "undeclared");
+    const hosts = by(u => (u.nature_profile || {}).host_class || "undeclared");
+    const supervision = by(u => (u.nature_profile || {}).supervision || "undeclared");
+    const classes = by(u => (u.nature_profile || {}).persistence_class || "undeclared");
+    const grades = by(u => (u.livenessNode && u.livenessNode.grade) || (u.liveness && u.liveness.grade) || "unproven");
+    const gpuCount = users.filter(u => (((u.nature_profile || {}).machine || {}).gpus || []).length > 0).length;
+    const oses = by(u => { const os = ((u.nature_profile || {}).machine || {}).os || ""; return os ? os.split(" ")[0] : "undeclared"; });
+    const nonCompliant = users.filter(u => {
+      const rec = u.liveness; const node = u.livenessNode;
+      if(node && node.nature_compliant !== undefined) return !node.nature_compliant;
+      if(rec) return !rec.nature_compliant;
+      return !(u.nature_version > 0);
+    }).length;
+    natureCard.innerHTML = '<div class="card"><h3>Fleet nature — the fleet\'s real shape (declared)</h3>' +
+      '<p class="sub">Runtime: ' + dist(runtime) + '<br>Host: ' + dist(hosts) +
+      '<br>Supervision: ' + dist(supervision) + '<br>Persistence class: ' + dist(classes) +
+      '<br>Grades now: ' + dist(grades) + '<br>Hardware: <b>' + gpuCount + "</b> GPU-equipped of " +
+      users.length + " · OS: " + dist(oses) +
+      '<br>Non-compliant (no current nature declaration): <b>' + nonCompliant + "</b></p></div>";
+  };
+  paintNature();
+  root.appendChild(natureCard);
   const grid = document.createElement("div");
   grid.className = "grid2";
   grid.innerHTML = '<div class="card"><h3>Groups &amp; Channels</h3><div class="gc"></div></div>' +
@@ -67,7 +102,8 @@ export async function render(root, ctx){
   unsubs.push(ctx.bus.on("activity", () => paintFeed()));
   unsubs.push(ctx.bus.on("alerts", () => paintAlerts()));
   unsubs.push(ctx.bus.on("work", () => paintStats()));
-  unsubs.push(ctx.bus.on("users", () => { paintStats(); paintGC(); }));
+  unsubs.push(ctx.bus.on("users", () => { paintStats(); paintGC(); paintNature(); }));
+  unsubs.push(ctx.bus.on("liveness", () => paintNature()));
   unsubs.push(ctx.bus.on("conversations", () => paintStats()));
   return { destroy };
 }
