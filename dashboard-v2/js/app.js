@@ -13,9 +13,9 @@ import * as v_grants from "./views/grants.js";
 import * as v_rooms from "./views/rooms.js";
 import * as v_support from "./views/support.js";
 import { session, login, clearSession, loadAll, oversightOpen, oversightCredentials, oversightFile, oversightVaultFile, oversightLibraryFile, archiveConversation, ensureFreshJwt } from "./data.js";
-import { streamPresence, applyPresence, currentPresence, startActivenessTick } from "./presence.js";
+import { streamPresence, applyPresence, currentPresence, startActivenessTick, streamLiveness, applyLiveness, currentLiveness } from "./presence.js";
 import { startRealtime, onRtState, rtState, setRealtimeJwt, stopRealtime } from "./realtime.js";
-import { store, on as busOn } from "./store.js";
+import { store, on as busOn, emitBus } from "./store.js";
 import { activenessLabel } from "./activeness.js";
 import { toast } from "./util.js";
 const VIEWS = { overview: v_overview,agents: v_agents,conversations: v_conversations,probes: v_probes,activity: v_activity,work: v_work,chains: v_chains,library: v_library,vault: v_vault,credentials: v_credentials,grants: v_grants,rooms: v_rooms,support: v_support };
@@ -93,6 +93,7 @@ async function softReload(){
     // re-apply the live presence map the stream already holds
     // onto the fresh rows immediately.
     applyPresence(d, currentPresence());
+    applyLiveness(d, currentLiveness());
     paintActiveness();
     // Preserve unread badges the operator has not yet cleared.
     oldUnread.forEach((n, key) => { if(n > 0){ const c = store.findConv(key); if(c && (c.lastTs||0) > (oldMark.get(key)||0)) store.unread.set(key, n); } });
@@ -119,6 +120,11 @@ async function showShell(){
   if(booted) return; booted = true;
   streamPresence(p => { if(store.data){ applyPresence(store.data, p); cache = store.data; paintActiveness(); } },
     () => { /* RTDB stream hiccup: it reconnects itself; the mirror + ladder stay truthful */ });
+  // Life Signs (2.5.0): grade transitions + proofs arrive on the
+  // liveness stream the moment the platform verifies them; the
+  // Agents view re-renders its Life sign cells from the nodes.
+  streamLiveness(l => { if(store.data){ applyLiveness(store.data, l); cache = store.data; emitBus("liveness"); } },
+    () => { /* liveness stream hiccup: nodes keep their as_of; cells mark stale by age, never fake fresh */ });
   if(!tickStarted){ tickStarted = true; startActivenessTick(() => paintActiveness()); }
   onRtState(paintLiveState);
   startRealtime({
