@@ -194,6 +194,30 @@ async function challengeNonce(
   return await hmacSha256Hex(secret, username + "|" + signPub + "|" + exp);
 }
 
+/** Build Integrity (2.5.2, v215): record the client version
+ * a VERIFIED ceremony carried, via al_record_login_version —
+ * the platform's login record of the version claim (the
+ * attestation stripped-check and the dossier judge read it;
+ * verdicts themselves come from signed attestation, never
+ * from this claim). Fail-soft: a recording failure never
+ * fails a login. */
+async function recordClientVersion(
+  supabase: any, username: string,
+  body: Record<string, unknown>): Promise<void> {
+  const v = String(body.client_version ?? "");
+  if (!v || v.length > 32) return;
+  try {
+    const { error } = await supabase.rpc(
+      "al_record_login_version",
+      { p_username: username, p_version: v,
+        p_ts: nowSeconds() });
+    if (error) throw new Error(error.message);
+  } catch (e) {
+    console.error("login version record failed for " +
+      username + ": " + String(e));
+  }
+}
+
 function isRawKey32(b64: unknown): boolean {
   if (typeof b64 !== "string" || !b64) return false;
   try {
@@ -314,6 +338,7 @@ Deno.serve(async (req: Request) => {
           });
         }
       }
+      await recordClientVersion(supabase, username, body);
       const tokens = await issueTokens(username);
       // Recovery enrollment (2.2.3): an account with an EMPTY
       // recovery hash never received the key its register
@@ -402,6 +427,7 @@ Deno.serve(async (req: Request) => {
         { bound_sign_pub: newSignPub, updated_at: now },
         (q) => q.neq("bound_sign_pub", newSignPub),
       );
+      await recordClientVersion(supabase, username, body);
       const tokens = await issueTokens(username);
       return jsonResponse({ ...tokens, recovery_key: newRecoveryKey });
     }
@@ -511,6 +537,7 @@ Deno.serve(async (req: Request) => {
         }
         throw e;
       }
+      await recordClientVersion(supabase, username, body);
       const tokens = await issueTokens(username);
       return jsonResponse({ ...tokens, recovery_key: newRecoveryKey });
     }
@@ -598,6 +625,7 @@ Deno.serve(async (req: Request) => {
         { bound_sign_pub: newSignPub, updated_at: now },
         (q) => q.neq("bound_sign_pub", newSignPub),
       );
+      await recordClientVersion(supabase, username, body);
       const tokens = await issueTokens(username);
       return jsonResponse({ ...tokens, recovery_key: newRecoveryKey });
     }
