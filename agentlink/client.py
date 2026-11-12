@@ -1556,7 +1556,10 @@ class Agent:
                           # operator (or the agent itself) sees
                           # at a glance whether the orders are in
                           # place. A status line, not behavior.
-                          "orders": self._orders_status()}
+                          "orders": self._orders_status(),
+                          # Life Signs (v2.5.0): grade snapshot +
+                          # spec-drift state ride the ping too.
+                          "liveness": self._liveness_local()}
             elif cmd == "whoami":
                 # The running instance's own truthful surface
                 # (2.2.3): setup's already-registered fast path
@@ -1580,6 +1583,25 @@ class Agent:
                         "instance runs the relay transport")
                 result = await asyncio.to_thread(
                     self._v2.doorbell.read_presence, self.username)
+            elif cmd == "liveness_prove":
+                # Life Signs (2.5.0): the runtime's waking duty —
+                # `agentlink liveness prove` forwards here so the
+                # RUNNING daemon's session makes the proof (its
+                # JWT, its signer). The daemon tier never crosses
+                # this channel: challenge answers are automatic
+                # transport machinery, not a control command.
+                result = await self.liveness_prove()
+            elif cmd == "liveness_declare":
+                result = await self.liveness_declare(
+                    dict(spec.get("profile") or {}))
+            elif cmd == "liveness_status":
+                result = await self.liveness_status()
+            elif cmd == "dossier_maintain":
+                result = await self.dossier_maintain(
+                    spec.get("reason") or "manual")
+            elif cmd == "peer_liveness":
+                result = await self.peer_liveness(
+                    str(spec.get("username") or ""))
             elif cmd == "send":
                 result = await self.send_message(
                     str(spec["to"]), str(spec["body"]),
@@ -2486,7 +2508,15 @@ class Agent:
                 # installed, inscribed, tamper count): the
                 # platform reports placement + the agent's
                 # attestation; it never speaks for the agent.
-                "orders": self._orders_status()}
+                "orders": self._orders_status(),
+                # Life Signs surface (v2.5.0): the last server
+                # snapshot the daemon saw (grade + proof tiers,
+                # labelled a cache by its fetch time) + the
+                # machine spec-drift record. The LIVE grade is
+                # `agentlink liveness` (a server read); this is
+                # the at-a-glance local state, never dressed as
+                # fresher than it is.
+                "liveness": self._liveness_local()}
 
     # -- connector bridge + one-time admin grant (v1.8.1) --------
     # The owner's corrected model, end to end:
@@ -2845,6 +2875,205 @@ class Agent:
             except Exception:
                 pass
         return self.grant
+
+    # -- Life Signs (2.5.0) ----------------------------------------
+    # Nature declarations, liveness proofs and grades. The
+    # daemon's challenge answers are transport machinery (see
+    # transport_v2); these methods are the RUNTIME's own surface:
+    # declaring its nature, countersigning its proof on waking,
+    # and reading its grade. Serverless only — the relay era has
+    # no Life Signs machinery and says so plainly.
+
+    def _liveness_transport(self):
+        if self._v2 is None:
+            raise RequestFailed(
+                "serverless_unsupported",
+                "Life Signs is a serverless surface; this instance"
+                " runs the relay transport")
+        return self._v2
+
+    async def liveness_status(self) -> dict:
+        v2 = self._liveness_transport()
+        return await asyncio.to_thread(v2.liveness_status)
+
+    async def liveness_prove(self) -> dict:
+        """The runtime's own countersignature (tier=runtime) —
+        the waking duty the Standing Orders (O2) name. Distinct
+        from the daemon's automatic challenge receipts, which
+        prove only the daemon."""
+        v2 = self._liveness_transport()
+        return await asyncio.to_thread(v2.liveness_prove)
+
+    async def liveness_declare(self, profile: dict) -> dict:
+        v2 = self._liveness_transport()
+        return await asyncio.to_thread(v2.liveness_declare,
+                                       profile)
+
+    async def liveness_answer(self) -> dict:
+        """Manually trigger the daemon's challenge answer (the
+        same machinery that runs automatically on beats and
+        reconnects) — an operator/drill convenience, daemon
+        tier only, exactly like the automatic path."""
+        v2 = self._liveness_transport()
+        return await asyncio.to_thread(
+            v2.answer_liveness_challenges)
+
+    async def peer_liveness(self, username: str) -> dict:
+        v2 = self._liveness_transport()
+        return await asyncio.to_thread(v2.peer_liveness, username)
+
+    def _dossier_maintain(self, reason: str) -> dict:
+        """The Agent Dossier duty (2.5.0, hardened reporting):
+        generate when stale, drain the deposit queue when a
+        route exists, and report the flag. AUTOMATIC — at
+        setup, at daemon start, on nature version change, and
+        on the 7-day max-age refresh. Mandatory-but-non-
+        blocking: any failure is recorded in the result and the
+        flag; it never raises into the daemon. Dossier CONTENT
+        is built + deposited only (Drive System tree); the platform
+        sees the flag + deposit date and nothing else."""
+        from . import dossier as dossier_mod
+        out: dict = {"reason": reason}
+        try:
+            v2 = self._v2
+            if v2 is None or self.identity is None \
+                    or not self.username or self.ephemeral:
+                out["status"] = "skipped"
+                return out
+            status = {}
+            try:
+                status = v2.liveness_status()
+            except Exception:
+                status = {}
+            nature_version = int(status.get("nature_version")
+                                 or 0)
+            if dossier_mod.needs_refresh(self.state_dir,
+                                         nature_version):
+                standing = {
+                    "grade": status.get("grade") or "unproven",
+                    "nature_compliant": bool(
+                        nature_version > 0
+                        and not status.get("spec_drift")),
+                    "nature_version": nature_version,
+                    "last_daemon_receipt_at":
+                        status.get("last_daemon_receipt_at") or 0,
+                    "last_runtime_proof_at":
+                        status.get("last_runtime_proof_at") or 0,
+                }
+                try:
+                    rows = v2._rest(
+                        "GET", "al_work",
+                        "select=id&assignee=eq."
+                        f"{self.username}&status=eq.assigned")
+                    standing["open_work_count"] = len(rows or [])
+                except Exception:
+                    try:
+                        inbox = self.store.list_work(
+                            self.username,
+                            status="assigned") or []
+                        standing["open_work_count"] = len(
+                            [w for w in inbox
+                             if w.get("assignee")
+                             == self.username])
+                    except Exception:
+                        standing["open_work_count"] = 0
+                registered_at = 0
+                display_name = ""
+                try:
+                    rows = v2._rest(
+                        "GET", "al_users",
+                        "select=created_at,display_name"
+                        f"&username=eq.{self.username}")
+                    if rows:
+                        registered_at = int(
+                            rows[0].get("created_at") or 0)
+                        display_name = str(
+                            rows[0].get("display_name") or "")
+                except Exception:
+                    pass
+                gen = dossier_mod.generate(
+                    self.state_dir,
+                    signer=self.identity.sign,
+                    username=self.username,
+                    display_name=display_name,
+                    registered_at=registered_at,
+                    client_version=_package_version(),
+                    sign_pub_b64=(
+                        self.identity.signing_public_key_b64),
+                    nature_profile=status.get("nature"),
+                    standing=standing)
+                out["generated"] = gen["version"]
+            depositor = dossier_mod.resolve_depositor(
+                self.username)
+            if depositor is not None:
+                drained = dossier_mod.drain_queue(
+                    self.state_dir, depositor)
+                out["drain"] = drained
+            st = dossier_mod.load_state(self.state_dir)
+            flag = dossier_mod.dossier_status(
+                self.state_dir, nature_version)
+            out["status"] = flag
+            out["version"] = st.get("version") or 0
+            out["deposited_at"] = st.get("deposited_at") or 0
+            try:
+                v2.report_dossier_status(
+                    flag, int(st.get("deposited_at") or 0),
+                    int(st.get("version") or 0))
+                out["reported"] = True
+            except Exception as exc:
+                out["report_error"] = str(exc)[:160]
+        except Exception as exc:
+            out["status"] = "error"
+            out["error"] = str(exc)[:200]
+        return out
+
+    async def dossier_maintain(self, reason: str = "manual") \
+            -> dict:
+        return await asyncio.to_thread(self._dossier_maintain,
+                                       reason)
+
+    def _liveness_local(self) -> dict:
+        """Local Life Signs state for whoami / ping: the last
+        server snapshot the daemon saw (labelled with its fetch
+        time — a cache, never dressed as live truth) + the
+        machine spec-drift record from the state dir."""
+        out: dict = {}
+        v2 = self._v2
+        if v2 is not None and getattr(v2, "_liveness_snapshot",
+                                      None):
+            out["last_snapshot"] = v2._liveness_snapshot
+        if self.username and not self.ephemeral:
+            try:
+                from .liveness import nature_state
+                ns = nature_state(self.state_dir)
+                if ns.get("spec_drift"):
+                    out["spec_drift"] = ns["spec_drift"]
+                    out["spec_drift_at"] = ns.get("spec_drift_at")
+                    out["note"] = (
+                        "machine spec drifted from the declared "
+                        "snapshot — redeclare with "
+                        "`agentlink nature declare`")
+                if ns.get("last_probe_at"):
+                    out["last_probe_at"] = ns["last_probe_at"]
+            except Exception:
+                pass
+            try:
+                from . import dossier as _dossier_mod
+                _dst = _dossier_mod.load_state(self.state_dir)
+                if _dst.get("version"):
+                    out["dossier"] = {
+                        "status": _dossier_mod.dossier_status(
+                            self.state_dir),
+                        "version": _dst.get("version"),
+                        "deposited_at":
+                            _dst.get("deposited_at") or 0,
+                        "note": "dossier content lives only in "
+                                "the AgentLink System tree — "
+                                "this surface carries the flag + "
+                                "date, never content"}
+            except Exception:
+                pass
+        return out
 
     async def my_connectors(self) -> dict:
         """The agent's connector vault as the RELAY holds it:
@@ -3444,6 +3673,56 @@ class Agent:
         token = os.environ.get("AGENTLINK_ARCHIVE_TOKEN", "")
         return _archive.https_deposit(url, record, token)
 
+    def _archive_readable_sync(self, conversation_id: str,
+                               participants, entry: dict) -> dict:
+        """TWO-COPY LAW (2.5.0): file this message's READABLE
+        transcript entry beside the sealed chain, rendered from
+        MY plaintext (I am the sender — the plaintext is mine at
+        send time; it is never produced by opening a seal).
+        Resolution mirrors the deposit path: an injected backend
+        or a local staging tree can hold plaintext; the HTTPS
+        archive service CANNOT (it never sees plaintext), so on
+        that path the gap is reported, not hidden — the readable
+        copy then lands via a participant-side local backend or
+        the operator backfill (see backfill_readable.py).
+        Never raises: a readable failure never blocks a send."""
+        from . import archive as _archive
+        try:
+            backend = self._archive_backend
+            if backend is not None and hasattr(
+                    backend, "deposit_readable"):
+                return backend.deposit_readable(
+                    participants, conversation_id, entry)
+            local = os.environ.get("AGENTLINK_ARCHIVE_LOCAL_DIR")
+            if local:
+                return _archive.LocalArchiveBackend(
+                    local).deposit_readable(
+                        participants, conversation_id, entry)
+            return {"status": "gap",
+                    "reason": "archive service path holds no "
+                              "plaintext — readable renders via a "
+                              "participant-side local backend or "
+                              "the operator backfill"}
+        except Exception as exc:  # noqa: BLE001 - visible, not fatal
+            return {"status": "error", "reason": str(exc)[:160]}
+
+    def _readable_entry(self, mid: str, ts: int, body: str,
+                        file: dict | None) -> dict | None:
+        entry = {"message_id": mid, "sender": self.username,
+                 "ts": int(ts)}
+        if file:
+            entry["file"] = {
+                "name": str(file.get("name") or "file"),
+                "size": int(file.get("size") or 0),
+                "sha256": str(file.get("sha256") or "")}
+            if body:
+                entry["text"] = body
+            return entry
+        if body is not None:
+            entry["text"] = body
+            return entry
+        return None
+
     def _on_v2_dead_letter(self, record: dict) -> None:
         log.warning(
             "dead-letter: %s %s to @%s parked after %s attempts "
@@ -3617,6 +3896,7 @@ class Agent:
         the local stamp contract so host supervision behaves
         identically on both transports."""
         stamp = self.state_dir / f"heartbeat-{self.username}.txt"
+        last_dossier_check = 0.0
         while True:
             await asyncio.sleep(HEARTBEAT_SECONDS)
             try:
@@ -3624,6 +3904,16 @@ class Agent:
             except Exception:
                 return
             _sd_notify_watchdog()
+            # Dossier max-age duty (2.5.0): a long-lived daemon
+            # still owes a fresh dossier every 7 days — checked
+            # daily on this local loop (no network traffic of
+            # its own; maintenance runs only when stale).
+            if time.time() - last_dossier_check > 86400:
+                last_dossier_check = time.time()
+                try:
+                    await self.dossier_maintain("max-age-check")
+                except Exception:
+                    pass
 
     async def _present_rectify_code(self, v2, code: str) -> bool:
         """Present a held operator rectification code to the
@@ -4133,6 +4423,81 @@ class Agent:
                 v2.publish_my_directory(_my_entry)
         except Exception:
             pass
+        # Life Signs assertion (2.5.0, hardened reporting —
+        # owner's ruling): nature+spec reporting is AUTOMATIC
+        # and carries no opt-out. Every start: (1) re-probe this
+        # machine and record any drift against the DECLARED
+        # snapshot locally; (2) ensure the declaration on record
+        # is current — the transport declares on its own when
+        # there is no declaration, when the machine drifted, or
+        # when the client version moved (the same on-line
+        # assertion path as presence; never a separate voluntary
+        # call, never blocking the start); (3) if drift could
+        # not be healed by a fresh declaration (the declaration
+        # could not land), put the signed drift report on the
+        # record so the flag is visible until it lands.
+        if self.username and not self.ephemeral:
+            try:
+                _declared = None
+                try:
+                    _declared = v2.liveness_status().get("nature")
+                except Exception:
+                    _declared = None
+                from .liveness import record_machine_probe
+                _ns = record_machine_probe(self.state_dir,
+                                           _declared)
+                _ensured = v2.ensure_nature_declared(
+                    self.state_dir)
+                if _ensured.get("declared"):
+                    log.info(
+                        "nature asserted on start (%s) — nature "
+                        "v%s", "; ".join(_ensured.get("reasons")
+                                         or []),
+                        _ensured.get("nature_version"))
+                    # The fresh declaration IS the current
+                    # snapshot: re-record the probe against it so
+                    # the local drift record clears.
+                    try:
+                        _fresh = v2.liveness_status().get(
+                            "nature")
+                    except Exception:
+                        _fresh = None
+                    if _fresh:
+                        _ns = record_machine_probe(
+                            self.state_dir, _fresh)
+                elif _ensured.get("error"):
+                    log.warning(
+                        "nature assertion could not land (%s) — "
+                        "the record carries non-compliant until "
+                        "it does; retrying next start",
+                        _ensured["error"])
+                if _ns.get("spec_drift") and not _ensured.get(
+                        "declared"):
+                    log.warning(
+                        "machine spec drift vs declared nature: "
+                        "%s", ", ".join(_ns["spec_drift"]))
+                    try:
+                        v2.report_spec_drift(_ns["spec_drift"])
+                    except Exception:
+                        log.debug("spec drift report skipped",
+                                  exc_info=True)
+            except Exception:
+                log.debug("nature assertion skipped",
+                          exc_info=True)
+            # The Agent Dossier duty rides the same start
+            # (2.5.0): regenerate when stale (nature moved,
+            # spec moved, 7-day max-age), drain the deposit
+            # queue if a route exists, report the flag. Never
+            # blocks the start; the flag carries the truth.
+            try:
+                _dm = self._dossier_maintain("start")
+                if _dm.get("generated"):
+                    log.info("dossier v%s generated at start "
+                             "(status %s)",
+                             _dm["generated"], _dm.get("status"))
+            except Exception:
+                log.debug("dossier maintenance skipped",
+                          exc_info=True)
         # Owner-seat control channel: the lock holder serves
         # forwarded one-shot commands, as on the relay path.
         await self._start_control_server()
@@ -8172,6 +8537,16 @@ class Agent:
             sent["archive_entry"] = (
                 result.get("archive") or {}).get("entry_id")
         self._mailbox_record_sent(sent)
+        # TWO-COPY LAW: the readable transcript entry rides every
+        # send (standard + disappearing alike).
+        rentry = self._readable_entry(sent["id"], sent["ts"],
+                                      body, file)
+        if rentry is not None:
+            from .archive import conversation_id_dm as _cdm
+            result["readable"] = await asyncio.to_thread(
+                self._archive_readable_sync,
+                _cdm(self.username, u),
+                [self.username, u], rentry)
         return result
 
     def _mailbox_record_sent(self, item: dict) -> None:
@@ -8499,6 +8874,21 @@ class Agent:
             sent["archive_entry"] = (
                 result.get("archive") or {}).get("entry_id")
         self._mailbox_record_sent(sent)
+        rentry = self._readable_entry(sent["id"], sent["ts"],
+                                      body, file)
+        if rentry is not None:
+            from .archive import conversation_id_group as _cg
+            parts = [self.username]
+            mem = (self.memberships.get(group_id) or {}).get(
+                "members") or []
+            for mm in mem:
+                u2 = mm.get("username") if isinstance(mm, dict) \
+                    else mm
+                if u2 and str(u2) not in parts:
+                    parts.append(str(u2))
+            result["readable"] = await asyncio.to_thread(
+                self._archive_readable_sync, _cg(group_id),
+                parts, rentry)
         return result
 
     async def group_send_file(self, group_id: str, path: str,
