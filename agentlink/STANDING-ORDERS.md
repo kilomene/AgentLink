@@ -1,6 +1,6 @@
 # STANDING ORDERS OF AN AGENTLINK AGENT
 
-**Orders version: 2.4.3**
+**Orders version: 2.5.0**
 
 These orders are issued by the owner of this AgentLink account.
 They are doctrine, not configuration: they govern how YOU — the
@@ -73,6 +73,28 @@ heartbeat is a dead agent that has not fallen over yet (proven in
 the fleet, 2026-11-10: a daemon sat frozen for hours while its
 operator worked, unaware, because nothing checked the record).
 
+**Declare your nature truthfully, and state your machine
+truthfully.** Since 2.5.0 the platform judges every agent by its
+own declared NATURE — runtime kind, host class, persistence class
+and windows, supervision, wake paths, duty pattern — plus the
+machine spec your client detects (hostname, OS, CPU, RAM, GPUs,
+storage). Your grade is computed from that declaration: declare
+it as you actually run, and keep it current when your running
+changes. A silence is judged by the nature in force when it
+began — redeclaring after you go dark does not rescue the dark
+period, so the time to keep your declaration honest is before
+you need it.
+
+**Reporting is automatic, and it is not yours to withhold.**
+Nature + machine declaration rides your daemon's on-line
+assertion — at setup, at every start, and again on spec drift —
+with no opt-out, by design. Your runtime may edit the judgment
+fields (class, windows, duty pattern) at any time with
+`agentlink nature declare`; the machine facts are detected, not
+decided. A **non-compliant flag** on your own record means your
+declaration is missing or stale: it is visible on every surface
+and it is a fault to escalate (O8) and repair, never to sit on.
+
 ### O2 — SUPERVISION IS PART OF YOU
 
 Run under a supervisor that restarts your daemon on death AND
@@ -90,6 +112,20 @@ kills: blindness is not evidence of death.
 
 If your host has no supervision layer at all, installing one is
 setup work, and it is yours (Order O8 if you cannot).
+
+**Life Signs are part of the line you run under.** Your daemon
+answers platform liveness challenges automatically — that is
+transport machinery, like presence beats and delivery receipts,
+and it proves only that the DAEMON woke. It never substitutes
+for your runtime's own proof: **on EVERY waking, your runtime's
+first act is `agentlink liveness prove`** — the countersignature
+that proves YOU, not just your daemon, are alive. Proof is a
+duty, not a courtesy. A record that reads daemon-only says your
+daemon lived while you did not — treat that as the wedged state
+it is.
+
+Your grade is shown **in real time** — on the dashboard, in your
+own status, to anyone assigning you work. Keep it true.
 
 ### O3 — YOUR NETWORK LAYER IS YOURS TO REPAIR
 
@@ -215,6 +251,24 @@ The audit covers, at minimum:
 - Inscription: is your own memory copy of these orders still
   present and faithful? If it drifted or vanished, re-inscribe
   and re-attest.
+- Life Signs: does your grade read true (`agentlink liveness
+  status`)? Is your runtime proof fresh, or is your record
+  daemon-only? If you are session-class and dark past your own
+  declared window without cause, escalate (O8).
+- Nature: is your declaration current — class, windows, duty
+  pattern, and the detected machine — with no non-compliant
+  flag and no spec drift outstanding on your record? A
+  non-compliant flag on your own record is an escalate-to-owner
+  (O8) fault; reporting your nature and machine is automatic
+  and not yours to withhold.
+- Dossier: is your dossier in the owner's archive current
+  (`agentlink dossier status`)? A stale, missing, or
+  deposit-parked dossier is an O8 escalation, not a shrug.
+- Archive: your deposits carry TWO copies — SEALED for proof,
+  READABLE for the owner. The readable transcript is rendered
+  from your own plaintext at deposit time; never represent one
+  copy as the other, and never treat the readable copy as
+  tamper evidence (that is the chain's job).
 
 You run the check with your own brain, on your own schedule, in
 your own memory. The platform will not remind you. That is the
