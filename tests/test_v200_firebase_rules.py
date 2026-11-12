@@ -42,10 +42,13 @@ def test_rules_file_is_valid_json_with_rules_root():
     assert set(data.keys()) == {"rules"}
     # digest added at v2.0 integration (fan-out valve writer/reader);
     # inbox + directory added in 2.3.0 (the split's live layer:
-    # message transit queue + directory working copy).
+    # message transit queue + directory working copy); liveness
+    # added in 2.5.0 (Life Signs live grade nodes — written only
+    # by the server path, read publicly like presence: grade
+    # metadata only, no content ever).
     assert set(data["rules"].keys()) == \
         {"signals", "presence", "doorbell", "digest",
-         "inbox", "directory"}
+         "inbox", "directory", "liveness"}
 
 
 def test_firebase_json_points_at_the_rules_file():
@@ -65,11 +68,19 @@ def test_no_public_access_anywhere():
     dashboard permanently blind (verified live: anonymous read
     401 before the fix, 200 after, writes still denied). Every
     other .read/.write in the file must require auth, and every
-    .write anywhere — presence included — must require auth."""
+    .write anywhere — presence included — must require auth.
+    2.5.0 extends the same deliberate exception to the /liveness
+    read: the grade node holds metadata only (grade word, proof
+    tier + time, nature version, flags — never content), the
+    dashboard subscribes to it exactly like presence, and its
+    writes are server-only (the $user .write names a uid no
+    agent token ever carries; the real writers use the
+    service-account path, which bypasses rules)."""
     for path, key, value in _walk(_rules()):
         if key not in (".read", ".write"):
             continue
-        if path == "/rules/presence/.read":
+        if path in ("/rules/presence/.read",
+                    "/rules/liveness/.read"):
             assert value is True
             continue
         assert value is not True, f"{path} grants public access"
