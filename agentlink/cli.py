@@ -693,7 +693,14 @@ def _orders(rest: list[str]) -> int:
     the platform records the agent's word; it never claims an
     inscription it cannot see. Both flags are required for the
     full attestation — inscription without the scheduled
-    self-check is half the duty (Order O9)."""
+    self-check is half the duty (Order O9).
+
+    PLATFORM ACCEPTANCE IS NOT THE ACK'S BUSINESS (2.5.1): the
+    daemon records acceptance of the installed orders version
+    automatically at every start (`platform_accepted` in the
+    state, by daemon-machinery) — no one is ever asked to accept
+    the orders, and this ack attests only the agent's own
+    inscription acts."""
     sub = rest[0] if rest else "status"
     if sub == "status":
         ap = argparse.ArgumentParser(prog="agentlink orders status")
@@ -703,6 +710,8 @@ def _orders(rest: list[str]) -> int:
         st = orders_state(_state_dir(args))
         print(f"standing orders {st.get('orders_version') or '?'}: "
               f"{'installed' if st.get('installed') else 'NOT installed'}"
+              f"; platform acceptance: "
+              f"{'recorded (daemon-machinery, orders ' + str(st.get('accepted_orders_version')) + ')' if st.get('platform_accepted') else 'NOT recorded'}"
               f"; inscription: {st.get('inscription_state', '?')}"
               f"; self-check scheduled: "
               f"{bool(st.get('self_check_scheduled'))}"
