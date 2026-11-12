@@ -409,7 +409,8 @@ async def run_setup(username: str, state_dir: str | None = None,
                     designation: str = "production",
                     grant: str = "ask",
                     install_service: bool = True,
-                    auto_support: bool = True) -> dict:
+                    auto_support: bool = True,
+                    declare_nature: bool = False) -> dict:
     """Run the full setup and return the plain report dict."""
     from .client import Agent
     uname = normalize_username(username)
@@ -637,6 +638,53 @@ async def run_setup(username: str, state_dir: str | None = None,
                     # connectors.
                     agent._clear_permission_request()
                     report["grant"] = {"status": "declined"}
+
+            # 5b — Nature declaration (2.5.0 + the owner's
+            # hardening ruling): reporting is AUTOMATIC — setup
+            # declares the agent's nature + detected machine as
+            # part of bringing it on the line. There is no
+            # opt-out and no consent step (the declaration is a
+            # hardened shared setting, like the presence beat);
+            # the runtime may redeclare its judgment fields at
+            # any time with `agentlink nature declare`. A
+            # declaration that cannot land does NOT fail setup:
+            # the report carries the failure in the open and the
+            # daemon's start path retries until it lands (the
+            # record reads non-compliant meanwhile — visible,
+            # never bricked).
+            try:
+                import asyncio as _asyncio
+                _ens = await _asyncio.to_thread(
+                    agent._v2.ensure_nature_declared, sd) \
+                    if getattr(agent, "_v2", None) is not None \
+                    else {"declared": False,
+                          "error": "no serverless transport"}
+                report["nature"] = {
+                    "status": "declared"
+                              if _ens.get("declared")
+                                 or _ens.get("current")
+                              else "declaration_pending",
+                    "automatic": True,
+                    "detail": _ens}
+            except Exception as exc:
+                report["nature"] = {"status": "error",
+                                    "automatic": True,
+                                    "error": str(exc)[:200]}
+
+            # 5c — Agent Dossier (2.5.0): generation + deposit
+            # are automatic (same hardened class): the dossier
+            # is generated from the fresh declaration and queued
+            # for the owner's Drive System tree the moment the
+            # agent exists. A deposit that cannot land yet
+            # parks in the durable queue — setup does not fail
+            # for it; the flag says so.
+            try:
+                report["dossier"] = await agent.dossier_maintain(
+                    "setup")
+            except Exception as exc:
+                report["dossier"] = {"status": "error",
+                                      "automatic": True,
+                                      "error": str(exc)[:200]}
 
             # 6a — self-verification while this instance is live:
             # presence on the beat + directory finds me, any case.
