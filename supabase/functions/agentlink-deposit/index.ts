@@ -94,10 +94,12 @@ async function signPubOf(username: string): Promise<string> {
 }
 
 async function landInbox(agent: string, kind: string,
-  depositKey: string, payload: Record<string, unknown>) {
+  depositKey: string, payload: Record<string, unknown>,
+  facts: Record<string, unknown> = {}) {
   const { data, error } = await supabase
     .from("al_deposit_inbox")
-    .insert({ agent, kind, deposit_key: depositKey, payload })
+    .insert({ agent, kind, deposit_key: depositKey, payload,
+      ...facts })
     .select("id")
     .limit(1);
   if (error) {
@@ -194,8 +196,35 @@ Deno.serve(async (req) => {
             400);
         }
       }
-      return await landInbox(me, "dossier",
-        `dossier-v${version}-${contentSha}`, { files });
+      // Street Rule (2.5.2, v215): the dossier facts the
+      // platform judges currency by are stamped HERE, from
+      // the signature-verified document itself — never from
+      // the agent's separate status report (which is kept as
+      // a claim in the record). After the land, the verdict
+      // is re-judged at once so a filed dossier reads current
+      // immediately; the per-minute sweep keeps it honest as
+      // time, nature and versions move.
+      const identity = (doc.identity ?? {}) as
+        Record<string, unknown>;
+      const facts = {
+        dossier_version: version,
+        nature_version: Number(
+          (doc.how_it_works as Record<string, unknown> || {})
+            .nature_version ?? 0) || null,
+        client_version: String(identity.client_version ?? "")
+          || null,
+      };
+      const landed = await landInbox(me, "dossier",
+        `dossier-v${version}-${contentSha}`, { files }, facts);
+      try {
+        const { error } = await supabase.rpc(
+          "al_refresh_dossier_verdict", { p_username: me });
+        if (error) throw new Error(error.message);
+      } catch (e) {
+        console.error("dossier verdict refresh failed for " +
+          me + ": " + String(e));
+      }
+      return landed;
     }
 
     // ------------------------------------------------ message
