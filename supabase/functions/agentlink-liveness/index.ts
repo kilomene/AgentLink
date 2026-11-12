@@ -92,6 +92,68 @@ function provePayload(username: string, ts: number): string {
   return `agentlink-liveness-prove-v1|${username}|${ts}`;
 }
 
+// Build Integrity Attestation (2.5.2, v215) — mirrors of
+// agentlink/liveness.py. The manifest digest rides INSIDE
+// the signed bytes (v2 payloads): a build that strips
+// attestation cannot produce these signatures' meaning, and
+// a digest-less receipt from an agent recorded at >= 2.5.2
+// is rejected outright (attestation_required) — a visible
+// state, never a silent pass. The verdict itself is computed
+// in the database from the registered release digest (THE
+// STREET RULE: the platform judges; clients supply signed
+// evidence only).
+function receiptPayloadV2(username: string, cid: string,
+  nonce: string, tier: string, digest: string,
+  ts: number): string {
+  return `agentlink-liveness-receipt-v2|${username}|${cid}` +
+    `|${nonce}|${tier}|${digest}|${ts}`;
+}
+
+function provePayloadV2(username: string, digest: string,
+  ts: number): string {
+  return `agentlink-liveness-prove-v2|${username}|${digest}` +
+    `|${ts}`;
+}
+
+function attestPayload(username: string, version: string,
+  digest: string, ts: number): string {
+  return `agentlink-build-attest-v1|${username}|${version}` +
+    `|${digest}|${ts}`;
+}
+
+const DIGEST_RE = /^[0-9a-f]{64}$/;
+
+/** The client version the platform RECORDED at this agent's
+ * login (never the caller's say-so in this request). */
+async function recordedClientVersion(
+  username: string): Promise<string> {
+  const row = await selectOne(supabase, "al_activeness",
+    "client_version", { username });
+  return String(row?.client_version ?? "");
+}
+
+function semverGte(a: string, b: string): boolean {
+  const pa = a.split(".").map((x) => parseInt(x, 10) || 0);
+  const pb = b.split(".").map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d > 0;
+  }
+  return true;
+}
+
+/** The version a digest BELONGS to, per the platform's own
+ * register; falls back to the login-recorded version when
+ * the digest is registered nowhere (a modified build of the
+ * running version — the attestation fn judges it). */
+async function versionForDigest(username: string,
+  digest: string): Promise<string> {
+  const row = await selectOne(supabase, "al_releases",
+    "version", { manifest_sha256: digest });
+  if (row?.version) return String(row.version);
+  return await recordedClientVersion(username);
+}
+
 function declarePayload(username: string, profile: unknown,
   ts: number): string {
   return `agentlink-nature-declare-v1|${username}|` +
@@ -167,6 +229,13 @@ function composeNode(
     spec_drift: Boolean(String(lv?.spec_drift ?? "")),
     nature_compliant: Boolean(lv?.nature_compliant),
     dossier_status: String(lv?.dossier_status ?? "") || "missing",
+    // Build integrity (2.5.2): the platform's verdict, mirrored
+    // from the record (al_liveness.build_* are written only by
+    // al_build_apply_attestation).
+    build_integrity: String(lv?.build_integrity ?? "") ||
+      "unattested",
+    build_version: String(lv?.build_version ?? ""),
+    build_digest: String(lv?.build_digest ?? "").slice(0, 12),
   };
 }
 
@@ -277,9 +346,29 @@ Deno.serve(async (req) => {
           "receipt timestamp is outside the acceptance window",
           400);
       }
+      // Build attestation (2.5.2): the digest rides inside
+      // the signed receipt (v2 payload). A digest-less
+      // receipt from an agent the platform recorded at
+      // >= 2.5.2 is a build with attestation stripped —
+      // rejected loudly, never silently beating.
+      const digest = String(body.build_digest ?? "");
+      const hasDigest = DIGEST_RE.test(digest);
+      if (!hasDigest) {
+        const recorded = await recordedClientVersion(me);
+        if (recorded && semverGte(recorded, "2.5.2")) {
+          return errorResponse("attestation_required",
+            "this agent is recorded at client " + recorded +
+            " but its receipt carries no build digest — " +
+            "attestation is part of the signed receipt since " +
+            "2.5.2 and cannot be stripped quietly", 403);
+        }
+      }
       const ok = await verified(me,
-        receiptPayload(me, challengeId, String(ch.nonce),
-          "daemon", ts),
+        hasDigest
+          ? receiptPayloadV2(me, challengeId, String(ch.nonce),
+            "daemon", digest, ts)
+          : receiptPayload(me, challengeId, String(ch.nonce),
+            "daemon", ts),
         body.sig);
       if (!ok) {
         return errorResponse("bad_signature",
@@ -288,8 +377,13 @@ Deno.serve(async (req) => {
       }
       const { data, error } = await supabase.rpc(
         "al_liveness_apply_receipt",
-        { p_username: me, p_challenge_id: challengeId,
-          p_tier: "daemon", p_ts: ts });
+        hasDigest
+          ? { p_username: me, p_challenge_id: challengeId,
+              p_tier: "daemon", p_ts: ts,
+              p_version: await versionForDigest(me, digest),
+              p_digest: digest }
+          : { p_username: me, p_challenge_id: challengeId,
+              p_tier: "daemon", p_ts: ts });
       if (error) throw new Error(error.message);
       await evaluate(me);
       const lv = await selectOne(supabase, "al_liveness", "grade",
@@ -306,7 +400,22 @@ Deno.serve(async (req) => {
           "proof timestamp is outside the acceptance window",
           400);
       }
-      const ok = await verified(me, provePayload(me, ts), body.sig);
+      const digest = String(body.build_digest ?? "");
+      const hasDigest = DIGEST_RE.test(digest);
+      if (!hasDigest) {
+        const recorded = await recordedClientVersion(me);
+        if (recorded && semverGte(recorded, "2.5.2")) {
+          return errorResponse("attestation_required",
+            "this agent is recorded at client " + recorded +
+            " but its proof carries no build digest — " +
+            "attestation is part of the signed proof since " +
+            "2.5.2 and cannot be stripped quietly", 403);
+        }
+      }
+      const ok = await verified(me,
+        hasDigest ? provePayloadV2(me, digest, ts)
+          : provePayload(me, ts),
+        body.sig);
       if (!ok) {
         return errorResponse("bad_signature",
           "proof signature did not verify against the "
@@ -314,7 +423,11 @@ Deno.serve(async (req) => {
       }
       const { error } = await supabase.rpc(
         "al_liveness_apply_prove",
-        { p_username: me, p_ts: ts });
+        hasDigest
+          ? { p_username: me, p_ts: ts,
+              p_version: await versionForDigest(me, digest),
+              p_digest: digest }
+          : { p_username: me, p_ts: ts });
       if (error) throw new Error(error.message);
       await evaluate(me);
       const lv = await selectOne(supabase, "al_liveness", "grade",
@@ -414,6 +527,42 @@ Deno.serve(async (req) => {
       return jsonResponse({ ok: true, dossier_status: status });
     }
 
+    if (route === "attest") {
+      // The BUILD STATEMENT (2.5.2): signed at login and on
+      // the start that follows every update. The statement is
+      // EVIDENCE — the digest of the manifest the client
+      // installed from, signed with its identity key. The
+      // verdict is computed in the database against the
+      // registered release digest (al_build_apply_attestation)
+      // and pushed to the live node. Nothing the client says
+      // here is believed beyond its signature.
+      const version = String(body.version ?? "");
+      const digest = String(body.manifest_sha256 ?? "");
+      const ts = Number(body.ts ?? 0);
+      if (!version || !DIGEST_RE.test(digest) || !ts ||
+        Math.abs(now - ts) > 600) {
+        return errorResponse("bad_attestation",
+          "version, a sha256 manifest digest and a fresh ts " +
+          "are required", 400);
+      }
+      const ok = await verified(me,
+        attestPayload(me, version, digest, ts), body.sig);
+      if (!ok) {
+        return errorResponse("bad_signature",
+          "build statement signature did not verify against " +
+          "the registry key", 403);
+      }
+      const { data, error } = await supabase.rpc(
+        "al_build_apply_attestation",
+        { p_username: me, p_version: version,
+          p_digest: digest, p_source: "statement", p_ts: ts });
+      if (error) throw new Error(error.message);
+      await pushLiveNode(me);
+      return jsonResponse({ ok: true,
+        build_integrity: String(data ?? "unattested"),
+        version, digest });
+    }
+
     if (route === "peer") {
       const peer = normalizeUsername(body.username);
       if (!peer) {
@@ -433,7 +582,8 @@ Deno.serve(async (req) => {
         "grade,grade_since,daemon_only,last_daemon_receipt_at,"
         + "last_runtime_proof_at,judged_nature_version,"
         + "nature_compliant,spec_drift,dossier_status,"
-        + "dossier_deposited_at",
+        + "dossier_deposited_at,build_version,build_digest,"
+        + "build_integrity,build_attested_at",
         { username: peer });
       return jsonResponse({ ok: true, username: peer,
         nature: row.nature_profile ?? null,
@@ -444,7 +594,7 @@ Deno.serve(async (req) => {
 
     return errorResponse("unknown_route",
       "routes: challenge | answer | prove | declare | drift | "
-      + "dossier-status | peer", 404);
+      + "dossier-status | attest | peer", 404);
   } catch (e) {
     return errorResponse("liveness_failed",
       String(e instanceof Error ? e.message : e), 500);
