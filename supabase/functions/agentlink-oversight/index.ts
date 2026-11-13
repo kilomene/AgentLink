@@ -97,16 +97,22 @@ import {
   b64decode,
   b64encode,
   bearerToken,
+  CAP_LARGE,
   CORS_HEADERS,
   decryptWithKey,
   env,
   errorResponse,
   jsonResponse,
   methodGuard,
+  normalizeUsername,
   nowSeconds,
   openSealedEnvelope,
+  patchRows,
   presignR2Url,
   r2ConfigFromEnv,
+  randomTokenUrlSafe,
+  readJsonBody,
+  recordOperatorEvent,
   selectOne,
   sha256Hex,
   verifyAgentJwt,
@@ -491,7 +497,9 @@ function matchDeliveryFile(
 Deno.serve(async (req: Request) => {
   const guard = methodGuard(req);
   if (guard) return guard;
-  const body = await req.json().catch(() => ({})) as Record<string, unknown>;
+  const parsed = await readJsonBody(req, CAP_LARGE);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
 
   const sessionToken = String(body.session_token ?? "") || bearerToken(req);
   if (!(await sessionValid(sessionToken)) && !(await operatorAuthorized(req))) {
@@ -500,6 +508,138 @@ Deno.serve(async (req: Request) => {
       "a valid dashboard session is required",
       401,
     );
+  }
+
+  // ---- operator acts (2.6.0): provisioning + suspension ------
+  // These routes ride the SAME operator auth as everything in
+  // this function (dashboard session token or operator JWT,
+  // checked immediately above) — there is no lesser door. They
+  // are the server half of the operator CLI.
+  //
+  //   POST {action:"provisioning_issue", username, ttl_hours?}
+  //     -> {ok, grant_id, username, expires_at, provisioning_grant}
+  //     The raw token is returned EXACTLY ONCE, here; only its
+  //     SHA-256 is stored (al_provisioning_grants, v216).
+  //   POST {action:"provisioning_revoke", username} |
+  //        {action:"provisioning_revoke", grant_id}
+  //     -> {ok, revoked:n} — voids UNCONSUMED grants only.
+  //   POST {action:"suspend", username, reason?}
+  //     -> {ok, username, suspended_at} — sets the switch the
+  //     shared helper enforces on every agent Edge but support.
+  //   POST {action:"reinstate", username} -> {ok, username}
+  // Every act is recorded in al_operator_events.
+  const opAction = String(body.action ?? "");
+  if (opAction === "provisioning_issue" ||
+      opAction === "provisioning_revoke" ||
+      opAction === "suspend" || opAction === "reinstate") {
+    const target = normalizeUsername(body.username);
+    if (opAction === "provisioning_issue") {
+      if (!target) {
+        return errorResponse("invalid_username",
+          "provisioning_issue needs a well-formed username", 400);
+      }
+      const existingUser = await selectOne(supabase, "al_users",
+        "username", { username: target });
+      if (existingUser) {
+        return errorResponse("username_taken",
+          "that username is already registered; provisioning " +
+          "grants exist only for NEW usernames (existing " +
+          "accounts are never gated)", 409);
+      }
+      const ttlHours = Math.min(24 * 30, Math.max(1,
+        Number(body.ttl_hours ?? 72) || 72));
+      const now = nowSeconds();
+      const rawToken = randomTokenUrlSafe(32);
+      const { data, error } = await supabase
+        .from("al_provisioning_grants")
+        .insert({
+          username: target,
+          token_hash: await sha256Hex(rawToken),
+          issued_by: "operator",
+          issued_at: now,
+          expires_at: now + Math.trunc(ttlHours * 3600),
+          note: String(body.note ?? "").slice(0, 200),
+        })
+        .select("id")
+        .limit(1);
+      if (error) {
+        return errorResponse("issue_failed", error.message, 500);
+      }
+      const grantId = String(data?.[0]?.id ?? "");
+      await recordOperatorEvent(supabase, "provisioning_issued",
+        "operator", target,
+        "provisioning grant issued for " + target,
+        { grant_id: grantId, ttl_hours: ttlHours });
+      return jsonResponse({
+        ok: true,
+        grant_id: grantId,
+        username: target,
+        expires_at: now + Math.trunc(ttlHours * 3600),
+        // The raw token: returned ONCE, never stored, never
+        // logged. The operator hands it to the invited agent
+        // out of band.
+        provisioning_grant: rawToken,
+      });
+    }
+    if (opAction === "provisioning_revoke") {
+      const grantId = String(body.grant_id ?? "");
+      if (!grantId && !target) {
+        return errorResponse("invalid_request",
+          "provisioning_revoke needs a grant_id or a username",
+          400);
+      }
+      let q = supabase.from("al_provisioning_grants")
+        .update({ revoked_at: nowSeconds() })
+        .is("consumed_at", null).is("revoked_at", null);
+      q = grantId ? q.eq("id", grantId) : q.eq("username", target);
+      const { data, error } = await q.select("id");
+      if (error) {
+        return errorResponse("revoke_failed", error.message, 500);
+      }
+      const revoked = (data ?? []).length;
+      if (revoked) {
+        await recordOperatorEvent(supabase, "provisioning_revoked",
+          "operator", target ?? "",
+          "provisioning grant(s) revoked before consumption",
+          { grant_id: grantId, revoked });
+      }
+      return jsonResponse({ ok: true, revoked });
+    }
+    // suspend / reinstate
+    if (!target) {
+      return errorResponse("invalid_username",
+        opAction + " needs a well-formed username", 400);
+    }
+    const userRow = await selectOne(supabase, "al_users",
+      "username, suspended_at", { username: target });
+    if (!userRow) {
+      return errorResponse("unknown_agent",
+        "no registered agent by that name", 404);
+    }
+    if (opAction === "suspend") {
+      const now = nowSeconds();
+      const reason = String(body.reason ?? "").slice(0, 500);
+      await patchRows(supabase, "al_users", { username: target }, {
+        suspended_at: now,
+        suspended_by: "operator",
+        suspended_reason: reason,
+      });
+      await recordOperatorEvent(supabase, "agent_suspended",
+        "operator", target,
+        "agent suspended" + (reason ? ": " + reason : ""),
+        { reason });
+      return jsonResponse({ ok: true, username: target,
+        suspended_at: now });
+    }
+    await patchRows(supabase, "al_users", { username: target }, {
+      suspended_at: null,
+      suspended_by: "",
+      suspended_reason: "",
+    });
+    await recordOperatorEvent(supabase, "agent_reinstated",
+      "operator", target, "agent reinstated", {});
+    return jsonResponse({ ok: true, username: target,
+      reinstated: true });
   }
 
   let priv: string;
