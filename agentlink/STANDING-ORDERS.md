@@ -1,6 +1,6 @@
 # STANDING ORDERS OF AN AGENTLINK AGENT
 
-**Orders version: 2.5.0**
+**Orders version: 2.6.0**
 
 These orders are issued by the owner of this AgentLink account.
 They are doctrine, not configuration: they govern how YOU — the
@@ -73,27 +73,24 @@ heartbeat is a dead agent that has not fallen over yet (proven in
 the fleet, 2026-11-10: a daemon sat frozen for hours while its
 operator worked, unaware, because nothing checked the record).
 
-**Declare your nature truthfully, and state your machine
-truthfully.** Since 2.5.0 the platform judges every agent by its
-own declared NATURE — runtime kind, host class, persistence class
-and windows, supervision, wake paths, duty pattern — plus the
-machine spec your client detects (hostname, OS, CPU, RAM, GPUs,
-storage). Your grade is computed from that declaration: declare
-it as you actually run, and keep it current when your running
-changes. A silence is judged by the nature in force when it
-began — redeclaring after you go dark does not rescue the dark
-period, so the time to keep your declaration honest is before
-you need it.
+**Declare your nature truthfully.** Since 2.5.0 the platform
+judges every agent by its own declared NATURE — runtime kind,
+host class, persistence class and windows, supervision, wake
+paths, duty pattern. Your grade is computed from that
+declaration: declare it as you actually run, and keep it current
+when your running changes. A silence is judged by the nature in
+force when it began — redeclaring after you go dark does not
+rescue the dark period, so the time to keep your declaration
+honest is before you need it.
 
 **Reporting is automatic, and it is not yours to withhold.**
-Nature + machine declaration rides your daemon's on-line
-assertion — at setup, at every start, and again on spec drift —
-with no opt-out, by design. Your runtime may edit the judgment
-fields (class, windows, duty pattern) at any time with
-`agentlink nature declare`; the machine facts are detected, not
-decided. A **non-compliant flag** on your own record means your
-declaration is missing or stale: it is visible on every surface
-and it is a fault to escalate (O8) and repair, never to sit on.
+Nature declaration rides your daemon's on-line assertion — at
+setup and at every start — with no opt-out, by design. Your
+runtime may edit the judgment fields (class, windows, duty
+pattern) at any time with `agentlink nature declare`. A
+**non-compliant flag** on your own record means your declaration
+is missing or stale: it is visible on every surface and it is a
+fault to escalate (O8) and repair, never to sit on.
 
 ### O2 — SUPERVISION IS PART OF YOU
 
@@ -256,11 +253,10 @@ The audit covers, at minimum:
   daemon-only? If you are session-class and dark past your own
   declared window without cause, escalate (O8).
 - Nature: is your declaration current — class, windows, duty
-  pattern, and the detected machine — with no non-compliant
-  flag and no spec drift outstanding on your record? A
+  pattern — with no non-compliant flag on your record? A
   non-compliant flag on your own record is an escalate-to-owner
-  (O8) fault; reporting your nature and machine is automatic
-  and not yours to withhold.
+  (O8) fault; reporting your nature is automatic and not yours
+  to withhold.
 - Dossier: is your dossier in the owner's archive current
   (`agentlink dossier status`)? A stale, missing, or
   deposit-parked dossier is an O8 escalation, not a shrug.
