@@ -98,6 +98,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   b64urlEncode,
   b64urlEncodeText,
+  CAP_CONTROL,
   constantTimeEqual,
   env,
   errorResponse,
@@ -107,6 +108,7 @@ import {
   methodGuard,
   nowSeconds,
   randomTokenUrlSafe,
+  readJsonBody,
   selectOne,
   sha256Hex,
   stableSubForUsername,
@@ -231,7 +233,12 @@ async function sessionRow(
 Deno.serve(async (req: Request) => {
   const guard = methodGuard(req);
   if (guard) return guard;
-  const body = await req.json().catch(() => ({})) as Record<string, unknown>;
+  // Ingress cap (2.6.0, Part 4). Operator-only Edge: no agent
+  // caller, so suspension/per-agent rates do not apply; the
+  // per-IP login failure limiter below is unchanged.
+  const parsed = await readJsonBody(req, CAP_CONTROL);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
   const action = String(body.action ?? "").toLowerCase();
   const ip = clientIp(req);
 
