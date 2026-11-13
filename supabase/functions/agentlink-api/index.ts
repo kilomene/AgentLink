@@ -16,6 +16,11 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { isOffline, TIMING } from "../_shared/rules.ts";
+import {
+  CAP_CONTROL,
+  escapeIlike,
+  readJsonBody,
+} from "../_shared/v200.ts";
 
 const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
@@ -164,7 +169,11 @@ Deno.serve(async (req: Request) => {
     const q = url.searchParams.get("q") ?? "";
     let query = supabase.from("al_library").select("*")
       .order("ts", { ascending: false }).limit(100);
-    if (q) query = query.ilike("filename", `%${q}%`);
+    // Injection hygiene (2.6.0): the ilike pattern's
+    // metacharacters in the operator's query are escaped so
+    // the value matches literally — a % in q can no longer
+    // widen this into a pattern scan of the whole index.
+    if (q) query = query.ilike("filename", `%${escapeIlike(q)}%`);
     const { data } = await query;
     return json({ entries: data ?? [] });
   }
@@ -178,7 +187,14 @@ Deno.serve(async (req: Request) => {
 
   // Operator action (metadata-only): revoke a trusted dashboard device.
   if (path === "/devices/revoke" && req.method === "POST") {
-    const body = await req.json().catch(() => ({}));
+    // Ingress cap (2.6.0, Part 4): this is the only body this
+    // Edge reads; it is read under CAP_CONTROL. (The other
+    // routes are parameter reads with no body.) This Edge is
+    // operator-authenticated throughout — no agent caller, so
+    // the suspension switch and per-agent rates do not apply.
+    const parsed = await readJsonBody(req, CAP_CONTROL);
+    if (parsed.response) return parsed.response;
+    const body = parsed.body;
     const token = String(body.token ?? "");
     if (!token) return json({ error: "token required" }, 400);
     const { error } = await supabase.from("al_dashboard_sessions")
