@@ -52,12 +52,16 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   b64encode,
   bearerToken,
+  CAP_LARGE,
   errorResponse,
   jsonResponse,
   methodGuard,
   nowSeconds,
+  rateLimitRefusal,
+  readJsonBody,
   sha256Bytes,
   signEd25519,
+  suspendedRefusal,
   verifyAgentJwt,
   verifyEd25519,
 } from "../_shared/v200.ts";
@@ -1016,10 +1020,19 @@ Deno.serve(async (req: Request) => {
       "unauthorized", "a valid agent JWT is required", 401);
   }
   const me = claims.username;
-  const body = await req.json().catch(() => ({})) as Record<
-    string,
-    unknown
-  >;
+  // Containment (2.6.0, Part 4): suspension, cap, rate. NOTE:
+  // this is the v1.8.1 admin grant broker — the 2.6.0
+  // PROVISIONING gate does not live here and this Edge's
+  // semantics are unchanged; only the sweep's shared ingress
+  // discipline is added, as on every Edge.
+  const suspended = await suspendedRefusal(supabase, me);
+  if (suspended) return suspended;
+  const parsed = await readJsonBody(req, CAP_LARGE);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
+  const limited = await rateLimitRefusal(
+    supabase, "grants:" + me, 300);
+  if (limited) return limited;
   if (body.username !== undefined && body.username !== me) {
     return errorResponse(
       "identity_mismatch",
