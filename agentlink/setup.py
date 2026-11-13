@@ -410,8 +410,18 @@ async def run_setup(username: str, state_dir: str | None = None,
                     grant: str = "ask",
                     install_service: bool = True,
                     auto_support: bool = True,
-                    declare_nature: bool = False) -> dict:
-    """Run the full setup and return the plain report dict."""
+                    declare_nature: bool = False,
+                    provisioning_grant: str | None = None) -> dict:
+    """Run the full setup and return the plain report dict.
+
+    ``provisioning_grant`` (2.6.0, SPEC Part 2): the one-time
+    operator-issued token for a BRAND-NEW username, threaded to
+    the registration request only. Resolution mirrors the
+    rectification code: this argument, else the
+    AGENTLINK_PROVISIONING_GRANT env var, else the workspace
+    drop-in file (both resolved inside Agent). Existing accounts
+    and reclaims never present it. The report records only
+    presented/not-presented — never the token itself."""
     from .client import Agent
     uname = normalize_username(username)
     if uname is None:
@@ -478,7 +488,10 @@ async def run_setup(username: str, state_dir: str | None = None,
     # retried.
     from .client import InstanceCollision, RegistrationFailed
     agent = Agent(uname, state_dir=str(sd), designation=designation,
-                  mode="manual")
+                  mode="manual", provisioning_grant=provisioning_grant)
+    report["provisioning_grant"] = (
+        "presented" if provisioning_grant else
+        "resolved_at_registration")
     already: dict | None = None
     try:
         import asyncio as _aio
@@ -640,8 +653,9 @@ async def run_setup(username: str, state_dir: str | None = None,
                     report["grant"] = {"status": "declined"}
 
             # 5b — Nature declaration (2.5.0 + the owner's
-            # hardening ruling): reporting is AUTOMATIC — setup
-            # declares the agent's nature + detected machine as
+            # hardening ruling; nature-only since 2.6.0 spec
+            # retirement): reporting is AUTOMATIC — setup
+            # declares the agent's nature as
             # part of bringing it on the line. There is no
             # opt-out and no consent step (the declaration is a
             # hardened shared setting, like the presence beat);
