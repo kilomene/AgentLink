@@ -23,10 +23,13 @@
 //                    declare_payload(username, canonical profile,
 //                    ts); appended to the signed history by
 //                    al_liveness_apply_declaration
-//   POST /drift      spec drift: {fields, ts, sig} over
-//                    drift_payload(username, sorted fields, ts)
-//                    — field names only; a fresh declaration
-//                    carries the new values and clears the flag
+//   POST /drift      RETIRED (2.6.0, Part 1): the machine spec
+//                    is no longer collected, stored or judged.
+//                    Legacy drift reports are accepted and
+//                    DISCARDED ({ok:true, retired:true}) — no
+//                    state write, no spec_drift update — so a
+//                    legacy client never error-loops on a door
+//                    the platform deliberately closed.
 //   POST /dossier-status  the daemon's signed dossier flag:
 //                    {status, deposited_at, version, ts, sig}
 //                    over dossier_status_payload(...) — a FLAG
@@ -34,9 +37,13 @@
 //                    in the owner's Drive archive, never here
 //   POST /peer       nature-fit surface for assignment:
 //                    {username} -> the peer's declared nature +
-//                    machine + current grade + last proofs
-//                    (operational metadata, fleet-visible like
-//                    the directory; never content)
+//                    current grade + last proofs (operational
+//                    metadata, fleet-visible like the directory;
+//                    never content). Since 2.6.0 the nature
+//                    profile is returned with any legacy
+//                    spec-bearing keys stripped (Part 1), and
+//                    spec_drift is no longer selected or
+//                    returned anywhere in this Edge.
 //
 // Canonical payload strings are defined in agentlink/liveness.py
 // and mirrored here byte-for-byte (one law, two places).
@@ -48,6 +55,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   bearerToken,
+  CAP_CONTROL,
+  claimOnce,
   env,
   errorResponse,
   jsonResponse,
@@ -55,8 +64,12 @@ import {
   mintGoogleAccessToken,
   normalizeUsername,
   nowSeconds,
+  rateLimitRefusal,
+  readJsonBody,
   sanitizeKey,
   selectOne,
+  stripSpecFields,
+  suspendedRefusal,
   verifyAgentJwt,
   verifyEd25519,
 } from "../_shared/v200.ts";
@@ -226,7 +239,9 @@ function composeNode(
     last_proof_tier: tier,
     last_proof_at: at,
     daemon_only: Boolean(lv?.daemon_only),
-    spec_drift: Boolean(String(lv?.spec_drift ?? "")),
+    // Part 1 (2.6.0): spec_drift is NOT mirrored anymore. The
+    // al_liveness.spec_drift column is legacy residue; no Edge
+    // writes it and no node carries it.
     nature_compliant: Boolean(lv?.nature_compliant),
     dossier_status: String(lv?.dossier_status ?? "") || "missing",
     // Build integrity (2.5.2): the platform's verdict, mirrored
@@ -298,11 +313,22 @@ Deno.serve(async (req) => {
     return errorResponse("unauthorized",
       "agent JWT did not verify", 401);
   }
-  const me = claims.username;
+  const me = claims.username as string;
+  // Containment (2.6.0, Part 4): suspension switch (support is
+  // the only exempt Edge; this is not it), then the payload
+  // cap, then the per-agent rate limit — all before any route
+  // touches state. The rate limit is 240/min: proof cadences
+  // are minutes-scale, so this is headroom, not a squeeze.
+  const suspended = await suspendedRefusal(supabase, me);
+  if (suspended) return suspended;
+  const parsed = await readJsonBody(req, CAP_CONTROL);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
+  const limited = await rateLimitRefusal(
+    supabase, "liveness:" + me, 240);
+  if (limited) return limited;
   const url = new URL(req.url);
   const route = url.pathname.split("/").filter(Boolean).pop() ?? "";
-  const body = await req.json().catch(() => ({})) as
-    Record<string, unknown>;
   const now = nowSeconds();
 
   try {
@@ -421,6 +447,16 @@ Deno.serve(async (req) => {
           "proof signature did not verify against the "
           + "registry key", 403);
       }
+      // Replay (2.6.0, Part 4): a proof is a signed statement
+      // with a ±600s freshness window; inside that window the
+      // identical statement is claimed exactly once, so a
+      // captured proof cannot be replayed to refresh a stale
+      // runtime's grade.
+      if (!await claimOnce(supabase, "liveness_prove", me,
+        ts + "|" + String(body.sig ?? ""), ts + 900)) {
+        return errorResponse("replayed_statement",
+          "this proof statement was already presented", 409);
+      }
       const { error } = await supabase.rpc(
         "al_liveness_apply_prove",
         hasDigest
@@ -449,6 +485,9 @@ Deno.serve(async (req) => {
           "declaration timestamp is outside the acceptance "
           + "window", 400);
       }
+      // The signature is verified over the profile AS SENT —
+      // a legacy client's signature covers its whole profile,
+      // spec fields included, and must still verify.
       const ok = await verified(me,
         declarePayload(me, profile, ts), body.sig);
       if (!ok) {
@@ -456,9 +495,17 @@ Deno.serve(async (req) => {
           "declaration signature did not verify against the "
           + "registry key", 403);
       }
+      // Part 1 (2.6.0): SPEC RETIREMENT at ingress. Any
+      // machine / detection_gap / spec fields a legacy client
+      // still sends are stripped HERE, before validation and
+      // storage: silently discarded, never stored, never
+      // mirrored (hostile case 10). The v216 declaration
+      // function strips the same keys again server-side, so
+      // no spec record can be created by any caller.
+      const cleanProfile = stripSpecFields(profile);
       const { data, error } = await supabase.rpc(
         "al_liveness_apply_declaration",
-        { p_username: me, p_profile: profile,
+        { p_username: me, p_profile: cleanProfile,
           p_signature: String(body.sig), p_ts: ts });
       if (error) {
         return errorResponse("bad_declaration",
@@ -470,30 +517,16 @@ Deno.serve(async (req) => {
     }
 
     if (route === "drift") {
-      // Spec drift: the agent's signed self-report that its
-      // machine changed vs the declared snapshot (field names
-      // only). Recorded on al_liveness + pushed to the node;
-      // a fresh declaration clears it.
-      const ts = Number(body.ts ?? 0);
-      const fields = Array.isArray(body.fields)
-        ? body.fields.map((f) => String(f)).filter(Boolean)
-        : [];
-      if (!ts || Math.abs(now - ts) > 600 || !fields.length) {
-        return errorResponse("bad_drift_report",
-          "fields and a fresh ts are required", 400);
-      }
-      const ok = await verified(me,
-        driftPayload(me, fields, ts), body.sig);
-      if (!ok) {
-        return errorResponse("bad_signature",
-          "drift report signature did not verify", 403);
-      }
-      const { error } = await supabase.rpc(
-        "al_liveness_apply_drift",
-        { p_username: me, p_fields: fields.join(","), p_ts: ts });
-      if (error) throw new Error(error.message);
-      await pushLiveNode(me);
-      return jsonResponse({ ok: true, spec_drift: fields });
+      // RETIRED (2.6.0, Part 1). CHOICE, documented per the
+      // release brief: discard-with-200 {ok:true, retired:true}
+      // rather than a named retired fault, so legacy clients
+      // that still report drift on their start cadence do not
+      // error-loop against a door the platform closed on
+      // purpose. NO signature check (the report is not
+      // believed, recorded or acted on — verifying it would
+      // only give a dead concept a live code path), NO state
+      // write, NO spec_drift update, NO live-node push.
+      return jsonResponse({ ok: true, retired: true });
     }
 
     if (route === "dossier-status") {
@@ -516,6 +549,15 @@ Deno.serve(async (req) => {
       if (!ok) {
         return errorResponse("bad_signature",
           "dossier status signature did not verify", 403);
+      }
+      // Replay (2.6.0, Part 4): the identical signed report is
+      // claimed once; a replay cannot re-stamp the claim.
+      if (!await claimOnce(supabase, "dossier_status", me,
+        status + "|" + depositedAt + "|" + version + "|" + ts +
+          "|" + String(body.sig ?? ""), ts + 900)) {
+        return errorResponse("replayed_statement",
+          "this dossier status report was already presented",
+          409);
       }
       const { error } = await supabase.rpc(
         "al_liveness_apply_dossier_status",
@@ -552,6 +594,16 @@ Deno.serve(async (req) => {
           "build statement signature did not verify against " +
           "the registry key", 403);
       }
+      // Replay (2.6.0, Part 4; hostile case 7): the identical
+      // signed statement is claimed once — a captured build
+      // statement replayed inside its ±600s window is refused,
+      // never re-judged.
+      if (!await claimOnce(supabase, "build_attest", me,
+        version + "|" + digest + "|" + ts + "|" +
+          String(body.sig ?? ""), ts + 900)) {
+        return errorResponse("replayed_statement",
+          "this build statement was already presented", 409);
+      }
       const { data, error } = await supabase.rpc(
         "al_build_apply_attestation",
         { p_username: me, p_version: version,
@@ -581,12 +633,15 @@ Deno.serve(async (req) => {
       const lv = await selectOne(supabase, "al_liveness",
         "grade,grade_since,daemon_only,last_daemon_receipt_at,"
         + "last_runtime_proof_at,judged_nature_version,"
-        + "nature_compliant,spec_drift,dossier_status,"
+        + "nature_compliant,dossier_status,"
         + "dossier_deposited_at,build_version,build_digest,"
         + "build_integrity,build_attested_at",
         { username: peer });
       return jsonResponse({ ok: true, username: peer,
-        nature: row.nature_profile ?? null,
+        // Part 1: a legacy stored profile may still carry a
+        // spec section from a pre-2.6.0 declaration; it is
+        // stripped on the way out, never returned.
+        nature: stripSpecFields(row.nature_profile ?? null),
         nature_version: Number(row.nature_version ?? 0),
         nature_declared_at: Number(row.nature_declared_at ?? 0),
         liveness: lv ?? null });
