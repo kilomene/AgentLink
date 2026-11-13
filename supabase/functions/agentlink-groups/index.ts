@@ -46,6 +46,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   bearerToken,
+  CAP_CONTROL,
   errorResponse,
   jsonResponse,
   methodGuard,
@@ -53,7 +54,10 @@ import {
   normalizeUsernameList,
   nowSeconds,
   randomTokenUrlSafe,
+  rateLimitRefusal,
+  readJsonBody,
   sha256Hex,
+  suspendedRefusal,
   verifyAgentJwt,
 } from "../_shared/v200.ts";
 
@@ -951,10 +955,15 @@ Deno.serve(async (req: Request) => {
       "unauthorized", "a valid agent JWT is required", 401);
   }
   const me = claims.username;
-  const body = await req.json().catch(() => ({})) as Record<
-    string,
-    unknown
-  >;
+  // Containment (2.6.0, Part 4): suspension, cap, rate.
+  const suspended = await suspendedRefusal(supabase, me);
+  if (suspended) return suspended;
+  const parsed = await readJsonBody(req, CAP_CONTROL);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
+  const limited = await rateLimitRefusal(
+    supabase, "groups:" + me, 300);
+  if (limited) return limited;
   // Identity comes from the verified JWT ONLY (2.3.1 fix). An
   // earlier dispatcher guard here rejected any body whose
   // `username` field disagreed with the JWT — but the target
