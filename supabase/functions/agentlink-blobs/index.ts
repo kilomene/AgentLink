@@ -33,13 +33,17 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   b64decode,
   bearerToken,
+  CAP_BLOB,
   errorResponse,
   jsonResponse,
   methodGuard,
   nowSeconds,
   presignR2Url,
   r2ConfigFromEnv,
+  rateLimitRefusal,
+  readJsonBody,
   sha256Hex,
+  suspendedRefusal,
   verifyAgentJwt,
 } from "../_shared/v200.ts";
 
@@ -265,10 +269,33 @@ Deno.serve(async (req: Request) => {
       "unauthorized", "a valid agent JWT is required", 401);
   }
   const me = claims.username;
-  const body = await req.json().catch(() => ({})) as Record<
-    string,
-    unknown
-  >;
+  // Containment (2.6.0, Part 4): suspension, cap, rate. The
+  // cap is CAP_BLOB (8 MiB): the chunk route carries one chunk
+  // as base64 in the body. The rate is 600/min — a legitimate
+  // multi-chunk upload is the fleet's bursty case and gets
+  // headroom, not a squeeze.
+  const suspended = await suspendedRefusal(supabase, me);
+  if (suspended) return suspended;
+  const parsed = await readJsonBody(req, CAP_BLOB);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
+  const limited = await rateLimitRefusal(
+    supabase, "blobs:" + me, 600);
+  if (limited) return limited;
+  // Injection hygiene: blob/session ids become R2 keys. The
+  // platform's ids are [A-Za-z0-9._-] only; anything carrying
+  // a path separator or traversal segment is refused before
+  // it can shape a key. (presignR2Url also encodes each key
+  // segment — this is the second layer, at the door.)
+  for (const idField of ["blob_id", "session_id"]) {
+    const v = body[idField];
+    if (v !== undefined &&
+        (typeof v !== "string" ||
+         !/^[A-Za-z0-9._-]+$/.test(v) || v.includes(".."))) {
+      return errorResponse("invalid_request",
+        idField + " is not a well-formed platform id", 400);
+    }
+  }
   if (body.username !== undefined && body.username !== me) {
     return errorResponse(
       "identity_mismatch",
