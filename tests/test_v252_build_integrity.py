@@ -56,7 +56,7 @@ DIGEST_250 = ("df22f7a4e1fddd4186a4b33d26efcc237cc73"
               "287c7380825ac215674ef1d9e6b")
 DIGEST_251 = ("48051b9f2aa945be3df24c59f8705fa02edeb"
               "7fa29a5b8a8f3dc24f0b993302b")
-RUNNING = "2.5.2"  # agentlink.__version__ on this tree
+RUNNING = "2.6.0"  # agentlink.__version__ on this tree
 
 
 def _manifest_bytes(version: str, files: dict) -> bytes:
