@@ -20,7 +20,7 @@ configuration, never from a literal in the source.
 
 CONTENT: identity (username, display name, registered_at,
 client version, identity-key fingerprint), the FULL nature
-profile + machine spec, how the agent works (runtime kind,
+profile, how the agent works (runtime kind,
 supervision, wake paths, duty pattern, transports), a location
 block (system timezone, OS locale, an agent/owner-declared
 label — what the machine itself knows; NO IP geolocation, NO
@@ -61,8 +61,16 @@ the failure loudly (non-current on every surface, and the
 platform's single transition alert past 24h) until it does.
 Generation + deposit are AUTOMATIC (hardened reporting
 class): at setup, at daemon start when stale, on any
-nature/spec version change, on a client version change, and
+nature version change, on a client version change, and
 at a 7-day max-age refresh. No opt-out exists.
+
+SCHEMA /2 (v2.6.0, spec retirement): dossier/2 is dossier/1
+minus the machine spec section — the platform no longer
+collects the spec, so the dossier no longer carries it.
+build_dossier strips any retired 'machine' / 'detection_gap'
+keys from the incoming profile before embedding, so a legacy
+local profile can never leak spec into a v2 dossier. Filed
+v1 dossiers remain untouched historical record.
 """
 from __future__ import annotations
 
@@ -78,7 +86,7 @@ from .archive import entry_hash
 from .liveness import canonical_json
 from .timing import DOSSIER_DEPOSIT_NEXT_DUE_BASE_SECONDS
 
-SCHEMA = "agentlink-dossier/1"
+SCHEMA = "agentlink-dossier/2"
 MAX_AGE_S = 7 * 86400
 #: Deposit retry discipline (mirrors the archive queue's):
 #: bounded attempts with a growing next-due interval, then the
@@ -167,8 +175,11 @@ def build_dossier(*, username: str, display_name: str,
     """Assemble the dossier document (unsigned). Raises
     ValueError if anything forbidden is present — generation
     fails closed rather than deposit a tainted record."""
-    prof = nature_profile or {}
-    machine = prof.get("machine") or {}
+    # Spec retirement (2.6.0): the profile is embedded WITHOUT
+    # the retired spec keys — a legacy local profile carrying
+    # them must never leak spec into a v2 dossier.
+    prof = {k: v for k, v in (nature_profile or {}).items()
+            if k not in ("machine", "detection_gap")}
     doc = {
         "schema": SCHEMA,
         "username": username,
@@ -183,7 +194,6 @@ def build_dossier(*, username: str, display_name: str,
             "state_dir_name": state_dir_name,
         },
         "nature": prof,
-        "machine": machine,
         "how_it_works": {
             "runtime_kind": prof.get("runtime_kind") or "",
             "persistence_class":
@@ -223,8 +233,6 @@ def build_dossier(*, username: str, display_name: str,
                 int(standing.get("last_runtime_proof_at") or 0),
         },
     }
-    if prof.get("detection_gap"):
-        doc["detection_gap"] = str(prof["detection_gap"])
     _scan_clean(doc)
     return doc
 
@@ -280,18 +288,10 @@ def render_markdown(doc: dict) -> str:
     never diverge."""
     ident = doc["identity"]
     nat = doc.get("nature") or {}
-    m = doc.get("machine") or {}
     hw = doc["how_it_works"]
     loc = doc["location"]
     sd = doc["self_description"]
     st = doc["standing"]
-    gpus = m.get("gpus") or []
-    gpu_lines = "\n".join(
-        f"  - {g.get('vendor', '')} {g.get('model', '')}"
-        f" ({g.get('vram_mb')} MB VRAM)"
-        if g.get("vram_mb") else
-        f"  - {g.get('vendor', '')} {g.get('model', '')}"
-        for g in gpus) or "  - none"
     lines = [
         f"# Agent Dossier — @{doc['username']}",
         "",
@@ -320,21 +320,6 @@ def render_markdown(doc: dict) -> str:
         f"- Wake paths: {', '.join(nat.get('wake_paths') or [])}",
         f"- Duty pattern: {nat.get('duty_pattern') or '—'}",
         f"- Network class: {nat.get('network_class') or '—'}",
-        "",
-        "## Machine (client-detected at declaration time)",
-        f"- Hostname: {m.get('hostname') or 'unknown'}",
-        f"- OS: {m.get('os') or 'unknown'} "
-        f"({m.get('os_version') or ''})",
-        f"- Architecture: {m.get('arch') or 'unknown'}",
-        f"- CPU: {m.get('cpu_model') or 'unknown'} "
-        f"({m.get('cores_physical')} physical / "
-        f"{m.get('cores_logical')} logical cores)",
-        f"- RAM: {m.get('ram_mb')} MB",
-        "- GPUs:",
-        gpu_lines,
-        f"- Storage: {m.get('storage_total_mb')} MB total / "
-        f"{m.get('storage_free_mb')} MB free",
-        f"- Client runtime: {m.get('client_runtime') or '—'}",
         "",
         "## How it works",
         f"- Transports: {', '.join(hw['transports'])}",
@@ -446,7 +431,7 @@ def needs_refresh(state_dir: Path, nature_version: int = 0,
                   now: int | None = None,
                   client_version: str = "") -> bool:
     """Generation triggers (owner's dossier ruling): no
-    dossier yet, the nature/spec version moved since the
+    dossier yet, the nature version moved since the
     dossier was generated, the dossier aged past the 7-day
     max — or (2.5.1) the CLIENT version moved: the dossier
     names the client that generated it, and a dossier stating
