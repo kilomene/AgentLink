@@ -22,9 +22,13 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   bearerToken,
+  CAP_CONTROL,
   errorResponse,
   jsonResponse,
   methodGuard,
+  rateLimitRefusal,
+  readJsonBody,
+  suspendedRefusal,
   verifyAgentJwt,
 } from "../_shared/v200.ts";
 
@@ -168,10 +172,15 @@ Deno.serve(async (req: Request) => {
       "unauthorized", "a valid agent JWT is required", 401);
   }
   const me = claims.username;
-  const body = await req.json().catch(() => ({})) as Record<
-    string,
-    unknown
-  >;
+  // Containment (2.6.0, Part 4): suspension, cap, rate.
+  const suspended = await suspendedRefusal(supabase, me);
+  if (suspended) return suspended;
+  const parsed = await readJsonBody(req, CAP_CONTROL);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
+  const limited = await rateLimitRefusal(
+    supabase, "library:" + me, 300);
+  if (limited) return limited;
   if (body.username !== undefined && body.username !== me) {
     return errorResponse(
       "identity_mismatch",
