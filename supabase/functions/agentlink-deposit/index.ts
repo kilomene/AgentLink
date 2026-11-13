@@ -44,10 +44,14 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   bearerToken,
+  CAP_DEPOSIT,
   errorResponse,
   jsonResponse,
   methodGuard,
+  rateLimitRefusal,
+  readJsonBody,
   selectOne,
+  suspendedRefusal,
   verifyAgentJwt,
   verifyEd25519,
 } from "../_shared/v200.ts";
@@ -125,9 +129,23 @@ Deno.serve(async (req) => {
     return errorResponse("unauthorized",
       "agent JWT did not verify", 401);
   }
-  const me = claims.username;
-  const body = await req.json().catch(() => ({})) as
-    Record<string, unknown>;
+  const me = claims.username as string;
+  // Containment (2.6.0, Part 4): suspension first, then the
+  // payload cap, then the rate limit — all before any file is
+  // decoded or any state is touched (hostile case 9). The cap
+  // is CAP_DEPOSIT (8 MiB): a dossier deposit is a base64 file
+  // SET and legitimately multi-MiB; before 2.6.0 this Edge had
+  // NO cap at all. The rate is 60/min: deposits are rare,
+  // deliberate acts, and 60 is wide headroom over the client's
+  // retry cadence.
+  const suspended = await suspendedRefusal(supabase, me);
+  if (suspended) return suspended;
+  const parsed = await readJsonBody(req, CAP_DEPOSIT);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
+  const limited = await rateLimitRefusal(
+    supabase, "deposit:" + me, 60);
+  if (limited) return limited;
 
   try {
     // ------------------------------------------------ dossier
@@ -142,6 +160,21 @@ Deno.serve(async (req) => {
         return errorResponse("bad_deposit",
           "dossier deposit needs files with DOSSIER.json", 400);
       }
+      // Ingress hygiene (2.6.0): file names become Drive
+      // names and, in the operator drain, local temp paths.
+      // The legitimate set is flat names plus the
+      // "dossier-history/" prefix — traversal segments,
+      // backslashes and absolute names are refused here so
+      // no downstream surface ever has to trust them.
+      for (const name of Object.keys(files)) {
+        if (name.length > 200 || name.startsWith("/") ||
+            name.includes("\\") ||
+            name.split("/").includes("..")) {
+          return errorResponse("bad_deposit",
+            "dossier file name is not a lawful deposit name: " +
+            name.slice(0, 80), 400);
+        }
+      }
       let doc: Record<string, unknown>;
       try {
         doc = JSON.parse(new TextDecoder().decode(
@@ -150,7 +183,12 @@ Deno.serve(async (req) => {
         return errorResponse("bad_deposit",
           "DOSSIER.json is not decodable JSON", 400);
       }
-      if (String(doc.schema ?? "") !== "agentlink-dossier/1" ||
+      // Dossier schema: /2 is current (2.6.0 — the machine
+      // spec section is retired); /1 stays acceptable from
+      // pre-2.6.0 agents, which keep working unchanged.
+      if (!["agentlink-dossier/1",
+            "agentlink-dossier/2"].includes(
+              String(doc.schema ?? "")) ||
           String(doc.username ?? "") !== me) {
         return errorResponse("bad_deposit",
           "dossier document is not this agent's dossier", 400);
