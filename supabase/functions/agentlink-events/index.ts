@@ -17,6 +17,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { buildAlertPayload } from "../_shared/rules.ts";
+import { CAP_CONTROL, readJsonBody } from "../_shared/v200.ts";
 
 const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
@@ -70,8 +71,18 @@ async function dispatchWebhook(payload: Record<string, unknown>,
 }
 
 Deno.serve(async (req: Request) => {
-  const payload = await req.json().catch(() => ({}));
-  const record_ = payload.record ?? {};
+  // Ingress cap (2.6.0, Part 4): webhook payloads are alert /
+  // work metadata records; CAP_CONTROL is wide headroom. This
+  // Edge is invoked by database webhooks (operator plumbing,
+  // no agent caller), so suspension and per-agent rates do
+  // not apply. NOTE (pre-existing, flagged in SERVER-AUDIT.md,
+  // unchanged by this sweep): unlike agentlink-doorbell, this
+  // function performs no webhook-secret check of its own.
+  const parsed = await readJsonBody(req, CAP_CONTROL);
+  if (parsed.response) return parsed.response;
+  const payload = parsed.body;
+  // deno-lint-ignore no-explicit-any
+  const record_ = (payload.record ?? {}) as Record<string, any>;
   const table = payload.table ?? "";
 
   if (table === "al_alerts" && record_.id) {
