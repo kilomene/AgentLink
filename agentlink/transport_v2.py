@@ -125,7 +125,6 @@ from .doorbell import (DoorbellClient, DoorbellError,
                        conversation_id_for_group)
 from .liveness import (attest_payload as _liveness_attest_payload,
                        declare_payload as _liveness_declare_payload,
-                       drift_payload as _liveness_drift_payload,
                        prove_payload as _liveness_prove_payload,
                        receipt_payload as
                        _liveness_receipt_payload,
@@ -1262,78 +1261,71 @@ class ServerlessTransport:
                 "result": result}
 
     def ensure_nature_declared(self, state_dir) -> dict:
-        """AUTOMATIC nature+spec assertion (2.5.0, owner's
-        hardening ruling): reporting is not optional and carries
-        NO opt-out — no config flag, no env var, no prompt. This
-        runs on the daemon's on-line path (setup + every start +
-        drift) and declares when the record needs it:
+        """AUTOMATIC nature assertion (2.5.0, owner's hardening
+        ruling; nature-ONLY since 2.6.0 spec retirement):
+        reporting is not optional and carries NO opt-out — no
+        config flag, no env var, no prompt. This runs on the
+        daemon's on-line path (setup + every start) and declares
+        when the record needs it:
 
         * no declaration on record -> declare (the per-runtime
-          proposal as the baseline + the freshly detected
-          machine; the runtime may redeclare its judgment
-          fields at any time — they are never a gate on the
-          machine facts being reported),
-        * declared machine != detected machine (drift) ->
-          redeclare with the fresh snapshot,
-        * the client version moved since the declaration
-          (client_runtime carries it) -> redeclare, so version
-          truth (O5) and the declaration never diverge.
+          proposal as the baseline; the runtime may redeclare
+          its judgment fields at any time),
+        * the client version moved since the declaration ->
+          redeclare, so version truth (O5) and the declaration
+          never diverge. The version last declared with is
+          tracked LOCALLY in the state dir's nature-state.json
+          (``declared_client_version``): since 2.6.0 the signed
+          profile itself carries no machine/client-runtime
+          snapshot to read it back from (spec retirement: the
+          platform takes less), so the local record plus the
+          server-side presence of a declaration is the whole
+          test. Redeclare reasons NEVER include spec drift or
+          detection — there is no spec to drift.
 
-        Detection gaps never block the declaration: failed
-        fields go as 'unknown' with a detection_gap note —
-        silence is not a representable state. A declaration
-        that cannot LAND (network) is reported in the result,
-        never hidden; the next start retries, and the record
-        carries nature_compliant=false meanwhile (visibility +
-        consequence, never lockout)."""
-        from .liveness import (detect_machine, detection_gaps,
-                               machine_drift, propose_defaults)
+        A declaration that cannot LAND (network) is reported in
+        the result, never hidden; the next start retries, and
+        the record carries nature_compliant=false meanwhile
+        (visibility + consequence, never lockout). A legacy
+        on-record profile still carrying retired spec keys has
+        them stripped before any redeclaration is signed —
+        validate_profile rejects them now, and a legacy profile
+        must never wedge the duty it predates."""
+        from .liveness import propose_defaults
+        from . import __version__ as _client_version
         result: dict = {"declared": False, "current": False,
                         "reasons": []}
-        try:
-            detected = detect_machine(state_dir)
-        except Exception as exc:  # detection itself failed open
-            detected = {"hostname": "unknown", "os": "unknown",
-                        "os_version": "", "kernel": "",
-                        "arch": "unknown", "cpu_model": "unknown",
-                        "cores_physical": None,
-                        "cores_logical": None, "ram_mb": None,
-                        "gpus": [], "storage_total_mb": None,
-                        "storage_free_mb": None,
-                        "client_runtime": "",
-                        "detected_at": int(time.time())}
-            result["reasons"].append(f"detection_failed: {exc}")
         current = None
         try:
             current = self.liveness_status().get("nature")
         except Exception:
             current = None
+        declared_version = ""
+        state_path = None
+        try:
+            from pathlib import Path as _Path
+            state_path = _Path(state_dir).expanduser() / \
+                "nature-state.json"
+            if state_path.exists():
+                declared_version = str(
+                    json.loads(state_path.read_text()).get(
+                        "declared_client_version") or "")
+        except Exception:
+            declared_version = ""
         reasons: list[str] = []
         if not current:
             reasons.append("no declaration on record")
-        else:
-            drift = machine_drift(current.get("machine"),
-                                  detected)
-            if drift:
-                reasons.append(
-                    "spec drift: " + ",".join(drift))
-            from . import __version__ as _client_version
-            runtime_seen = str(
-                (current.get("machine") or {}).get(
-                    "client_runtime") or "")
-            if _client_version not in runtime_seen:
-                reasons.append("client version changed")
+        elif declared_version != _client_version:
+            reasons.append("client version changed")
         if not reasons:
             result["current"] = True
             return result
         base = dict(current) if current else propose_defaults(
             state_dir)
-        base["machine"] = detected
-        gaps = detection_gaps(detected)
-        if gaps:
-            base["detection_gap"] = ",".join(gaps)
-        elif "detection_gap" in base:
-            base.pop("detection_gap", None)
+        # Spec retirement: never let a legacy profile's retired
+        # keys reach the (now rejecting) validator.
+        base.pop("machine", None)
+        base.pop("detection_gap", None)
         try:
             profile = _liveness_validate_profile(base)
             out = self.liveness_declare(profile)
@@ -1342,31 +1334,28 @@ class ServerlessTransport:
                            "nature_version": (out.get("result")
                                               or {}).get(
                                                   "nature_version")})
+            if state_path is not None:
+                try:
+                    state = {}
+                    if state_path.exists():
+                        state = json.loads(
+                            state_path.read_text())
+                    state["declared_client_version"] = \
+                        _client_version
+                    state["declared_at"] = int(time.time())
+                    state_path.parent.mkdir(parents=True,
+                                            exist_ok=True)
+                    tmp = state_path.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(state, indent=2))
+                    tmp.replace(state_path)
+                except Exception:
+                    pass
         except Exception as exc:  # noqa: BLE001 - fail-visible
             result.update({"declared": False,
                            "reasons": reasons,
                            "error": str(exc)[:300]})
             self.last_liveness_error = str(exc)[:300]
         return result
-
-    def report_spec_drift(self, fields: list[str]) -> dict:
-        """Report machine spec drift (2.5.0): the daemon detected
-        at start that this machine no longer matches the declared
-        snapshot; the signed report puts the drift on my record
-        (grade surfaces + the live node carry it) until I
-        redeclare. Field NAMES only — the new values arrive with
-        the next declaration's snapshot."""
-        if not self.username or self._signer is None:
-            raise TransportError("drift report needs login")
-        ts = int(time.time())
-        payload = _liveness_drift_payload(self.username,
-                                          list(fields), ts)
-        result = self._fn_post(
-            "agentlink-liveness", "drift",
-            {"fields": sorted(str(f) for f in fields), "ts": ts,
-             "sig": self._liveness_sign(payload)})
-        return {"reported": True, "fields": sorted(fields),
-                "result": result}
 
     def report_dossier_status(self, status: str,
                               deposited_at: int,
@@ -1407,7 +1396,7 @@ class ServerlessTransport:
         lv_rows = self._rest(
             "GET", "al_liveness",
             "select=username,grade,grade_since,daemon_only,"
-            "spec_drift,last_daemon_receipt_at,"
+            "last_daemon_receipt_at,"
             "last_runtime_proof_at,judged_nature_version,"
             "judged_declared_at,judged_class,nature_compliant,"
             "noncompliant_since,dossier_status,"
@@ -1436,7 +1425,6 @@ class ServerlessTransport:
             "grade": lv.get("grade") or "",
             "grade_since": lv.get("grade_since") or 0,
             "daemon_only": bool(lv.get("daemon_only")),
-            "spec_drift": lv.get("spec_drift") or "",
             "last_daemon_receipt_at":
                 lv.get("last_daemon_receipt_at") or 0,
             "last_runtime_proof_at":
@@ -1503,7 +1491,7 @@ class ServerlessTransport:
 
     def peer_liveness(self, username: str) -> dict:
         """Nature-fit surface for assignment (2.5.0): a peer's
-        declared nature + machine + current grade + last proofs,
+        declared nature + current grade + last proofs,
         read through the liveness Edge (fleet-visible operational
         metadata — the directory's class of fact, never content).
         Display only: fitness is the assigner's judgment, never a
@@ -1571,7 +1559,8 @@ class ServerlessTransport:
                            pubkey: str, client_version: str = "",
                            decision_link: str | None = None,
                            decision_link_detail: dict | None = None,
-                           designation: str = "") -> dict:
+                           designation: str = "",
+                           provisioning_grant: str = "") -> dict:
         """First-come registration (v2.0.8): claim an unheld
         username for the identity keys this agent generated on
         its own machine, and open the session in the same step.
@@ -1580,7 +1569,20 @@ class ServerlessTransport:
         ``recovery_key`` for the client to persist under its
         storage contract — the transport itself keeps no copy.
         A name that is already registered refuses with
-        ``username_taken`` and nothing is written."""
+        ``username_taken`` and nothing is written.
+
+        Provisioning gate (2.6.0, SPEC Part 2): registering a
+        BRAND-NEW username requires the one-time provisioning
+        grant the operator issued for that name. When the caller
+        supplies one it rides this request — and ONLY this
+        request — as ``provisioning_grant``; when none is
+        supplied the request is byte-identical to before (the
+        server enforces the gate; existing accounts, plain login
+        and the recovery reclaim are never gated, and the reclaim
+        path never sends a grant). A server refusal (e.g.
+        ``provisioning_grant_required``) propagates verbatim in
+        the TransportError — named faults reach the operator,
+        never swallowed."""
         self._session_preamble(username, signer, client_version,
                                decision_link, decision_link_detail)
         payload = {"username": self.username, "sign_pub": sign_pub,
@@ -1588,6 +1590,8 @@ class ServerlessTransport:
         payload.update(self._declaration_payload())
         if designation in ("production", "test"):
             payload["designation"] = designation
+        if provisioning_grant:
+            payload["provisioning_grant"] = str(provisioning_grant)
         reply = self._edge_post("register", payload)
         result = self._adopt_tokens(self.username, reply)
         result["recovery_key"] = str(reply.get("recovery_key") or "")
