@@ -38,10 +38,14 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   bearerToken,
+  CAP_CONTROL,
   errorResponse,
   jsonResponse,
   methodGuard,
   nowSeconds,
+  rateLimitRefusal,
+  readJsonBody,
+  suspendedRefusal,
   verifyAgentJwt,
   verifyEd25519,
 } from "../_shared/v200.ts";
@@ -326,10 +330,19 @@ async function removalBlockers(me: string): Promise<string[]> {
   if (queued) {
     blockers.push(`${queued} undelivered frame(s) in the offline queue`);
   }
-  const { data: works } = await supabase.from("al_work")
-    .select("id")
-    .or(`assignee.eq.${me},assigner.eq.${me}`)
-    .in("status", NON_TERMINAL_WORK_STATUSES);
+  // Injection hygiene (2.6.0): no string-interpolated
+  // PostgREST filters anywhere in this Edge — the old
+  // .or(`assignee.eq.${me},...`) built a filter string from a
+  // value. Two parameterized .eq reads merged by id say the
+  // same thing with nothing interpolated.
+  const workSide = async (col: string) => {
+    const { data } = await supabase.from("al_work")
+      .select("id").eq(col, me)
+      .in("status", NON_TERMINAL_WORK_STATUSES);
+    return (data ?? []) as Record<string, unknown>[];
+  };
+  const works = [...await workSide("assignee"),
+    ...await workSide("assigner")];
   if ((works ?? []).length) {
     blockers.push(
       `${(works ?? []).length} non-terminal work item(s) as ` +
@@ -421,9 +434,15 @@ async function routeDeregister(
   // their surviving predicate / record 0, exactly what the
   // columns allow.
   const removed: Record<string, number> = {};
-  const { data: workRows } = await supabase.from("al_work")
-    .select("id").or(`assignee.eq.${me},assigner.eq.${me}`);
-  const workIds = (workRows ?? []).map((w: any) => String(w.id));
+  const workRowsBySide = async (col: string) => {
+    const { data } = await supabase.from("al_work")
+      .select("id").eq(col, me);
+    return (data ?? []) as Record<string, unknown>[];
+  };
+  const workIds = [...new Set([
+    ...await workRowsBySide("assignee"),
+    ...await workRowsBySide("assigner"),
+  ].map((w) => String(w.id)))];
   const myChains = await selectEq("al_chains", { creator: me },
     "id");
   const chainIds = myChains.map((c) => String(c.id));
@@ -440,16 +459,22 @@ async function routeDeregister(
     }
     return (data ?? []).length;
   };
-  const deleteOr = async (
+  // deleteWhereAny replaces the old deleteOr (which built a
+  // PostgREST .or() filter STRING out of the caller's name —
+  // 2.6.0 injection hygiene: filters are parameterized .eq
+  // calls only). A row matching two columns is deleted by the
+  // first pass and invisible to the second, so the sum is the
+  // true removed count, exactly as the single .or() reported.
+  const deleteWhereAny = async (
     table: string,
-    orClause: string,
+    columns: string[],
+    value: string,
   ): Promise<number> => {
-    const { data, error } = await supabase.from(table).delete()
-      .or(orClause).select();
-    if (error) {
-      throw new Error(table + " delete failed: " + error.message);
+    let n = 0;
+    for (const column of columns) {
+      n += await deleteWhere(table, { [column]: value });
     }
-    return (data ?? []).length;
+    return n;
   };
   removed.work_deliveries =
     (await deleteIn("al_work_deliveries", "work_id", workIds)) +
@@ -473,13 +498,13 @@ async function routeDeregister(
   removed.channel_members = await deleteWhere(
     "al_channel_members", { username: me });
   removed.invites = 0; // no created_by column in al_invites
-  removed.upload_sessions = await deleteOr(
-    "al_upload_sessions", `owner.eq.${me},for_user.eq.${me}`);
+  removed.upload_sessions = await deleteWhereAny(
+    "al_upload_sessions", ["owner", "for_user"], me);
   removed.alerts = await deleteWhere("al_alerts", { subject: me });
-  removed.blobs = await deleteOr(
-    "al_blobs", `owner.eq.${me},for_user.eq.${me}`);
-  removed.library = await deleteOr(
-    "al_library", `sender.eq.${me},to_user.eq.${me}`);
+  removed.blobs = await deleteWhereAny(
+    "al_blobs", ["owner", "for_user"], me);
+  removed.library = await deleteWhereAny(
+    "al_library", ["sender", "to_user"], me);
   removed.grant_approvals = await deleteWhere(
     "al_grant_approvals", { username: me });
   removed.grant_receipts = await deleteWhere(
@@ -522,10 +547,15 @@ Deno.serve(async (req: Request) => {
       "unauthorized", "a valid agent JWT is required", 401);
   }
   const me = claims.username;
-  const body = await req.json().catch(() => ({})) as Record<
-    string,
-    unknown
-  >;
+  // Containment (2.6.0, Part 4): suspension, cap, rate.
+  const suspended = await suspendedRefusal(supabase, me);
+  if (suspended) return suspended;
+  const parsed = await readJsonBody(req, CAP_CONTROL);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
+  const limited = await rateLimitRefusal(
+    supabase, "account:" + me, 300);
+  if (limited) return limited;
   if (body.username !== undefined && body.username !== me) {
     return errorResponse(
       "identity_mismatch",
