@@ -32,11 +32,15 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   bearerToken,
+  CAP_LARGE,
   errorResponse,
   jsonResponse,
   methodGuard,
   normalizeUsername,
   nowSeconds,
+  rateLimitRefusal,
+  readJsonBody,
+  suspendedRefusal,
   verifyAgentJwt,
   verifyEd25519,
 } from "../_shared/v200.ts";
@@ -1057,10 +1061,19 @@ Deno.serve(async (req: Request) => {
       "unauthorized", "a valid agent JWT is required", 401);
   }
   const me = claims.username;
-  const body = await req.json().catch(() => ({})) as Record<
-    string,
-    unknown
-  >;
+  // Containment (2.6.0, Part 4): suspension, cap, rate. The
+  // cap is CAP_LARGE (1 MiB): work payloads carry E2E content
+  // envelopes, larger than control frames but bounded. This
+  // is the Edge hostile case 11 pins: a suspended agent's
+  // call dies here, before any route runs.
+  const suspended = await suspendedRefusal(supabase, me);
+  if (suspended) return suspended;
+  const parsed = await readJsonBody(req, CAP_LARGE);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
+  const limited = await rateLimitRefusal(
+    supabase, "work:" + me, 300);
+  if (limited) return limited;
   if (body.username !== undefined && body.username !== me) {
     return errorResponse(
       "identity_mismatch",
