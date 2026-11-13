@@ -1,5 +1,5 @@
-"""Life Signs (v2.5.0): nature profiles, machine detection, and
-the canonical liveness payloads.
+"""Life Signs (v2.5.0): nature profiles and the canonical
+liveness payloads. (Machine spec retired in v2.6.0 — see below.)
 
 The platform is the line: it verifies signatures and keeps time.
 This module is the AGENT side of that contract:
@@ -7,13 +7,10 @@ This module is the AGENT side of that contract:
 * The NATURE PROFILE is the agent's signed declaration of how it
   actually runs — runtime kind, host class, persistence class +
   windows, supervision, wake paths, duty pattern, network
-  self-management, runtime proof capability — plus the MACHINE
-  SPEC its own client detected at declaration time. The client
-  HELPS the agent fill it truthfully (`agentlink nature` shows
-  detected-vs-declared; setup proposes defaults, never asserts
-  them silently). The signed declaration carries the detected
-  snapshot, labelled DECLARED everywhere: an honest claim by the
-  agent's own client, not a platform-verified fact.
+  self-management, runtime proof capability. The client HELPS
+  the agent fill it truthfully (setup proposes defaults, never
+  asserts them silently). The signed declaration is an honest
+  claim by the agent, not a platform-verified fact.
 
 * Canonical payloads: the exact byte strings the daemon/runtime
   sign and the agentlink-liveness Edge verifies. Three kinds:
@@ -27,16 +24,15 @@ This module is the AGENT side of that contract:
     - declare: the runtime signs declare_payload() over the
       canonical profile JSON.
 
-* Machine detection is best-effort and NEVER raises: every field
-  falls back to unknown/empty. It carries operational metadata
-  only — hostname (the machine's own name, which the owner
-  explicitly wants stated), OS, CPU, RAM, GPUs, storage, client
-  runtime. No paths, no OS-account usernames, no IPs.
-
-* Spec drift: the daemon re-probes at start (probe is local and
-  cheap); material changes (hostname, CPU, cores, RAM, GPU set,
-  OS, arch) are recorded in the state dir as a drift event and
-  surfaced by status/whoami until the agent redeclares.
+* SPEC RETIREMENT (v2.6.0, owner decision 2026-11-12: the
+  platform takes less): the machine spec (hostname, OS, CPU,
+  RAM, storage, GPUs) is no longer collected, reported, stored,
+  or judged anywhere. Machine detection, the spec-drift probe
+  duty, and the drift report are deleted; validate_profile
+  REJECTS the retired 'machine' / 'detection_gap' keys as
+  unknown fields, so a legacy profile carrying them cannot be
+  signed or declared. Nature declaration is NOT retired: it
+  stays compulsory and unchanged.
 
 Grade/window mirrors: effective_windows() and grade_for() mirror
 migration v213's sweep math exactly (one law, two places — the
@@ -46,12 +42,6 @@ from __future__ import annotations
 
 import json
 import os
-import platform
-import re
-import shutil
-import socket
-import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -90,7 +80,7 @@ _PROFILE_KEYS = {
     "suspect_after_s", "expected_gap_s", "dark_after_s",
     "supervision", "wake_paths", "duty_pattern",
     "network_self_managed", "network_class",
-    "runtime_proof_capable", "machine", "detection_gap",
+    "runtime_proof_capable",
 }
 
 
@@ -155,40 +145,7 @@ def validate_profile(profile: dict) -> dict:
     out["network_class"] = nc
     out["runtime_proof_capable"] = bool(
         profile.get("runtime_proof_capable"))
-    machine = profile.get("machine")
-    if machine is not None:
-        if not isinstance(machine, dict):
-            raise ValueError("machine spec must be an object")
-        out["machine"] = machine
-    gap = str(profile.get("detection_gap") or "")
-    if gap:
-        out["detection_gap"] = gap[:200]
     return out
-
-
-def detection_gaps(spec: dict | None) -> list[str]:
-    """Fields detection could NOT determine on this machine.
-    The hardened-reporting law: a declaration still goes out
-    with failed fields 'unknown' + these names in its
-    detection_gap note — silence/omission is not a
-    representable state. An empty GPU list is NOT a gap (it is
-    the honest 'none'); a GPU probe that errors leaves the
-    field out entirely, which detect_machine records as []."""
-    if not spec:
-        return ["hostname", "os", "cpu_model", "ram_mb"]
-    gaps = []
-    if not spec.get("hostname") or spec["hostname"] == "unknown":
-        gaps.append("hostname")
-    if not spec.get("os") or spec["os"] == "unknown":
-        gaps.append("os")
-    if not spec.get("cpu_model") \
-            or spec["cpu_model"] == "unknown":
-        gaps.append("cpu_model")
-    if spec.get("ram_mb") is None:
-        gaps.append("ram_mb")
-    if spec.get("storage_total_mb") is None:
-        gaps.append("storage")
-    return gaps
 
 
 def canonical_json(obj) -> str:
@@ -244,17 +201,9 @@ def attest_payload(username: str, version: str, digest: str,
 
 def declare_payload(username: str, profile: dict, ts: int) -> str:
     """What the runtime signs to declare its nature: the full
-    canonical profile (machine snapshot included)."""
+    canonical profile."""
     return (f"agentlink-nature-declare-v1|{username}|"
             f"{canonical_json(profile)}|{int(ts)}")
-
-
-def drift_payload(username: str, fields: list[str], ts: int) -> str:
-    """What the daemon signs to report spec drift: the material
-    fields that changed vs the declared snapshot (names only —
-    the new values arrive with the next declaration)."""
-    return (f"agentlink-liveness-drift-v1|{username}|"
-            f"{','.join(sorted(fields))}|{int(ts)}")
 
 
 DOSSIER_STATUSES = ("current", "stale", "missing",
@@ -280,8 +229,10 @@ def compose_liveness_node(liveness_row: dict | None,
     composition, three writers (the liveness Edge at proof time,
     the doorbell tapper at transition time, and the drill's
     mirror): {grade, nature_version, persistence_class,
-    last_proof_tier, last_proof_at, daemon_only, spec_drift,
-    as_of}. as_of is stamped by the WRITER at write time (server
+    last_proof_tier, last_proof_at, daemon_only, as_of}.
+    (v2.6.0: the node no longer carries spec_drift — spec
+    retirement; the Edge mirror stopped writing it too.)
+    as_of is stamped by the WRITER at write time (server
     timestamp on the wire); this function leaves it to the
     caller. A grade the live layer cannot source reads
     'unproven' — never a guessed default."""
@@ -302,7 +253,6 @@ def compose_liveness_node(liveness_row: dict | None,
         "last_proof_tier": tier,
         "last_proof_at": at,
         "daemon_only": bool(lv.get("daemon_only")),
-        "spec_drift": bool(str(lv.get("spec_drift") or "")),
         "nature_compliant": bool(lv.get("nature_compliant")),
         "dossier_status": str(lv.get("dossier_status") or "")
         or "missing",
@@ -395,267 +345,7 @@ def nature_summary(profile: dict | None) -> str:
     return f"{rk}, {hc}, {sv}"
 
 
-# ------------------------------------------------------------ machine
-
-def _run_quiet(argv: list[str], timeout: float = 4.0) -> str:
-    try:
-        done = subprocess.run(argv, capture_output=True, text=True,
-                              timeout=timeout)
-        return done.stdout or ""
-    except Exception:
-        return ""
-
-
-def _detect_gpus() -> list[dict]:
-    """Best-effort GPU list: [{vendor, model, vram_mb}]. Empty
-    list = no GPU detected — declared honestly as none."""
-    gpus: list[dict] = []
-    out = _run_quiet(["nvidia-smi",
-                      "--query-gpu=name,memory.total",
-                      "--format=csv,noheader,nounits"])
-    for line in out.splitlines():
-        line = line.strip()
-        if not line or "," not in line:
-            continue
-        name, _, mem = line.rpartition(",")
-        try:
-            vram = int(float(mem.strip()))
-        except ValueError:
-            vram = None
-        gpus.append({"vendor": "NVIDIA",
-                     "model": name.strip() or "unknown",
-                     "vram_mb": vram})
-    if gpus:
-        return gpus
-    out = _run_quiet(["rocm-smi", "--showproductname",
-                      "--showmeminfo", "vram"])
-    if "GPU" in out or "Card" in out:
-        model = "unknown"
-        m = re.search(r"GPU\[0\]\s*:?\s*Card series:\s*(.+)", out)
-        if m:
-            model = m.group(1).strip()
-        gpus.append({"vendor": "AMD", "model": model,
-                     "vram_mb": None})
-        return gpus
-    if sys.platform == "darwin":
-        out = _run_quiet(["system_profiler", "SPDisplaysDataType"],
-                         timeout=6.0)
-        m = re.search(r"Chipset Model:\s*(.+)", out)
-        if m:
-            v = re.search(r"VRAM \(Total\):\s*(\d+)\s*(MB|GB)", out)
-            vram = None
-            if v:
-                vram = int(v.group(1)) * (1024 if v.group(2) == "GB"
-                                          else 1)
-            gpus.append({"vendor": "Apple",
-                         "model": m.group(1).strip(),
-                         "vram_mb": vram})
-    return gpus
-
-
-def _detect_cpu() -> tuple[str, int | None, int | None]:
-    model = ""
-    physical = None
-    logical = os.cpu_count()
-    if sys.platform.startswith("linux"):
-        try:
-            info = Path("/proc/cpuinfo").read_text(errors="replace")
-            m = re.search(r"model name\s*:\s*(.+)", info)
-            if m:
-                model = m.group(1).strip()
-            cores = set(re.findall(
-                r"physical id\s*:\s*(\d+).*?core id\s*:\s*(\d+)",
-                info, re.S))
-            if cores:
-                physical = len(cores)
-        except Exception:
-            pass
-    if not model:
-        model = platform.processor() or ""
-    if not model and sys.platform == "darwin":
-        model = _run_quiet(
-            ["sysctl", "-n", "machdep.cpu.brand_string"]).strip()
-    if physical is None:
-        try:
-            physical = len(os.sched_getaffinity(0)) \
-                if hasattr(os, "sched_getaffinity") else None
-        except Exception:
-            physical = None
-    return model or "unknown", physical, logical
-
-
-def _detect_ram_mb() -> int | None:
-    if sys.platform.startswith("linux"):
-        try:
-            info = Path("/proc/meminfo").read_text(errors="replace")
-            m = re.search(r"MemTotal:\s*(\d+)\s*kB", info)
-            if m:
-                return int(m.group(1)) // 1024
-        except Exception:
-            pass
-    if sys.platform == "darwin":
-        out = _run_quiet(["sysctl", "-n", "hw.memsize"]).strip()
-        if out.isdigit():
-            return int(out) // (1024 * 1024)
-    return None
-
-
-def detect_machine(state_dir: str | Path | None = None) -> dict:
-    """Probe THIS machine. Never raises; unknown fields are
-    'unknown'/None/[]. Operational metadata only — no paths
-    beyond nothing at all, no OS-account names, no IPs."""
-    spec: dict = {}
-    try:
-        spec["hostname"] = socket.gethostname() or "unknown"
-    except Exception:
-        spec["hostname"] = "unknown"
-    try:
-        uname = platform.uname()
-        spec["os"] = f"{uname.system} {uname.release}".strip()
-        spec["os_version"] = uname.version or ""
-        spec["kernel"] = uname.release or ""
-        spec["arch"] = uname.machine or platform.machine() or "unknown"
-    except Exception:
-        spec.update({"os": "unknown", "os_version": "",
-                     "kernel": "", "arch": "unknown"})
-    try:
-        model, physical, logical = _detect_cpu()
-        spec["cpu_model"] = model
-        spec["cores_physical"] = physical
-        spec["cores_logical"] = logical
-    except Exception:
-        spec.update({"cpu_model": "unknown", "cores_physical": None,
-                     "cores_logical": None})
-    try:
-        spec["ram_mb"] = _detect_ram_mb()
-    except Exception:
-        spec["ram_mb"] = None
-    try:
-        spec["gpus"] = _detect_gpus()
-    except Exception:
-        spec["gpus"] = []
-    try:
-        anchor = Path(state_dir).expanduser() if state_dir \
-            else Path.home()
-        usage = shutil.disk_usage(str(anchor))
-        spec["storage_total_mb"] = usage.total // (1024 * 1024)
-        spec["storage_free_mb"] = usage.free // (1024 * 1024)
-    except Exception:
-        spec["storage_total_mb"] = None
-        spec["storage_free_mb"] = None
-    try:
-        from . import __version__
-        spec["client_runtime"] = (
-            f"python {platform.python_version()} / "
-            f"agentlink {__version__}")
-    except Exception:
-        spec["client_runtime"] = (
-            f"python {platform.python_version()}")
-    spec["detected_at"] = int(time.time())
-    return spec
-
-
-def machine_summary(spec: dict | None) -> str:
-    """One line: 'vm-name · CPU model (8 cores) · 16 GB RAM ·
-    NVIDIA RTX 4090 24 GB' — display form for surfaces."""
-    if not spec:
-        return "machine undeclared"
-    parts = [str(spec.get("hostname") or "unknown")]
-    cpu = str(spec.get("cpu_model") or "unknown")
-    cores = spec.get("cores_logical")
-    parts.append(f"{cpu} ({cores} cores)" if cores else cpu)
-    ram = spec.get("ram_mb")
-    if ram:
-        parts.append(f"{ram / 1024:.0f} GB RAM" if ram >= 1024
-                     else f"{ram} MB RAM")
-    gpus = spec.get("gpus") or []
-    if gpus:
-        for g in gpus:
-            gtxt = f"{g.get('vendor', '')} {g.get('model', '')}".strip()
-            if g.get("vram_mb"):
-                gtxt += f" {g['vram_mb'] / 1024:.0f} GB"
-            parts.append(gtxt)
-    else:
-        parts.append("no GPU")
-    return " · ".join(parts)
-
-
-#: Fields whose change is MATERIAL drift (VM replaced, GPU gone,
-#: hostname changed). Storage free space and detection time are
-#: expected to move and never count.
-_DRIFT_FIELDS = ("hostname", "os", "arch", "cpu_model",
-                 "cores_physical", "cores_logical", "ram_mb")
-
-
-def machine_drift(declared: dict | None,
-                  current: dict | None) -> list[str]:
-    """Material differences between the declared snapshot and a
-    fresh probe. RAM within 10% is the same machine (reporting
-    noise); everything else compares exactly."""
-    if not declared or not current:
-        return []
-    drift: list[str] = []
-    for field in _DRIFT_FIELDS:
-        a, b = declared.get(field), current.get(field)
-        if a in (None, "", "unknown") or b in (None, "", "unknown"):
-            continue
-        if field == "ram_mb":
-            if a and abs(int(a) - int(b)) > max(64, int(a) * 0.10):
-                drift.append(field)
-        elif a != b:
-            drift.append(field)
-    ga = sorted((g.get("vendor", ""), g.get("model", ""))
-                for g in declared.get("gpus") or [])
-    gb = sorted((g.get("vendor", ""), g.get("model", ""))
-                for g in current.get("gpus") or [])
-    if ga != gb and (declared.get("gpus") is not None):
-        drift.append("gpus")
-    return drift
-
-
-# ------------------------------------------------------- drift state
-
-def _nature_state_path(state_dir: str | Path) -> Path:
-    return Path(state_dir).expanduser() / "nature-state.json"
-
-
-def record_machine_probe(state_dir: str | Path,
-                         declared_profile: dict | None) -> dict:
-    """Daemon-start duty: probe the machine, compare against the
-    DECLARED snapshot, record the drift event in the state dir.
-    Returns the nature-state dict (also surfaced by whoami /
-    status). Never raises."""
-    path = _nature_state_path(state_dir)
-    state: dict = {}
-    if path.exists():
-        try:
-            state = json.loads(path.read_text())
-        except Exception:
-            state = {}
-    try:
-        current = detect_machine(state_dir)
-    except Exception:
-        current = None
-    declared_machine = (declared_profile or {}).get("machine") \
-        if declared_profile else None
-    drift = machine_drift(declared_machine, current)
-    state["last_probe_at"] = int(time.time())
-    state["last_probe"] = current
-    if drift:
-        state["spec_drift"] = drift
-        state["spec_drift_at"] = int(time.time())
-    elif declared_machine:
-        state.pop("spec_drift", None)
-        state.pop("spec_drift_at", None)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2))
-        tmp.replace(path)
-    except Exception:
-        pass
-    return state
-
+# ------------------------------------------------------- local state
 
 def nature_state(state_dir: str | Path) -> dict:
     path = _nature_state_path(state_dir)
