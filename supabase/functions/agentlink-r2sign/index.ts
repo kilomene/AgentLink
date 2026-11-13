@@ -34,12 +34,16 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   bearerToken,
+  CAP_CONTROL,
   errorResponse,
   jsonResponse,
   methodGuard,
   presignR2Url,
   r2ConfigFromEnv,
+  rateLimitRefusal,
+  readJsonBody,
   selectOne,
+  suspendedRefusal,
   verifyAgentJwt,
 } from "../_shared/v200.ts";
 
@@ -60,9 +64,30 @@ Deno.serve(async (req: Request) => {
   }
   const username = claims.username;
 
-  const body = await req.json().catch(() => ({})) as Record<string, unknown>;
+  // Containment (2.6.0, Part 4): suspension, cap, rate.
+  const suspended = await suspendedRefusal(supabase, username);
+  if (suspended) return suspended;
+  const parsed = await readJsonBody(req, CAP_CONTROL);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
+  const limited = await rateLimitRefusal(
+    supabase, "r2sign:" + username, 300);
+  if (limited) return limited;
   const action = String(body.action ?? "");
   const blobId = String(body.blob_id ?? "");
+  // Injection hygiene: the blob id becomes the R2 object key.
+  // Platform blob ids carry no path separator; one that does
+  // can never name a registered blob, so refuse it at the
+  // door (the entitlement check below stays the authority —
+  // this only keeps unscoped keys from ever being signed).
+  if (blobId.includes("/") || blobId.includes("\\") ||
+      blobId.includes("..")) {
+    return errorResponse(
+      "invalid_request",
+      "blob_id is not a well-formed blob id",
+      400,
+    );
+  }
   if ((action !== "get" && action !== "put") || !blobId || blobId.length > 512) {
     return errorResponse(
       "invalid_request",
