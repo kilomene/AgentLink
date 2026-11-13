@@ -118,9 +118,10 @@ def test_acceptance_is_never_a_question(tmp_path):
     assert "NEVER a question" in letter
     assert "never present this attestation" in letter
     # and the orders text itself is UNCHANGED doctrine:
-    # orders version stays 2.5.0 in this machinery release
+    # orders version: 2.5.0 at this machinery release; 2.6.0
+    # since the spec-retirement orders revision (SPEC Part 1)
     raw, version, _digest = shipped_orders()
-    assert version == "2.5.0"
+    assert version == "2.6.0"
     manifest = json.loads(
         (ROOT / "update-manifest.json").read_text())
     import hashlib
@@ -286,6 +287,7 @@ def test_migration_v214_and_deposit_edge_pins():
     assert "verifyAgentJwt" in edge
     assert "verifyEd25519" in edge
     assert "al_deposit_inbox" in edge
+    assert "agentlink-dossier/2" in edge
     assert "agentlink-dossier/1" in edge
     assert "sender_mismatch" in edge
     assert "plaintext_refused" in edge
