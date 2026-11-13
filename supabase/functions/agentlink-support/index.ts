@@ -49,6 +49,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
+  CAP_CONTROL,
   constantTimeEqual,
   errorResponse,
   jsonResponse,
@@ -56,6 +57,7 @@ import {
   normalizeUsername,
   presignR2Url,
   r2ConfigFromEnv,
+  readJsonBody,
   sha256Hex,
 } from "../_shared/v200.ts";
 
@@ -132,7 +134,17 @@ Deno.serve(async (req: Request) => {
   if (guard) return guard;
   const url = new URL(req.url);
   const path = url.pathname.replace(/^.*agentlink-support/, "") || "/";
-  const body = await req.json().catch(() => ({})) as Record<string, unknown>;
+  // Containment (2.6.0, Part 4): the payload cap applies here
+  // as everywhere. The SUSPENSION SWITCH DELIBERATELY DOES
+  // NOT: support is the one Edge a suspended agent may still
+  // use (spec Part 4 — it can plead its case), and in fact
+  // this Edge's public routes ride no agent identity at all
+  // (ticket id + claim secret), while its operator routes
+  // ride the dashboard session. Per-IP / per-username lodge
+  // limits below are this Edge's rate discipline, unchanged.
+  const parsed = await readJsonBody(req, CAP_CONTROL);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
   const now = nowSec();
 
   // ---------------- public: lodge --------------------------------
@@ -354,9 +366,12 @@ Deno.serve(async (req: Request) => {
       const { claim_secret_hash: _drop, ip_hash: _drop2, ...rest } = row;
       // Life Signs context (2.5.0): half of Folk-class tickets
       // are nature mismatches — the operator reads the ticket
-      // WITH the agent's declared nature, declared machine and
-      // current grade beside it. Read-only registry facts; a
-      // ticket from an unregistered name says so plainly.
+      // WITH the agent's declared nature and current grade
+      // beside it. (2.6.0, Part 1: the declared MACHINE is no
+      // longer part of this context — the spec is retired and
+      // spec_drift is no longer selected.) Read-only registry
+      // facts; a ticket from an unregistered name says so
+      // plainly.
       let natureContext: Record<string, unknown> = {
         registered: false,
         note: "no registered agent by the ticket's name",
@@ -372,7 +387,7 @@ Deno.serve(async (req: Request) => {
         if (u) {
           const { data: lrows } = await supabase
             .from("al_liveness")
-            .select("grade, daemon_only, spec_drift, " +
+            .select("grade, daemon_only, " +
               "last_daemon_receipt_at, last_runtime_proof_at")
             .eq("username", tUser).limit(1);
           natureContext = {
