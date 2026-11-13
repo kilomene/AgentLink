@@ -181,7 +181,7 @@ export function applyPresence(data, presence, nowSeconds){
 // ------------------------------------------------ Life Signs
 // (2.5.0): /liveness/<username> holds {grade, nature_version,
 // persistence_class, last_proof_tier, last_proof_at, daemon_only,
-// spec_drift, as_of} — written by the platform's verification
+// as_of} — written by the platform's verification
 // machinery (the liveness Edge at proof time, the doorbell
 // tapper at sweep transitions) from the record layer's truth.
 // The dashboard subscribes exactly like presence: server-push,
