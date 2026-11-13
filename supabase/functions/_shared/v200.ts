@@ -1084,3 +1084,304 @@ export async function mintGoogleAccessToken(
   }
   return data.access_token;
 }
+
+// ============================================================ v216
+// CONTAINMENT (AgentLink 2.6.0, Part 4 + the Part 2 gate's shared
+// shapes). Everything below is new in 2.6.0; nothing above changed.
+//
+// SUSPENSION AUTH SHAPE (pinned decision, spec Part 4): identity
+// is not the punishment. agentlink-login still authenticates a
+// suspended agent — it mints the same JWTs as for any agent —
+// because (a) suspension is a containment of the agent's USE of
+// the platform, not an erasure of its identity, and (b) the
+// support door must stay reachable: agentlink-support's public
+// routes ride no agent JWT at all (ticket id + claim secret),
+// and its operator routes ride the dashboard session, so a
+// suspended agent can always plead its case there. What
+// suspension DOES refuse is every agent-authenticated Edge
+// except support: each one calls suspendedRefusal() right after
+// verifyAgentJwt and answers 403 agent_suspended. Operator and
+// webhook Edges (api, dashboard, oversight, doorbell, events)
+// have no agent caller and are out of the switch's scope.
+// Suspension/reinstatement are operator acts on the oversight
+// Edge, recorded in al_operator_events (migration v216).
+//
+// PAYLOAD CAPS (Part 4 ingress discipline): read the body ONCE,
+// as bytes, and refuse before any JSON parse or state touch.
+//   CAP_CONTROL (256 KiB) — control-class routes: login,
+//     account, groups, library, liveness, r2sign, support,
+//     doorbell, dashboard, api. Legitimate control frames are
+//     a few KiB; 256 KiB is wide headroom, not a squeeze.
+//   CAP_LARGE (1 MiB) — envelope-class routes: work, grants,
+//     oversight, whose legitimate payloads carry E2E envelopes
+//     and inventories.
+//   CAP_DEPOSIT (8 MiB) — agentlink-deposit: dossier deposits
+//     are base64 file SETS (DOSSIER.json + markdown + chain +
+//     history snapshots); base64 inflates by 4/3 and a full
+//     dossier set is legitimately multi-MiB. This cap replaces
+//     the previous state of NO cap at all.
+//   CAP_BLOB (8 MiB) — agentlink-blobs chunk route: one chunk
+//     rides as base64 in the JSON body; 8 MiB of body is ~6 MiB
+//     of chunk, above the client's chunking.
+//
+// RATE LIMITS (Part 4): durable fixed windows in
+// al_rate_counters via al_rate_hit (v216). Per-agent limits are
+// sized with headroom over legitimate cadence: presence and
+// liveness proofs are minutes-scale (the ratified beat is
+// 180s), work/group traffic is human-paced, deposits are rare.
+// The per-Edge numbers are pinned at each Edge's call site.
+// This layer is a containment speed bump, not the platform's
+// only defence: a counter failure FAILS OPEN with a console
+// error (a broken counter must never brick the fleet's
+// legitimate traffic — the same reasoning as the login header's
+// honest note, now with the durable counter the note asked
+// for), and every pre-existing per-route limiter stays.
+//
+// REPLAY (Part 4): freshness windows already existed per path
+// (login challenge TTL 60s; liveness ±600s, receipts ±900s;
+// grant statements ±300s — audited in SERVER-AUDIT.md). v216
+// adds CONSUMPTION where a captured statement could otherwise
+// be replayed inside its window: claimOnce() inserts the
+// statement's fingerprint into al_consumed_nonces; the insert
+// lands once and every replay conflicts. Login verify nonces
+// and liveness build statements / runtime proofs /
+// dossier-status reports are claimed; challenge receipts were
+// already single-use by row state, grant statements are
+// state-machine guarded, deposits idempotent by key.
+
+export const CAP_CONTROL = 256 * 1024;
+export const CAP_LARGE = 1024 * 1024;
+export const CAP_DEPOSIT = 8 * 1024 * 1024;
+export const CAP_BLOB = 8 * 1024 * 1024;
+
+/** Read a request's JSON body under a hard byte cap. Returns
+ * {body} on success — an unparseable body reads as {} exactly
+ * as the Edges' longstanding req.json().catch(() => ({}))
+ * did — or {response} with the refusal to return: 413
+ * payload_too_large BEFORE any parse or state touch when the
+ * body exceeds the cap. The byte count is the UTF-8 length of
+ * the raw text, so a body cannot smuggle past the cap with
+ * multibyte characters. */
+export async function readJsonBody(
+  req: Request,
+  maxBytes: number,
+): Promise<
+  { body: Record<string, unknown>; response: null } |
+  { body: null; response: Response }
+> {
+  const text = await req.text().catch(() => "");
+  if (new TextEncoder().encode(text).length > maxBytes) {
+    return {
+      body: null,
+      response: errorResponse(
+        "payload_too_large",
+        "request body exceeds this route's " + maxBytes +
+          "-byte cap; nothing was read or written",
+        413,
+      ),
+    };
+  }
+  let parsed: unknown = {};
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    parsed = {};
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    parsed = {};
+  }
+  return { body: parsed as Record<string, unknown>, response: null };
+}
+
+/** The suspension switch's read: the agent's al_users row
+ * suspension fields, or null when there is no row. */
+// deno-lint-ignore no-explicit-any
+export async function suspensionOf(
+  client: ServiceClient,
+  username: string,
+): Promise<Record<string, unknown> | null> {
+  return await selectOne(client, "al_users",
+    "suspended_at, suspended_by, suspended_reason", { username });
+}
+
+/** Non-null (a 403 agent_suspended Response) when the agent is
+ * suspended; null when it is in good standing or unknown.
+ * Wire this into every agent-authenticated Edge EXCEPT
+ * agentlink-support, right after the JWT verifies (see the
+ * pinned auth shape above). Fail-soft on read error: a failed
+ * suspension READ logs and lets the request proceed to its
+ * ordinary checks — the alternative (refusing the whole fleet
+ * on a record-layer hiccup) would make the switch itself an
+ * outage lever; suspension is re-checked on the very next
+ * call, so the window is one request, never a session. */
+// deno-lint-ignore no-explicit-any
+export async function suspendedRefusal(
+  client: ServiceClient,
+  username: string,
+): Promise<Response | null> {
+  let row: Record<string, unknown> | null;
+  try {
+    row = await suspensionOf(client, username);
+  } catch (e) {
+    console.error("suspension read failed for " + username +
+      ": " + String(e));
+    return null;
+  }
+  if (!row || !(Number(row.suspended_at ?? 0) > 0)) return null;
+  return jsonResponse({
+    ok: false,
+    error: "agent_suspended",
+    detail: "this agent is suspended by the operator" +
+      (row.suspended_reason
+        ? ": " + String(row.suspended_reason)
+        : "") +
+      ". Authenticated calls are refused on every Edge except " +
+      "support; lodge a support ticket to plead the case.",
+    support: "agentlink-support/lodge",
+  }, 403);
+}
+
+/** Durable fixed-window rate check (al_rate_hit, v216).
+ * Returns a 429 Response when the caller is over its limit for
+ * this window, else null. Key families: "<edge>:<username>"
+ * (per agent per Edge) and "login:<method>:<username>".
+ * Fails OPEN on counter error, logged (see the header note). */
+// deno-lint-ignore no-explicit-any
+export async function rateLimitRefusal(
+  client: ServiceClient,
+  key: string,
+  limit: number,
+  windowSeconds = 60,
+): Promise<Response | null> {
+  try {
+    const now = nowSeconds();
+    const windowStart = Math.floor(now / windowSeconds) * windowSeconds;
+    const { data, error } = await client.rpc("al_rate_hit", {
+      p_key: key,
+      p_window_start: windowStart,
+      p_limit: limit,
+    });
+    if (error) throw new Error(error.message);
+    if (data === false) {
+      return errorResponse(
+        "rate_limited",
+        "too many requests in this window; retry shortly",
+        429,
+      );
+    }
+    return null;
+  } catch (e) {
+    console.error("rate counter failed for " + key + ": " + String(e));
+    return null;
+  }
+}
+
+/** Claim a signed statement's fingerprint exactly once
+ * (al_consumed_nonces, v216). True when THIS presentation is
+ * the first; false when the fingerprint was already claimed —
+ * the caller refuses with its replay fault. Fails CLOSED on
+ * ledger error (returns false): replay protection that cannot
+ * read its ledger must not wave statements through. */
+// deno-lint-ignore no-explicit-any
+export async function claimOnce(
+  client: ServiceClient,
+  kind: string,
+  username: string,
+  fingerprint: string,
+  expiresAt: number,
+): Promise<boolean> {
+  try {
+    const nonceKey = await sha256Hex(
+      kind + "|" + username + "|" + fingerprint);
+    const { error } = await client.from("al_consumed_nonces")
+      .insert({
+        nonce_key: nonceKey,
+        username,
+        kind,
+        consumed_at: nowSeconds(),
+        expires_at: expiresAt,
+      });
+    if (error) {
+      // 23505 = the primary key already holds this fingerprint.
+      if (String(error.code) === "23505" ||
+          /duplicate|unique/i.test(String(error.message))) {
+        return false;
+      }
+      throw new Error(error.message);
+    }
+    return true;
+  } catch (e) {
+    console.error("nonce claim failed (" + kind + "/" + username +
+      "): " + String(e));
+    return false;
+  }
+}
+
+/** Record one operator event (al_operator_events, v216).
+ * Fail-soft: the operator ACTION has already landed when this
+ * is called; a failed record write is logged loudly, never
+ * allowed to un-happen the act — and the oversight Edge's
+ * response still carries the act's own result. */
+// deno-lint-ignore no-explicit-any
+export async function recordOperatorEvent(
+  client: ServiceClient,
+  kind: string,
+  actor: string,
+  target: string,
+  detail: string,
+  meta: Record<string, unknown> = {},
+): Promise<void> {
+  try {
+    const { error } = await client.from("al_operator_events")
+      .insert({
+        ts: nowSeconds(),
+        kind,
+        actor,
+        target,
+        detail,
+        meta,
+      });
+    if (error) throw new Error(error.message);
+  } catch (e) {
+    console.error("operator event record failed (" + kind + "/" +
+      target + "): " + String(e));
+  }
+}
+
+/** Spec retirement (2.6.0 Part 1): the keys a legacy client may
+ * still send inside a nature profile that the platform no
+ * longer collects, stores or judges. Stripping happens at
+ * liveness ingress (before the declaration RPC) AND inside
+ * al_liveness_apply_declaration itself (v216) — two layers,
+ * one outcome: no spec record is ever created from a
+ * declaration, whichever layer a future caller forgets. */
+export const SPEC_PROFILE_KEYS = [
+  "machine", "machine_spec", "spec", "spec_drift",
+  "detection_gap", "detection_gaps",
+] as const;
+
+/** Return a copy of a profile object with every spec-bearing
+ * key removed (top level — the v213 machine spec was a single
+ * top-level "machine" object). Non-objects pass through. */
+export function stripSpecFields<T>(profile: T): T {
+  if (!profile || typeof profile !== "object" ||
+      Array.isArray(profile)) {
+    return profile;
+  }
+  const out: Record<string, unknown> = {
+    ...(profile as Record<string, unknown>),
+  };
+  for (const k of SPEC_PROFILE_KEYS) delete out[k];
+  return out as T;
+}
+
+/** Escape a user string for a PostgREST ilike pattern: the
+ * pattern metacharacters (% _ \) in the VALUE are escaped so
+ * the value matches literally. PostgREST binds the pattern as
+ * a value, never as SQL — this closes the remaining gap where
+ * a client-supplied % could widen an operator search into a
+ * full-table pattern match. */
+export function escapeIlike(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/%/g, "\\%")
+    .replace(/_/g, "\\_");
+}
