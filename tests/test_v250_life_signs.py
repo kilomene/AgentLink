@@ -1,21 +1,25 @@
-"""v2.5.0 — LIFE SIGNS + NATURE + MACHINE SPEC + REAL-TIME SYNC
+"""v2.5.0 — LIFE SIGNS + NATURE + REAL-TIME SYNC
 + HARDENED REPORTING + THE AGENT DOSSIER (owner's commission
 2026-11-11 incl. expansions 1-5). Pins:
 
 * canonical signed payloads are byte-exact (receipt tier INSIDE
   the signed bytes; the daemon answer path signs ONLY 'daemon');
 * profile validation (closed key set, enum + window bounds,
-  ≤280 duty text, machine normalization);
+  ≤280 duty text);
 * grade bands per class + undeclared conservatism (never
   persistent windows);
-* machine drift materiality + detection gaps (an empty GPU
-  list is honest none, never a gap);
+* SPEC RETIREMENT (2.6.0): declarations carry no machine;
+  validate_profile REJECTS machine/detection_gap keys; the
+  detection/drift APIs no longer exist; the live node carries
+  no spec_drift; the dossier is schema /2 with no machine
+  section; the shipped orders carry the nature duty and NO
+  machine-spec duty;
 * the live node's ONE composition (tiers, unproven default,
   dossier flag default 'missing');
 * hardened reporting: setup declares AUTOMATICALLY, there is
-  no --no-machine opt-out, ensure_nature_declared's decision
-  matrix (declare / current / drift-redeclare preserving
-  judgment fields / version-change redeclare / gaps attached);
+  no opt-out, ensure_nature_declared's decision matrix
+  (declare / current / version-change redeclare preserving
+  judgment fields — never a spec reason);
 * the dossier: build completeness, the forbidden-content
   refusal, signature round-trip, chain verification, version
   roll + history, deposit queue drain/park/heal, status flags,
@@ -25,10 +29,11 @@
   86400s, the apply functions, the cron job);
 * Edge + tapper + rules + dashboard source pins (routes,
   evaluate-on-proof, dossier mirrors, lifeSignCell, census);
-* Standing Orders 2.5.0 text (nature duty, prove duty,
-  real-time grade line, dossier self-check line);
+* Standing Orders text (orders 2.6.0 since the spec
+  retirement: nature duty, prove duty, real-time grade line,
+  dossier self-check line, NO machine-spec duty);
 * the manifest carries liveness.py + dossier.py + the orders
-  with true hashes at version 2.5.0.
+  with true hashes at the shipped version.
 """
 from __future__ import annotations
 
@@ -66,15 +71,6 @@ def _profile(**over):
         "network_class": "mobile",
         "network_self_managed": True,
         "runtime_proof_capable": True,
-        "machine": {
-            "hostname": "pixel", "os": "Android", "os_version": "14",
-            "kernel": "", "arch": "aarch64", "cpu_model": "Tensor",
-            "cores_physical": 4, "cores_logical": 8,
-            "ram_mb": 8192, "gpus": [],
-            "storage_total_mb": 128000, "storage_free_mb": 40000,
-            "client_runtime": "python 3.12 / agentlink 2.5.0",
-            "detected_at": NOW,
-        },
     }
     p.update(over)
     return p
@@ -92,8 +88,6 @@ def test_payload_bytes_are_exact():
         "folk", "lc-1", "ab" * 32, "runtime", 42)
     assert lv.prove_payload("folk", 42) == \
         "agentlink-liveness-prove-v1|folk|42"
-    assert lv.drift_payload("folk", ["ram_mb", "gpus"], 42) == \
-        "agentlink-liveness-drift-v1|folk|gpus,ram_mb|42"
     assert lv.dossier_status_payload(
         "folk", "deposit-parked", 7, 3, 42) == (
         "agentlink-dossier-status-v1|folk|deposit-parked|7|3|42")
@@ -152,52 +146,19 @@ def test_grade_bands_per_class():
     assert lv.grade_for(None, 700000) == "DARK"
 
 
-def test_machine_drift_materiality():
-    m = _profile()["machine"]
-    assert lv.machine_drift(m, dict(m)) == []
-    assert lv.machine_drift(m, dict(m, hostname="other")) == \
-        ["hostname"]
-    assert lv.machine_drift(m, dict(m, ram_mb=8100)) == []
-    assert lv.machine_drift(m, dict(m, ram_mb=4000)) == ["ram_mb"]
-    gpu = dict(m, gpus=[{"vendor": "NVIDIA", "model": "H100",
-                         "vram_mb": 80000}])
-    assert lv.machine_drift(gpu, m) == ["gpus"]
-    assert lv.machine_drift(None, m) == []
-    assert lv.machine_drift(m, None) == []
-
-
-def test_detection_gaps_gpu_none_is_honest():
-    assert lv.detection_gaps(_profile()["machine"]) == []
-    gaps = lv.detection_gaps({"hostname": "unknown", "os": "x",
-                              "cpu_model": "unknown",
-                              "ram_mb": None, "gpus": [],
-                              "storage_total_mb": None})
-    assert "hostname" in gaps and "ram_mb" in gaps
-    assert "gpus" not in gaps
-
-
-def test_detect_machine_this_vm():
-    spec = lv.detect_machine()
-    import socket
-    assert spec["hostname"] == socket.gethostname()
-    assert spec["ram_mb"] and spec["ram_mb"] > 0
-    assert spec["cpu_model"] != "unknown"
-    assert isinstance(spec["gpus"], list)
-    assert spec["storage_total_mb"] > 0
-    assert "agentlink" in spec["client_runtime"]
-
-
 def test_compose_node_one_truth():
     node = lv.compose_liveness_node(
         {"grade": "BEATING", "judged_nature_version": 3,
          "judged_class": "session", "last_daemon_receipt_at": 50,
          "last_runtime_proof_at": 90, "daemon_only": False,
-         "spec_drift": "", "nature_compliant": True,
+         "nature_compliant": True,
          "dossier_status": "current"},
         {"last_seen": 10})
     assert node["last_proof_tier"] == "runtime"
     assert node["last_proof_at"] == 90
     assert node["dossier_status"] == "current"
+    # 2.6.0 spec retirement: the node carries no spec_drift key
+    assert "spec_drift" not in node
     empty = lv.compose_liveness_node(None, None)
     assert empty["grade"] == "unproven"
     assert empty["dossier_status"] == "missing"
@@ -252,44 +213,60 @@ def test_ensure_declares_when_no_declaration(tmp_path):
     t = _ensure_harness(None, cap)
     out = t.ensure_nature_declared(tmp_path)
     assert out["declared"] is True and cap
-    # the baseline is the per-runtime PROPOSAL, machine attached
-    assert cap[0]["machine"]["hostname"]
+    # the baseline is the per-runtime PROPOSAL, nature only —
+    # no machine snapshot rides a declaration (2.6.0)
+    assert "machine" not in cap[0]
+    assert "detection_gap" not in cap[0]
     assert "persistence_class" in cap[0]
+    # the client version declared with is recorded locally
+    state = json.loads(
+        (tmp_path / "nature-state.json").read_text())
+    from agentlink import __version__
+    assert state["declared_client_version"] == __version__
+
+
+def _seed_declared_version(tmp_path):
+    from agentlink import __version__
+    (tmp_path / "nature-state.json").write_text(json.dumps(
+        {"declared_client_version": __version__}))
 
 
 def test_ensure_noop_when_current(tmp_path):
     cap = []
     cur = _profile()
-    cur["machine"] = lv.detect_machine(tmp_path)
+    _seed_declared_version(tmp_path)
     t = _ensure_harness(cur, cap)
     out = t.ensure_nature_declared(tmp_path)
     assert out["current"] is True and not cap
 
 
-def test_ensure_redeclares_on_drift_preserving_judgment(tmp_path):
-    cap = []
-    cur = _profile(duty_pattern="my own words")
-    cur["machine"] = dict(lv.detect_machine(tmp_path),
-                          hostname="some-other-host")
-    t = _ensure_harness(cur, cap)
-    out = t.ensure_nature_declared(tmp_path)
-    assert out["declared"] is True
-    assert "spec drift: hostname" in "; ".join(out["reasons"])
-    assert cap[0]["duty_pattern"] == "my own words"
-    import socket
-    assert cap[0]["machine"]["hostname"] == socket.gethostname()
-
-
 def test_ensure_redeclares_on_client_version_change(tmp_path):
     cap = []
-    cur = _profile()
-    m = lv.detect_machine(tmp_path)
-    m["client_runtime"] = "python 3.12 / agentlink 0.0.1"
-    cur["machine"] = m
+    cur = _profile(duty_pattern="my own words")
+    (tmp_path / "nature-state.json").write_text(json.dumps(
+        {"declared_client_version": "0.0.1"}))
     t = _ensure_harness(cur, cap)
     out = t.ensure_nature_declared(tmp_path)
     assert out["declared"] is True
     assert "client version changed" in out["reasons"]
+    # judgment fields survive the redeclaration; no spec keys
+    assert cap[0]["duty_pattern"] == "my own words"
+    assert "machine" not in cap[0]
+
+
+def test_ensure_strips_legacy_spec_keys_on_redeclare(tmp_path):
+    # A pre-2.6.0 declaration on record still carries the
+    # retired keys; the redeclaration must strip them (the
+    # validator rejects them now) rather than wedge forever.
+    cap = []
+    cur = _profile()
+    cur["machine"] = {"hostname": "legacy"}
+    cur["detection_gap"] = "ram_mb"
+    t = _ensure_harness(cur, cap)
+    out = t.ensure_nature_declared(tmp_path)
+    assert out["declared"] is True and cap
+    assert "machine" not in cap[0]
+    assert "detection_gap" not in cap[0]
 
 
 def test_hardened_reporting_no_opt_outs():
@@ -329,16 +306,18 @@ def test_dossier_build_complete_and_clean(tmp_path):
                "self_description_updated_at": NOW - 1},
         state_dir_name=".agentlink", version=1,
         generated_at=NOW)
-    assert doc["schema"] == "agentlink-dossier/1"
+    assert doc["schema"] == "agentlink-dossier/2"
     assert doc["identity"]["sign_key_fingerprint"] == \
         dm.key_fingerprint(ident.signing_public_key_b64)
-    assert doc["machine"]["hostname"] == "pixel"
+    assert "machine" not in doc
+    assert "detection_gap" not in doc
     assert doc["location"]["declared_label"] == "Houston"
     assert "ip" not in json.dumps(doc["location"]).lower()
     assert doc["self_description"]["present"] is True
     md = dm.render_markdown(doc)
     assert "Agent Dossier — @dossierdrill" in md
-    assert "pixel" in md and "I test things." in md
+    assert "I test things." in md
+    assert "## Machine" not in md
 
 
 def test_dossier_refuses_forbidden_content(tmp_path):
@@ -353,16 +332,22 @@ def test_dossier_refuses_forbidden_content(tmp_path):
             standing=_standing(), local={},
             state_dir_name=".agentlink", version=1,
             generated_at=NOW)
+    # A legacy local profile carrying retired spec keys: the
+    # spec is STRIPPED before embedding (never leaked into a
+    # v2 dossier) — including anything nasty inside it.
     bad = _profile()
-    bad["machine"] = dict(bad["machine"], token="zzz")
-    with pytest.raises(ValueError):
-        dm.build_dossier(
-            username="x", display_name="", registered_at=0,
-            client_version="2.5.0",
-            sign_pub_b64=ident.signing_public_key_b64,
-            nature_profile=bad, standing=_standing(), local={},
-            state_dir_name=".agentlink", version=1,
-            generated_at=NOW)
+    bad["machine"] = {"hostname": "legacy", "token": "zzz"}
+    bad["detection_gap"] = "ram_mb"
+    doc2 = dm.build_dossier(
+        username="x", display_name="", registered_at=0,
+        client_version="2.5.0",
+        sign_pub_b64=ident.signing_public_key_b64,
+        nature_profile=bad, standing=_standing(), local={},
+        state_dir_name=".agentlink", version=1,
+        generated_at=NOW)
+    assert "machine" not in doc2
+    assert "machine" not in doc2["nature"]
+    assert "detection_gap" not in doc2
 
 
 def test_dossier_sign_chain_and_roll(tmp_path):
@@ -619,16 +604,55 @@ def test_edge_and_dashboard_pins():
     assert "feeds pending subscription" in app
 
 
-def test_orders_250_text():
+def test_orders_260_text():
     orders = (ROOT / "agentlink" / "STANDING-ORDERS.md").read_text()
-    assert "Orders version: 2.5.0" in orders
+    orders = " ".join(orders.split())  # wrap-insensitive phrases
+    assert "Orders version: 2.6.0" in orders
+    # (a) the nature duty survives in substance
     assert "Declare your nature truthfully" in orders
-    assert "state your machine" in orders.lower()
+    assert "runtime kind" in orders
+    assert "persistence class" in orders
+    assert "A silence is judged by the nature in force" in orders
+    assert "reporting your nature is automatic" in orders.lower()
     assert "agentlink liveness prove" in orders
     assert "in real time" in orders
     assert "not yours to withhold" in orders
     assert "dossier" in orders.lower()
     assert "deposit-parked dossier" in orders
+    # (a) and NO machine-spec duty anywhere in the canonical text
+    low = orders.lower()
+    for phrase in ("machine spec", "spec drift",
+                   "state your machine", "detected machine",
+                   "detects (hostname", "hostname, os, cpu"):
+        assert phrase not in low, phrase
+
+
+def test_spec_retirement_gate_pins(tmp_path):
+    # (b) a profile mandating spec reporting fails validation:
+    # the retired keys are unknown fields now.
+    with pytest.raises(ValueError):
+        lv.validate_profile(_profile(machine={"hostname": "x"}))
+    with pytest.raises(ValueError):
+        lv.validate_profile(_profile(detection_gap="ram_mb"))
+    # (b) the detection / drift / probe APIs no longer exist
+    for name in ("detect_machine", "detection_gaps",
+                 "machine_drift", "machine_summary",
+                 "drift_payload", "record_machine_probe"):
+        assert not hasattr(lv, name), name
+    from agentlink.transport_v2 import ServerlessTransport
+    assert not hasattr(ServerlessTransport, "report_spec_drift")
+    # (c) dossier schema is /2 with no machine key after build
+    ident = _identity(tmp_path)
+    doc = dm.build_dossier(
+        username="pin", display_name="", registered_at=0,
+        client_version="2.6.0",
+        sign_pub_b64=ident.signing_public_key_b64,
+        nature_profile=_profile(), standing=_standing(),
+        local={}, state_dir_name=".agentlink", version=1,
+        generated_at=NOW)
+    assert doc["schema"] == "agentlink-dossier/2"
+    assert "machine" not in doc
+    assert "## Machine" not in dm.render_markdown(doc)
 
 
 def test_drive_folder_law():
@@ -650,7 +674,7 @@ def test_drive_folder_law():
 
 def test_manifest_250():
     m = json.loads((ROOT / "update-manifest.json").read_text())
-    assert m["version"] == "2.5.2"
+    assert m["version"] == "2.6.0"
     for rel in ("agentlink/liveness.py", "agentlink/dossier.py",
                 "agentlink/STANDING-ORDERS.md"):
         assert rel in m["files"]
