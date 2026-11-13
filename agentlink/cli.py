@@ -108,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         print("commands: relay server register reclaim agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
               "credentials alerts capabilities update doctor census service backup "
-              "oversight-keygen deregister remove-user set-designation grant my-grant inbox sync delivery setup support orders liveness nature dossier archive")
+              "oversight-keygen deregister remove-user set-designation grant my-grant inbox sync delivery setup install operator support orders liveness nature dossier archive")
         return 0
     cmd, rest = argv[0], argv[1:]
 
@@ -160,6 +160,13 @@ def main(argv: list[str] | None = None) -> int:
         ap = argparse.ArgumentParser(prog="agentlink register")
         _add_common(ap)
         ap.add_argument("--display-name", default=None)
+        ap.add_argument("--provisioning-grant", default=None,
+                        help="the one-time provisioning grant the"
+                             " operator issued for this username"
+                             " (2.6.0): required for a BRAND-NEW"
+                             " username (default:"
+                             " AGENTLINK_PROVISIONING_GRANT or the"
+                             " workspace drop-in file)")
         ap.add_argument("--designation", default="production",
                         choices=["production", "test"],
                         help="registration designation (v1.6.0): "
@@ -179,7 +186,8 @@ def main(argv: list[str] | None = None) -> int:
         async def _go():
             a = Agent(args.username, display_name=args.display_name,
                       endpoint=_endpoint(args), state_dir=_state_dir(args),
-                      designation=args.designation)
+                      designation=args.designation,
+                      provisioning_grant=args.provisioning_grant)
             await a.start()
             info = a.whoami()
             await a.close()
@@ -518,6 +526,10 @@ def main(argv: list[str] | None = None) -> int:
         return _delivery(rest)
     if cmd == "setup":
         return _setup(rest)
+    if cmd == "install":
+        return _install(rest)
+    if cmd == "operator":
+        return _operator(rest)
     if cmd == "support":
         return _support(rest)
     if cmd == "orders":
@@ -947,22 +959,19 @@ def _dossier(rest: list[str]) -> int:
 def _nature(rest: list[str]) -> int:
     """Nature Profile (2.5.0): my signed declaration of how I run.
 
-    `nature` / `nature show` — declared profile vs the machine
-    this client detects NOW, side by side (the declaration is a
-    signed snapshot; drift between them is shown, never hidden).
-    `nature propose` — sensible per-runtime defaults, proposed
-    only: nothing is signed or sent. `nature declare` — sign +
-    record a declaration: fields not given keep their current
-    declared values (or the proposal, when nothing is declared
-    yet); the machine snapshot is detected fresh and always
-    carried in the declaration (hardened reporting: there is
-    no way to declare without it). Declarations are
-    versioned history; grading judges a silence by the nature in
-    force when it began — a redeclaration never rewrites a past
-    silence."""
-    from .liveness import (detect_machine, machine_drift,
-                           machine_summary, nature_summary,
-                           propose_defaults, validate_profile)
+    `nature` / `nature show` — the declared profile + its
+    one-line summary. `nature propose` — sensible per-runtime
+    defaults, proposed only: nothing is signed or sent.
+    `nature declare` — sign + record a declaration: fields not
+    given keep their current declared values (or the proposal,
+    when nothing is declared yet). Declarations are versioned
+    history; grading judges a silence by the nature in force
+    when it began — a redeclaration never rewrites a past
+    silence. (2.6.0 spec retirement: no machine snapshot rides
+    a declaration any more — the platform takes less; nature
+    only.)"""
+    from .liveness import (nature_summary, propose_defaults,
+                           validate_profile)
     sub = rest[0] if rest else "show"
     r = rest[1:] if rest else []
     if sub == "propose":
@@ -973,9 +982,6 @@ def _nature(rest: list[str]) -> int:
         print("proposed nature (NOT declared — review, edit, then"
               " `agentlink nature declare`):")
         _print(proposal)
-        print("detected machine (would be carried as the declared"
-              " snapshot):")
-        _print(detect_machine(_state_dir(args)))
         return 0
     if sub == "show":
         ap = argparse.ArgumentParser(prog="agentlink nature show")
@@ -988,21 +994,10 @@ def _nature(rest: list[str]) -> int:
             and "result" in out else out
         profile = (st or {}).get("nature") if isinstance(st, dict) \
             else None
-        detected = detect_machine(_state_dir(args))
         print(f"declared: {nature_summary(profile)}"
               f" (nature v{(st or {}).get('nature_version') or 0},"
               f" declared at {(st or {}).get('nature_declared_at') or 'never'})")
-        print(f"declared machine: "
-              f"{machine_summary((profile or {}).get('machine'))}")
-        print(f"detected machine: {machine_summary(detected)}")
-        drift = machine_drift((profile or {}).get("machine"),
-                              detected)
-        if drift:
-            print(f"SPEC DRIFT: {', '.join(drift)} — the machine"
-                  " changed since the declaration; redeclare with"
-                  " `agentlink nature declare`")
-        _print({"declared": profile, "detected": detected,
-                "spec_drift": drift})
+        _print({"declared": profile})
         return 0
     if sub == "declare":
         ap = argparse.ArgumentParser(prog="agentlink nature declare")
@@ -1042,11 +1037,15 @@ def _nature(rest: list[str]) -> int:
             and "result" in cur_out else cur_out
         current = (cur_st or {}).get("nature") or {} \
             if isinstance(cur_st, dict) else {}
-        # Step 2: merge + detect + validate HERE, so the exact
-        # profile being signed is printed before it is sent.
+        # Step 2: merge + validate HERE, so the exact profile
+        # being signed is printed before it is sent. Nature
+        # fields only (2.6.0): a legacy on-record profile's
+        # retired spec keys are dropped, never re-signed.
         base = dict(current) if current else propose_defaults(
             state_dir)
         merged = dict(base)
+        merged.pop("machine", None)
+        merged.pop("detection_gap", None)
         for key, val in (
                 ("runtime_kind", args.runtime_kind),
                 ("host_class", args.host_class),
@@ -1060,11 +1059,6 @@ def _nature(rest: list[str]) -> int:
                 ("network_class", args.network_class)):
             if val is not None:
                 merged[key] = val
-        # The machine snapshot ALWAYS rides a declaration
-        # (hardened reporting): detection is the client's job,
-        # run automatically — there is no flag to declare
-        # without it.
-        merged["machine"] = detect_machine(state_dir)
         profile = validate_profile(merged)
         print("declaring nature (signed, versioned, history kept):")
         _print(profile)
@@ -1104,10 +1098,18 @@ def _setup(rest: list[str]) -> int:
                     help="skip the supervision install")
     ap.add_argument("--declare-nature", action="store_true",
                     help="accepted for compatibility (2.5.0):"
-                         " nature+machine declaration at setup is"
+                         " nature declaration at setup is"
                          " AUTOMATIC and carries no opt-out — the"
                          " hardened reporting ruling; the report"
                          " shows the declaration either way")
+    ap.add_argument("--provisioning-grant", default=None,
+                    help="the one-time provisioning grant the"
+                         " operator issued for this username"
+                         " (2.6.0): required to register a"
+                         " BRAND-NEW username; existing accounts"
+                         " and reclaims never need it (default:"
+                         " AGENTLINK_PROVISIONING_GRANT or the"
+                         " workspace drop-in file)")
     args = ap.parse_args(rest)
     username = args.username
     if not username:
@@ -1118,7 +1120,8 @@ def _setup(rest: list[str]) -> int:
             username, state_dir=args.state_dir,
             designation=args.designation, grant=args.grant,
             install_service=not args.no_service,
-            declare_nature=args.declare_nature))
+            declare_nature=args.declare_nature,
+            provisioning_grant=args.provisioning_grant))
     except Exception as exc:
         support = getattr(exc, "support", None)
         check = getattr(exc, "check", None)
@@ -1137,6 +1140,173 @@ def _setup(rest: list[str]) -> int:
         return 1
     _print(report)
     return 0 if report.get("ok") else 1
+
+
+def _install(rest: list[str]) -> int:
+    """Attended install ceremony (2.6.0, SPEC Part 3):
+    `agentlink install --username <u> --provisioning-grant
+    <token> [--state-dir D]` runs the nine steps in order, each
+    landing a signed step receipt in
+    <state-dir>/ceremony-state.json. Exit 0 ONLY when all nine
+    steps have landed. A failure halts with a named fault (no
+    workaround is improvised); re-running the same command
+    resumes at the first incomplete step — no step can be
+    skipped. `--status` reads the per-username ceremony state
+    (the operator's local view; halts and completions are also
+    lodged on the support desk, kind 'ceremony')."""
+    if "--status" in rest:
+        ap = argparse.ArgumentParser(prog="agentlink install --status")
+        _add_common(ap)
+        ap.add_argument("--status", action="store_true")
+        args = ap.parse_args(rest)
+        username = _username(args)
+        from .ceremony import load_state
+        state = load_state(_state_dir(args))
+        if state is None or state.get("username") != username:
+            print(f"no ceremony state for @{username} in "
+                  f"{_state_dir(args)} — no install ceremony has "
+                  f"run (or completed a step) there yet")
+            return 2
+        landed = [r["step"] for r in state.get("receipts") or []
+                  if r.get("ok")]
+        print(f"ceremony for @{username}: "
+              f"{'COMPLETE (all nine steps landed)' if state.get('complete') else 'not complete'}"
+              f"; steps landed: {landed or 'none'}"
+              + (f"; HALTED at step {state.get('failed_step')} "
+                 f"with fault {state.get('fault')}"
+                 if state.get("fault") else ""))
+        _print(state)
+        return 0 if state.get("complete") else 1
+    ap = argparse.ArgumentParser(prog="agentlink install")
+    _add_common(ap)
+    ap.add_argument("--provisioning-grant", default=None,
+                    help="the one-time provisioning grant the "
+                         "operator issued for this username "
+                         "(2.6.0): presented at registration "
+                         "(step 4) only; default resolution is "
+                         "the Agent's own: this flag, else "
+                         "AGENTLINK_PROVISIONING_GRANT, else the "
+                         "workspace drop-in file")
+    ap.add_argument("--designation", default="production",
+                    choices=["production", "test"],
+                    help="registration designation (default "
+                         "production; drills pass test)")
+    args = ap.parse_args(rest)
+    if not getattr(args, "username", None):
+        raise SystemExit("install needs --username @name")
+    from .ceremony import SUPPORT_POINTER, run_install
+    try:
+        state = run_install(
+            args.username, _state_dir(args),
+            provisioning_grant=args.provisioning_grant,
+            designation=args.designation)
+    except Exception as exc:
+        print(f"install ceremony could not run for "
+              f"{args.username}: {exc}", file=sys.stderr)
+        print(SUPPORT_POINTER, file=sys.stderr)
+        return 1
+    landed = [r["step"] for r in state.get("receipts") or []
+              if r.get("ok")]
+    if state.get("complete"):
+        print(f"install ceremony COMPLETE for @{args.username}: "
+              f"all nine steps landed; receipts are in "
+              f"{_state_dir(args)}/ceremony-state.json")
+        _print({"username": args.username, "complete": True,
+                "steps_landed": landed,
+                "support": state.get("support")})
+        return 0
+    print(f"install ceremony HALTED for @{args.username} at step "
+          f"{state.get('failed_step')} with fault "
+          f"{state.get('fault')}: {state.get('fault_detail') or ''}",
+          file=sys.stderr)
+    print("re-running `agentlink install` with the same "
+          "--username/--state-dir resumes at that step; no step "
+          "can be skipped.", file=sys.stderr)
+    print(SUPPORT_POINTER, file=sys.stderr)
+    _print({"username": args.username, "complete": False,
+            "steps_landed": landed,
+            "failed_step": state.get("failed_step"),
+            "fault": state.get("fault"),
+            "support": state.get("support")})
+    return 1
+
+
+def _operator(rest: list[str]) -> int:
+    """Operator commands (2.6.0): the operator's own acts,
+    authenticated to the oversight Edge with the operator
+    credential IT expects (AGENTLINK_OPERATOR_TOKEN — a
+    dashboard session token or operator JWT; see
+    agentlink/operator.py). Today: the provisioning-grant
+    issue/revoke pair (SPEC Part 2)."""
+    from .operator import OperatorError
+    sub = rest[0] if rest else ""
+    r = rest[1:] if rest else []
+    if sub == "provisioning":
+        action = r[0] if r else ""
+        rr = r[1:] if r else []
+        if action == "issue":
+            ap = argparse.ArgumentParser(
+                prog="agentlink operator provisioning issue")
+            ap.add_argument("--username", required=True,
+                            help="the NEW username the grant is "
+                                 "bound to")
+            ap.add_argument("--ttl-hours", type=int, default=None,
+                            help="grant lifetime in hours "
+                                 "(default: the server's 72)")
+            args = ap.parse_args(rr)
+            from .operator import provisioning_issue
+            try:
+                out = provisioning_issue(args.username,
+                                         ttl_hours=args.ttl_hours)
+            except OperatorError as exc:
+                print(f"provisioning issue failed: {exc}",
+                      file=sys.stderr)
+                return 1
+            token = str(out.get("provisioning_grant") or "")
+            print(f"provisioning grant issued for "
+                  f"@{out.get('username')} (grant id "
+                  f"{out.get('grant_id')}, expires_at "
+                  f"{out.get('expires_at')})")
+            print("give this token to the agent ONCE — it is "
+                  "shown only here; the server stores only its "
+                  "hash, and it cannot be recovered:")
+            print(token)
+            print("the agent presents it with: agentlink "
+                  "install --username "
+                  f"{out.get('username')} --provisioning-grant "
+                  "<token>  (or `agentlink setup "
+                  "--provisioning-grant <token>`)")
+            return 0
+        if action == "revoke":
+            ap = argparse.ArgumentParser(
+                prog="agentlink operator provisioning revoke")
+            ap.add_argument("--username", default=None,
+                            help="revoke every unconsumed grant "
+                                 "for this username")
+            ap.add_argument("--grant-id", default=None,
+                            help="revoke one grant by its id")
+            args = ap.parse_args(rr)
+            if not args.username and not args.grant_id:
+                print("revoke needs --username or --grant-id",
+                      file=sys.stderr)
+                return 2
+            from .operator import provisioning_revoke
+            try:
+                out = provisioning_revoke(
+                    username=args.username,
+                    grant_id=args.grant_id)
+            except OperatorError as exc:
+                print(f"provisioning revoke failed: {exc}",
+                      file=sys.stderr)
+                return 1
+            _print(out)
+            return 0
+        print("usage: agentlink operator provisioning "
+              "{issue|revoke} ...", file=sys.stderr)
+        return 2
+    print("usage: agentlink operator provisioning "
+          "{issue|revoke} ...", file=sys.stderr)
+    return 2
 
 
 def _support(rest: list[str]) -> int:
@@ -2241,12 +2411,12 @@ def _assign(rest: list[str]) -> int:
                     help="approval gate: a proven delivery parks in"
                          " awaiting_approval until you approve/reject")
     ap.add_argument("--heavy", action="store_true",
-                    help="the work is hardware-heavy: the nature-fit"
-                         " lines below warn when an assignee's"
-                         " DECLARED machine carries no GPU (a"
-                         " client-side warning only — fitness is"
-                         " the assigner's judgment, never a platform"
-                         " refusal)")
+                    help="accepted for compatibility: the work is"
+                         " hardware-heavy. Since 2.6.0 the platform"
+                         " keeps no machine record (spec retirement),"
+                         " so the nature-fit lines carry nature +"
+                         " grade only — fitness is the assigner's"
+                         " judgment, never a platform refusal)")
     ap.add_argument("assignees", help="comma-separated usernames")
     ap.add_argument("title")
     ap.add_argument("instructions", nargs="?", default="")
@@ -2276,11 +2446,13 @@ def _assign(rest: list[str]) -> int:
                  "priority": args.priority, "role": args.role,
                  "require_approval": args.require_approval})))
     # Nature-fit surface (2.5.0): after the assignment, state each
-    # assignee's declared nature + grade + declared machine, so a
-    # long job is never handed to a nature that cannot hold it
-    # blind. Best-effort display — the assignment already landed;
-    # a failed read is reported as unavailable, never hidden.
-    from .liveness import machine_summary, nature_summary
+    # assignee's declared nature + grade, so a long job is never
+    # handed to a nature that cannot hold it blind. Best-effort
+    # display — the assignment already landed; a failed read is
+    # reported as unavailable, never hidden. (2.6.0: no machine
+    # line — spec retirement; the platform holds no spec record
+    # to display.)
+    from .liveness import nature_summary
     for name in assignees:
         try:
             out = asyncio.run(_with_agent(
@@ -2293,14 +2465,7 @@ def _assign(rest: list[str]) -> int:
             prof = (peer or {}).get("nature") or {}
             print(f"nature-fit @{name}: {nature_summary(prof)} · "
                   f"grade {lv.get('grade') or 'unproven'}"
-                  f"{' · daemon-only' if lv.get('daemon_only') else ''}"
-                  f" · machine (declared): "
-                  f"{machine_summary(prof.get('machine'))}")
-            if args.heavy and prof.get("machine") is not None \
-                    and not (prof["machine"].get("gpus") or []):
-                print(f"  WARNING: @{name} declares no GPU — heavy"
-                      " work fitness is your call (the platform"
-                      " does not refuse assignments)")
+                  f"{' · daemon-only' if lv.get('daemon_only') else ''}")
         except Exception as exc:
             print(f"nature-fit @{name}: unavailable ({exc})")
     return 0
