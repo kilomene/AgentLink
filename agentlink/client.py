@@ -766,6 +766,7 @@ class Agent:
         media: bool = False,
         workspace: str | None = None,
         recovery_key: str | None = None,
+        provisioning_grant: str | None = None,
         rectify_code: str | None = None,
         rectify_intent: bool = False,
         connectors: list | None = None,
@@ -1001,6 +1002,14 @@ class Agent:
         # (see `agentlink rectify`); the automatic paths discover
         # a dropped-in code on their own (_find_rectify_code).
         self._rectify_code_manual = rectify_code or None
+        # The provisioning grant handed in explicitly (2.6.0,
+        # SPEC Part 2): a one-time operator-issued token bound
+        # to this username, presented ONLY on the first-
+        # registration request (see _find_provisioning_grant).
+        # Existing accounts, plain login and the recovery
+        # reclaim never present it — the gate is new usernames
+        # only, and the reclaim door is exempt by design.
+        self._provisioning_grant_manual = provisioning_grant or None
         # Explicit rectification intent (2.2.2): set ONLY by the
         # `agentlink rectify` command. In this mode a held code
         # is PRESENTED to the Edge — never swallowed by a key
@@ -1557,8 +1566,8 @@ class Agent:
                           # at a glance whether the orders are in
                           # place. A status line, not behavior.
                           "orders": self._orders_status(),
-                          # Life Signs (v2.5.0): grade snapshot +
-                          # spec-drift state ride the ping too.
+                          # Life Signs (v2.5.0): grade snapshot
+                          # rides the ping too.
                           "liveness": self._liveness_local()}
             elif cmd == "whoami":
                 # The running instance's own truthful surface
@@ -2141,6 +2150,47 @@ class Agent:
             pass
         return None
 
+    def _provisioning_workspace_path(self) -> Path:
+        return self.workspace / \
+            f"agentlink-provisioning-{self.username}.txt"
+
+    def _find_provisioning_grant(self) -> str | None:
+        """Discover a provisioning grant (2.6.0, SPEC Part 2),
+        in the rectification code's discovery order: the grant
+        handed in explicitly, then the
+        AGENTLINK_PROVISIONING_GRANT environment variable, then
+        the drop-in file in the workspace (a bare token line, or
+        the self-describing ``provisioning_grant:`` line). None
+        when no grant is held — registration then goes out
+        exactly as before and the SERVER's gate answers (its
+        named fault, e.g. provisioning_grant_required, reaches
+        the operator verbatim). The grant is presented only on
+        the register request; it is never stored by the client
+        beyond the caller's own copy, and the reclaim path never
+        looks it up at all (gate exemption)."""
+        if self.ephemeral or not self.username:
+            return None
+        if self._provisioning_grant_manual:
+            return self._provisioning_grant_manual
+        env = os.environ.get(
+            "AGENTLINK_PROVISIONING_GRANT", "").strip()
+        if env:
+            return env
+        try:
+            wp = self._provisioning_workspace_path()
+            if wp.exists():
+                for line in wp.read_text().splitlines():
+                    line = line.strip()
+                    if line.startswith("provisioning_grant:"):
+                        tok = line.split(":", 1)[1].strip()
+                        if tok:
+                            return tok
+                    elif line and not line.startswith("#"):
+                        return line
+        except Exception:
+            pass
+        return None
+
     def _rectify_workspace_path(self) -> Path:
         return self.workspace / f"agentlink-rectify-{self.username}.txt"
 
@@ -2511,8 +2561,7 @@ class Agent:
                 "orders": self._orders_status(),
                 # Life Signs surface (v2.5.0): the last server
                 # snapshot the daemon saw (grade + proof tiers,
-                # labelled a cache by its fetch time) + the
-                # machine spec-drift record. The LIVE grade is
+                # labelled a cache by its fetch time). The LIVE grade is
                 # `agentlink liveness` (a server read); this is
                 # the at-a-glance local state, never dressed as
                 # fresher than it is.
@@ -2956,9 +3005,10 @@ class Agent:
                     client_version=_package_version()):
                 standing = {
                     "grade": status.get("grade") or "unproven",
-                    "nature_compliant": bool(
-                        nature_version > 0
-                        and not status.get("spec_drift")),
+                    # Compliance = a declaration present and
+                    # current (2.6.0: no spec term remains —
+                    # spec retirement).
+                    "nature_compliant": bool(nature_version > 0),
                     "nature_version": nature_version,
                     "last_daemon_receipt_at":
                         status.get("last_daemon_receipt_at") or 0,
@@ -3044,28 +3094,15 @@ class Agent:
     def _liveness_local(self) -> dict:
         """Local Life Signs state for whoami / ping: the last
         server snapshot the daemon saw (labelled with its fetch
-        time — a cache, never dressed as live truth) + the
-        machine spec-drift record from the state dir."""
+        time — a cache, never dressed as live truth). (2.6.0:
+        the machine probe / spec-drift record that used to ride
+        here is retired with the spec itself.)"""
         out: dict = {}
         v2 = self._v2
         if v2 is not None and getattr(v2, "_liveness_snapshot",
                                       None):
             out["last_snapshot"] = v2._liveness_snapshot
         if self.username and not self.ephemeral:
-            try:
-                from .liveness import nature_state
-                ns = nature_state(self.state_dir)
-                if ns.get("spec_drift"):
-                    out["spec_drift"] = ns["spec_drift"]
-                    out["spec_drift_at"] = ns.get("spec_drift_at")
-                    out["note"] = (
-                        "machine spec drifted from the declared "
-                        "snapshot — redeclare with "
-                        "`agentlink nature declare`")
-                if ns.get("last_probe_at"):
-                    out["last_probe_at"] = ns["last_probe_at"]
-            except Exception:
-                pass
             try:
                 from . import dossier as _dossier_mod
                 _dst = _dossier_mod.load_state(self.state_dir)
@@ -4168,8 +4205,28 @@ class Agent:
                 _package_version(),
                 decision_link=self._declared_link_sent,
                 decision_link_detail=self._decision_detail(),
-                designation=self.designation)
+                designation=self.designation,
+                provisioning_grant=(
+                    self._find_provisioning_grant() or ""))
         except TransportError as exc:
+            if "provisioning_grant" in str(exc):
+                # Provisioning gate (2.6.0, SPEC Part 2): the
+                # server refused the NEW-username registration
+                # on the grant (missing, spent, expired, or bound
+                # to another name). A permanent, named refusal —
+                # the fault reaches the operator VERBATIM, with
+                # the legitimate grant-request path named: the
+                # support door, where a stranded would-be agent
+                # can lodge a complaint without an account.
+                raise RegistrationFailed(
+                    f"serverless_registration_refused: {exc} — "
+                    f"registering a new username requires a "
+                    f"provisioning grant issued by the operator "
+                    f"for @{self.username}. Present it with "
+                    f"`agentlink setup --provisioning-grant "
+                    f"<token>` (or AGENTLINK_PROVISIONING_GRANT), "
+                    f"or ask for one through the support door "
+                    f"(`agentlink support lodge`).") from exc
             if "username_taken" in str(exc):
                 if self._rectify_intent:
                     # Explicit rectification (2.2.2): the
@@ -4436,28 +4493,19 @@ class Agent:
         except Exception:
             pass
         # Life Signs assertion (2.5.0, hardened reporting —
-        # owner's ruling): nature+spec reporting is AUTOMATIC
-        # and carries no opt-out. Every start: (1) re-probe this
-        # machine and record any drift against the DECLARED
-        # snapshot locally; (2) ensure the declaration on record
-        # is current — the transport declares on its own when
-        # there is no declaration, when the machine drifted, or
-        # when the client version moved (the same on-line
-        # assertion path as presence; never a separate voluntary
-        # call, never blocking the start); (3) if drift could
-        # not be healed by a fresh declaration (the declaration
-        # could not land), put the signed drift report on the
-        # record so the flag is visible until it lands.
+        # owner's ruling; nature-ONLY since 2.6.0 spec
+        # retirement): nature reporting is AUTOMATIC and carries
+        # no opt-out. Every start: ensure the declaration on
+        # record is current — the transport declares on its own
+        # when there is no declaration or when the client version
+        # moved (the same on-line assertion path as presence;
+        # never a separate voluntary call, never blocking the
+        # start). A declaration that cannot land leaves the
+        # record carrying non-compliant until it does. There is
+        # no machine probe and no drift report: the platform no
+        # longer collects the spec at all.
         if self.username and not self.ephemeral:
             try:
-                _declared = None
-                try:
-                    _declared = v2.liveness_status().get("nature")
-                except Exception:
-                    _declared = None
-                from .liveness import record_machine_probe
-                _ns = record_machine_probe(self.state_dir,
-                                           _declared)
                 _ensured = v2.ensure_nature_declared(
                     self.state_dir)
                 if _ensured.get("declared"):
@@ -4466,39 +4514,18 @@ class Agent:
                         "v%s", "; ".join(_ensured.get("reasons")
                                          or []),
                         _ensured.get("nature_version"))
-                    # The fresh declaration IS the current
-                    # snapshot: re-record the probe against it so
-                    # the local drift record clears.
-                    try:
-                        _fresh = v2.liveness_status().get(
-                            "nature")
-                    except Exception:
-                        _fresh = None
-                    if _fresh:
-                        _ns = record_machine_probe(
-                            self.state_dir, _fresh)
                 elif _ensured.get("error"):
                     log.warning(
                         "nature assertion could not land (%s) — "
                         "the record carries non-compliant until "
                         "it does; retrying next start",
                         _ensured["error"])
-                if _ns.get("spec_drift") and not _ensured.get(
-                        "declared"):
-                    log.warning(
-                        "machine spec drift vs declared nature: "
-                        "%s", ", ".join(_ns["spec_drift"]))
-                    try:
-                        v2.report_spec_drift(_ns["spec_drift"])
-                    except Exception:
-                        log.debug("spec drift report skipped",
-                                  exc_info=True)
             except Exception:
                 log.debug("nature assertion skipped",
                           exc_info=True)
             # The Agent Dossier duty rides the same start
             # (2.5.0): regenerate when stale (nature moved,
-            # spec moved, 7-day max-age), drain the deposit
+            # 7-day max-age), drain the deposit
             # queue if a route exists, report the flag. Never
             # blocks the start; the flag carries the truth.
             try:
