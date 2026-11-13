@@ -94,6 +94,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   bearerToken,
+  CAP_CONTROL,
   constantTimeEqual,
   env,
   errorResponse,
@@ -101,6 +102,7 @@ import {
   methodGuard,
   mintGoogleAccessToken,
   patchRows,
+  readJsonBody,
   sanitizeKey,
   selectOne,
 } from "../_shared/v200.ts";
@@ -198,7 +200,14 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  const body = await req.json().catch(() => ({})) as Record<string, unknown>;
+  // Ingress cap (2.6.0, Part 4): webhook records are control
+  // metadata; CAP_CONTROL is wide headroom. This Edge has no
+  // agent caller (webhook secret), so the per-agent rate and
+  // suspension switch do not apply here — the taps it emits
+  // are derived from record rows, never from a caller claim.
+  const parsed = await readJsonBody(req, CAP_CONTROL);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
   const record = (body.record ?? {}) as Record<string, unknown>;
   // A direct POST of a bare outbox row (no table/record wrapper)
   // is normalized to the outbox shape; webhook POSTs always carry
@@ -311,7 +320,8 @@ Deno.serve(async (req: Request) => {
             last_proof_tier: tier,
             last_proof_at: at,
             daemon_only: Boolean(lv?.daemon_only),
-            spec_drift: Boolean(String(lv?.spec_drift ?? "")),
+            // Part 1 (2.6.0): spec_drift is NOT mirrored
+            // anymore (legacy residue in the record only).
             nature_compliant: Boolean(lv?.nature_compliant),
             dossier_status: String(lv?.dossier_status ?? "")
               || "missing",
