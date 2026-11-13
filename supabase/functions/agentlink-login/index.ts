@@ -42,17 +42,32 @@
 // never be replayed, and every failure (unknown username, no
 // live code, expired, wrong code) returns the same refusal.
 //
-// Registration (v2.0.8) is FIRST-COME and fully automatic — the
-// v1 relay's claiming hello, restored: a well-formed username
-// nobody holds is claimed on the spot, bound to the identity
-// keys the agent generated on its own machine. No password, no
-// approval, no operator involvement exists anywhere in this
-// ceremony. The account's recovery key is minted here, returned
-// ONCE in this response, and stored only as its SHA-256 — the
-// same issuance contract as the recovery method's rotation. A
-// name that already has a row is refused {error:"username_taken"}
-// and NOTHING is written: a taken name can only be re-entered
-// through the recovery method with the key its owner holds.
+// Registration (v2.0.8) was FIRST-COME and fully automatic.
+// 2.6.0 (Part 2) puts a PROVISIONING GATE on the NEW-username
+// door only: registration now requires a provisioning grant —
+// a one-time, operator-issued token bound to this exact
+// username, presented as body.provisioning_grant. The Edge
+// verifies the token's SHA-256 against al_provisioning_grants
+// (v216; only the hash is ever stored), the username binding,
+// the expiry and the unconsumed state, then consumes the
+// grant atomically (UPDATE ... WHERE consumed_at IS NULL)
+// before the account row is born; a failed birth restores
+// the grant. Every gate failure is a NAMED fault
+// (provisioning_grant_required / _invalid / _expired /
+// _consumed / _username_mismatch) whose body points at the
+// support door — agentlink-support, the legitimate
+// grant-request path for a stranded would-be agent.
+// GRANDFATHERING: a name that already has a row is still
+// refused {error:"username_taken"} BEFORE the gate is even
+// consulted, and the verify / recovery / rectify ceremonies
+// for existing accounts are NOT gated — the reclaim door
+// (recovery key) is explicitly exempt, so a legitimate agent
+// that lost its state is never locked out by the gate.
+// This is NOT the v1.8.1 admin grant model (al_grants /
+// agentlink-grants): that concept is untouched. The account's
+// recovery key is minted here, returned ONCE in this
+// response, and stored only as its SHA-256 — the same
+// issuance contract as the recovery method's rotation.
 //
 // The challenge is STATELESS (no table needed): nonce =
 // HMAC-SHA256-hex(AGENTLINK_LOGIN_HMAC, "<username>|<sign_pub>|<exp>")
@@ -81,15 +96,30 @@
 // against an unknown username returns the relay's own
 // "no such registered username" refusal, as relay.py does.
 //
-// RATE LIMITING (honest note): Edge instances are short-lived and
-// do not share memory, so the per-instance fixed-window limiter
-// below is a speed bump, not a platform guarantee — it mirrors the
-// SPIRIT of the relay's per-username recovery-attempt counter
-// (relay.py _recovery_attempts, which only logs). Durable,
-// cross-instance rate limiting belongs in front of this function
-// (platform / gateway limits) or in a future Postgres counter; it
-// is NOT claimed here. Failed attempts never mutate the user row,
-// exactly as a failed relay recovery/key hello changes nothing.
+// RATE LIMITING: the per-instance fixed-window limiter below
+// remains as the first speed bump (the relay's spirit, exact
+// numbers). 2.6.0 (Part 4) adds the durable counter this note
+// used to ask for: every method ALSO hits al_rate_counters via
+// al_rate_hit (v216, shared rateLimitRefusal) under the key
+// "login:<method>:<username>" with the same per-minute limits,
+// so the limit now holds across Edge instances. The durable
+// layer fails open on counter error (logged) — a broken
+// counter must never brick legitimate logins. Failed attempts
+// never mutate the user row, exactly as a failed relay
+// recovery/key hello changes nothing.
+//
+// REPLAY (2.6.0, Part 4): the challenge stays HMAC-stateless
+// (no table to issue it), but a SUCCESSFUL verify now CLAIMS
+// its nonce in al_consumed_nonces (v216): the same
+// nonce+signature pair presented twice is refused
+// replay_refused, so a captured login statement cannot be
+// replayed inside its 60-second window (hostile case 7).
+//
+// SUSPENSION (2.6.0, Part 4): this Edge deliberately does NOT
+// refuse suspended agents — identity is not the punishment
+// (the pinned shape in ../_shared/v200.ts). Login still
+// authenticates them; every agent Edge except support refuses
+// their calls, and support itself rides no agent JWT.
 //
 // Deploy: supabase functions deploy agentlink-login
 // Secrets (NAMES only): SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
@@ -101,6 +131,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   authChallengePayload,
   b64decode,
+  CAP_CONTROL,
+  claimOnce,
   constantTimeEqual,
   Ed25519UnsupportedError,
   env,
@@ -115,6 +147,9 @@ import {
   nowSeconds,
   patchRows,
   randomTokenUrlSafe,
+  rateLimitRefusal,
+  readJsonBody,
+  recordOperatorEvent,
   selectOne,
   sha256Hex,
   verifyEd25519,
@@ -227,10 +262,31 @@ function isRawKey32(b64: unknown): boolean {
   }
 }
 
+/** A provisioning-gate refusal (2.6.0, Part 2): the named
+ * fault plus the pointer to the support door — a stranded
+ * would-be agent lodges a complaint at agentlink-support with
+ * NO account, and that complaint is the legitimate
+ * grant-request path. */
+function provisioningFault(code: string, detail: string): Response {
+  return jsonResponse({
+    ok: false,
+    error: code,
+    detail: detail + " If you were invited, ask the operator " +
+      "for a provisioning grant; if you are stranded, lodge a " +
+      "support complaint at the support door and the operator " +
+      "will answer there.",
+    support: "agentlink-support/lodge",
+    support_route: "agentlink-support/lodge",
+  }, 403);
+}
+
 Deno.serve(async (req: Request) => {
   const guard = methodGuard(req);
   if (guard) return guard;
-  const body = await req.json().catch(() => ({})) as Record<string, unknown>;
+  // Ingress discipline (2.6.0, Part 4): byte cap before parse.
+  const parsed = await readJsonBody(req, CAP_CONTROL);
+  if (parsed.response) return parsed.response;
+  const body = parsed.body;
   // method comes from the body ({username, method}); a path suffix
   // (/challenge, /verify, /recovery) is accepted as an alias.
   const pathTail = new URL(req.url).pathname.split("/").filter(Boolean).pop();
@@ -240,12 +296,20 @@ Deno.serve(async (req: Request) => {
     return errorResponse("invalid_username", "username is not well-formed", 400);
   }
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "";
+  // Durable rate layer (2.6.0): same limits as the per-instance
+  // limiter below, enforced across instances via al_rate_hit.
+  const durableLimited = (kind: string) =>
+    rateLimitRefusal(supabase, `login:${kind}:${username}`,
+      LIMITS[kind] ?? 20, 60);
 
   try {
     // ------------------------------------------------ challenge
     if (method === "challenge") {
       if (rateLimited("challenge", username, ip)) {
         return errorResponse("rate_limited", "too many challenges; retry shortly", 429);
+      }
+      if (await durableLimited("challenge")) {
+        return errorResponse("rate_limited", "too many challenge attempts; retry shortly", 429);
       }
       const row = await selectOne(supabase, "al_users", "sign_pub", {
         username,
@@ -264,6 +328,9 @@ Deno.serve(async (req: Request) => {
     // --------------------------------------------------- verify
     if (method === "verify") {
       if (rateLimited("verify", username, ip)) {
+        return errorResponse("rate_limited", "too many verify attempts; retry shortly", 429);
+      }
+      if (await durableLimited("verify")) {
         return errorResponse("rate_limited", "too many verify attempts; retry shortly", 429);
       }
       const fail = () => errorResponse("key_auth_failed", KEY_AUTH_FAILED_DETAIL, 401);
@@ -299,6 +366,17 @@ Deno.serve(async (req: Request) => {
         throw e;
       }
       if (!ok) return fail();
+      // Replay claim (2.6.0, Part 4): the signature verified,
+      // so this presentation is legitimate — and it is the
+      // ONLY presentation of this nonce that ever will be.
+      // The claim lands before any token is minted; a replay
+      // of the captured statement dies here.
+      if (!await claimOnce(supabase, "login_verify", username,
+        nonce, exp + 300)) {
+        return errorResponse("replay_refused",
+          "this login statement was already presented; " +
+          "request a fresh challenge", 401);
+      }
       await patchRows(supabase, "al_users", { username }, {
         last_seen: nowSeconds(),
         auth_method: "key-v2",
@@ -365,6 +443,9 @@ Deno.serve(async (req: Request) => {
     // ------------------------------------------------- recovery
     if (method === "recovery") {
       if (rateLimited("recovery", username, ip)) {
+        return errorResponse("rate_limited", "too many recovery attempts; retry shortly", 429);
+      }
+      if (await durableLimited("recovery")) {
         return errorResponse("rate_limited", "too many recovery attempts; retry shortly", 429);
       }
       const row = await selectOne(
@@ -437,6 +518,9 @@ Deno.serve(async (req: Request) => {
       if (rateLimited("register", username, ip)) {
         return errorResponse("rate_limited", "too many registration attempts; retry shortly", 429);
       }
+      if (await durableLimited("register")) {
+        return errorResponse("rate_limited", "too many register attempts; retry shortly", 429);
+      }
       // First-come claim of an unheld name (v2.0.8 — see the
       // header). Key material is validated exactly as the
       // recovery method validates a rebind: raw 32-byte keys in
@@ -460,6 +544,9 @@ Deno.serve(async (req: Request) => {
         // A taken name is never re-issued and nothing is
         // written: the only way back into it is the recovery
         // method with the key the account's owner holds.
+        // GRANDFATHERING (2.6.0): this refusal precedes the
+        // provisioning gate — existing accounts are never
+        // gated, and no grant is consulted or consumed here.
         return errorResponse(
           "username_taken",
           "that username is already registered; if it is yours, " +
@@ -467,6 +554,78 @@ Deno.serve(async (req: Request) => {
           409,
         );
       }
+      // -------------------------------- PROVISIONING GATE
+      // (2.6.0, Part 2): a NEW username registers only with a
+      // provisioning grant bound to THIS username. Verify in
+      // order: presented -> exists -> binding -> expiry ->
+      // unconsumed; then consume atomically BEFORE the birth,
+      // restoring the grant if the birth fails.
+      const grantToken = String(body.provisioning_grant ?? "");
+      if (!grantToken) {
+        return provisioningFault("provisioning_grant_required",
+          "registering a new username requires a provisioning " +
+          "grant: a one-time token the operator issued for " +
+          "this exact username.");
+      }
+      const grant = await selectOne(
+        supabase,
+        "al_provisioning_grants",
+        "id, username, expires_at, consumed_at, revoked_at",
+        { token_hash: await sha256Hex(grantToken) },
+      );
+      if (!grant || grant.revoked_at) {
+        return provisioningFault("provisioning_grant_invalid",
+          "the provisioning grant presented does not exist " +
+          "(or was revoked by the operator).");
+      }
+      if (String(grant.username) !== username) {
+        return provisioningFault(
+          "provisioning_grant_username_mismatch",
+          "the provisioning grant presented was issued for a " +
+          "different username; a grant is bound to the one " +
+          "username it was issued for.");
+      }
+      if (Number(grant.expires_at ?? 0) <= nowSeconds()) {
+        return provisioningFault("provisioning_grant_expired",
+          "the provisioning grant presented has expired.");
+      }
+      if (grant.consumed_at) {
+        return provisioningFault("provisioning_grant_consumed",
+          "the provisioning grant presented was already " +
+          "consumed; grants are one-time.");
+      }
+      const grantId = String(grant.id);
+      const consumedCount = await patchRows(
+        supabase,
+        "al_provisioning_grants",
+        { id: grantId },
+        { consumed_at: nowSeconds(), consumed_ip: ip || null },
+        (q) => q.is("consumed_at", null),
+      );
+      if (consumedCount !== 1) {
+        // Lost a race against a concurrent presentation of
+        // the same grant: it is consumed now, by definition.
+        return provisioningFault("provisioning_grant_consumed",
+          "the provisioning grant presented was already " +
+          "consumed; grants are one-time.");
+      }
+      const releaseGrant = async () => {
+        // The birth failed after consumption: restore the
+        // grant so a legitimate retry is not stranded by a
+        // server-side failure. Best-effort and logged — the
+        // operator event trail shows the restore.
+        try {
+          await patchRows(
+            supabase,
+            "al_provisioning_grants",
+            { id: grantId },
+            { consumed_at: null, consumed_ip: null },
+          );
+        } catch (e) {
+          console.error("provisioning grant restore failed " +
+            "for " + grantId + ": " + String(e));
+        }
+      };
       const now = nowSeconds();
       // The recovery key is minted here and returned ONCE in
       // this response; only its SHA-256 is stored — the
@@ -518,6 +677,9 @@ Deno.serve(async (req: Request) => {
       try {
         await insertRow(supabase, "al_users", row);
       } catch (e) {
+        // The birth failed: the grant goes back unconsumed
+        // (see releaseGrant) before any refusal is spoken.
+        await releaseGrant();
         // A simultaneous claim of the same name: the loser's
         // insert fails on the key — report the truth (taken),
         // never a fake internal error.
@@ -537,6 +699,10 @@ Deno.serve(async (req: Request) => {
         }
         throw e;
       }
+      await recordOperatorEvent(supabase,
+        "provisioning_consumed", username, username,
+        "provisioning grant consumed at registration",
+        { grant_id: grantId });
       await recordClientVersion(supabase, username, body);
       const tokens = await issueTokens(username);
       return jsonResponse({ ...tokens, recovery_key: newRecoveryKey });
@@ -546,6 +712,9 @@ Deno.serve(async (req: Request) => {
     if (method === "rectify") {
       if (rateLimited("rectify", username, ip)) {
         return errorResponse("rate_limited", "too many rectification attempts; retry shortly", 429);
+      }
+      if (await durableLimited("rectify")) {
+        return errorResponse("rate_limited", "too many rectify attempts; retry shortly", 429);
       }
       // The operator path back into a stranded legacy account
       // (see the header). Authorization is a one-time code the
