@@ -42,13 +42,12 @@ function lifeSignCell(r, now){
   const node = r.livenessNode || null;
   const rec = r.liveness || null;
   let grade = "", tier = "", proofAt = 0, daemonOnly = false,
-      specDrift = false, stale = false, source = "";
+      stale = false, source = "";
   if(node && node.grade){
     grade = String(node.grade);
     tier = String(node.last_proof_tier || "");
     proofAt = Number(node.last_proof_at || 0);
     daemonOnly = !!node.daemon_only;
-    specDrift = !!node.spec_drift;
     const asOf = nodeAsOfS(node, now);
     stale = !asOf || (now - asOf) > LIVENESS_STALE_S;
     source = stale ? "live node stale " + fmtAge(now - asOf) : "live";
@@ -59,7 +58,6 @@ function lifeSignCell(r, now){
     if(rAt >= dAt && rAt > 0){ tier = "runtime"; proofAt = rAt; }
     else if(dAt > 0){ tier = "daemon"; proofAt = dAt; }
     daemonOnly = !!rec.daemon_only;
-    specDrift = !!rec.spec_drift;
     source = "recorded " + fmtAge(now - Number(rec.updated_at || 0));
   }
   if(!grade){
@@ -78,7 +76,6 @@ function lifeSignCell(r, now){
     '<br>judged by nature v' +
     esc(String(node ? (node.nature_version ?? 0) : (rec.judged_nature_version ?? 0))) +
     " · " + esc(source) + "</small>";
-  if(specDrift) html += '<br><small><b>spec drift</b> — redeclare pending</small>';
   // Dossier FLAG only: the dossier itself lives solely in the
   // owner's Drive archive — never rendered here; this line is
   // the status + last deposit date and nothing else.
@@ -95,10 +92,12 @@ function lifeSignCell(r, now){
   return html;
 }
 
-// Nature badge + declared machine, under the agent's name. The
-// declaration is the agent's signed statement (client-detected
-// machine snapshot), labelled DECLARED — an honest claim, not a
-// platform-verified fact. Non-compliance (no current signed
+// Nature badge, under the agent's name. The declaration is
+// the agent's signed statement of how it runs, labelled by
+// its nature words — an honest claim, not a platform-verified
+// fact. (2.6.0: the dashboard shows no machine spec; the
+// platform retired spec collection entirely.) Non-compliance
+// (no current signed
 // declaration) replaces the badge outright (owner's hardening
 // ruling): it is impossible to miss.
 const RK_LABEL = { "persistent-daemon": "persistent daemon", "session-chat": "session runtime", "scheduled": "scheduled", "embedded": "embedded", "other": "other runtime" };
@@ -118,15 +117,6 @@ function natureLine(r){
     " · " + esc(HC_LABEL[prof.host_class] || "host") +
     " · " + esc(prof.persistence_class || "") + " class · nature v" +
     esc(String(r.nature_version || 0)) + "</small>";
-  const m = prof.machine;
-  if(m){
-    const gpus = (m.gpus || []);
-    const gpuTxt = gpus.length ? gpus.map(g => esc(String(g.vendor || "") + " " + String(g.model || ""))).join(", ") : "no GPU";
-    line += '<br><small>' + esc(String(m.hostname || "?")) + " · " +
-      esc(String(m.cpu_model || "?")) + " · " +
-      (m.ram_mb ? Math.round(m.ram_mb / 1024) + " GB RAM · " : "") +
-      gpuTxt + " (declared)</small>";
-  }
   if(prof.duty_pattern) line += '<br><small>' + esc(String(prof.duty_pattern)) + "</small>";
   return line;
 }
