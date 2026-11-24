@@ -108,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         print("commands: relay server register reclaim agent whoami directory send send-file "
               "dial group channel chain assign deliver work library vault "
               "credentials alerts capabilities update doctor census service backup "
-              "oversight-keygen deregister remove-user set-designation grant my-grant inbox sync delivery setup install operator support orders liveness nature dossier archive")
+              "oversight-keygen deregister remove-user set-designation grant my-grant inbox sync delivery setup install operator support orders liveness nature dossier archive keys")
         return 0
     cmd, rest = argv[0], argv[1:]
 
@@ -144,6 +144,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         _relay.main(rest)
         return 0
+
+    if cmd == "keys":
+        return _keys(rest)
 
     if cmd == "deregister":
         return _deregister(rest)
@@ -2390,9 +2393,34 @@ def _group(rest: list[str]) -> int:
         return 2
     # Owner-seat control channel (v1.3.9): group add forwards to
     # the running instance when the daemon holds the lock.
-    _fwd = {"cmd": "group_add", "group_id": args.group_id,
-            "members": list(args.members)} if sub == "add" else None
+    # (2.6.1, Fix 3): group create and group remove forward the
+    # same way — a one-shot must never boot a rival agent
+    # against the state-dir lock.
+    if sub == "add":
+        _fwd = {"cmd": "group_add", "group_id": args.group_id,
+                "members": list(args.members)}
+    elif sub == "create":
+        _fwd = {"cmd": "group_create", "name": args.name,
+                "members": list(args.members)}
+    elif sub == "remove":
+        _fwd = {"cmd": "group_remove", "group_id": args.group_id,
+                "target": args.target}
+    else:
+        _fwd = None
     _print(asyncio.run(_with_agent(args, fn, forward=_fwd)))
+    return 0
+
+
+def _keys(rest: list[str]) -> int:
+    if not rest or rest[0] != "rotate":
+        print("usage: agentlink keys rotate",
+              file=sys.stderr)
+        return 2
+    ap = argparse.ArgumentParser(prog="agentlink keys rotate")
+    _add_common(ap)
+    args = ap.parse_args(rest[1:])
+    _print(asyncio.run(_with_agent(
+        args, lambda a: a.rotate_keys())))
     return 0
 
 
