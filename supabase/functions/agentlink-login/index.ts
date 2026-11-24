@@ -69,6 +69,26 @@
 // response, and stored only as its SHA-256 — the same
 // issuance contract as the recovery method's rotation.
 //
+// KEY EPOCHS + POSSESSION PROOF (2.6.1, Fix 2, v217): a new
+// encryption pubkey is never published on a bare claim. Before
+// registration or any key CHANGE, the client fetches method
+// "key_challenge" {username, purpose, candidate_pubkey,
+// candidate_sign_pub} and the server seals a one-time nonce to
+// the candidate pubkey (the crypto.py envelope shape, sealed
+// by _shared sealToPubkey) and stores only the nonce's SHA-256
+// in al_key_challenges (TTL 300s). The client opens the nonce
+// with the candidate private key and presents key_proof
+// {challenge_id, nonce, signature} - Ed25519 over
+// "agentlink-key-proof-v1:" + challenge_id + ":" + nonce by
+// the CANDIDATE signing key. Any presentation consumes the
+// challenge (success or failure); expired, consumed or
+// mismatched -> key_proof_invalid, absent -> key_proof_required.
+// register always requires proof (epoch 1, history row).
+// recovery/rectify require proof only when the pubkey CHANGES
+// (unchanged pubkey: no proof, epoch unchanged); a change
+// increments the epoch and writes a history row. al_users +
+// al_directory (a view over al_users) carry key_epoch.
+//
 // The challenge is STATELESS (no table needed): nonce =
 // HMAC-SHA256-hex(AGENTLINK_LOGIN_HMAC, "<username>|<sign_pub>|<exp>")
 // with exp = now + 60 (protocol.AUTH_CHALLENGE_TTL_SECONDS). The
@@ -150,6 +170,7 @@ import {
   rateLimitRefusal,
   readJsonBody,
   recordOperatorEvent,
+  sealToPubkey,
   selectOne,
   sha256Hex,
   verifyEd25519,
@@ -162,6 +183,8 @@ const supabase = createClient(
 
 const RELAY_ID = env("AGENTLINK_LOGIN_RELAY_ID") || "agentlink-login-v2";
 const CHALLENGE_TTL_SECONDS = 60; // protocol.AUTH_CHALLENGE_TTL_SECONDS
+const KEY_PROOF_TTL_SECONDS = 300; // v217 al_key_challenges TTL
+const KEY_PROOF_PREFIX = "agentlink-key-proof-v1:";
 
 const KEY_AUTH_FAILED_DETAIL =
   "key-signed hello refused: the signature did not verify against " +
@@ -180,6 +203,7 @@ const LIMITS: Record<string, number> = {
   recovery: 10,
   register: 10,
   rectify: 10,
+  key_challenge: 10,
 };
 const attempts = new Map<string, { window: number; count: number }>();
 
@@ -262,6 +286,136 @@ function isRawKey32(b64: unknown): boolean {
   }
 }
 
+/** The bytes a key-possession proof signs: Ed25519 over
+ * "agentlink-key-proof-v1:" + challenge_id + ":" + nonce, by
+ * the CANDIDATE signing key. */
+function keyProofPayload(challengeId: string, nonce: string): Uint8Array {
+  return new TextEncoder().encode(KEY_PROOF_PREFIX + challengeId + ":" + nonce);
+}
+
+/** Verify a key_proof presentation (2.6.1, Fix 2). Returns
+ * "ok", "required" (no proof presented at all), "invalid"
+ * (expired, consumed, mismatched, or a bad signature), or
+ * "unsupported" (this runtime has no Ed25519 - a platform
+ * defect, never a failed proof). ANY presentation consumes
+ * its challenge: the consume lands before any binding check,
+ * so a captured proof can never be presented twice, whatever
+ * the outcome. A challenge binds (username, purpose,
+ * candidate keys); the presenting ceremony must name the
+ * purpose it is proving for. */
+async function verifyKeyProof(
+  username: string,
+  purpose: string,
+  candidatePubkey: string,
+  candidateSignPub: string,
+  proof: unknown,
+): Promise<"ok" | "required" | "invalid" | "unsupported"> {
+  if (!proof || typeof proof !== "object" || Array.isArray(proof)) {
+    return "required";
+  }
+  const p = proof as Record<string, unknown>;
+  const challengeId = String(p.challenge_id ?? "");
+  const nonce = String(p.nonce ?? "");
+  const signature = String(p.signature ?? "");
+  if (!challengeId || !nonce || !signature) return "invalid";
+  const row = await selectOne(supabase, "al_key_challenges",
+    "username, purpose, candidate_pubkey, candidate_sign_pub, " +
+      "nonce_hash, expires_at, consumed_at",
+    { id: challengeId });
+  if (!row) return "invalid";
+  // Consume FIRST: any presentation spends the challenge,
+  // success or failure. The conditional update is the claim:
+  // a second presentation finds consumed_at set and dies here.
+  const consumed = await patchRows(
+    supabase,
+    "al_key_challenges",
+    { id: challengeId },
+    { consumed_at: nowSeconds() },
+    (q) => q.is("consumed_at", null),
+  );
+  if (consumed !== 1) return "invalid";
+  const now = nowSeconds();
+  if (String(row.username ?? "") !== username) return "invalid";
+  if (String(row.purpose ?? "") !== purpose) return "invalid";
+  if (String(row.candidate_pubkey ?? "") !== candidatePubkey) {
+    return "invalid";
+  }
+  if (String(row.candidate_sign_pub ?? "") !== candidateSignPub) {
+    return "invalid";
+  }
+  if (Number(row.expires_at ?? 0) <= now) return "invalid";
+  const nonceHash = await sha256Hex(nonce);
+  if (!constantTimeEqual(nonceHash, String(row.nonce_hash ?? ""))) {
+    return "invalid";
+  }
+  let ok = false;
+  try {
+    ok = await verifyEd25519(
+      candidateSignPub,
+      keyProofPayload(challengeId, nonce),
+      signature,
+    );
+  } catch (e) {
+    if (e instanceof Ed25519UnsupportedError) return "unsupported";
+    throw e;
+  }
+  return ok ? "ok" : "invalid";
+}
+
+/** Map a verifyKeyProof verdict to its fault response, or null
+ * when the proof verified. Callers pass their own "required"
+ * wording (the ceremony differs); "invalid" is one shape. */
+function keyProofFault(
+  verdict: "ok" | "required" | "invalid" | "unsupported",
+  requiredDetail: string,
+): Response | null {
+  if (verdict === "ok") return null;
+  if (verdict === "required") {
+    return errorResponse("key_proof_required", requiredDetail, 401);
+  }
+  if (verdict === "unsupported") {
+    return errorResponse(
+      "ed25519_unsupported",
+      "WebCrypto in this runtime does not support Ed25519; " +
+        "the Supabase Edge (Deno) runtime is required",
+      500,
+    );
+  }
+  return errorResponse(
+    "key_proof_invalid",
+    "the key-possession proof did not verify for this username " +
+      "and candidate keys; fetch a fresh key_challenge and " +
+      "try again (a challenge is consumed on any presentation)",
+    401,
+  );
+}
+
+/** Key history (2.6.1, Fix 2): retain one row per published
+ * (username, key_epoch) in al_key_history. Fail-soft with a
+ * loud log, exactly like recordClientVersion: the publish
+ * itself has already landed when this is called, and a failed
+ * history write must never un-happen it. */
+async function recordKeyHistory(
+  username: string,
+  epoch: number,
+  pubkey: string,
+  signPub: string,
+  now: number,
+): Promise<void> {
+  try {
+    await insertRow(supabase, "al_key_history", {
+      username,
+      key_epoch: epoch,
+      pubkey,
+      sign_pub: signPub,
+      created_at: now,
+    });
+  } catch (e) {
+    console.error("key history record failed for " +
+      username + " epoch " + epoch + ": " + String(e));
+  }
+}
+
 /** A provisioning-gate refusal (2.6.0, Part 2): the named
  * fault plus the pointer to the support door — a stranded
  * would-be agent lodges a complaint at agentlink-support with
@@ -323,6 +477,70 @@ Deno.serve(async (req: Request) => {
       // reads `expires`; both names carry the same value (v2.0
       // integration alignment — the canonical payload uses this int).
       return jsonResponse({ nonce, exp, expires: exp, relay: RELAY_ID, expires_in: CHALLENGE_TTL_SECONDS });
+    }
+
+    // -------------------------------------------- key_challenge
+    if (method === "key_challenge") {
+      if (rateLimited("key_challenge", username, ip)) {
+        return errorResponse("rate_limited", "too many key_challenge attempts; retry shortly", 429);
+      }
+      if (await durableLimited("key_challenge")) {
+        return errorResponse("rate_limited", "too many key_challenge attempts; retry shortly", 429);
+      }
+      // Possession proof, step 1 (2.6.1, Fix 2): seal a
+      // one-time nonce to the CANDIDATE pubkey. The envelope
+      // is crypto.py encrypt_to_pubkey's shape (sealToPubkey);
+      // only the nonce's SHA-256 is stored, never the nonce.
+      // The challenge binds (username, purpose, candidate
+      // keys) and lives 300 seconds; any presentation
+      // consumes it (see verifyKeyProof).
+      const purpose = String(body.purpose ?? "").toLowerCase();
+      if (!["register", "recovery", "rectify"].includes(purpose)) {
+        return errorResponse(
+          "invalid_purpose",
+          "purpose must be register, recovery or rectify",
+          400,
+        );
+      }
+      const candidatePubkey = String(body.candidate_pubkey ?? "");
+      const candidateSignPub = String(body.candidate_sign_pub ?? "");
+      if (!isRawKey32(candidatePubkey) ||
+          !isRawKey32(candidateSignPub)) {
+        return errorResponse(
+          "invalid_key_material",
+          "candidate_pubkey and candidate_sign_pub must be " +
+            "base64 raw 32-byte keys",
+          400,
+        );
+      }
+      const now = nowSeconds();
+      const nonce = randomTokenUrlSafe(32);
+      const challengeId = "kc-" + randomTokenUrlSafe(24);
+      const envelope = await sealToPubkey(
+        candidatePubkey,
+        new TextEncoder().encode(JSON.stringify({
+          nonce,
+          challenge_id: challengeId,
+          username,
+        })),
+      );
+      await insertRow(supabase, "al_key_challenges", {
+        id: challengeId,
+        username,
+        purpose,
+        candidate_pubkey: candidatePubkey,
+        candidate_sign_pub: candidateSignPub,
+        nonce_hash: await sha256Hex(nonce),
+        created_at: now,
+        expires_at: now + KEY_PROOF_TTL_SECONDS,
+        consumed_at: null,
+      });
+      return jsonResponse({
+        ok: true,
+        challenge_id: challengeId,
+        envelope,
+        expires_in: KEY_PROOF_TTL_SECONDS,
+      });
     }
 
     // --------------------------------------------------- verify
@@ -451,7 +669,7 @@ Deno.serve(async (req: Request) => {
       const row = await selectOne(
         supabase,
         "al_users",
-        "recovery_hash, sign_pub",
+        "recovery_hash, sign_pub, pubkey, key_epoch",
         { username },
       );
       if (!row) {
@@ -483,6 +701,23 @@ Deno.serve(async (req: Request) => {
         );
       }
       const now = nowSeconds();
+      // Key epochs (2.6.1, Fix 2): an UNCHANGED pubkey rebinds
+      // with no proof and no epoch change; a CHANGED pubkey
+      // requires the possession proof and increments the epoch.
+      const currentPubkey = String(row.pubkey ?? "");
+      const currentEpoch = Number(row.key_epoch ?? 1) || 1;
+      let newEpoch = currentEpoch;
+      if (newPubkey !== currentPubkey) {
+        const verdict = await verifyKeyProof(username, "recovery",
+          newPubkey, newSignPub, body.key_proof);
+        const fault = keyProofFault(verdict,
+          "recovery to a new encryption key requires a " +
+          "key-possession proof: fetch a key_challenge for " +
+          "the new pubkey, open the sealed nonce with the " +
+          "new private key, and present the signed proof");
+        if (fault) return fault;
+        newEpoch = currentEpoch + 1;
+      }
       // The used key BURNS and its successor is issued in the same
       // response, returned ONCE (only its SHA-256 is stored). The
       // legacy account secret rotates too, mirroring relay.py's
@@ -493,12 +728,17 @@ Deno.serve(async (req: Request) => {
       await patchRows(supabase, "al_users", { username }, {
         sign_pub: newSignPub,
         pubkey: newPubkey,
+        key_epoch: newEpoch,
         secret: await sha256Hex(rotatedSecret),
         recovery_hash: await sha256Hex(newRecoveryKey),
         recovery_used_at: now,
         auth_method: "recovery",
         last_seen: now,
       });
+      if (newEpoch !== currentEpoch) {
+        await recordKeyHistory(username, newEpoch, newPubkey,
+          newSignPub, now);
+      }
       // Grant rebind (relay.py, v1.8.0): an ACTIVE grant follows
       // the proven identity to its new signing key.
       await patchRows(
@@ -554,6 +794,20 @@ Deno.serve(async (req: Request) => {
           409,
         );
       }
+      // Key epochs (2.6.1, Fix 2): registration ALWAYS
+      // requires the possession proof for the pubkey being
+      // published - a pubkey whose private half the client
+      // does not hold is never published. Verified BEFORE
+      // the provisioning gate, so a failed proof never
+      // spends the operator's one-time grant.
+      const proofVerdict = await verifyKeyProof(username,
+        "register", pubkey, signPub, body.key_proof);
+      const proofFault = keyProofFault(proofVerdict,
+        "registering a new username requires a key-possession " +
+        "proof: fetch a key_challenge for this pubkey, open " +
+        "the sealed nonce with the private key, and present " +
+        "the signed proof");
+      if (proofFault) return proofFault;
       // -------------------------------- PROVISIONING GATE
       // (2.6.0, Part 2): a NEW username registers only with a
       // provisioning grant bound to THIS username. Verify in
@@ -643,6 +897,7 @@ Deno.serve(async (req: Request) => {
         secret,
         sign_pub: signPub,
         pubkey,
+        key_epoch: 1,
         created_at: now,
         last_seen: now,
         auth_method: "register",
@@ -703,6 +958,9 @@ Deno.serve(async (req: Request) => {
         "provisioning_consumed", username, username,
         "provisioning grant consumed at registration",
         { grant_id: grantId });
+      // Key epochs (2.6.1, Fix 2): registration publishes
+      // epoch 1; the history row is the retention record.
+      await recordKeyHistory(username, 1, pubkey, signPub, now);
       await recordClientVersion(supabase, username, body);
       const tokens = await issueTokens(username);
       return jsonResponse({ ...tokens, recovery_key: newRecoveryKey });
@@ -724,7 +982,7 @@ Deno.serve(async (req: Request) => {
       const user = await selectOne(
         supabase,
         "al_users",
-        "username",
+        "username, pubkey, key_epoch",
         { username },
       );
       if (!user) {
@@ -758,6 +1016,25 @@ Deno.serve(async (req: Request) => {
           400,
         );
       }
+      // Key epochs (2.6.1, Fix 2): as in recovery - an
+      // UNCHANGED pubkey rebinds with no proof and no epoch
+      // change; a CHANGED pubkey requires the possession proof
+      // and increments the epoch. Verified BEFORE the code
+      // burns, so a failed proof never spends it either.
+      const currentPubkey = String(user.pubkey ?? "");
+      const currentEpoch = Number(user.key_epoch ?? 1) || 1;
+      let newEpoch = currentEpoch;
+      if (newPubkey !== currentPubkey) {
+        const verdict = await verifyKeyProof(username, "rectify",
+          newPubkey, newSignPub, body.key_proof);
+        const fault = keyProofFault(verdict,
+          "rectification to a new encryption key requires a " +
+          "key-possession proof: fetch a key_challenge for " +
+          "the new pubkey, open the sealed nonce with the " +
+          "new private key, and present the signed proof");
+        if (fault) return fault;
+        newEpoch = currentEpoch + 1;
+      }
       // Burn the code atomically: the status match makes this
       // update land only while the code is still live, so two
       // concurrent presentations can never both pass.
@@ -781,12 +1058,17 @@ Deno.serve(async (req: Request) => {
       await patchRows(supabase, "al_users", { username }, {
         sign_pub: newSignPub,
         pubkey: newPubkey,
+        key_epoch: newEpoch,
         secret,
         recovery_hash: await sha256Hex(newRecoveryKey),
         recovery_used_at: now,
         auth_method: "rectify",
         last_seen: now,
       });
+      if (newEpoch !== currentEpoch) {
+        await recordKeyHistory(username, newEpoch, newPubkey,
+          newSignPub, now);
+      }
       await patchRows(
         supabase,
         "al_grants",
@@ -801,7 +1083,8 @@ Deno.serve(async (req: Request) => {
 
     return errorResponse(
       "unknown_method",
-      "method must be challenge, verify, recovery, register or rectify",
+      "method must be challenge, verify, recovery, register, " +
+        "rectify or key_challenge",
       400,
     );
   } catch (e) {
