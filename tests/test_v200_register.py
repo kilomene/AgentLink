@@ -27,6 +27,7 @@ Pinned separately:
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -71,8 +72,13 @@ def test_login_edge_register_method_contract():
     assert "issueTokens" in block
     # designation honored at registration (v1.6.0 contract)
     assert 'body.designation === "test"' in block
-    # the method router knows the new methods
-    assert "challenge, verify, recovery, register or rectify" in src
+    # the method router knows the new methods (2.6.1: key_challenge
+    # added for the possession handshake; the router string is
+    # a string concatenation in the Edge source, so join the
+    # fragments before matching)
+    flat = re.sub(r"\s+", " ",
+                  re.sub(r'"\s*\+\s*"', "", src))
+    assert "challenge, verify, recovery, register, rectify or key_challenge" in flat
 
 
 def test_login_edge_register_never_stores_plaintext_key():
@@ -308,4 +314,4 @@ def test_first_contact_rectify_weather_is_connection_error(tmp_path):
 
 
 def test_version_230():
-    assert __version__ == "2.6.0"
+    assert __version__ == "2.6.1"
