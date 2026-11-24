@@ -52,11 +52,17 @@ class Identity:
     def __init__(self, username: str, state_dir: str | Path):
         self.username = username
         self.path = Path(state_dir).expanduser() / f"keys-{username}.json"
+        self.keyring_path = (
+            Path(state_dir).expanduser() / f"keyring-{username}.json")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
             data = json.loads(self.path.read_text())
             self._priv = X25519PrivateKey.from_private_bytes(
                 _unb64(data["private_key"]))
+            # Key epoch (2.6.1): pre-epoch files read as epoch 1.
+            # Set BEFORE any _save below, so a re-save never
+            # clobbers a recorded epoch with the default.
+            self.key_epoch = int(data.get("key_epoch") or 1)
             if data.get("signing_private_key"):
                 self._sign = Ed25519PrivateKey.from_private_bytes(
                     _unb64(data["signing_private_key"]))
@@ -64,12 +70,17 @@ class Identity:
                 # Older keys file: add a signing key and re-save.
                 self._sign = Ed25519PrivateKey.generate()
                 self._save(data)
+            if data.get("key_epoch") is None:
+                self._save(data)
         else:
             self._priv = X25519PrivateKey.generate()
             self._sign = Ed25519PrivateKey.generate()
+            self.key_epoch = 1
             self._save({})
 
     def _save(self, data: dict) -> None:
+        if self.path is None:
+            return
         raw = self._priv.private_bytes(
             serialization.Encoding.Raw,
             serialization.PrivateFormat.Raw,
@@ -82,7 +93,9 @@ class Identity:
                      "private_key": _b64(raw),
                      "public_key": self.public_key_b64,
                      "signing_private_key": _b64(sraw),
-                     "signing_public_key": self.signing_public_key_b64})
+                     "signing_public_key": self.signing_public_key_b64,
+                     "key_epoch": int(getattr(
+                         self, "key_epoch", 1) or 1)})
         self.path.write_text(json.dumps(data))
         try:
             os.chmod(self.path, 0o600)
@@ -95,9 +108,137 @@ class Identity:
         obj = cls.__new__(cls)
         obj.username = "ephemeral"
         obj.path = None
+        obj.keyring_path = None
+        obj.key_epoch = 1
         obj._priv = X25519PrivateKey.generate()
         obj._sign = Ed25519PrivateKey.generate()
         return obj
+
+    # -- keyring (2.6.1): retained prior encryption keys -----------
+    # Rotation must never orphan delivered-but-unread mail: the
+    # prior encryption private key is archived here (mode 600)
+    # before the fresh key takes over, and decryption tries the
+    # current key first, then the retired keys newest-first.
+
+    def _load_keyring(self) -> list[dict]:
+        """The retired-key list (empty for ephemeral identities,
+        which hold no durable state and write no files)."""
+        if self.keyring_path is None:
+            return []
+        try:
+            data = json.loads(self.keyring_path.read_text())
+            retired = data.get("retired") or []
+            if isinstance(retired, list):
+                return [dict(r) for r in retired
+                        if isinstance(r, dict)
+                        and r.get("private_key")]
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        return []
+
+    def _save_keyring(self, retired: list[dict]) -> None:
+        if self.keyring_path is None:
+            return
+        self.keyring_path.write_text(json.dumps(
+            {"retired": list(retired)}))
+        try:
+            os.chmod(self.keyring_path, 0o600)
+        except OSError:
+            pass
+
+    def _raw_private(self) -> bytes:
+        return self._priv.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption())
+
+    def archive_current_key(self) -> bool:
+        """Archive the CURRENT encryption private key under its
+        epoch in the keyring. No-op (False) for ephemeral
+        identities and when this epoch is already archived.
+        True when a new entry was written."""
+        if self.keyring_path is None:
+            return False
+        import time as _time
+        retired = self._load_keyring()
+        epoch = int(self.key_epoch or 1)
+        if any(int(r.get("key_epoch") or 0) == epoch
+               for r in retired):
+            return False
+        retired.append({"key_epoch": epoch,
+                        "private_key": _b64(self._raw_private()),
+                        "retired_at": int(_time.time())})
+        self._save_keyring(retired)
+        return True
+
+    def _decrypt_with_priv(self, priv: X25519PrivateKey,
+                           envelope: dict) -> bytes:
+        peer = X25519PublicKey.from_public_bytes(
+            _unb64(envelope["eph_pub"]))
+        shared = priv.exchange(peer)
+        key = HKDF(algorithm=hashes.SHA256(), length=32,
+                   salt=None, info=_INFO).derive(shared)
+        return ChaCha20Poly1305(key).decrypt(
+            _unb64(envelope["nonce"]), _unb64(envelope["ct"]), None)
+
+    def decrypt_any(self, envelope: dict) -> tuple[bytes, int]:
+        """Open an envelope with the current key first, then the
+        retired keys newest-first. Returns (plaintext,
+        epoch_used). Raises when no held key opens it."""
+        try:
+            return (self.decrypt_envelope(envelope),
+                    int(self.key_epoch or 1))
+        except Exception:
+            pass
+        last_exc: Exception | None = None
+        retired = sorted(
+            self._load_keyring(),
+            key=lambda r: int(r.get("key_epoch") or 0),
+            reverse=True)
+        for entry in retired:
+            try:
+                priv = X25519PrivateKey.from_private_bytes(
+                    _unb64(str(entry["private_key"])))
+                return (self._decrypt_with_priv(priv, envelope),
+                        int(entry.get("key_epoch") or 0))
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if last_exc is not None:
+            raise last_exc
+        raise ValueError("no key available to open the envelope")
+
+    def rotate_encryption_key(self) -> int:
+        """Rotate the ENCRYPTION key only (the signing key is
+        untouched, so the session and the account identity
+        survive): archive the current key, generate a fresh
+        X25519 pair, bump the epoch, persist. Returns the new
+        epoch. Ephemeral identities rotate in memory only and
+        write no files."""
+        self.archive_current_key()
+        self._priv = X25519PrivateKey.generate()
+        self.key_epoch = int(self.key_epoch or 1) + 1
+        self._save({})
+        return self.key_epoch
+
+    def restore_retired_key(self, epoch: int) -> bool:
+        """Restore a retired encryption key to current (the
+        rotation-rollback used when a rebind fails after the
+        local rotation already landed): the keyring entry for
+        ``epoch`` becomes the current key and the epoch steps
+        back to it. False when no such entry exists."""
+        epoch = int(epoch)
+        for entry in self._load_keyring():
+            if int(entry.get("key_epoch") or 0) != epoch:
+                continue
+            self._priv = X25519PrivateKey.from_private_bytes(
+                _unb64(str(entry["private_key"])))
+            self.key_epoch = epoch
+            self._save({})
+            return True
+        return False
 
     @property
     def signing_public_key_b64(self) -> str:
