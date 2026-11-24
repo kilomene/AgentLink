@@ -1047,6 +1047,14 @@ class Agent:
         # envelope from being retried in a hot loop (class A).
         self._unreadable: dict[str, dict] = {}
         self._load_unreadable()
+        # Key-mismatch notices sent (2.6.1, Fix 2): one notice
+        # per (message_id, own current key_epoch), persisted so
+        # restarts never re-notice. Reseals sent (same fix):
+        # one reseal per (message_id, recipient_epoch).
+        self._key_mismatch_sent: dict[str, int] = {}
+        self._load_key_mismatch_sent()
+        self._key_reseals: dict[str, dict] = {}
+        self._load_key_reseals()
         self.identity: Identity | None = None
         if not ephemeral and self.username:
             try:
@@ -1624,6 +1632,20 @@ class Agent:
                 result = await self.group_add(
                     str(spec["group_id"]),
                     [str(m) for m in (spec.get("members") or [])])
+            elif cmd == "group_create":
+                # Control-channel forwarding (2.6.1, Fix 3):
+                # a one-shot group create forwards to the
+                # running daemon instead of booting a rival
+                # agent against the state-dir lock.
+                result = await self.group_create(
+                    str(spec["name"]),
+                    [str(m) for m in (spec.get("members") or [])])
+            elif cmd == "group_remove":
+                # Control-channel forwarding (2.6.1, Fix 3):
+                # same discipline as group_add above.
+                result = await self.group_remove(
+                    str(spec["group_id"]),
+                    str(spec["target"]))
             elif cmd == "vault_put":
                 # Credentials vault (v1.4.0): the operator-side CLI
                 # reaches the RUNNING daemon's own vault through
@@ -4429,6 +4451,7 @@ class Agent:
                     f" state dir resumes cleanly.") from exc
         self._hello_sent = True
         self._v2_close_requested = False
+        await self._adopt_published_key_epoch(v2)
         if not self._oversight_configured and v2.oversight_pubkey:
             # Login-Edge-advertised oversight key (the serverless
             # welcome frame, 2.0.4): fleet agents pick it up with
@@ -4833,6 +4856,13 @@ class Agent:
                 oversight=frame.get("oversight"),
                 disappearing=bool(frame.get("disappearing")),
                 from_name=self.display_name, from_pubkey=pub)
+        if ftype == "key_mismatch":
+            # Decrypt-failure signal (2.6.1, Fix 2): the api
+            # Edge records the notice and forwards it to the
+            # sender as an inbox frame.
+            return v2.key_mismatch(
+                str(frame.get("message_id") or ""),
+                int(frame.get("recipient_epoch") or 0))
         if ftype == "group_send":
             gid = frame["group_id"]
             members = [m["username"] for m in v2.group_members(gid)]
@@ -6128,6 +6158,13 @@ class Agent:
             recipient_pub, json.dumps(obj).encode())
 
     def _decrypt_obj(self, envelope: dict) -> dict:
+        # Keyring decryption (2.6.1): the current key first,
+        # then retained prior keys — a message sealed before
+        # this agent's rotation still opens.
+        if self.identity is not None \
+                and hasattr(self.identity, "decrypt_any"):
+            plaintext, _epoch = self.identity.decrypt_any(envelope)
+            return json.loads(plaintext)
         return json.loads(self.identity.decrypt_envelope(envelope))
 
     # -- owner oversight wraps ------------------------------------------------
@@ -6191,9 +6228,11 @@ class Agent:
     async def _ask_key_reissue(self, scope: str, scope_id: str) -> None:
         """My stored wrap for this group/channel no longer unwraps
         (the classic cause: my identity rotated after the wrap was
-        sealed). Ask the room's admins — at most once per room per
-        session — to re-issue the current epoch key sealed to my
-        CURRENT directory key. Fail-soft: if the ask cannot go
+        sealed). Ask the room, its admins when it has any and every
+        other member when it has none (2.6.1, Fix 2 sub-item 6: a
+        group with no admin still heals), at most once per room
+        per session, to re-issue the current epoch key sealed to
+        my CURRENT directory key. Fail-soft: if the ask cannot go
         out, the next session asks again."""
         tag = (scope, scope_id)
         if tag in self._key_reissue_asked:
@@ -6210,11 +6249,14 @@ class Agent:
         """A member's group wrap no longer unwraps: if I hold this
         group's key, re-seal the SAME epoch key to the member's
         CURRENT directory pubkey and re-distribute to them alone.
-        The store enforces admin rights on the write; a non-admin
-        attempt is refused there and logged here, never fatal. The
-        request frame is acked once handled — or when there is
-        nothing I can do (no key held) — and left in custody when
-        the re-distribution itself failed, so it is retried."""
+        No admin precondition on the re-issuer beyond holding
+        the key (2.6.1, Fix 2 sub-item 6): the groups Edge gate
+        permits a same-epoch, single-member reissue by any group
+        member, so a group with no admin still heals. A failed
+        re-distribution is logged, never fatal. The request frame
+        is acked once handled — or when there is nothing I can do
+        (no key held) — and left in custody when the
+        re-distribution itself failed, so it is retried."""
         gid = frame.get("group_id")
         requester = frame.get("from")
         rec = self._group_keys.get(gid) if gid else None
@@ -6305,6 +6347,12 @@ class Agent:
             return
         if ftype == "group_key_request":
             asyncio.create_task(self._reissue_group_key(frame))
+            return
+        if ftype == "key_mismatch":
+            # The recipient could not open my message (2.6.1,
+            # Fix 2): reseal the stored sent plaintext to their
+            # current key, once per (message, epoch).
+            asyncio.create_task(self._handle_key_mismatch(frame))
             return
         if ftype == "channel_key_request":
             asyncio.create_task(self._reissue_channel_key(frame))
@@ -7261,6 +7309,261 @@ class Agent:
         if self._unreadable.pop(str(mid), None) is not None:
             self._save_unreadable()
 
+    # -- key-mismatch notices + reseals (2.6.1, Fix 2) -----------
+    # Two small durable journals, same shape as the unreadable
+    # park journal (atomic tmp+replace, mode 600):
+    # * key-mismatch-<user>.json: {"<message_id>:<epoch>": ts}
+    #   — a notice is sent at most once per (message, epoch);
+    # * key-reseals-<user>.json: {"<message_id>:<epoch>":
+    #   {"reseal_id", "ts", "epoch"}} — a reseal is sent at
+    #   most once per (message, recipient epoch).
+
+    def _key_mismatch_path(self) -> Path:
+        return Path(self.state_dir) / f"key-mismatch-{self.username}.json"
+
+    def _key_reseals_path(self) -> Path:
+        return Path(self.state_dir) / f"key-reseals-{self.username}.json"
+
+    def _load_key_mismatch_sent(self) -> None:
+        if self.ephemeral or not self.username:
+            return
+        try:
+            data = json.loads(self._key_mismatch_path().read_text())
+            if isinstance(data, dict):
+                self._key_mismatch_sent = {
+                    str(k): int(v) for k, v in data.items()}
+        except FileNotFoundError:
+            pass
+        except Exception:
+            log.exception("loading the key-mismatch journal failed")
+
+    def _save_key_mismatch_sent(self) -> None:
+        if self.ephemeral or not self.username:
+            return
+        try:
+            path = self._key_mismatch_path()
+            if not self._key_mismatch_sent:
+                path.unlink(missing_ok=True)
+                return
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._key_mismatch_sent))
+            os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        except Exception:
+            log.exception("persisting the key-mismatch journal failed")
+
+    def _load_key_reseals(self) -> None:
+        if self.ephemeral or not self.username:
+            return
+        try:
+            data = json.loads(self._key_reseals_path().read_text())
+            if isinstance(data, dict):
+                self._key_reseals = {
+                    str(k): dict(v) for k, v in data.items()
+                    if isinstance(v, dict)}
+        except FileNotFoundError:
+            pass
+        except Exception:
+            log.exception("loading the key-reseal journal failed")
+
+    def _save_key_reseals(self) -> None:
+        if self.ephemeral or not self.username:
+            return
+        try:
+            path = self._key_reseals_path()
+            if not self._key_reseals:
+                path.unlink(missing_ok=True)
+                return
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._key_reseals))
+            os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        except Exception:
+            log.exception("persisting the key-reseal journal failed")
+
+    async def _peer_key(self, username: str) -> tuple[str, int]:
+        """A peer's CURRENT (pubkey, key_epoch) at send time.
+        Serverless: a FRESH directory read per call (no cache).
+        Relay path: the cached pubkey with no known epoch."""
+        if self._v2 is not None:
+            return await asyncio.to_thread(self._v2.peer_key,
+                                           username)
+        pub = await self.pubkey_of(username)
+        return pub, 0
+
+    async def _report_key_mismatch(self, mid: str) -> bool:
+        """Send the sender ONE key_mismatch notice for this
+        message at my current epoch (2.6.1, Fix 2). Returns
+        True when a notice went out. Serverless only; the
+        journal is recorded BEFORE the send so a crash or a
+        re-offer can never re-notice the same (message,
+        epoch). A failed send is logged, never fatal."""
+        if self._v2 is None or self.identity is None or not mid:
+            return False
+        epoch = int(getattr(self.identity, "key_epoch", 1) or 1)
+        key = f"{mid}:{epoch}"
+        if key in self._key_mismatch_sent:
+            return False
+        self._key_mismatch_sent[key] = int(time.time())
+        self._save_key_mismatch_sent()
+        try:
+            await self._request({"type": "key_mismatch",
+                                 "message_id": str(mid),
+                                 "recipient_epoch": epoch})
+        except Exception:
+            log.warning("key_mismatch notice for %s failed",
+                        mid, exc_info=True)
+            return False
+        log.warning("key_mismatch notice sent for %s (epoch %s)",
+                    mid, epoch)
+        return True
+
+    async def _handle_key_mismatch(self, frame: dict) -> None:
+        """Inbound key_mismatch frame (2.6.1, Fix 2): the
+        recipient could not open my message ``message_id`` at
+        its epoch ``recipient_epoch``. Reseal my STORED sent
+        plaintext to the recipient's CURRENT published key and
+        resend once as a new DM with meta {"reseals":
+        message_id}. One reseal per (message_id,
+        recipient_epoch), recorded locally before the send is
+        attempted; no stored plaintext, no reseal."""
+        mid = str(frame.get("message_id") or "")
+        reporter = str(frame.get("from") or "")
+        try:
+            recipient_epoch = int(frame.get("recipient_epoch") or 0)
+        except Exception:
+            return
+        if not mid or not reporter or reporter == self.username:
+            return
+        if self.mailbox is None or self._v2 is None:
+            return
+        sent = self.mailbox.get(mid)
+        if not sent or sent.get("from") != self.username:
+            return
+        if not sent.get("body") and not sent.get("file"):
+            return
+        key = f"{mid}:{recipient_epoch}"
+        if key in self._key_reseals:
+            return
+        try:
+            result = await self.send_message(
+                reporter, str(sent.get("body") or ""),
+                kind=str(sent.get("kind") or "text"),
+                file=sent.get("file"),
+                meta={"reseals": mid})
+        except Exception:
+            log.warning("key_mismatch reseal for %s failed",
+                        mid, exc_info=True)
+            return
+        # The epoch the reseal was actually sealed to rides
+        # the send result (send_message resolved it fresh at
+        # send time); fall back to the reported epoch.
+        epoch = int(result.get("key_epoch")
+                    or recipient_epoch or 0)
+        self._key_reseals[key] = {
+            "reseal_id": str(result.get("id") or ""),
+            "ts": int(time.time()), "epoch": epoch}
+        self._save_key_reseals()
+        log.warning("resealed %s to @%s at epoch %s (reseal %s)",
+                    mid, reporter, epoch,
+                    result.get("id") or "")
+
+    async def _adopt_published_key_epoch(self, v2) -> None:
+        """Adopt the server's published key_epoch for MY
+        identity (2.6.1, Fix 2): a rebind (recovery, rectify,
+        rotation) bumps the epoch server-side, and the local
+        keys file must agree with the directory, or keyring
+        labels and key_mismatch notices carry a stale epoch.
+        Runs once per serverless login, after the ceremony.
+        Fail-soft by design: adoption never fails a login."""
+        try:
+            if self.ephemeral or self.identity is None \
+                    or self.identity.path is None:
+                return
+            epoch = int(await asyncio.to_thread(
+                v2.published_key_epoch, self.username) or 0)
+            current = int(getattr(self.identity, "key_epoch", 1)
+                          or 1)
+            if epoch and epoch != current:
+                data = {}
+                try:
+                    data = json.loads(
+                        self.identity.path.read_text())
+                except Exception:
+                    data = {}
+                self.identity.key_epoch = epoch
+                self.identity._save(data)
+                log.info("adopted published key_epoch %s for @%s",
+                         epoch, self.username)
+        except Exception:
+            log.debug("key epoch adoption failed",
+                      exc_info=True)
+
+    async def rotate_keys(self) -> dict:
+        """Rotate MY encryption key (2.6.1, Fix 2): archive the
+        current key into the keyring, generate a fresh X25519
+        pair at epoch+1, then rebind the account through the
+        recovery path, where the possession handshake proves the
+        new key before the server publishes it. The signing key is
+        untouched, so the session survives; the recovery key
+        burns and its successor is saved. On a rebind failure
+        the local rotation is rolled back to the archived key
+        and the failure is reported, so the agent is never left
+        stranded on an unpublished key."""
+        if self.ephemeral or self.identity is None:
+            raise RequestFailed(
+                "rotate_keys_unavailable",
+                "ephemeral agents hold no durable identity to "
+                "rotate")
+        if self._v2 is None:
+            raise RequestFailed(
+                "rotate_keys_needs_serverless",
+                "key rotation rebinds through the serverless "
+                "recovery path")
+        held = self._recovery_key_manual or self._find_recovery_key()
+        if not held:
+            raise RequestFailed(
+                "rotate_keys_needs_recovery_key",
+                "rotation rebinds through the recovery path and "
+                "no recovery key is held for this account")
+        old_epoch = int(getattr(self.identity, "key_epoch", 1) or 1)
+        self.identity.rotate_encryption_key()
+        try:
+            result = await asyncio.to_thread(
+                self._v2.recover_and_login, self.username,
+                self.identity.sign, held,
+                self.identity.signing_public_key_b64,
+                self.identity.public_key_b64,
+                _package_version(),
+                decision_link=self._declared_link_sent,
+                decision_link_detail=self._decision_detail(),
+                identity=self.identity)
+        except Exception as exc:
+            self.identity.restore_retired_key(old_epoch)
+            raise RequestFailed(
+                "rotate_keys_rebind_failed",
+                f"the rotation rebind failed ({exc}); the local "
+                f"key was rolled back to epoch {old_epoch}") from exc
+        issued = str(result.get("recovery_key") or "")
+        if issued:
+            self._save_recovery_key(issued)
+        try:
+            self._v2._directory_cache.pop(self.username, None)
+            entry = self._v2.directory_entry(self.username)
+            if entry:
+                self._v2.publish_my_directory(entry)
+        except Exception:
+            pass
+        return {"rotated": True, "old_epoch": old_epoch,
+                "key_epoch": int(self.identity.key_epoch or 1),
+                "recovery_key_issued": bool(issued)}
+
     def _unreadable_due(self, mid: str) -> bool:
         """True when a parked id may be attempted again (no park
         record, or its backoff has elapsed)."""
@@ -7405,6 +7708,15 @@ class Agent:
                             frame.get("archive"))
                     self.mailbox.put_if_absent(stub)
                     await self._send_ack([mid])
+                if mid and not frame.get("group_id") \
+                        and not frame.get("channel_id"):
+                    # Decrypt-failure signal (2.6.1, Fix 2): a
+                    # DM that opens with no held key tells its
+                    # sender, once per (message, epoch), so the
+                    # sender can reseal to my current key. Group
+                    # and channel traffic heals through the room
+                    # key reissue instead, never a DM notice.
+                    await self._report_key_mismatch(str(mid))
                 log.warning(
                     "message %s could not be decrypted — parked as "
                     "unreadable (attempt %s); it heals automatically "
@@ -7480,6 +7792,37 @@ class Agent:
             msg["archive_confirmed"] = bool(frame.get("archive"))
             msg["archive_entry"] = (
                 frame.get("archive") or {}).get("entry_id")
+        # Reseal linking (2.6.1, Fix 2): a DM whose meta
+        # carries {"reseals": X} is the sender's answer to my
+        # key_mismatch notice for X.
+        reseals = (payload.get("meta") or {}).get("reseals")
+        if reseals and self.mailbox is not None:
+            orig = self.mailbox.get(str(reseals))
+            if orig is not None and orig.get("body") \
+                    and not orig.get("sealed") \
+                    and not orig.get("unreadable"):
+                # X is already readable here: link the reseal
+                # to it, ack, and do NOT surface the reseal as
+                # a second message.
+                linked = dict(orig)
+                linked["resealed_by"] = frame.get("id")
+                self.mailbox.replace_msg(linked)
+                await self._send_ack([frame.get("id")])
+                log.info("reseal %s links to readable original "
+                         "%s — not surfaced twice",
+                         frame.get("id"), reseals)
+                return
+            if orig is not None and (orig.get("sealed")
+                                     or orig.get("unreadable")):
+                # X is parked unreadable: heal its journal entry
+                # with the reseal's content, then surface the
+                # reseal itself below.
+                healed = dict(msg)
+                healed["id"] = str(reseals)
+                self.mailbox.replace_msg(healed)
+                self._clear_unreadable(str(reseals))
+                log.info("reseal %s healed unreadable original "
+                         "%s", frame.get("id"), reseals)
         # CANONICAL MAILBOX (v1.3.7): journal BEFORE processing,
         # ack only once the item is durable, and never reprocess a
         # duplicate. The claim is taken synchronously — before the
@@ -8574,7 +8917,22 @@ class Agent:
                 "disappearing_files_unsupported",
                 "disappearing mode refuses file sends (fail-closed)")
         u = normalize_username(to) or to
-        pub = await self.pubkey_of(u)
+        # Send-time freshness (2.6.1, Fix 2): the serverless
+        # path resolves the recipient's CURRENT (pubkey, epoch)
+        # from the directory on every send, never a cached
+        # key, and stamps the envelope with that epoch, so
+        # the recipient knows which key opens it. The relay
+        # path keeps its cached pubkey and stamps no epoch.
+        epoch: int | None = None
+        if self._v2 is not None:
+            try:
+                pub, epoch = await self._peer_key(u)
+            except TransportError as exc:
+                raise RequestFailed(
+                    "unknown_recipient",
+                    f"no key for @{u}") from exc
+        else:
+            pub = await self.pubkey_of(u)
         if not pub:
             raise RequestFailed("unknown_recipient", f"no key for @{u}")
         obj = {"body": body, "kind": kind, "file": file}
@@ -8585,6 +8943,8 @@ class Agent:
             # caps. The relay never sees it.
             obj["meta"] = dict(meta)
         content = self._encrypt_obj(pub, obj)
+        if epoch is not None:
+            content["key_epoch"] = int(epoch)
         frame = {
             "type": "send", "to": u, "content": content, "id": new_id(),
             "mentions": parse_mentions(body), "in_reply_to": in_reply_to,
@@ -8600,6 +8960,11 @@ class Agent:
                     "to deposit (fail-closed)")
             frame["disappearing"] = True
         result = await self._send_request(frame)
+        if epoch is not None:
+            # The epoch this seal rode, for callers that record
+            # it (the key_mismatch reseal journal, 2.6.1).
+            result = dict(result)
+            result["key_epoch"] = int(epoch)
         sent = {
             "id": result.get("id") or frame["id"], "from": self.username,
             "to": u, "group_id": None, "channel_id": None,
@@ -8634,7 +8999,25 @@ class Agent:
         if self.mailbox is None or not item.get("id"):
             return
         try:
-            self.mailbox.put_if_absent(item, taken=True)
+            if self.mailbox.put_if_absent(item, taken=True):
+                return
+            # The send's own sealed echo can win the journal
+            # race: it returns through the inbox/history path
+            # while the send is still in flight and journals
+            # as a sealed, body-less copy under the same id.
+            # That stub must never stand in for the sent
+            # record — the journal is my memory of what I
+            # said, plaintext and meta included (the 2.6.1
+            # reseal record is read back from it) — so upgrade
+            # a sealed own-message stub in place. Anything
+            # else already journaled under the id (a readable
+            # item, another sender's item) is left untouched.
+            existing = self.mailbox.get(str(item["id"]))
+            if existing is not None \
+                    and existing.get("from") == self.username \
+                    and existing.get("sealed") \
+                    and not existing.get("body"):
+                self.mailbox.replace_msg(item)
         except Exception:
             log.exception("mailbox record of sent item failed")
 
