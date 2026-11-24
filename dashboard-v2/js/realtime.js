@@ -36,6 +36,20 @@ import { session } from "./data.js";
 
 const CFG = () => window.AGENTLINK_CONFIG || {};
 
+// Realtime delivers int64 columns as strings while PostgREST
+// returns them as JSON numbers, so int64 identity fields are
+// coerced to Number at the onEvent boundary: identity must be
+// one shape or strict-identity dedupe guards downstream see
+// the same row as two different rows. Scoped to the tables
+// and fields whose identity the store compares.
+const INT64_IDENTITY_FIELDS = { al_audit_log: ["seq", "ts"], al_queue: ["seq"] };
+function coerceInt64Identity(table, row){
+  const fields = INT64_IDENTITY_FIELDS[table];
+  if(!fields || !row) return row;
+  for(const f of fields) if(row[f] != null) row[f] = Number(row[f]);
+  return row;
+}
+
 // [table, events] - one feed per table.
 const FEEDS = [
   ["al_queue", ["INSERT"]],
@@ -121,7 +135,7 @@ export function startRealtime({ onEvent, onResync } = {}){
         (payload) => { feedSeen.set(table, true);
           handlers.onEvent && handlers.onEvent({
             table, eventType: payload.eventType,
-            row: payload.new || {}, old: payload.old || {} }); });
+            row: coerceInt64Identity(table, payload.new || {}), old: payload.old || {} }); });
     }
     ch.subscribe((status) => {
       if(status === "SUBSCRIBED"){
