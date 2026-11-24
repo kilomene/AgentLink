@@ -95,14 +95,24 @@ export async function pgAll(table, query){
 // asks for rows strictly newer than the highest seq already
 // held, so a 60s safety resync costs the delta, not the archive.
 export const AUDIT_SELECT = "select=seq,ts,kind,actor,target,group_id,work_id,status,priority,size,mentions,ref_id,sender_nickname,sender_role,sender_custom_role,oversight,content_envelope";
+// al_audit_log seq/ts are int64: PostgREST returns them as JSON
+// numbers, Supabase Realtime delivers them as strings. Normalize
+// to Number on every cached row so identity is one shape.
+function normalizeAuditRow(r){
+  if(r){
+    if(r.seq != null) r.seq = Number(r.seq);
+    if(r.ts != null) r.ts = Number(r.ts);
+  }
+  return r;
+}
 let _auditCache = null, _auditMaxSeq = 0;
 export async function loadAudit(){
   if(!_auditCache){
-    _auditCache = await pgAll("al_audit_log", AUDIT_SELECT + "&order=seq.asc");
+    _auditCache = (await pgAll("al_audit_log", AUDIT_SELECT + "&order=seq.asc")).map(normalizeAuditRow);
     _auditMaxSeq = _auditCache.reduce((m, r) => Math.max(m, Number(r.seq || 0)), 0);
     return _auditCache;
   }
-  const fresh = await pgAll("al_audit_log", AUDIT_SELECT + "&seq=gt." + _auditMaxSeq + "&order=seq.asc");
+  const fresh = (await pgAll("al_audit_log", AUDIT_SELECT + "&seq=gt." + _auditMaxSeq + "&order=seq.asc")).map(normalizeAuditRow);
   if(fresh.length){
     _auditCache.push(...fresh);
     _auditMaxSeq = fresh.reduce((m, r) => Math.max(m, Number(r.seq || 0)), _auditMaxSeq);
@@ -203,7 +213,7 @@ export function convKeyOf(r){
   return "dm:"+pair.join("|");
 }
 export function itemOf(r){
-  return { id: r.ref_id || String(r.seq), seq: r.seq || 0, ts: r.ts, from: r.actor, target: r.target||"", group_id: r.group_id||"",
+  return { id: r.ref_id || String(r.seq), seq: Number(r.seq || 0), ts: Number(r.ts || 0), from: r.actor, target: r.target||"", group_id: r.group_id||"",
     kind: r.kind, status: r.status||"", size: r.size||0, mentions: r.mentions||[], work_id: r.work_id||"",
     sender_nickname: r.sender_nickname||"", sender_role: r.sender_role||"",
     oversight: r.oversight || null, content_envelope: r.content_envelope || null, sealed: true, opened: null };
