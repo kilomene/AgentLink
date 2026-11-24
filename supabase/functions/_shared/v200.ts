@@ -849,6 +849,75 @@ export function chacha20Poly1305Decrypt(
   return chacha20Xor(key, 1, nonce, ct);
 }
 
+/** ChaCha20-Poly1305 AEAD ENCRYPT (RFC 8439 §2.8), the encrypt
+ * twin of chacha20Poly1305Decrypt above: ct carries the 16-byte
+ * tag appended, AAD empty - the exact construction Python's
+ * ChaCha20Poly1305 uses, so an envelope sealed here opens under
+ * crypto.py's decrypt_envelope and vice versa. */
+export function chacha20Poly1305Encrypt(
+  key: Uint8Array,
+  nonce: Uint8Array,
+  plaintext: Uint8Array,
+): Uint8Array {
+  if (key.length !== 32) throw new Error("chacha key must be 32 bytes");
+  if (nonce.length !== 12) throw new Error("chacha nonce must be 12 bytes");
+  const polyKey = chacha20Block(key, 0, nonce).subarray(0, 32);
+  const ct = chacha20Xor(key, 1, nonce, plaintext);
+  const macData = new Uint8Array(
+    ct.length + pad16(ct).length + 16,
+  );
+  macData.set(ct, 0);
+  macData.set(u64le(0), ct.length + pad16(ct).length); // aad length = 0
+  macData.set(u64le(ct.length), ct.length + pad16(ct).length + 8);
+  const tag = poly1305Mac(polyKey, macData);
+  const out = new Uint8Array(ct.length + 16);
+  out.set(ct, 0);
+  out.set(tag, ct.length);
+  return out;
+}
+
+/** Mirror of crypto.encrypt_to_pubkey: ephemeral X25519 ->
+ * HKDF-SHA256(info="agentlink-e2ee-v1", 32) -> ChaCha20Poly1305.
+ * Returns the envelope {v:1, alg:"x25519-chacha20poly1305",
+ * eph_pub, nonce, ct} in crypto.py's standard-base64 encodings.
+ * The ephemeral public key is the ladder over the base point
+ * (u = 9), exactly as an X25519 key generation does it. */
+export async function sealToPubkey(
+  recipientPubB64: string,
+  plaintext: Uint8Array,
+): Promise<{
+  v: number;
+  alg: string;
+  eph_pub: string;
+  nonce: string;
+  ct: string;
+}> {
+  const peer = b64decode(recipientPubB64);
+  if (peer.length !== 32) {
+    throw new Error("recipient pubkey must be 32 bytes (base64)");
+  }
+  const eph = new Uint8Array(32);
+  crypto.getRandomValues(eph);
+  const shared = x25519(eph, peer);
+  if (shared.every((b) => b === 0)) {
+    throw new Error("x25519 produced an all-zero shared secret");
+  }
+  const key = await hkdfSha256(shared, E2EE_INFO, 32);
+  const nonce = new Uint8Array(12);
+  crypto.getRandomValues(nonce);
+  const ct = chacha20Poly1305Encrypt(key, nonce, plaintext);
+  const basePoint = new Uint8Array(32);
+  basePoint[0] = 9;
+  const ephPub = x25519(eph, basePoint);
+  return {
+    v: 1,
+    alg: "x25519-chacha20poly1305",
+    eph_pub: b64encode(ephPub),
+    nonce: b64encode(nonce),
+    ct: b64encode(ct),
+  };
+}
+
 /** Mirror of crypto.decrypt_with_key: envelope {nonce, ct} under a
  * raw symmetric key (group/channel/file content envelopes). */
 export function decryptWithKey(
