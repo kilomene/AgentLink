@@ -8,7 +8,11 @@
 //                      ladder over al_activeness), the COMPUTED
 //                      trust score (store.compute_trust's
 //                      formula, ported exactly), the decision
-//                      fields and the legacy-auth flag. The
+//                      fields and the legacy-auth flag. Rows
+//                      carry key_epoch alongside pubkey (v217,
+//                      2.6.1): the epoch of the pubkey shown, so
+//                      a sender seals to the key the directory
+//                      actually names. The
 //                      relay-memory-only fields state their
 //                      serverless truth: compliance core {} /
 //                      core_compliant null / connection_pattern
@@ -199,7 +203,8 @@ async function routeDirectory(
   const capability = String(body.capability ?? "");
   const { data, error } = await supabase.from("al_users")
     .select(
-      "username, display_name, pubkey, sign_pub, capabilities, " +
+      "username, display_name, pubkey, sign_pub, key_epoch, " +
+        "capabilities, " +
         "cap_desc, mode, decision_link, decision_link_detail, " +
         "delivery_ack, auth_method, designation, last_seen, " +
         "recovery_hash, recovery_used_at, created_at")
