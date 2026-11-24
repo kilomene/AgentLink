@@ -556,7 +556,7 @@ async function makeInvite(scopeId: string): Promise<string> {
     new TextEncoder().encode(token));
   const { error } = await supabase.from("al_invites").insert({
     group_id: scopeId,
-    token_hash: tokenHash,
+    token: tokenHash,
     created_at: nowSeconds(),
   });
   if (error) throw new Error("invite insert failed: " + error.message);
@@ -571,7 +571,7 @@ async function inviteValid(
   const tokenHash = await sha256Hex(
     new TextEncoder().encode(token));
   const row = await oneEq("al_invites",
-    { group_id: scopeId, token_hash: tokenHash }, "created_at");
+    { group_id: scopeId, token: tokenHash }, "created_at");
   if (!row) return false;
   return Number(row.created_at) + INVITE_TTL_SECONDS >= nowSeconds();
 }
