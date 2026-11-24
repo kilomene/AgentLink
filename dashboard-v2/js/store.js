@@ -94,6 +94,11 @@ export const store = {
 
   applyAudit(r){
     const d = this.data;
+    // Normalize int64 identity fields to Number BEFORE any guard
+    // runs: Realtime delivers seq/ts as strings, PostgREST as
+    // numbers, and the guards below use strict identity.
+    if(r.seq != null) r.seq = Number(r.seq);
+    if(r.ts != null) r.ts = Number(r.ts);
     if(r.seq && this.seenAuditSeq.has(r.seq)) return;
     if(r.seq) this.seenAuditSeq.add(r.seq);
     d.auditAsc.push(r);
@@ -111,7 +116,7 @@ export const store = {
       (test ? d.testConversations : d.conversations).unshift(conv);
     }
     const item = itemOf(r);
-    if(conv.items.some(m => m.id === item.id && m.ts === item.ts)) return;
+    if(conv.items.some(m => m.id === item.id)) return;
     conv.items.push(item);
     conv.items.sort((a, b) => a.ts - b.ts || (a.seq || 0) - (b.seq || 0));
     conv.lastTs = Math.max(conv.lastTs || 0, item.ts);
