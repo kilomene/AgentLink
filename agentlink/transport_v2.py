@@ -1555,12 +1555,82 @@ class ServerlessTransport:
             payload["client_version"] = self.client_version
         return payload
 
+    # -- key possession handshake (2.6.1, Fix 2) ------------------
+    # Before a new encryption pubkey is published (registration
+    # and every rotation/reclaim), the server seals a one-time
+    # nonce to the CANDIDATE pubkey; the client must open it
+    # with the candidate private key and return it signed with
+    # the candidate signing key. A pubkey whose private half
+    # the client does not hold is never published. The
+    # candidate identity rides the bound `signer` (identity.sign
+    # in every real call site) or an explicit `identity=` kwarg.
+
+    @staticmethod
+    def _candidate_identity(signer, identity=None):
+        if identity is not None \
+                and hasattr(identity, "decrypt_envelope"):
+            return identity
+        bound = getattr(signer, "__self__", None)
+        if bound is not None \
+                and hasattr(bound, "decrypt_envelope"):
+            return bound
+        return None
+
+    def _key_proof(self, username: str, purpose: str, signer,
+                   sign_pub: str, pubkey: str,
+                   identity=None) -> dict:
+        """One possession handshake: key_challenge -> open the
+        envelope with the candidate identity -> sign the proof
+        string with the candidate signing key. Returns the
+        key_proof dict the register/recovery/rectify payloads
+        carry. Fail-closed: any step failing raises
+        TransportError and no key is published."""
+        ident = self._candidate_identity(signer, identity)
+        if ident is None:
+            raise TransportError(
+                "key_challenge needs the candidate identity to "
+                "open the challenge envelope (pass identity= or "
+                "the identity's bound sign method)")
+        reply = self._edge_post("key_challenge", {
+            "username": str(username), "purpose": str(purpose),
+            "candidate_pubkey": str(pubkey),
+            "candidate_sign_pub": str(sign_pub)})
+        challenge_id = str(reply.get("challenge_id") or "")
+        envelope = reply.get("envelope")
+        if not challenge_id or not isinstance(envelope, dict) \
+                or not envelope.get("ct"):
+            raise TransportError(
+                "login Edge key_challenge missing challenge_id/"
+                "envelope")
+        try:
+            opened = ident.decrypt_envelope(envelope)
+            data = json.loads(opened.decode())
+        except Exception as exc:
+            raise TransportError(
+                "key_challenge envelope could not be opened "
+                "with the candidate key") from exc
+        nonce = str(data.get("nonce") or "")
+        if not nonce \
+                or str(data.get("challenge_id") or "") != challenge_id:
+            raise TransportError(
+                "key_challenge envelope does not match the "
+                "challenge")
+        proof_text = ("agentlink-key-proof-v1:" + challenge_id
+                      + ":" + nonce).encode()
+        signature = signer(proof_text)
+        if isinstance(signature, bytes):
+            import base64 as _b64
+            signature = _b64.b64encode(signature).decode()
+        return {"challenge_id": challenge_id, "nonce": nonce,
+                "signature": str(signature)}
+
     def register_and_login(self, username: str, signer, sign_pub: str,
                            pubkey: str, client_version: str = "",
                            decision_link: str | None = None,
                            decision_link_detail: dict | None = None,
                            designation: str = "",
-                           provisioning_grant: str = "") -> dict:
+                           provisioning_grant: str = "",
+                           identity=None) -> dict:
         """First-come registration (v2.0.8): claim an unheld
         username for the identity keys this agent generated on
         its own machine, and open the session in the same step.
@@ -1587,6 +1657,9 @@ class ServerlessTransport:
                                decision_link, decision_link_detail)
         payload = {"username": self.username, "sign_pub": sign_pub,
                    "pubkey": pubkey}
+        payload["key_proof"] = self._key_proof(
+            self.username, "register", signer, sign_pub, pubkey,
+            identity=identity)
         payload.update(self._declaration_payload())
         if designation in ("production", "test"):
             payload["designation"] = designation
@@ -1602,7 +1675,8 @@ class ServerlessTransport:
                           sign_pub: str, pubkey: str,
                           client_version: str = "",
                           decision_link: str | None = None,
-                          decision_link_detail: dict | None = None) -> dict:
+                          decision_link_detail: dict | None = None,
+                          identity=None) -> dict:
         """Recovery-key reclaim (the client path, v2.0.8): present
         the account's recovery key and rebind the account to THIS
         machine's identity keys (the fresh pair in the state
@@ -1616,6 +1690,9 @@ class ServerlessTransport:
         payload = {"username": self.username,
                    "recovery_key": recovery_key,
                    "new_sign_pub": sign_pub, "new_pubkey": pubkey}
+        payload["key_proof"] = self._key_proof(
+            self.username, "recovery", signer, sign_pub, pubkey,
+            identity=identity)
         payload.update(self._declaration_payload())
         reply = self._edge_post("recovery", payload)
         result = self._adopt_tokens(self.username, reply)
@@ -1627,7 +1704,8 @@ class ServerlessTransport:
                           sign_pub: str, pubkey: str,
                           client_version: str = "",
                           decision_link: str | None = None,
-                          decision_link_detail: dict | None = None) -> dict:
+                          decision_link_detail: dict | None = None,
+                          identity=None) -> dict:
         """Operator rectification (v2.0.9): present the one-time
         code the operator issued for this username and rebind the
         stranded account to THIS machine's identity keys. The
@@ -1643,6 +1721,9 @@ class ServerlessTransport:
         payload = {"username": self.username,
                    "rectify_code": rectify_code,
                    "new_sign_pub": sign_pub, "new_pubkey": pubkey}
+        payload["key_proof"] = self._key_proof(
+            self.username, "rectify", signer, sign_pub, pubkey,
+            identity=identity)
         payload.update(self._declaration_payload())
         reply = self._edge_post("rectify", payload)
         result = self._adopt_tokens(self.username, reply)
@@ -1677,6 +1758,11 @@ class ServerlessTransport:
             return False
         payload = dict(entry or {})
         payload["username"] = self.username
+        # Key epoch (2.6.1): the live copy carries the same
+        # epoch as the master row (default 1 for pre-epoch
+        # rows), so RTDB readers see the epoch too.
+        payload["key_epoch"] = int(entry.get("key_epoch") or 1) \
+            if isinstance(entry, dict) else 1
         try:
             self.doorbell.publish_directory(payload)
         except Exception:
@@ -1685,6 +1771,54 @@ class ServerlessTransport:
             return False
         self._directory_cache[self.username] = payload
         return True
+
+    def peer_key(self, username: str) -> tuple[str, int]:
+        """A peer's CURRENT (pubkey, key_epoch), read FRESH
+        from the al_directory master on EVERY call: send-time
+        freshness (2.6.1), no cross-send cache is consulted or
+        populated here, so a seal never rides a key the peer
+        has rotated away from. Raises TransportError when the
+        peer has no published key."""
+        name = str(username)
+        rows = self._rest(
+            "GET", "directory",
+            self._eq("username", name)
+            + "&select=username,pubkey,key_epoch") or []
+        if not rows or not rows[0].get("pubkey"):
+            raise TransportError(
+                f"no published key for @{name}")
+        return (str(rows[0]["pubkey"]),
+                int(rows[0].get("key_epoch") or 1))
+
+    def published_key_epoch(self, username: str) -> int:
+        """The account's published key_epoch from the MASTER
+        record (al_directory via REST) — never the RTDB working
+        copy: for one's OWN entry the working copy is derived
+        from the local identity, so it can never correct it
+        (2.6.1, Fix 2 adoption). 0 when unknown."""
+        rows = self._rest(
+            "GET", "directory",
+            self._eq("username", str(username))
+            + "&select=username,key_epoch") or []
+        if not rows:
+            return 0
+        try:
+            return int(rows[0].get("key_epoch") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def key_mismatch(self, message_id: str,
+                     recipient_epoch: int) -> dict:
+        """Report one undecryptable DM to its sender (2.6.1,
+        Fix 2): the api Edge records it, writes the audit row
+        and enqueues a key_mismatch inbox frame to the sender.
+        The Edge dedupes on (message_id, recipient_epoch)."""
+        if not self.username or self._signer is None:
+            raise TransportError("key_mismatch needs login")
+        return self._fn_data(
+            "agentlink-api", "key_mismatch",
+            {"message_id": str(message_id),
+             "recipient_epoch": int(recipient_epoch)})
 
     # -- scoped presence subscriptions ----------------------------------
     def set_counterparty_provider(self, provider) -> None:
@@ -2640,33 +2774,52 @@ class ServerlessTransport:
         classic cause is an identity rotation after the wrap was
         sealed). One group_key_request custody frame per admin;
         an admin's client re-distributes the SAME epoch key sealed
-        to my CURRENT directory pubkey (2.0.6)."""
+        to my CURRENT directory pubkey (2.0.6).
+
+        No-admin heal (2.6.1, Fix 2 sub-item 6): a group with NO
+        admin (e.g. PACE after its admin removed itself) would
+        otherwise have nobody to ask. When the admin set is
+        empty, the request goes to EVERY other member instead:
+        the re-issuer needs only to HOLD the group key, never
+        admin rights (client._reissue_group_key enforces no
+        admin precondition; the groups Edge gate permits a
+        same-epoch single-member reissue by any member)."""
         gid = str(frame.get("group_id") or "")
         if not gid or not self.username:
             return {"admins": []}
-        admins = [m["username"] for m in self.group_members(gid)
+        members = self.group_members(gid)
+        admins = [m["username"] for m in members
                   if m.get("role") in ("admin", "superadmin")
                   and m.get("username") != self.username]
+        targets = admins if admins else [
+            m["username"] for m in members
+            if m.get("username") != self.username]
         req = {"type": "group_key_request", "group_id": gid,
                "from": self.username, "id": new_id(),
                "epoch": frame.get("epoch"), "ts": now_ts()}
-        for admin in admins:
-            self._enqueue(admin, dict(req))
+        for target in targets:
+            self._enqueue(target, dict(req))
         return {"admins": admins}
 
     def request_channel_key(self, frame: dict) -> dict:
-        """The channel twin of request_group_key."""
+        """The channel twin of request_group_key (same
+        no-admin fallback: every other member when no admin
+        holds the channel)."""
         cid = str(frame.get("channel_id") or "")
         if not cid or not self.username:
             return {"admins": []}
-        admins = [m["username"] for m in self.channel_members(cid)
+        members = self.channel_members(cid)
+        admins = [m["username"] for m in members
                   if m.get("role") in ("admin", "superadmin")
                   and m.get("username") != self.username]
+        targets = admins if admins else [
+            m["username"] for m in members
+            if m.get("username") != self.username]
         req = {"type": "channel_key_request", "channel_id": cid,
                "from": self.username, "id": new_id(),
                "epoch": frame.get("epoch"), "ts": now_ts()}
-        for admin in admins:
-            self._enqueue(admin, dict(req))
+        for target in targets:
+            self._enqueue(target, dict(req))
         return {"admins": admins}
 
     def fetch_conversation(self, peer: str | None = None,
@@ -2737,6 +2890,8 @@ class ServerlessTransport:
             caps = _loads(caps, [])
         row["capabilities"] = list(caps) if isinstance(
             caps, (list, tuple)) else []
+        # Key epoch (2.6.1): pre-epoch rows read as epoch 1.
+        row["key_epoch"] = int(row.get("key_epoch") or 1)
         return row
 
     def directory_entry(self, username: str) -> dict | None:
@@ -2770,7 +2925,8 @@ class ServerlessTransport:
             "GET", "directory",
             self._eq("username", name)
             + "&select=username,display_name,pubkey,sign_pub,"
-              "capabilities,cap_desc,mode,designation,last_seen") or []
+              "key_epoch,capabilities,cap_desc,mode,designation,"
+              "last_seen") or []
         if not rows:
             return None
         entry = self._shape_directory_row(rows[0])
@@ -3758,17 +3914,52 @@ class ServerlessTransport:
         admin/superadmin), then one wrapped-key row per named
         member (non-members in the map are skipped, exactly as
         the relay skips them) and the relay's group_key frame to
-        each recipient through the custody queue."""
+        each recipient through the custody queue.
+        (2.6.1, Fix 2 sub-item 6) SAME-EPOCH SINGLE-MEMBER
+        REISSUE: a plain member may re-seal the UNCHANGED
+        current-epoch key to exactly ONE member - the
+        group_key_request healing path (_reissue_group_key):
+        the writer already holds the group key, so re-sealing
+        it to another member grants no new capability, and a
+        group with NO admin (its creator removed itself) can
+        still heal a rotated member's wrap. The admin gate
+        stays for everything else: epoch changes, multi-member
+        distributions, and initial distribution (no key rows
+        yet means no epoch to re-seal)."""
         gid = str(frame.get("group_id") or "")
         if self._group_view(gid) is None:
             raise Refusal("unknown_group")
-        if self._my_group_role(gid) not in ("admin", "superadmin"):
-            raise Refusal("permission_denied",
-                          "only admins can distribute group keys")
         epoch = int(frame.get("epoch") or 1)
         wrapped_map = frame.get("wrapped") or {}
         member_names = {m["username"]
                         for m in self.group_members(gid)}
+        my_role = self._my_group_role(gid)
+        if my_role not in ("admin", "superadmin"):
+            # Same-epoch, single-member reissue by ANY member:
+            # the caller must be a member, the epoch must be
+            # the group's CURRENT epoch (a key row exists for
+            # it), and the map must name exactly one member.
+            # Anything else still needs an admin.
+            current_epoch = 0
+            rows = self._rest(
+                "GET", "group_keys",
+                self._eq("group_id", gid)
+                + "&select=epoch&order=epoch.desc&limit=1") or []
+            if rows:
+                try:
+                    current_epoch = int(rows[0]["epoch"])
+                except (KeyError, TypeError, ValueError):
+                    current_epoch = 0
+            targets = [str(u) for u in wrapped_map]
+            reissue = (
+                my_role is not None
+                and current_epoch > 0
+                and epoch == current_epoch
+                and len(targets) == 1
+                and targets[0] in member_names)
+            if not reissue:
+                raise Refusal("permission_denied",
+                              "only admins can distribute group keys")
         my_pub = ""
         entry = self.directory_entry(self.username)
         if entry:
