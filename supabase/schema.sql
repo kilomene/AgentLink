@@ -54,6 +54,7 @@ create table if not exists al_groups (
     id text primary key,
     name text not null,
     creator text not null,
+    key_epoch integer not null default 0,
     settings jsonb not null default '{}',
     created_at bigint not null
 );
@@ -88,6 +89,7 @@ create table if not exists al_channels (
     id text primary key,
     name text not null,
     creator text not null,
+    key_epoch integer not null default 0,
     created_at bigint not null
 );
 
